@@ -1,5 +1,7 @@
 //! `GET /api/v1/audit`, `GET /api/v1/audit/{seq}` and
-//! `POST /api/v1/audit/verify` (`audit-log-format.md` sections 2.4 and 6).
+//! `POST /api/v1/audit/verify` (`audit-log-format.md` sections 2.4 and 6),
+//! and what the audit records of the request body limit and of parameters
+//! kept as a digest (README "Request body limit", section 4.1).
 
 mod common;
 
@@ -332,4 +334,347 @@ async fn audit_lists_verifies_and_reports_a_tampered_record() {
         .await
         .unwrap();
     assert_eq!(seen, (1..=all).collect::<Vec<_>>(), "pages walk the log");
+}
+
+// ---------------------------------------------------------------------------
+// The request body limit and the parameters digest (README "Request body
+// limit", `audit-log-format.md` section 4.1, ADR 0306).
+// ---------------------------------------------------------------------------
+
+/// The limit: 256 KiB.
+const LIMIT: usize = 262_144;
+
+/// A `createProject` body of exactly `len` bytes.
+fn project_body(len: usize) -> String {
+    let empty = r#"{"slug":"big","name":""}"#;
+    let body = format!(
+        r#"{{"slug":"big","name":"{}"}}"#,
+        "n".repeat(len - empty.len())
+    );
+    assert_eq!(body.len(), len);
+    body
+}
+
+async fn audit_count(server: &common::Server) -> i64 {
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    count
+}
+
+/// The newest record, as `listAudit` returns it.
+async fn newest(server: &common::Server, owner: &reqwest::Client) -> Value {
+    let page = list(owner, &server.url("/api/v1/audit?order=desc&limit=1")).await;
+    items(&page).remove(0)
+}
+
+/// Lowercase hex SHA-256, computed here rather than by the server.
+fn sha256(text: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Asserts that `record` is the audit of a 413: refused, `payload_too_large`,
+/// `params` `{}` and neither digest field.
+fn assert_too_large_record(record: &Value, operation: &str) {
+    assert_eq!(record["operation"], operation, "{record}");
+    assert_eq!(record["result"], "refused", "{record}");
+    assert_eq!(record["result_detail"], "payload_too_large", "{record}");
+    assert_eq!(record["params"], json!({}), "{record}");
+    assert!(record["params_sha256"].is_null(), "{record}");
+    assert!(record["params_bytes"].is_null(), "{record}");
+}
+
+/// The owner's `quoro_session=...` cookie, from a login of its own.
+async fn session_cookie(server: &common::Server) -> String {
+    let res = reqwest::Client::new()
+        .post(server.url("/api/v1/auth/login"))
+        .json(&json!({ "email": common::OWNER_EMAIL, "password": common::OWNER_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let cookie = res
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("quoro_session="))
+        .unwrap()
+        .to_string();
+    cookie.split(';').next().unwrap().to_string()
+}
+
+/// `POST path` with `body` sent chunked, so with no `Content-Length`; returns
+/// the status and the raw response.
+async fn post_chunked(
+    server: &common::Server,
+    path: &str,
+    cookie: &str,
+    body: &[u8],
+) -> (u16, String) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::TcpStream::connect(server.address())
+        .await
+        .unwrap();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {}\r\nCookie: {cookie}\r\n\
+         Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\
+         Connection: close\r\n\r\n",
+        server.address()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    for chunk in body.chunks(16 * 1024) {
+        stream
+            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .await
+            .unwrap();
+        stream.write_all(chunk).await.unwrap();
+        stream.write_all(b"\r\n").await.unwrap();
+    }
+    // The server may answer before it reads the terminator.
+    let _ = stream.write_all(b"0\r\n\r\n").await;
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response).await;
+    let text = String::from_utf8_lossy(&response).to_string();
+    let status = text
+        .split(' ')
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .unwrap_or_else(|| panic!("no status line: {text:?}"));
+    (status, text)
+}
+
+#[tokio::test]
+async fn a_body_above_the_limit_is_refused_and_audited() {
+    let server = common::start().await;
+    let owner = server.owner().await;
+
+    // With a Content-Length: 413, unparsed, and audited as a refusal of the
+    // call with `params` `{}`.
+    let before = audit_count(&server).await;
+    let res = owner
+        .post(server.url("/api/v1/projects"))
+        .header("Content-Type", "application/json")
+        .body(project_body(LIMIT + 1))
+        .send()
+        .await
+        .unwrap();
+    let (status, code, _) = common::problem(res).await;
+    assert_eq!((status, code.as_str()), (413, "payload_too_large"));
+    assert_eq!(audit_count(&server).await, before + 1);
+    let record = newest(&server, &owner).await;
+    assert_too_large_record(&record, "POST /api/v1/projects");
+    assert_eq!(record["actor_type"], "user");
+    assert_eq!(record["channel"], "panel");
+    let (projects,): (i64,) = sqlx::query_as("SELECT count(*) FROM projects")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(projects, 0, "the body was not acted on");
+
+    // Chunked, with no Content-Length: the same.
+    let cookie = session_cookie(&server).await;
+    let before = audit_count(&server).await;
+    let (status, text) = post_chunked(
+        &server,
+        "/api/v1/projects",
+        &cookie,
+        project_body(LIMIT + 1).as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 413, "{text}");
+    assert!(text.contains("payload_too_large"), "{text}");
+    assert_eq!(audit_count(&server).await, before + 1);
+    assert_too_large_record(&newest(&server, &owner).await, "POST /api/v1/projects");
+
+    // The chain with these records verifies.
+    let verified: Value = owner
+        .post(server.url("/api/v1/audit/verify"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(verified["ok"], true, "{verified}");
+}
+
+#[tokio::test]
+async fn a_body_at_the_limit_is_not_refused_for_its_size() {
+    let server = common::start().await;
+    let owner = server.owner().await;
+    let cookie = session_cookie(&server).await;
+    for chunked in [false, true] {
+        let status = if chunked {
+            post_chunked(
+                &server,
+                "/api/v1/projects",
+                &cookie,
+                project_body(LIMIT).as_bytes(),
+            )
+            .await
+            .0
+        } else {
+            owner
+                .post(server.url("/api/v1/projects"))
+                .header("Content-Type", "application/json")
+                .body(project_body(LIMIT))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        };
+        assert_ne!(status, 413, "chunked: {chunked}");
+    }
+    let refused: Vec<i64> = stored_seqs(&server, "result_detail = 'payload_too_large'").await;
+    assert!(refused.is_empty(), "{refused:?}");
+}
+
+#[tokio::test]
+async fn a_body_above_the_limit_without_an_identity_is_not_recorded() {
+    let server = common::start().await;
+    let owner = server.owner().await;
+    let before = audit_count(&server).await;
+
+    // No credential at all.
+    let res = server
+        .client()
+        .post(server.url("/api/v1/projects"))
+        .header("Content-Type", "application/json")
+        .body(project_body(LIMIT + 1))
+        .send()
+        .await
+        .unwrap();
+    let (status, code, _) = common::problem(res).await;
+    assert_eq!((status, code.as_str()), (413, "payload_too_large"));
+
+    // A public operation has no identity, even with a session alongside.
+    let res = owner
+        .post(server.url("/api/v1/auth/login"))
+        .header("Content-Type", "application/json")
+        .body(project_body(LIMIT + 1))
+        .send()
+        .await
+        .unwrap();
+    let (status, code, _) = common::problem(res).await;
+    assert_eq!((status, code.as_str()), (413, "payload_too_large"));
+
+    // A human's read is not recorded either.
+    let res = owner
+        .get(server.url("/api/v1/projects"))
+        .header("Content-Type", "application/json")
+        .body(project_body(LIMIT + 1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 413);
+
+    assert_eq!(audit_count(&server).await, before);
+}
+
+#[tokio::test]
+async fn an_agent_key_call_above_the_limit_is_recorded_for_its_agent() {
+    let server = common::start().await;
+    let owner = server.owner().await;
+    let me = list(&owner, &server.url("/api/v1/auth/me")).await;
+    let agent: Value = owner
+        .post(server.url("/api/v1/agents"))
+        .json(&json!({ "name": "operator", "model": "m", "owner_user_id": me["user"]["id"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+    let key: Value = owner
+        .post(server.url(&format!("/api/v1/agents/{agent_id}/keys")))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let res = reqwest::Client::new()
+        .post(server.url("/api/v1/auth/agent-token"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", key["key"].as_str().unwrap()),
+        )
+        .header("Content-Type", "application/json")
+        .body(project_body(LIMIT + 1))
+        .send()
+        .await
+        .unwrap();
+    let (status, code, _) = common::problem(res).await;
+    assert_eq!((status, code.as_str()), (413, "payload_too_large"));
+    let record = newest(&server, &owner).await;
+    assert_too_large_record(&record, "POST /api/v1/auth/agent-token");
+    assert_eq!(record["actor_type"], "agent");
+    assert_eq!(record["actor_id"], agent_id.as_str());
+}
+
+#[tokio::test]
+async fn a_float_a_node_reads_as_another_number_is_audited_with_a_digest() {
+    let server = common::start().await;
+    let owner = server.owner().await;
+
+    // A human's approval request: refused after authorization, so the error
+    // is audited with the body's parameters. One of them is a float a node
+    // would read back as another number (`audit-log-format.md` section 4.1).
+    let body = r#"{"scope":"app:delete","target":{"type":"app","id":"app_01JC9Z6Q5W8N3K4T7R2M1XHB0F"},"operation":"DELETE /api/v1/apps/{app_id}","params":{"x":18983552425072.563},"justification":"j"}"#;
+    let before = audit_count(&server).await;
+    let res = owner
+        .post(server.url("/api/v1/approvals"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let (status, code, _) = common::problem(res).await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
+    assert_eq!(audit_count(&server).await, before + 1);
+
+    // The record keeps the digest of the parameters' RFC 8785 text, the
+    // float as the primary read it.
+    let record = newest(&server, &owner).await;
+    assert_eq!(record["operation"], "POST /api/v1/approvals", "{record}");
+    assert_eq!(record["params"], json!({}), "{record}");
+    let text = r#"{"incident_id":null,"justification":"j","operation":"DELETE /api/v1/apps/{app_id}","params":{"x":18983552425072.563},"scope":"app:delete","target":{"id":"app_01JC9Z6Q5W8N3K4T7R2M1XHB0F","type":"app"}}"#;
+    assert_eq!(record["params_sha256"], json!(sha256(text)), "{record}");
+    assert_eq!(record["params_bytes"], json!(text.len()), "{record}");
+    let seq = record["seq"].as_i64().unwrap();
+    assert_eq!(
+        list(&owner, &server.url(&format!("/api/v1/audit/{seq}"))).await,
+        record
+    );
+
+    // Its change-log entry was written, and the chain verifies.
+    let (entries,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM change_log WHERE entity_type = 'audit' AND entity_id = ?",
+    )
+    .bind(seq.to_string())
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(entries, 1);
+    let verified: Value = owner
+        .post(server.url("/api/v1/audit/verify"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(verified["ok"], true, "{verified}");
+    assert_eq!(verified["checked"].as_i64(), Some(seq));
 }

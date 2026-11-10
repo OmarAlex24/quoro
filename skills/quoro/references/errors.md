@@ -9,7 +9,7 @@ Branch on these; they never change meaning.
 | Exit | Meaning | Next step |
 | --- | --- | --- |
 | 0 | Success. | Read the state back to confirm the change. |
-| 1 | Any other failure: `unauthenticated`, `validation_failed`, `rate_limited`, `not_primary`, `internal`, a local file, or a build that `quoro up` followed and that failed or was cancelled. | Read the message. For a build, read `quoro logs --build`. For `unauthenticated`, the key file or the context is wrong: tell the human; never ask for a key. |
+| 1 | Any other failure: `unauthenticated`, `payload_too_large`, `validation_failed`, `rate_limited`, `not_primary`, `internal`, a local file, or a build that `quoro up` followed and that failed or was cancelled. | Read the message. For a build, read `quoro logs --build`. For `unauthenticated`, the key file or the context is wrong: tell the human; never ask for a key. |
 | 2 | The CLI refused the command line, the context or a request body before sending anything. | Fix the command: check [commands](commands.md). Pass `--reason` on a change. |
 | 3 | `approval_required`: a human must approve this call first; or the approval you waited for was denied or expired. | Run the same command with `--request-approval --wait`. After a denial or an expiry, stop and report. |
 | 4 | `forbidden`, whatever the reason, `human_only` included. Retrying the same call cannot succeed. | Read the reason below. |
@@ -26,6 +26,7 @@ Branch on these; they never change meaning.
 | `approval_required` | 403 | 3 | The answer names the `scope` and `target`. File the approval: `--request-approval --wait`, or MCP `request_approval`. |
 | `not_found` | 404 | 5 | The id or name does not exist, or your grant's selector hides it. |
 | `conflict` | 409 | 6 | The state does not allow the call: a deploy or build in progress, an image given to a Git app (use `quoro up`), a name in use. |
+| `payload_too_large` | 413 | 1 | The request body is larger than 256 KiB, so the primary did not read it; the call is still recorded in the audit log. Send less at once: split the change into smaller calls. Repeating the same call cannot succeed. |
 | `validation_failed` | 422 | 1 | The input is invalid; the message names the field. Fix it and repeat. |
 | `rate_limited` | 429 | 1 | Wait and repeat once. |
 | `not_primary` | 503 | 1 | The call reached a node that is not the primary. Retry; if it persists, tell the human. |

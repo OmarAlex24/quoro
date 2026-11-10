@@ -14,9 +14,10 @@ use std::io::Write;
 ///
 /// - `unauthenticated` is [`OTHER`]: a missing or wrong credential is fixed
 ///   locally, not by a grant, so it is kept apart from [`FORBIDDEN`].
-/// - `validation_failed`, `rate_limited`, `not_primary` and `internal` are
-///   [`OTHER`]; [`USAGE`] stays for command lines the client itself refuses
-///   before it sends anything.
+/// - `payload_too_large`, `validation_failed`, `rate_limited`, `not_primary`
+///   and `internal` are [`OTHER`]; [`USAGE`] stays for command lines the
+///   client itself refuses before it sends anything, and a body the primary
+///   refused for its size was sent.
 /// - `forbidden` is [`FORBIDDEN`] whatever its `reason`, `human_only`
 ///   included: retrying the same call cannot succeed.
 pub mod exit {
@@ -167,6 +168,7 @@ mod tests {
             ("approval_required", 403, exit::APPROVAL_REQUIRED),
             ("not_found", 404, exit::NOT_FOUND),
             ("conflict", 409, exit::CONFLICT),
+            ("payload_too_large", 413, exit::OTHER),
             ("validation_failed", 422, exit::OTHER),
             ("rate_limited", 429, exit::OTHER),
             ("not_primary", 503, exit::OTHER),
@@ -197,6 +199,24 @@ mod tests {
         assert_eq!(
             failure.message,
             "Approval required (approval_required); scope app:delete on app app_1"
+        );
+    }
+
+    #[test]
+    fn a_body_above_the_limit_names_the_limit() {
+        let failure = problem(json!({
+            "code": "payload_too_large", "status": 413, "title": "Payload too large",
+            "detail": "the request body is larger than 262144 bytes (256 KiB)"
+        }));
+        assert_eq!(failure.code, exit::OTHER);
+        assert_eq!(
+            failure.message,
+            "the request body is larger than 262144 bytes (256 KiB) (payload_too_large)"
+        );
+        assert_eq!(
+            Failure::from_response(413, b"", None).code,
+            exit::OTHER,
+            "a 413 without a problem body"
         );
     }
 

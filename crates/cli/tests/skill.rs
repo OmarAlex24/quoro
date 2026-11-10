@@ -667,6 +667,7 @@ fn the_error_reference_covers_every_exit_code() {
         "approval_required",
         "not_found",
         "conflict",
+        "payload_too_large",
         "validation_failed",
         "rate_limited",
         "not_primary",

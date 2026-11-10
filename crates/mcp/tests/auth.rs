@@ -447,3 +447,106 @@ async fn initialize_needs_no_session() {
         quoro_mcp::tools::specs().len()
     );
 }
+
+/// The limit of a request body: 256 KiB (README "Request body limit").
+const LIMIT: usize = 262_144;
+
+/// A `tools/call` body of exactly `len` bytes.
+fn tool_call_body(len: usize) -> String {
+    let empty = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_cluster","arguments":{"pad":""}}}"#;
+    let body = empty.replace(
+        r#""pad":"""#,
+        &format!(r#""pad":"{}""#, "p".repeat(len - empty.len())),
+    );
+    assert_eq!(body.len(), len);
+    body
+}
+
+/// `POST /mcp` with `body` as it is, and an optional bearer token.
+async fn send_raw(server: &Server, token: Option<&str>, body: String) -> Response {
+    let mut headers = Vec::new();
+    if let Some(token) = token {
+        headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+    }
+    let mut request = reqwest::Client::new()
+        .post(server.url("/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("MCP-Protocol-Version", PROTOCOL_VERSION)
+        .body(body);
+    for (name, value) in &headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let content_type = header(response.headers(), "content-type");
+    let www_authenticate = header(response.headers(), "www-authenticate");
+    let session_id = header(response.headers(), "mcp-session-id");
+    let text = response.text().await.unwrap();
+    let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+    Response {
+        status,
+        content_type,
+        www_authenticate,
+        session_id,
+        text,
+        body,
+    }
+}
+
+// 14. A body above the limit is answered 413 without being parsed, and an
+// agent's call is audited with the request line as its operation, since the
+// tool is named inside the unread body (README "Request body limit").
+#[tokio::test]
+async fn a_body_above_the_limit_is_refused_and_audited_as_post_mcp() {
+    let s = seeded().await;
+    let before = s.server.audit_rows().await.len();
+    let response = send_raw(&s.server, Some(&s.access_token), tool_call_body(LIMIT + 1)).await;
+    assert_eq!(response.status, 413, "{}", response.text);
+    assert_eq!(
+        response.content_type.as_deref(),
+        Some("application/problem+json")
+    );
+    assert_eq!(
+        response.body["code"], "payload_too_large",
+        "{}",
+        response.text
+    );
+
+    let rows = s.server.audit_rows().await;
+    assert_eq!(rows.len(), before + 1);
+    let record = rows.last().unwrap();
+    assert_eq!(record["operation"], "POST /mcp", "{record}");
+    assert_eq!(record["channel"], "mcp", "{record}");
+    assert_eq!(record["actor_type"], "agent", "{record}");
+    assert_eq!(record["actor_id"], s.agent_id.as_str(), "{record}");
+    assert_eq!(record["result"], "refused", "{record}");
+    assert_eq!(record["result_detail"], "payload_too_large", "{record}");
+    assert_eq!(record["params"], json!({}), "{record}");
+    let (digest,): (Option<String>,) =
+        sqlx::query_as("SELECT params_sha256 FROM audit_log ORDER BY seq DESC LIMIT 1")
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(digest, None);
+
+    // Without a credential: the same answer, and no record.
+    let response = send_raw(&s.server, None, tool_call_body(LIMIT + 1)).await;
+    assert_eq!(response.status, 413, "{}", response.text);
+    assert_eq!(
+        response.body["code"], "payload_too_large",
+        "{}",
+        response.text
+    );
+    assert_eq!(s.server.audit_rows().await.len(), before + 1);
+
+    // A body of exactly the limit is not refused for its size.
+    let response = send_raw(&s.server, Some(&s.access_token), tool_call_body(LIMIT)).await;
+    assert_ne!(response.status, 413, "{}", response.text);
+    let refused: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM audit_log WHERE result_detail = 'payload_too_large'")
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(refused.0, 1);
+}

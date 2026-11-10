@@ -1,6 +1,7 @@
-//! Per-request plumbing: the `Quoro-Request-Id`, the JSON body extractor that
-//! answers `validation_failed`, and [`CallCtx`], the one place where a call is
-//! authorized and audited (D-0031: one authorization path, one audit path).
+//! Per-request plumbing: the `Quoro-Request-Id`, the request body limit, the
+//! JSON body extractor that answers `validation_failed`, and [`CallCtx`], the
+//! one place where a call is authorized and audited (D-0031: one
+//! authorization path, one audit path).
 
 use crate::AppState;
 use crate::audit::{self, Channel, Outcome, Record};
@@ -10,10 +11,13 @@ use crate::changelog::{self, Actor, Op};
 use crate::error::{ApiError, Code, Reason, Target};
 use crate::events::{self, NewEvent, Source};
 use crate::store::now_rfc3339;
-use axum::extract::{FromRequest, OptionalFromRequest, Request};
-use axum::http::{HeaderMap, HeaderValue};
+use axum::body::Body;
+use axum::extract::{FromRequest, MatchedPath, OptionalFromRequest, Request, State};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt as _;
 use quoro_types::{Prefix, Scope, new_id};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -45,6 +49,181 @@ pub fn request_id_of(extensions: &axum::http::Extensions) -> String {
         .map_or_else(|| new_id(Prefix::Request), |r| r.0.clone())
 }
 
+/// The largest request body the primary reads, on every API operation and on
+/// `/mcp`: 256 KiB (README "Request body limit", ADR 0306).
+pub const MAX_BODY_BYTES: usize = 262_144;
+
+/// A request whose body was read against [`MAX_BODY_BYTES`].
+#[derive(Debug)]
+pub enum Limited {
+    /// The body is within the limit: the request, with its body in memory.
+    Within(Request),
+    /// The body is above the limit: the request's parts. The body was read
+    /// no further than the limit and is dropped unparsed.
+    Above(Parts),
+}
+
+/// Reads `request`'s body into memory, but no more of it than
+/// [`MAX_BODY_BYTES`] and the chunk that passes it. The count is of the bytes
+/// that arrive, so a body without a `Content-Length`, such as a chunked one,
+/// is held to the limit too. The parts, upgrade handles included, are kept.
+///
+/// # Errors
+///
+/// `validation_failed` for a body that could not be read, as [`ApiJson`]
+/// answers it.
+pub async fn read_limited(request: Request) -> Result<Limited, ApiError> {
+    let (parts, body) = request.into_parts();
+    let mut stream = body.into_data_stream();
+    let mut read = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            ApiError::validation(format!("the request body could not be read: {e}"))
+        })?;
+        if read.len() + chunk.len() > MAX_BODY_BYTES {
+            return Ok(Limited::Above(parts));
+        }
+        read.extend_from_slice(&chunk);
+    }
+    Ok(Limited::Within(Request::from_parts(
+        parts,
+        Body::from(read),
+    )))
+}
+
+/// The answer to a body above the limit, `413 payload_too_large`. When
+/// `caller` is a call the audit log records, the refusal is audited first
+/// (README "Request body limit", `audit-log-format.md` section 3).
+///
+/// Returns the error to answer: the 413, or an internal error when the
+/// refusal could not be recorded.
+pub async fn refuse_too_large(state: &AppState, caller: Option<&CallCtx>) -> ApiError {
+    if let Some(ctx) = caller
+        && let Err(error) = ctx.audit_too_large(state).await
+    {
+        return error;
+    }
+    ApiError::new(
+        Code::PayloadTooLarge,
+        format!("the request body is larger than {MAX_BODY_BYTES} bytes (256 KiB)"),
+    )
+}
+
+/// Middleware: the request body limit of every API operation (README
+/// "Request body limit", ADR 0306). It runs after routing, so it knows the
+/// operation, and before any extractor reads the body. A body within the
+/// limit goes on, in memory; a larger one is answered by
+/// [`refuse_too_large`] without being parsed, and audited when the call is
+/// one the audit log records ([`oversized_caller`]).
+pub async fn limit_body(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    match read_limited(request).await {
+        Ok(Limited::Within(request)) => next.run(request).await,
+        Ok(Limited::Above(parts)) => match oversized_caller(&state, &parts).await {
+            Ok(caller) => refuse_too_large(&state, caller.as_ref())
+                .await
+                .into_response(),
+            Err(error) => error.into_response(),
+        },
+        Err(error) => error.into_response(),
+    }
+}
+
+/// How an operation's caller authenticates, from its `x-quoro-scope` and
+/// `security` in the generated document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Credentials {
+    /// `public` or `node`: the call has no identity the audit log records.
+    None,
+    /// An agent key, on `createAgentToken` only.
+    AgentKey,
+    /// A session, a personal API token or an agent access token.
+    Caller,
+}
+
+/// The [`Credentials`] of `operation` (`POST /api/v1/vms` style), read once
+/// from the operations' annotations (`crate::openapi`, which
+/// `tests/openapi_diff.rs` holds to the contract). An operation the document
+/// does not name takes the usual credentials.
+fn credentials_of(operation: &str) -> Credentials {
+    static OPERATIONS: OnceLock<HashMap<String, Credentials>> = OnceLock::new();
+    let operations = OPERATIONS.get_or_init(|| {
+        use utoipa::OpenApi as _;
+        let document = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap_or_default();
+        let mut operations = HashMap::new();
+        for (path, item) in document["paths"].as_object().into_iter().flatten() {
+            for (method, spec) in item.as_object().into_iter().flatten() {
+                let agent_key = spec["security"]
+                    .as_array()
+                    .is_some_and(|schemes| schemes.iter().any(|s| s.get("agentKey").is_some()));
+                let credentials = match spec["x-quoro-scope"].as_str() {
+                    Some("public" | "node") => Credentials::None,
+                    _ if agent_key => Credentials::AgentKey,
+                    _ => Credentials::Caller,
+                };
+                operations.insert(
+                    format!("{} {path}", method.to_ascii_uppercase()),
+                    credentials,
+                );
+            }
+        }
+        operations
+    });
+    operations
+        .get(operation)
+        .copied()
+        .unwrap_or(Credentials::Caller)
+}
+
+/// The context of an API call whose body is above the limit, when the audit
+/// log records the call: the request is authenticated as the operation
+/// authenticates it, without its body. `None` for a call with no identity (a
+/// public operation, a missing or unknown credential, a path no operation
+/// matched) and for a human's read, which is not recorded
+/// (`audit-log-format.md` section 3).
+///
+/// # Errors
+///
+/// An internal error while resolving the credential.
+async fn oversized_caller(state: &AppState, parts: &Parts) -> Result<Option<CallCtx>, ApiError> {
+    let Some(path) = parts.extensions.get::<MatchedPath>() else {
+        return Ok(None);
+    };
+    let operation = format!("{} {}", parts.method, path.as_str());
+    let resolved = match credentials_of(&operation) {
+        Credentials::None => return Ok(None),
+        Credentials::AgentKey => crate::auth::authenticate_agent_key(state, &parts.headers)
+            .await
+            .map(|holder| holder.identity(holder.key_id.clone())),
+        Credentials::Caller => crate::auth::authenticate(state, &parts.headers).await,
+    };
+    let identity = match resolved {
+        Ok(identity) => identity,
+        Err(error) if error.code == Code::Unauthenticated => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if identity.is_human() && matches!(parts.method, Method::GET | Method::HEAD) {
+        return Ok(None);
+    }
+    Ok(Some(CallCtx::new(
+        identity,
+        request_id_of(&parts.extensions),
+        &operation,
+        &parts.headers,
+    )))
+}
+
+/// The problem for an extractor's rejection: `payload_too_large` for a body
+/// above the router's `DefaultBodyLimit`, `validation_failed` otherwise.
+/// [`limit_body`] refuses such a body before any extractor runs; this keeps
+/// the code right should one reach an extractor all the same.
+fn rejection_problem(status: StatusCode, text: String) -> ApiError {
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::new(Code::PayloadTooLarge, text)
+    } else {
+        ApiError::validation(text)
+    }
+}
+
 /// `axum::Json` whose rejection is a `validation_failed` problem.
 pub struct ApiJson<T>(pub T);
 
@@ -58,7 +237,7 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match <axum::Json<T> as FromRequest<S>>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(ApiError::validation(rejection.body_text())),
+            Err(rejection) => Err(rejection_problem(rejection.status(), rejection.body_text())),
         }
     }
 }
@@ -81,7 +260,7 @@ where
             state,
         )
         .await
-        .map_err(|rejection| ApiError::validation(rejection.body_text()))?;
+        .map_err(|rejection| rejection_problem(rejection.status(), rejection.body_text()))?;
         if bytes.is_empty() {
             return Ok(None);
         }
@@ -89,7 +268,7 @@ where
         match <axum::Json<T> as OptionalFromRequest<S>>::from_request(req, state).await {
             Ok(Some(axum::Json(value))) => Ok(Some(Self(value))),
             Ok(None) => Ok(None),
-            Err(rejection) => Err(ApiError::validation(rejection.body_text())),
+            Err(rejection) => Err(rejection_problem(rejection.status(), rejection.body_text())),
         }
     }
 }
@@ -750,6 +929,32 @@ impl CallCtx {
         Ok(())
     }
 
+    /// Records this call as refused because its body is above the limit
+    /// (README "Request body limit"), in its own transaction, the way
+    /// [`CallCtx::authorize`] records any refusal: `result_detail`
+    /// `payload_too_large` and `params` `{}`, since the body was never read.
+    /// The call was refused before it was authorized, so the record names no
+    /// scope and no target.
+    ///
+    /// # Errors
+    ///
+    /// An internal error if the record could not be written.
+    pub async fn audit_too_large(&self, state: &AppState) -> Result<(), ApiError> {
+        let record = self.record(
+            None,
+            None,
+            None,
+            &json!({}),
+            Outcome::Refused,
+            Some(Code::PayloadTooLarge.as_str().to_string()),
+            None,
+        );
+        let mut w = state.store.begin_write().await?;
+        audit::append(&mut w.tx, &record).await?;
+        w.commit().await?;
+        Ok(())
+    }
+
     /// The audit record for this call, with the agent fields of
     /// permission-model.md section 11 filled from the identity and the
     /// authority the call ran under.
@@ -856,5 +1061,40 @@ impl CallCtx {
         audit::append(&mut w.tx, &record).await?;
         w.commit().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn which_calls_have_an_identity_comes_from_the_operations() {
+        // Public operations have no identity to record, whatever credential
+        // comes with them; `createAgentToken` takes an agent key.
+        for operation in [
+            "POST /api/v1/setup",
+            "POST /api/v1/auth/login",
+            "POST /api/v1/nodes/enroll",
+            "GET /api/v1/health",
+        ] {
+            assert_eq!(credentials_of(operation), Credentials::None, "{operation}");
+        }
+        assert_eq!(
+            credentials_of("POST /api/v1/auth/agent-token"),
+            Credentials::AgentKey
+        );
+        for operation in [
+            "POST /api/v1/projects",
+            "POST /api/v1/auth/logout",
+            "POST /api/v1/audit/verify",
+            "DELETE /api/v1/apps/{app_id}",
+        ] {
+            assert_eq!(
+                credentials_of(operation),
+                Credentials::Caller,
+                "{operation}"
+            );
+        }
     }
 }

@@ -54,10 +54,16 @@ pub fn router(state: AppState) -> Router {
         Arc::new(LocalSessionManager::default()),
         config,
     );
+    // The body limit runs first, so a body above it is answered 413 whether
+    // or not its credential is valid, as on the API.
     Router::new()
         .route_service(MCP_PATH, service)
         .layer(axum::middleware::from_fn_with_state(
-            state,
+            state.clone(),
             auth::require_agent,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            auth::limit_body,
         ))
 }

@@ -13,11 +13,47 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use quoro_control_plane::AppState;
+use quoro_control_plane::audit::Channel;
 use quoro_control_plane::auth::{Identity, authenticate_bearer};
-use quoro_control_plane::error::ApiError;
+use quoro_control_plane::error::{ApiError, Code};
+use quoro_control_plane::request::{
+    CallCtx, Limited, read_limited, refuse_too_large, request_id_of,
+};
 
 /// The only credential prefix the MCP endpoint accepts.
 pub const ACCESS_TOKEN_PREFIX: &str = "atk_";
+
+/// Middleware, in front of [`require_agent`]: the request body limit of
+/// `/mcp` (README "Request body limit", ADR 0306). A body within the limit
+/// goes on, in memory, to authentication and rmcp. A larger one is answered
+/// `413 payload_too_large` without being parsed. The request is authenticated
+/// first, without its body: a valid agent access token makes the refusal an
+/// audited agent call, and since the tool is named inside the unread body,
+/// the record's operation is the request line, `POST /mcp`. A call without
+/// one is answered the same and not recorded, as an authentication failure
+/// is not.
+pub async fn limit_body(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let parts = match read_limited(request).await {
+        Ok(Limited::Within(request)) => return next.run(request).await,
+        Ok(Limited::Above(parts)) => parts,
+        Err(error) => return error.into_response(),
+    };
+    let caller = match agent_identity(&state, &parts.headers).await {
+        Ok(identity) => Some(CallCtx::with_channel(
+            identity,
+            Channel::Mcp,
+            request_id_of(&parts.extensions),
+            format!("{} {}", parts.method, crate::MCP_PATH),
+            None,
+            None,
+        )),
+        Err(error) if error.code == Code::Unauthenticated => None,
+        Err(error) => return error.into_response(),
+    };
+    refuse_too_large(&state, caller.as_ref())
+        .await
+        .into_response()
+}
 
 /// Middleware: resolves the agent access token and stores the [`Identity`] in
 /// the request extensions, where the tool handler reads it. Anything else is

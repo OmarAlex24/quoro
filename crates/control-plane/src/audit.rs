@@ -4,8 +4,11 @@
 //! `SHA-256(JCS(record without hash))` with absent optional fields omitted.
 //! Each record is also appended to the change log as `entity_type` `audit`, so
 //! it reaches replicas through the verified change-log stream (section 3.2).
+//! When the record's parameters would make that entry one the primary may not
+//! write, the record keeps their digest and size instead (section 4.1, ADR
+//! 0306), so the audit write never fails because of its parameters.
 
-use crate::changelog::{self, Actor, AppendError, Op};
+use crate::changelog::{self, Actor, AppendError, Op, StoredEntry};
 use crate::jcs;
 use crate::store::{GENESIS_HASH, now_rfc3339, sha256_hex};
 use serde_json::{Map, Value};
@@ -121,8 +124,8 @@ fn put(map: &mut Map<String, Value>, key: &str, value: Option<&String>) {
 
 /// Every column of `audit_log`, in the shape [`fields_from_row`] reads.
 pub const COLUMNS: &str = "seq, time, actor_type, actor_id, agent_model, on_behalf_of, channel, operation, scope, \
-     target_type, target_id, project_id, params, justification, trigger_event_id, incident_id, grant_id, approval_id, \
-     request_id, result, result_detail, change_seq, prev_hash, hash";
+     target_type, target_id, project_id, params, params_sha256, params_bytes, justification, trigger_event_id, \
+     incident_id, grant_id, approval_id, request_id, result, result_detail, change_seq, prev_hash, hash";
 
 /// The fields of one audit record, exactly as [`append`] serializes them into
 /// the hashed object: absent optional fields omitted, `params` already
@@ -146,6 +149,11 @@ pub struct HashedFields {
     pub target_id: Option<String>,
     pub project_id: Option<String>,
     pub params: Value,
+    /// The digest of the redacted parameters, when `params` is `{}` in their
+    /// place (section 4.1).
+    pub params_sha256: Option<String>,
+    /// The size of the text `params_sha256` covers; set exactly when it is.
+    pub params_bytes: Option<i64>,
     pub justification: Option<String>,
     pub trigger_event_id: Option<String>,
     pub incident_id: Option<String>,
@@ -177,6 +185,12 @@ impl HashedFields {
         put(&mut object, "target_id", self.target_id.as_ref());
         put(&mut object, "project_id", self.project_id.as_ref());
         object.insert("params".into(), self.params.clone());
+        // Section 4.1: both are part of the hashed record when set, and a
+        // record without them hashes as it did before they existed.
+        put(&mut object, "params_sha256", self.params_sha256.as_ref());
+        if let Some(params_bytes) = self.params_bytes {
+            object.insert("params_bytes".into(), Value::from(params_bytes));
+        }
         put(&mut object, "justification", self.justification.as_ref());
         put(
             &mut object,
@@ -247,6 +261,8 @@ pub fn fields_from_row(row: &SqliteRow) -> Result<HashedFields, sqlx::Error> {
         target_id: row.try_get("target_id")?,
         project_id: row.try_get("project_id")?,
         params,
+        params_sha256: row.try_get("params_sha256")?,
+        params_bytes: row.try_get("params_bytes")?,
         justification: row.try_get("justification")?,
         trigger_event_id: row.try_get("trigger_event_id")?,
         incident_id: row.try_get("incident_id")?,
@@ -275,9 +291,19 @@ pub fn record_value_from_row(row: &SqliteRow) -> Result<Value, sqlx::Error> {
 /// Appends `record` and returns its audit `seq`. Must run in the same write
 /// transaction as the change it describes (section 3.1).
 ///
+/// The record's change-log entry (section 3.2) is built and checked before
+/// anything is written, with the same check `changelog::append` makes
+/// ([`changelog::prepare`]). When the entry, built with the redacted
+/// parameters, is one the primary may not write (ADR 0302), or the parameters
+/// have no RFC 8785 form at all, the record keeps `params` `{}` with
+/// `params_sha256` and `params_bytes` instead (section 4.1, ADR 0306). There
+/// is no other threshold: parameters that fit and verify are kept.
+///
 /// # Errors
 ///
-/// A database error, or parameters JCS cannot canonicalize.
+/// A database error. A record that keeps the digest has no field left that
+/// could make its entry one a node cannot receive; should it still be one,
+/// that error is returned.
 pub async fn append(conn: &mut SqliteConnection, record: &Record) -> Result<i64, AppendError> {
     let last: Option<(i64, String)> =
         sqlx::query_as("SELECT seq, hash FROM audit_log ORDER BY seq DESC LIMIT 1")
@@ -288,7 +314,7 @@ pub async fn append(conn: &mut SqliteConnection, record: &Record) -> Result<i64,
         None => (1, GENESIS_HASH.to_string()),
     };
     let time = now_rfc3339();
-    let fields = HashedFields {
+    let mut fields = HashedFields {
         seq,
         time: time.clone(),
         actor_type: record.actor.kind.as_str().to_string(),
@@ -302,6 +328,8 @@ pub async fn append(conn: &mut SqliteConnection, record: &Record) -> Result<i64,
         target_id: record.target_id.clone(),
         project_id: record.project_id.clone(),
         params: redact(&record.params),
+        params_sha256: None,
+        params_bytes: None,
         justification: record.justification.clone(),
         trigger_event_id: record.trigger_event_id.clone(),
         incident_id: record.incident_id.clone(),
@@ -313,14 +341,40 @@ pub async fn append(conn: &mut SqliteConnection, record: &Record) -> Result<i64,
         change_seq: record.change_seq,
         prev_hash: prev_hash.clone(),
     };
-    let hash = fields.hash()?;
+    let (hash, entry) = match carried(conn, &record.actor, &fields).await {
+        Ok(carried) => carried,
+        Err(error) if kept_as_digest(&error) => {
+            // Section 4.1: the text is the redacted parameters as the primary
+            // read them, in their RFC 8785 form with exact integers beyond
+            // 2^53 written out; it exists for every value.
+            let text = jcs::canonicalize_lenient(&fields.params);
+            fields.params = Value::Object(Map::new());
+            fields.params_sha256 = Some(sha256_hex(text.as_bytes()));
+            fields.params_bytes = Some(i64::try_from(text.len()).unwrap_or(i64::MAX));
+            // With `params` `{}` the entry carries no number but `seq`,
+            // `change_seq` and `params_bytes`, integers far below 2^53, so it
+            // has an RFC 8785 form that reads back, and parses on a node, as
+            // itself. Its other fields are strings: ids, hashes, times and
+            // operation templates the server writes, and the request's path
+            // and headers (target ids, the justification, the incident id),
+            // which the HTTP server bounds to its header limit, well under
+            // the 1 MiB message limit even with every character escaped. So a
+            // node can receive the entry alone and verify it, and the audit
+            // write does not fail because of its parameters. Were that ever
+            // untrue, the error is returned rather than a record written
+            // without its entry.
+            carried(conn, &record.actor, &fields).await?
+        }
+        Err(error) => return Err(error),
+    };
+    // `carried` hashed these fields, so they have an RFC 8785 form.
     let params_text = jcs::canonicalize(&fields.params).map_err(AppendError::NotCanonical)?;
 
     sqlx::query(
         "INSERT INTO audit_log (seq, time, actor_type, actor_id, agent_model, on_behalf_of, channel, operation, scope, \
-         target_type, target_id, project_id, params, justification, trigger_event_id, incident_id, grant_id, approval_id, \
-         request_id, result, result_detail, change_seq, prev_hash, hash) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         target_type, target_id, project_id, params, params_sha256, params_bytes, justification, trigger_event_id, \
+         incident_id, grant_id, approval_id, request_id, result, result_detail, change_seq, prev_hash, hash) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(seq)
     .bind(&time)
@@ -335,6 +389,8 @@ pub async fn append(conn: &mut SqliteConnection, record: &Record) -> Result<i64,
     .bind(&record.target_id)
     .bind(&record.project_id)
     .bind(&params_text)
+    .bind(&fields.params_sha256)
+    .bind(fields.params_bytes)
     .bind(&record.justification)
     .bind(&record.trigger_event_id)
     .bind(&record.incident_id)
@@ -349,17 +405,50 @@ pub async fn append(conn: &mut SqliteConnection, record: &Record) -> Result<i64,
     .execute(&mut *conn)
     .await?;
 
-    // Section 3.2: the record travels to replicas as a change-log entry.
-    changelog::append(
+    // Section 3.2: the record travels to replicas as the change-log entry
+    // `carried` built and checked.
+    changelog::insert(conn, &entry).await?;
+    Ok(seq)
+}
+
+/// The record's `hash` (section 5) and the change-log entry that carries the
+/// record with that hash (section 3.2), as `changelog::append` would write it
+/// next, once [`changelog::prepare`] has shown a node can receive it alone and
+/// verify it.
+///
+/// # Errors
+///
+/// [`AppendError::NotCanonical`] for a record with no RFC 8785 form, the
+/// errors of [`changelog::prepare`], or a database error.
+async fn carried(
+    conn: &mut SqliteConnection,
+    actor: &Actor,
+    fields: &HashedFields,
+) -> Result<(String, StoredEntry), AppendError> {
+    let hash = fields.hash()?;
+    let entry = changelog::prepare(
         conn,
-        &record.actor,
+        actor,
         "audit",
-        &seq.to_string(),
+        &fields.seq.to_string(),
         Op::Create,
         fields.value_with_hash(&hash),
     )
     .await?;
-    Ok(seq)
+    Ok((hash, entry))
+}
+
+/// Whether [`carried`] refused the record for what it carries, so that the
+/// record keeps its parameters as a digest (section 4.1): it has no RFC 8785
+/// form, or its entry is one the primary may not write (ADR 0302). A database
+/// error is not one.
+fn kept_as_digest(error: &AppendError) -> bool {
+    matches!(
+        error,
+        AppendError::NotCanonical(_)
+            | AppendError::Unverifiable(_)
+            | AppendError::FrameTooLarge { .. }
+    )
 }
 
 /// Why a link of the chain does not verify (section 6).
@@ -636,5 +725,170 @@ mod tests {
             .await
             .unwrap();
         hash
+    }
+
+    /// Lowercase hex SHA-256, computed here rather than through the code
+    /// under test.
+    fn sha256(text: &str) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Request parameters exactly as the primary reads them from a body.
+    fn read(body: &str) -> Value {
+        serde_json::from_str(body).unwrap()
+    }
+
+    /// Appends one refused record carrying `params` after an ordinary one,
+    /// commits, and returns the stored record.
+    async fn append_with(store: &Store, params: Value) -> Value {
+        let mut w = store.begin_write().await.unwrap();
+        append(&mut w.tx, &record(Outcome::Ok)).await.unwrap();
+        let mut with_params = record(Outcome::Refused);
+        with_params.params = params;
+        let seq = append(&mut w.tx, &with_params).await.unwrap();
+        w.commit().await.unwrap();
+        let row = sqlx::query(&format!("SELECT {COLUMNS} FROM audit_log WHERE seq = ?"))
+            .bind(seq)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        record_value_from_row(&row).unwrap()
+    }
+
+    /// The record's change-log entry (section 3.2), parsed from its stored
+    /// payload.
+    async fn carried_payload(store: &Store, seq: i64) -> Value {
+        let (payload,): (String,) = sqlx::query_as(
+            "SELECT payload FROM change_log WHERE entity_type = 'audit' AND entity_id = ?",
+        )
+        .bind(seq.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        serde_json::from_str(&payload).unwrap()
+    }
+
+    /// A record that keeps the digest of `text` (section 4.1): `params` is
+    /// `{}`, the two fields name `text`, the stored record hashes to its
+    /// `hash`, its change-log entry was written with it, and the stored chain
+    /// verifies offline, as `quoro audit verify` walks it, and so does the
+    /// change log.
+    async fn assert_kept_as_digest(store: &Store, stored: &Value, text: &str) {
+        assert_eq!(stored["params"], json!({}), "{stored}");
+        assert_eq!(stored["params_sha256"], json!(sha256(text)), "{text}");
+        assert_eq!(stored["params_bytes"], json!(text.len()), "{text}");
+
+        let mut unhashed = stored.clone();
+        let hash = unhashed.as_object_mut().unwrap().remove("hash").unwrap();
+        assert_eq!(
+            hash,
+            json!(sha256(&jcs::canonicalize(&unhashed).unwrap())),
+            "the stored record hashes to its hash"
+        );
+
+        let seq = stored["seq"].as_i64().unwrap();
+        assert_eq!(&carried_payload(store, seq).await, stored);
+
+        let chain = verify_records(stored_records(store).await, 1, GENESIS_HASH);
+        assert!(chain.ok, "{chain:?}");
+        assert_eq!(chain.checked, seq);
+        let mut conn = store.pool().acquire().await.unwrap();
+        assert_eq!(changelog::verify(&mut conn).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_whole_number_float_above_2_53_keeps_its_digest() {
+        // `1e16` is read as a float; RFC 8785 writes it as an integer that
+        // reads back above 2^53 (section 4.1, first case).
+        let store = Store::open_in_memory().await.unwrap();
+        let stored = append_with(&store, read(r#"{"n": 1e16}"#)).await;
+        assert_eq!(stored["params_bytes"], json!(23));
+        assert_kept_as_digest(&store, &stored, r#"{"n":10000000000000000}"#).await;
+    }
+
+    #[tokio::test]
+    async fn an_exact_integer_beyond_2_53_keeps_its_digest() {
+        // Read exactly, it has no RFC 8785 form (section 4.1, second case);
+        // the text writes it out.
+        let store = Store::open_in_memory().await.unwrap();
+        let stored = append_with(&store, read(r#"{"n": 18446744073709551615}"#)).await;
+        assert_eq!(stored["params_bytes"], json!(26));
+        assert_kept_as_digest(&store, &stored, r#"{"n":18446744073709551615}"#).await;
+    }
+
+    #[tokio::test]
+    async fn a_float_a_node_reads_as_another_number_keeps_its_digest() {
+        // A node that parses the entry reads it back as another number
+        // (section 4.1, third case); the text is the RFC 8785 form of the
+        // number the primary read.
+        let store = Store::open_in_memory().await.unwrap();
+        let params = read(r#"{"x": 18983552425072.563}"#);
+        let text = jcs::canonicalize(&params).unwrap();
+        assert_eq!(text, r#"{"x":18983552425072.563}"#);
+        let stored = append_with(&store, params).await;
+        assert_kept_as_digest(&store, &stored, &text).await;
+    }
+
+    #[tokio::test]
+    async fn parameters_near_1_mib_keep_their_redacted_digest() {
+        // Alone in a `log_entries` message the entry would pass the 1 MiB
+        // limit. The digest covers the parameters after redaction.
+        let store = Store::open_in_memory().await.unwrap();
+        let blob = "x".repeat(1_048_000);
+        let stored = append_with(
+            &store,
+            json!({ "blob": blob, "password": "hunter2hunter2" }),
+        )
+        .await;
+        let text = format!(r#"{{"blob":"{blob}","password":"[redacted]"}}"#);
+        assert_kept_as_digest(&store, &stored, &text).await;
+        assert!(!stored.to_string().contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_parameters_are_kept_and_hash_as_before() {
+        // Several hundred KiB, safe integers and short floats: the entry fits
+        // and verifies, so the parameters are kept whatever their size.
+        let store = Store::open_in_memory().await.unwrap();
+        let params = json!({
+            "blob": "y".repeat(400_000),
+            "big": 9_007_199_254_740_991_i64,
+            "score": 9.8,
+            "whole": 10.0,
+            "password": "hunter2hunter2",
+        });
+        let stored = append_with(&store, params.clone()).await;
+        let mut redacted = params;
+        redacted["password"] = json!("[redacted]");
+        // Stored as `10`, `10.0` reads back as an integer; compare the forms.
+        assert_eq!(
+            jcs::canonicalize(&stored["params"]).unwrap(),
+            jcs::canonicalize(&redacted).unwrap()
+        );
+        assert!(stored.get("params_sha256").is_none(), "{stored}");
+        assert!(stored.get("params_bytes").is_none(), "{stored}");
+
+        // The hash covers the fields a record had before the digest existed,
+        // and no other.
+        let before = json!({
+            "seq": stored["seq"], "time": stored["time"], "actor_type": "user",
+            "actor_id": "usr_01JC9Z6Q5W8N3K4T7R2M1XHB0D", "channel": "panel",
+            "operation": "POST /api/v1/setup", "target_type": "user",
+            "target_id": "usr_01JC9Z6Q5W8N3K4T7R2M1XHB0D", "params": redacted,
+            "request_id": "req_01JC9Z6Q5W8N3K4T7R2M1XHB0D", "result": "refused",
+            "prev_hash": stored["prev_hash"],
+        });
+        assert_eq!(
+            stored["hash"],
+            json!(sha256(&jcs::canonicalize(&before).unwrap()))
+        );
+        let seq = stored["seq"].as_i64().unwrap();
+        assert_eq!(carried_payload(&store, seq).await, stored);
+        let chain = verify_records(stored_records(&store).await, 1, GENESIS_HASH);
+        assert!(chain.ok, "{chain:?}");
     }
 }

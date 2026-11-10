@@ -19,6 +19,7 @@ Each entry links the pull request that made the change and, where one exists, th
 ### Changed
 
 - **A write whose change-log entry a node could not receive now fails.** The primary refuses a write whose change-log entry a following node could not receive alone in one `log_entries` message or verify: one whose payload is not a JSON object; one that alone exceeds the 1 MiB message limit; one whose payload, read back from the stored text, has no canonical form, such as a whole-number float above 2^53; and one that a node, parsing the message, would not find hashing to its hash, such as a float the JSON parser reads back as another number. Such a write fails like any other write error instead of stopping change-log follow at that entry, and follow now sends every entry the primary accepts ([#713], [ADR 0302]).
+- **An audited call is always audited.** A request body larger than 256 KiB (262,144 bytes), on any API operation or on `/mcp`, is now refused with `413` and `code` `payload_too_large` without being read further, whether or not it has a `Content-Length`. When the caller has an identity, the refusal is audited as `refused` with `result_detail` `payload_too_large` and `params` `{}`; over MCP its operation is `POST /mcp`. A call with no identity is refused the same way and not recorded. An audit record whose redacted parameters would make its change-log entry one a node could not receive alone and verify, such as parameters near 1 MiB, an integer above 2^53 or a float a node reads back as another number, now keeps `params` `{}` with `params_sha256` and `params_bytes`, the SHA-256 and the size of the parameters' canonical text, so the call is audited instead of failing with a 500 and leaving no record. The two fields are part of the record's hash only when they are set, so existing records verify as before, and `listAudit`, `getAuditRecord`, `verifyAudit`, the MCP tool `list_audit` and `quoro audit verify` read and verify them. The CLI exits 1 on `payload_too_large` ([#731], [ADR 0306]).
 
 ## [v0.3.0] - 2026-11-09
 
@@ -599,6 +600,8 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0263]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0263-the-primary-measures-its-support-window-p-send-on-clock.md
 [#713]: https://github.com/OmarAlex24/quoro/issues/713
 [ADR 0302]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0302-change-log-append-refuses-an-entry-a-follower-could-not.md
+[#731]: https://github.com/OmarAlex24/quoro/issues/731
+[ADR 0306]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0306-an-audited-api-call-is-always-audited-bound-what-reaches.md
 [#726]: https://github.com/OmarAlex24/quoro/pull/726
 [#720]: https://github.com/OmarAlex24/quoro/issues/720
 [ADR 0266]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0266-where-the-primary-takes-a-voter-s-mesh-endpoint-from-node.md
