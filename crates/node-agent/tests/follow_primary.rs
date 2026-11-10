@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use agent_common::{TempDir, facts};
+use agent_common::{TempDir, facts, self_signed, server_config};
 use futures_util::{SinkExt as _, StreamExt as _};
 use quoro_node_agent::identity::{self, Identity, IdentityHandle};
 use quoro_node_agent::session::{Session, SessionSetup};
@@ -21,35 +21,11 @@ use quoro_node_agent::store::NodeStore;
 use quoro_node_agent::tls;
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{ControlMessage, Welcome};
-use rcgen::{CertificateParams, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
-
-/// A self-signed certificate for `127.0.0.1` and its private key, DER encoded.
-fn self_signed() -> (CertificateDer<'static>, Vec<u8>) {
-    let key = KeyPair::generate().expect("generate a key");
-    let params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).expect("params");
-    let cert = params.self_signed(&key).expect("self-sign");
-    (cert.der().clone(), key.serialize_der())
-}
-
-fn server_config(cert: CertificateDer<'static>, key: Vec<u8>) -> Arc<rustls::ServerConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("protocol versions")
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![cert],
-            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key)),
-        )
-        .expect("server config");
-    Arc::new(config)
-}
 
 /// Serves the node session far enough to answer `hello` with `welcome`, and
 /// counts the welcomes it sent in `welcomed`.
@@ -83,6 +59,7 @@ async fn serve_welcome(listener: TcpListener, acceptor: TlsAcceptor, welcomed: A
                         session_timeout_ms: 5_000,
                         primary_node_id: "nod_primary".to_owned(),
                         primary_urls: Vec::new(),
+                        schema_version: None,
                     })
                     .to_frame("msg_welcome", frame["id"].as_str())
                     .to_text();

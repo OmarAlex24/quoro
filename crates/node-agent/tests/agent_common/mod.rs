@@ -31,6 +31,8 @@ use quoro_proto::wire::{
     SpecVolume, SpecVolumeFile, SpecVolumeState,
 };
 use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, ResourceType};
+use rcgen::{CertificateParams, KeyPair};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 /// A temporary directory under the platform temp dir, removed on drop.
 pub struct TempDir(PathBuf);
@@ -302,6 +304,30 @@ pub fn facts() -> NodeFacts {
     }
 }
 
+/// A self-signed certificate for `127.0.0.1` and its private key, DER encoded.
+pub fn self_signed() -> (CertificateDer<'static>, Vec<u8>) {
+    let key = KeyPair::generate().expect("generate a key");
+    let params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).expect("params");
+    let cert = params.self_signed(&key).expect("self-sign");
+    (cert.der().clone(), key.serialize_der())
+}
+
+/// A TLS server configuration serving `cert` with `key`, as a fake primary's
+/// listener does.
+pub fn server_config(cert: CertificateDer<'static>, key: Vec<u8>) -> Arc<rustls::ServerConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert],
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key)),
+        )
+        .expect("server config");
+    Arc::new(config)
+}
+
 /// Writes the three identity files with a placeholder primary URL.
 pub fn identity_files(dir: &Path, cluster_key: &SigningKey) -> IdentityHandle {
     identity_files_with_url(dir, cluster_key, "https://primary.test")
@@ -313,6 +339,22 @@ pub fn identity_files_with_url(
     cluster_key: &SigningKey,
     primary_url: &str,
 ) -> IdentityHandle {
+    identity_files_pinned(
+        dir,
+        cluster_key,
+        primary_url,
+        "3f9a1c0e7b52d4a86e1f09c3b7d25e4a90c18f6b2d73e5a41c0b98f7e26d1a35",
+    )
+}
+
+/// Writes the three identity files pinning `fingerprint`, the hex SHA-256
+/// of the primary's certificate, and returns their handle.
+pub fn identity_files_pinned(
+    dir: &Path,
+    cluster_key: &SigningKey,
+    primary_url: &str,
+    fingerprint: &str,
+) -> IdentityHandle {
     identity::ensure_data_dir(dir).expect("create the data directory");
     identity::write_seed(dir, &[7; 32]).expect("write the seed");
     identity::write_credential(dir, "credential-for-tests").expect("write the credential");
@@ -323,10 +365,7 @@ pub fn identity_files_with_url(
             cluster_id: "cls_test".to_owned(),
             primary_url: primary_url.to_owned(),
             primary_urls: Vec::new(),
-            fingerprint: format!(
-                "sha256:{}",
-                "3f9a1c0e7b52d4a86e1f09c3b7d25e4a90c18f6b2d73e5a41c0b98f7e26d1a35"
-            ),
+            fingerprint: format!("sha256:{}", fingerprint.trim_start_matches("sha256:")),
             cluster_public_key: sign::public_key_to_base64(&cluster_key.verifying_key()),
             cluster_key_id: Identity::key_id_for(&sign::public_key_to_base64(
                 &cluster_key.verifying_key(),

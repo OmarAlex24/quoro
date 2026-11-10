@@ -8,21 +8,24 @@ mod common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_common::{
-    GATEWAY, SUBNET, TempDir, facts, identity_files, snapshot, snapshot_full, spec_vm, stateful_vm,
+    GATEWAY, SUBNET, TempDir, facts, identity_files, identity_files_pinned, self_signed,
+    server_config, snapshot, snapshot_full, spec_vm, stateful_vm,
 };
 use futures_util::{SinkExt as _, StreamExt as _};
 use quoro_engine::{Engine as _, FakeEngine, VmState};
 use quoro_ingress::cloudflared::CloudflaredConfig;
 use quoro_ingress::proxy::BackendObserver as _;
 use quoro_node_agent::edge::EdgeManager;
+use quoro_node_agent::freeze;
 use quoro_node_agent::identity::{CUSTODY_KEY_FILE, LOG_MARK_FILE};
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::session::{Session, SessionEnd, SessionSetup};
 use quoro_node_agent::store::{NodeStore, Refollowing, VOTE};
+use quoro_node_agent::tls;
 use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, ManualHostClock, start_local_leases};
 use quoro_proto::custody::CustodyKey;
 use quoro_proto::sign::{self, SigningKey};
@@ -38,7 +41,9 @@ use quoro_proto::{
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::io::DuplexStream;
-use tokio::sync::watch;
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, client_async};
 
@@ -119,6 +124,7 @@ async fn fake_primary(mut ws: WebSocketStream<DuplexStream>, key: SigningKey) {
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -249,6 +255,7 @@ async fn quiet_primary(server: DuplexStream) {
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -314,6 +321,7 @@ async fn listening_primary(server: DuplexStream, events: tokio::sync::mpsc::Send
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -420,6 +428,7 @@ async fn primary_with_primary_urls(
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls,
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -685,6 +694,7 @@ impl EdgeSession {
                 session_timeout_ms: 5_000,
                 primary_node_id: "nod_primary".to_owned(),
                 primary_urls: Vec::new(),
+                schema_version: None,
             })
             .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
             .to_text(),
@@ -946,6 +956,7 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
             session_timeout_ms: 15_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -1174,6 +1185,7 @@ async fn a_revoke_takes_effect_even_when_the_session_ends_at_once() {
             session_timeout_ms: 15_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -1272,6 +1284,7 @@ async fn the_session_carries_renewals_and_its_end_makes_the_lease_uncertain() {
             session_timeout_ms: 15_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -1411,6 +1424,7 @@ async fn a_fence_ack_over_the_session_clears_only_below_its_tokens() {
             session_timeout_ms: 15_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -1569,6 +1583,7 @@ async fn welcome(ws: &mut WebSocketStream<DuplexStream>, hello: &Value) {
             session_timeout_ms: 15_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -2681,6 +2696,7 @@ fn welcome_frame(term: u64, re: &str) -> String {
         session_timeout_ms: 15_000,
         primary_node_id: "nod_primary".to_owned(),
         primary_urls: Vec::new(),
+        schema_version: None,
     })
     .to_frame("msg_welcome", Some(re))
     .to_text()
@@ -3397,4 +3413,421 @@ async fn an_edge_that_gains_the_witness_role_votes_on_its_next_desired_state() {
         "no answer once the role is gone: {frames:?}"
     );
     end_session(ws, serving).await;
+}
+
+// --- `welcome.schema_version` and the promotion freeze (sections 5.10, 7.3) --
+
+/// A `welcome` answering `re` that carries `schema_version`, or none.
+fn welcome_with_schema(re: &str, schema_version: Option<u32>) -> String {
+    ControlMessage::Welcome(Welcome {
+        cluster_id: "cls_test".to_owned(),
+        term: 1,
+        server_time: "2026-11-02T10:15:30Z".to_owned(),
+        heartbeat_interval_ms: 100,
+        session_timeout_ms: 15_000,
+        primary_node_id: "nod_primary".to_owned(),
+        primary_urls: Vec::new(),
+        schema_version,
+    })
+    .to_frame("msg_welcome", Some(re))
+    .to_text()
+}
+
+/// Section 5.10 (ADR 0229): the node keeps the newest
+/// `welcome.schema_version` it saw. A lower one does not lower it, and a
+/// `welcome` without the field keeps what is stored.
+#[tokio::test]
+async fn the_newest_welcome_schema_version_is_kept_and_never_lowered() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let mut session = Session::new(setup);
+    for (sent, kept) in [
+        (None, None),
+        (Some(14), Some(14)),
+        (Some(12), Some(14)),
+        (None, Some(14)),
+        (Some(15), Some(15)),
+    ] {
+        let (mut ws, hello, serving) = open_session(session).await;
+        send(
+            &mut ws,
+            welcome_with_schema(hello["id"].as_str().unwrap(), sent),
+        )
+        .await;
+        read_until(&mut ws, "status_report").await;
+        assert_eq!(
+            store.welcome_schema_version().await.unwrap(),
+            kept,
+            "after a welcome with {sent:?}"
+        );
+        session = end_session(ws, serving).await;
+    }
+}
+
+/// Every frame the node sends until its session ends, which must happen
+/// within `limit`.
+async fn frames_until_closed_within(
+    ws: &mut WebSocketStream<DuplexStream>,
+    limit: Duration,
+) -> Vec<Value> {
+    tokio::time::timeout(limit, frames_until_closed(ws))
+        .await
+        .unwrap_or_else(|_| panic!("the session did not close within {limit:?}"))
+}
+
+/// Asserts that no frame in `frames` is a `hello` or a `log_ack`.
+fn assert_no_hello_or_ack(frames: &[Value]) {
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame["type"] != "hello" && frame["type"] != "log_ack"),
+        "no hello or log_ack after the freeze: {frames:?}"
+    );
+}
+
+/// The session's end and the session, once the socket closed.
+async fn ended_with(serving: Serving) -> (Session, SessionEnd) {
+    let (session, end) = tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("the session ended")
+        .unwrap();
+    (session, end.unwrap())
+}
+
+/// Section 7.3 "The freeze" (ADR 0261): a freeze set from another process,
+/// here its own connection to `node.db`, while a session is up ends the
+/// session within 2 s even though nothing arrives; nothing after the freeze
+/// is a `hello` or a `log_ack`. While the flag is set a new session sends no
+/// `hello` at all; once it ends, `hello` reports the log as it stood.
+#[tokio::test]
+async fn a_freeze_from_another_process_ends_the_session_within_2_s() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    let entries = log_chain(1, ZEROS, 3, "a");
+    send(
+        &mut ws,
+        log_entries_frame(entries.clone(), Some(3), "msg_log_1"),
+    )
+    .await;
+    assert_eq!(reply_to(&mut ws, "msg_log_1").await["type"], "log_ack");
+
+    freeze::freeze(dir.path()).await.unwrap();
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert_no_hello_or_ack(&frames);
+    let (session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+    assert_eq!(stored_log(&store).await, entries);
+
+    // A session that starts while the flag is set sends nothing.
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let mut ws = accept.await.unwrap().unwrap();
+    let mut session = session;
+    let serving = tokio::spawn(async move {
+        let end = session.serve(client_ws, std::future::pending::<()>()).await;
+        (session, end)
+    });
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert!(frames.is_empty(), "no hello while frozen: {frames:?}");
+    let (session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+
+    freeze::unfreeze(dir.path()).await.unwrap();
+    let (ws, hello, serving) = follow_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 3);
+    assert_eq!(hello["body"]["log_hash"], entries[2]["hash"]);
+    end_session(ws, serving).await;
+}
+
+/// Section 7.3 "The freeze" (ADR 0261): a `log_entries` delivered after the
+/// freeze committed is not stored and not acknowledged, and the log's newest
+/// `seq` is unchanged; the session ends without answering it.
+#[tokio::test]
+async fn log_entries_after_the_freeze_are_neither_stored_nor_acknowledged() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    let first = log_chain(1, ZEROS, 3, "a");
+    send(
+        &mut ws,
+        log_entries_frame(first.clone(), Some(5), "msg_log_1"),
+    )
+    .await;
+    assert_eq!(reply_to(&mut ws, "msg_log_1").await["type"], "log_ack");
+
+    freeze::freeze(dir.path()).await.unwrap();
+    let second = log_chain(4, first[2]["hash"].as_str().unwrap(), 2, "a");
+    send(&mut ws, log_entries_frame(second, Some(5), "msg_log_2")).await;
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert_no_hello_or_ack(&frames);
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_log_2"),
+        "no answer: {frames:?}"
+    );
+    let (_session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+    assert_eq!(
+        store.log_position().await.unwrap(),
+        (3, first[2]["hash"].as_str().unwrap().to_owned())
+    );
+    assert_eq!(stored_log(&store).await, first);
+}
+
+/// What the pinned TLS primary of the dial tests saw, in order.
+#[derive(Debug)]
+enum Seen {
+    /// A TCP connection was accepted: the node dialed.
+    Dial,
+    /// A text frame from the node.
+    Frame(Value),
+    /// A connection ended.
+    Closed,
+}
+
+/// A pinned TLS primary on `127.0.0.1` that answers `hello` with `welcome`
+/// and `ping` with `pong`, and reports every dial, frame and closed
+/// connection. Returns its URL, its certificate's pin and the reports.
+async fn counting_primary() -> (
+    String,
+    String,
+    mpsc::UnboundedReceiver<Seen>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (cert, key) = self_signed();
+    let pin = tls::cert_fingerprint(cert.as_ref());
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let url = format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let _ = seen_tx.send(Seen::Dial);
+            let acceptor = acceptor.clone();
+            let seen = seen_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(stream) = acceptor.accept(tcp).await
+                    && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+                {
+                    while let Some(Ok(message)) = ws.next().await {
+                        let Message::Text(text) = message else {
+                            continue;
+                        };
+                        let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) else {
+                            continue;
+                        };
+                        let id = frame["id"].as_str().unwrap_or_default().to_owned();
+                        let reply = match frame["type"].as_str() {
+                            Some("hello") => Some(welcome_frame(1, &id)),
+                            Some("ping") => Some(
+                                ControlMessage::Pong
+                                    .to_frame("msg_pong", Some(&id))
+                                    .to_text(),
+                            ),
+                            _ => None,
+                        };
+                        let _ = seen.send(Seen::Frame(frame));
+                        if let Some(reply) = reply
+                            && ws.send(Message::Text(reply.into())).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                let _ = seen.send(Seen::Closed);
+            });
+        }
+    });
+    (url, pin, seen_rx, task)
+}
+
+/// The next report of the primary, which must come within `limit`.
+async fn next_seen(seen: &mut mpsc::UnboundedReceiver<Seen>, limit: Duration) -> Seen {
+    tokio::time::timeout(limit, seen.recv())
+        .await
+        .unwrap_or_else(|_| panic!("the primary saw nothing within {limit:?}"))
+        .expect("the primary runs")
+}
+
+/// Waits until the primary sees a frame of type `kind`, within `limit`.
+async fn seen_frame(seen: &mut mpsc::UnboundedReceiver<Seen>, kind: &str, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if let Seen::Frame(frame) = next_seen(seen, left).await
+            && frame["type"] == kind
+        {
+            return;
+        }
+    }
+}
+
+/// Asserts that the primary sees nothing at all for `quiet`: no dial, no
+/// frame.
+async fn nothing_seen_for(seen: &mut mpsc::UnboundedReceiver<Seen>, quiet: Duration) {
+    if let Ok(report) = tokio::time::timeout(quiet, seen.recv()).await {
+        panic!("the primary saw {report:?} while the agent was frozen");
+    }
+}
+
+/// The dialing agent of a freeze test: a session over `dir` pinned to the
+/// primary at `url`, with `advertised` as the primary's other addresses, run
+/// until `stop`, and the store it holds.
+async fn dialing_agent(
+    dir: &TempDir,
+    url: &str,
+    pin: &str,
+    advertised: &[String],
+) -> (
+    NodeStore,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<Result<(), quoro_node_agent::AgentError>>,
+) {
+    let key = sign::signing_key_from_seed(&[8; 32]);
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (observed_tx, observed_rx) = watch::channel(Vec::new());
+    let identity = identity_files_pinned(dir.path(), &key, url, pin);
+    identity.set_primary_urls(advertised).unwrap();
+    let mut session = Session::new(SessionSetup {
+        identity,
+        store: store.clone(),
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+        builds: None,
+    });
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let running = tokio::spawn(async move {
+        let _observed = observed_tx;
+        session.run(stop_rx).await
+    });
+    (store, stop_tx, running)
+}
+
+/// Section 7.3 "The freeze" and section 4.4 (ADR 0261, ADR 0280): a freeze
+/// from another process ends the running session within 2 s with no `hello`
+/// or `log_ack` after it, and the primary sees no new dial for 3 s. Once the
+/// freeze ends, the agent dials again and sends `hello`.
+#[tokio::test]
+async fn a_frozen_agent_does_not_redial_until_the_freeze_ends() {
+    let dir = TempDir::new();
+    let (url, pin, mut seen, primary) = counting_primary().await;
+    let (store, stop, running) = dialing_agent(&dir, &url, &pin, &[]).await;
+    assert!(matches!(
+        next_seen(&mut seen, Duration::from_secs(5)).await,
+        Seen::Dial
+    ));
+    seen_frame(&mut seen, "status_report", Duration::from_secs(5)).await;
+
+    freeze::freeze(dir.path()).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, seen.recv()).await {
+            Ok(Some(Seen::Closed)) => break,
+            Ok(Some(Seen::Frame(frame))) => assert_no_hello_or_ack(&[frame]),
+            Ok(Some(Seen::Dial)) => panic!("a dial while frozen"),
+            Ok(None) | Err(_) => panic!("the session did not close within 2 s of the freeze"),
+        }
+    }
+    nothing_seen_for(&mut seen, Duration::from_secs(3)).await;
+    assert!(freeze::is_frozen(&store).await.unwrap());
+
+    freeze::unfreeze(dir.path()).await.unwrap();
+    assert!(matches!(
+        next_seen(&mut seen, Duration::from_secs(3)).await,
+        Seen::Dial
+    ));
+    seen_frame(&mut seen, "hello", Duration::from_secs(5)).await;
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    primary.abort();
+}
+
+/// Section 7.3 "The freeze", section 12 `node_meta`: the freeze is in the
+/// agent's store, so an agent that starts with it set (a restart) never
+/// dials until it ends, and then dials at once.
+#[tokio::test]
+async fn an_agent_started_frozen_never_dials_until_the_freeze_ends() {
+    let dir = TempDir::new();
+    let (url, pin, mut seen, primary) = counting_primary().await;
+    // The agent that ran before the restart left its store and a freeze.
+    drop(NodeStore::open(dir.path()).await.unwrap());
+    freeze::freeze(dir.path()).await.unwrap();
+
+    let (_store, stop, running) = dialing_agent(&dir, &url, &pin, &[]).await;
+    nothing_seen_for(&mut seen, Duration::from_secs(3)).await;
+
+    freeze::unfreeze(dir.path()).await.unwrap();
+    assert!(matches!(
+        next_seen(&mut seen, Duration::from_secs(3)).await,
+        Seen::Dial
+    ));
+    seen_frame(&mut seen, "hello", Duration::from_secs(5)).await;
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    primary.abort();
+}
+
+/// Section 7.3 "The freeze" and section 4.4: a dial attempt under way when
+/// the freeze commits ends. Here `primary_url` refuses, as a primary that is
+/// down does, so the attempt redials it for 2 s and would then try the
+/// advertised address, which accepts and never answers. Frozen at 0.5 s, the
+/// agent never reaches that address while the freeze lasts, and does once it
+/// ends.
+#[tokio::test]
+async fn a_freeze_ends_a_dial_attempt_under_way() {
+    let dir = TempDir::new();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = format!("https://127.0.0.1:{}", probe.local_addr().unwrap().port());
+    drop(probe);
+    let silent = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let silent_url = format!("https://127.0.0.1:{}", silent.local_addr().unwrap().port());
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    let listener = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((tcp, _)) = silent.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held.push(tcp);
+        }
+    });
+    let (_store, stop, running) =
+        dialing_agent(&dir, &closed, &"0".repeat(64), &[silent_url]).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    freeze::freeze(dir.path()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the attempt under way went on to the advertised address while frozen"
+    );
+
+    freeze::unfreeze(dir.path()).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while accepted.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no dial reached the advertised address after the freeze ended"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    listener.abort();
 }

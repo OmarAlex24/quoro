@@ -1,0 +1,478 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! The promotion freeze (`node-agent-protocol.md` section 7.3 "The freeze"
+//! and "`--abort`", section 12 `node_meta`, ADR 0261, ADR 0280).
+//!
+//! `quoro cluster promote` freezes the agent on its own host before its
+//! first real vote request, "through a local call". The agent has no control
+//! socket, so the call is a write to the agent's own store: [`freeze`] opens
+//! `<data_dir>/node.db` from the command's process and sets
+//! [`PROMOTION_FREEZE`] in `node_meta`. The store is SQLite in WAL mode, with
+//! SQLite's default locking mode and a busy timeout on every connection
+//! ([`crate::store::connect_options`]), so that second process opens it next
+//! to the running agent; its write waits for the agent's writer, and the
+//! agent's next transaction sees it.
+//!
+//! While the flag is set, the agent:
+//!
+//! - **stores no `log_entries`.** The transaction that would store a batch
+//!   reads the flag first, holding SQLite's write lock
+//!   ([`NodeStore::store_log_batch`]), so a batch is either in the log the
+//!   command reads after its freeze or never stored, and a batch never stored
+//!   is never acknowledged;
+//! - **keeps its log as it stands.** No quarantine moves it aside
+//!   ([`NodeStore::quarantine_log`]), and the mark and the refollowing state
+//!   are left alone;
+//! - **ends its session.** The session checks the flag every
+//!   [`SESSION_FREEZE_CHECK`], even when no `log_entries` arrives, and sends
+//!   no `hello` while it is set;
+//! - **does not dial the primary** (section 4.4). The dial loop checks the
+//!   flag before every dial and, while it is set, checks again every
+//!   [`FREEZE_POLL`]; once it clears, the agent dials at once. A dial
+//!   attempt under way when the freeze commits ends within [`FREEZE_POLL`].
+//!
+//! The flag is in `node_meta`, so a frozen agent stays frozen across a
+//! restart. Running VMs, the engine, the mesh and the voter's vote state are
+//! untouched: the agent's own vote does not depend on the freeze.
+//!
+//! A promotion holds [`PromotionLock`] for its whole run. [`abort`] ends a
+//! freeze that a killed or interrupted command left, after a reboot too, and
+//! is refused while a promotion holds the lock.
+
+use std::fs::OpenOptions;
+use std::path::Path;
+use std::time::Duration;
+
+use sqlx::Connection as _;
+use sqlx::SqliteConnection;
+
+use crate::AgentError;
+use crate::follow;
+use crate::store::{NodeStore, PROMOTION_FREEZE, Refollowing, connect_options};
+use crate::util;
+
+/// File name of the promotion lock in the agent's data directory, mode
+/// `0600`: a promotion holds an exclusive `flock` on it for its whole run.
+pub const PROMOTE_LOCK_FILE: &str = "promote.lock";
+
+/// How often the dial loop of a frozen agent checks whether the freeze
+/// ended (section 4.4).
+pub const FREEZE_POLL: Duration = Duration::from_secs(1);
+
+/// How often an open session checks the flag, so it ends within about a
+/// second of a freeze even when no `log_entries` arrives. A batch that does
+/// arrive is refused in its own transaction, whatever this interval.
+pub const SESSION_FREEZE_CHECK: Duration = Duration::from_millis(500);
+
+/// One connection to the agent's existing store, with the agent's own
+/// settings. It never creates the file: a host whose agent never opened its
+/// store has nothing to freeze.
+async fn connect(data_dir: &Path) -> Result<SqliteConnection, AgentError> {
+    SqliteConnection::connect_with(&connect_options(data_dir))
+        .await
+        .map_err(|e| AgentError::Store(format!("could not open the agent's store: {e}")))
+}
+
+/// Freezes the agent whose data directory is `data_dir`, from any process
+/// (section 7.3 "The freeze"): sets [`PROMOTION_FREEZE`] to the current time,
+/// RFC 3339, in one statement, which is its own transaction. Once this
+/// returns the freeze is durable, and no `log_entries` batch the agent
+/// stores after it is committed (see the module documentation).
+///
+/// It is idempotent: a second call keeps the time of the first.
+///
+/// # Errors
+///
+/// [`AgentError::Store`] when the store does not exist, cannot be opened, or
+/// the write fails; the agent is not frozen then.
+pub async fn freeze(data_dir: &Path) -> Result<(), AgentError> {
+    let mut conn = connect(data_dir).await?;
+    let written =
+        sqlx::query("INSERT INTO node_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING")
+            .bind(PROMOTION_FREEZE)
+            .bind(util::now_rfc3339())
+            .execute(&mut conn)
+            .await;
+    let _ = conn.close().await;
+    written
+        .map(|_| ())
+        .map_err(|e| AgentError::Store(format!("could not freeze the agent: {e}")))
+}
+
+/// Ends a freeze from any process: clears [`PROMOTION_FREEZE`]. The agent's
+/// dial loop sees it within [`FREEZE_POLL`] and dials at once. Clearing a
+/// flag that is not set changes nothing.
+///
+/// A promotion calls it while it holds [`PromotionLock`]; an operator goes
+/// through [`abort`], which takes the lock first.
+///
+/// # Errors
+///
+/// [`AgentError::Store`] when the store cannot be opened or the write fails.
+pub async fn unfreeze(data_dir: &Path) -> Result<(), AgentError> {
+    let mut conn = connect(data_dir).await?;
+    let deleted = sqlx::query("DELETE FROM node_meta WHERE key = ?")
+        .bind(PROMOTION_FREEZE)
+        .execute(&mut conn)
+        .await;
+    let _ = conn.close().await;
+    deleted
+        .map(|_| ())
+        .map_err(|e| AgentError::Store(format!("could not end the freeze: {e}")))
+}
+
+/// Whether a promotion on this host froze the agent.
+///
+/// # Errors
+///
+/// [`AgentError::Store`] on a SQLite failure.
+pub async fn is_frozen(store: &NodeStore) -> Result<bool, AgentError> {
+    Ok(store.meta(PROMOTION_FREEZE).await?.is_some())
+}
+
+/// The exclusive advisory lock a promotion holds for its whole run (section
+/// 7.3 "`--abort`", ADR 0280): an `flock` on [`PROMOTE_LOCK_FILE`] in the
+/// agent's data directory. The kernel drops it when the holder exits, a
+/// killed one or a reboot included, so a lock is never left behind. Dropping
+/// the value releases it.
+#[derive(Debug)]
+pub struct PromotionLock {
+    _file: std::fs::File,
+}
+
+impl PromotionLock {
+    /// Takes the lock without waiting, creating the file `0600` when it is
+    /// missing.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::PromotionRunning`] at once when another holder has it,
+    /// another process or another open of the file in this one;
+    /// [`AgentError::Io`] when the file cannot be opened or locked.
+    pub fn acquire(data_dir: &Path) -> Result<Self, AgentError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(data_dir.join(PROMOTE_LOCK_FILE))
+            .map_err(|e| AgentError::io("open the promotion lock", e))?;
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(rustix::io::Errno::WOULDBLOCK) => Err(AgentError::PromotionRunning),
+            Err(e) => Err(AgentError::io("lock the promotion lock", e.into())),
+        }
+    }
+}
+
+/// `quoro cluster promote --abort` (section 7.3, ADR 0280): ends a freeze a
+/// killed or interrupted promotion left, after a reboot too, when nothing
+/// holds the lock. It takes [`PromotionLock`] without waiting and holds it
+/// while it clears the flag, so no promotion starts in between.
+///
+/// # Errors
+///
+/// [`AgentError::PromotionRunning`] while a promotion runs on this host, and
+/// the flag stays set; otherwise the errors of [`PromotionLock::acquire`] and
+/// [`unfreeze`].
+pub async fn abort(data_dir: &Path) -> Result<(), AgentError> {
+    let _lock = PromotionLock::acquire(data_dir)?;
+    unfreeze(data_dir).await
+}
+
+/// What `quoro cluster promote` reads from the agent's store for its
+/// refusals and its step 1 (section 7.3), before the freeze and again after
+/// it. Each value is read on its own; once a freeze holds, the agent changes
+/// none of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromotionReads {
+    /// The last verified `seq` of the followed log, 0 when it is empty.
+    pub log_seq: u64,
+    /// The hash of that entry, 64 zeros when the log is empty.
+    pub log_hash: String,
+    /// The `head_seq` the primary last reported and when the node received
+    /// it, RFC 3339 ([`NodeStore::log_head`]).
+    pub head: Option<(u64, String)>,
+    /// The change-log mark ([`follow::read_mark`]), `None` without a mark
+    /// file.
+    pub mark: Option<u64>,
+    /// The refollowing state ([`NodeStore::refollowing`]).
+    pub refollowing: Option<Refollowing>,
+    /// Whether the log is quarantined: the node holds a copy the primary
+    /// declared diverged, or has not yet learned the head it refollows to
+    /// (section 7.1). That is the mark at [`follow::MAX_SEQ`], which a
+    /// quarantine writes first and which stays until the head is known
+    /// (ADR 0285), or the refollowing state "head unknown". A node that
+    /// learned its head is refollowing instead, which `--accept-loss` lifts;
+    /// a quarantined log it does not.
+    pub quarantined: bool,
+    /// The newest `welcome.schema_version` stored
+    /// ([`NodeStore::welcome_schema_version`]).
+    pub welcome_schema_version: Option<u32>,
+    /// When a promotion froze the agent, RFC 3339; `None` when it is not
+    /// frozen.
+    pub frozen_at: Option<String>,
+}
+
+impl PromotionReads {
+    /// Whether the followed log is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.log_seq == 0
+    }
+
+    /// Whether the followed log is below the mark (section 7.1 "The node's
+    /// mark"); no log is below a missing mark.
+    #[must_use]
+    pub fn below_mark(&self) -> bool {
+        self.log_seq < self.mark.unwrap_or(0)
+    }
+}
+
+/// Reads [`PromotionReads`] from the agent's store.
+///
+/// # Errors
+///
+/// The errors of the store's reads and of [`follow::read_mark`].
+pub async fn promotion_reads(store: &NodeStore) -> Result<PromotionReads, AgentError> {
+    let (log_seq, log_hash) = store.log_position().await?;
+    let head = store.log_head().await?;
+    let mark = follow::read_mark(store.data_dir())?;
+    let refollowing = store.refollowing().await?;
+    let quarantined =
+        mark == Some(follow::MAX_SEQ) || refollowing == Some(Refollowing::HeadUnknown);
+    Ok(PromotionReads {
+        log_seq,
+        log_hash,
+        head,
+        mark,
+        refollowing,
+        quarantined,
+        welcome_schema_version: store.welcome_schema_version().await?,
+        frozen_at: store.meta(PROMOTION_FREEZE).await?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::follow::{ZERO_HASH, verify_batch};
+    use crate::identity::LOG_MARK_FILE;
+    use crate::store::BatchStored;
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "quoro-freeze-{}",
+                util::hex(&util::random_bytes::<8>())
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn verified(
+        from_seq: u64,
+        prev_hash: &str,
+        count: u64,
+        salt: &str,
+    ) -> Vec<crate::follow::LogEntry> {
+        let entries = follow::testing::chain(from_seq, prev_hash, count, salt);
+        verify_batch(from_seq - 1, prev_hash, &follow::testing::message(entries)).unwrap()
+    }
+
+    /// Section 7.3 "The freeze": a freeze set over another connection, as
+    /// another process sets it, is seen by the agent's open store. It is
+    /// idempotent, keeps the time it was first set, and ends with
+    /// `unfreeze`; a host with no store has nothing to freeze, and none is
+    /// created.
+    #[tokio::test]
+    async fn a_freeze_from_another_connection_is_seen_and_ends() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        assert!(!is_frozen(&store).await.unwrap());
+
+        freeze(&dir.0).await.unwrap();
+        assert!(is_frozen(&store).await.unwrap());
+        let first = store.meta(PROMOTION_FREEZE).await.unwrap().unwrap();
+        assert!(util::parse_rfc3339_nanos(&first).is_some(), "{first}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        freeze(&dir.0).await.unwrap();
+        assert_eq!(
+            store.meta(PROMOTION_FREEZE).await.unwrap().as_deref(),
+            Some(first.as_str()),
+            "a second freeze keeps the first time"
+        );
+
+        unfreeze(&dir.0).await.unwrap();
+        assert!(!is_frozen(&store).await.unwrap());
+        unfreeze(&dir.0).await.unwrap();
+
+        let empty = TempDir::new();
+        assert!(freeze(&empty.0).await.is_err());
+        assert!(!empty.0.join("node.db").exists());
+    }
+
+    /// Section 7.3 "The freeze", ADR 0261: once a freeze committed, a batch
+    /// is not stored, and the log, its `head_seq` and the refollowing state
+    /// stay as they were; after the freeze ends the same batch is stored.
+    #[tokio::test]
+    async fn a_batch_after_a_committed_freeze_is_not_stored() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let first = verified(1, ZERO_HASH, 3, "a");
+        assert_eq!(
+            store.store_log_batch(&first, Some(5)).await.unwrap(),
+            BatchStored::Stored
+        );
+        store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+
+        freeze(&dir.0).await.unwrap();
+        let second = verified(4, &first[2].hash, 2, "a");
+        assert_eq!(
+            store.store_log_batch(&second, Some(9)).await.unwrap(),
+            BatchStored::Frozen
+        );
+        assert_eq!(
+            store.log_position().await.unwrap(),
+            (3, first[2].hash.clone())
+        );
+        assert_eq!(store.log_head().await.unwrap().unwrap().0, 5);
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::Head(5))
+        );
+
+        // A quarantine keeps the log as it stands too, and leaves no file.
+        assert!(store.quarantine_log("test").await.is_err());
+        assert_eq!(store.log_entries().await.unwrap(), first);
+        let quarantine = dir.0.join("quarantine");
+        assert!(
+            !quarantine.exists() || std::fs::read_dir(&quarantine).unwrap().count() == 0,
+            "no quarantine file"
+        );
+
+        unfreeze(&dir.0).await.unwrap();
+        assert_eq!(
+            store.store_log_batch(&second, Some(9)).await.unwrap(),
+            BatchStored::RefollowingEnded
+        );
+        assert_eq!(store.log_position().await.unwrap().0, 5);
+    }
+
+    /// Section 7.3 "`--abort`", ADR 0280: while a promotion holds the lock,
+    /// another lock and `abort` are refused at once and the freeze stays;
+    /// once the lock is dropped, `abort` ends the freeze. The lock file is
+    /// `0600`.
+    #[tokio::test]
+    async fn abort_is_refused_while_a_promotion_holds_the_lock() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        freeze(&dir.0).await.unwrap();
+
+        let lock = PromotionLock::acquire(&dir.0).unwrap();
+        assert!(matches!(
+            PromotionLock::acquire(&dir.0),
+            Err(AgentError::PromotionRunning)
+        ));
+        let refused = abort(&dir.0).await.unwrap_err();
+        assert!(matches!(refused, AgentError::PromotionRunning), "{refused}");
+        assert_eq!(refused.to_string(), "a promotion runs on this host");
+        assert!(is_frozen(&store).await.unwrap(), "the freeze stays");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.0.join(PROMOTE_LOCK_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        drop(lock);
+        abort(&dir.0).await.unwrap();
+        assert!(!is_frozen(&store).await.unwrap());
+        // `abort` let go of the lock.
+        drop(PromotionLock::acquire(&dir.0).unwrap());
+    }
+
+    /// Section 7.3: the reads reflect the log, its head, the mark, the
+    /// refollowing state, the schema version and the freeze. A quarantine's
+    /// mark, with or without a refollowing state, and "head unknown" read as
+    /// quarantined; a known head reads as refollowing only.
+    #[tokio::test]
+    async fn the_promotion_reads_reflect_the_store() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let fresh = promotion_reads(&store).await.unwrap();
+        assert_eq!(
+            fresh,
+            PromotionReads {
+                log_seq: 0,
+                log_hash: ZERO_HASH.to_owned(),
+                head: None,
+                mark: None,
+                refollowing: None,
+                quarantined: false,
+                welcome_schema_version: None,
+                frozen_at: None,
+            }
+        );
+        assert!(fresh.is_empty());
+        assert!(!fresh.below_mark());
+
+        let entries = verified(1, ZERO_HASH, 3, "a");
+        store.store_log_batch(&entries, Some(7)).await.unwrap();
+        store.raise_welcome_schema_version(14).await.unwrap();
+        std::fs::write(dir.0.join(LOG_MARK_FILE), "5").unwrap();
+        store.set_refollowing(Refollowing::Head(7)).await.unwrap();
+        freeze(&dir.0).await.unwrap();
+
+        let reads = promotion_reads(&store).await.unwrap();
+        assert_eq!(reads.log_seq, 3);
+        assert_eq!(reads.log_hash, entries[2].hash);
+        let (head, at) = reads.head.clone().unwrap();
+        assert_eq!(head, 7);
+        assert!(util::parse_rfc3339_nanos(&at).is_some(), "{at}");
+        assert_eq!(reads.mark, Some(5));
+        assert!(reads.below_mark());
+        assert!(!reads.is_empty());
+        assert_eq!(reads.refollowing, Some(Refollowing::Head(7)));
+        assert!(!reads.quarantined, "a known head is refollowing only");
+        assert_eq!(reads.welcome_schema_version, Some(14));
+        assert_eq!(reads.frozen_at, store.meta(PROMOTION_FREEZE).await.unwrap());
+        assert!(reads.frozen_at.is_some());
+
+        // ADR 0285: the quarantine's mark with no state recorded, over a log
+        // not yet moved aside.
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        store.store_log_batch(&entries, None).await.unwrap();
+        std::fs::write(dir.0.join(LOG_MARK_FILE), follow::MAX_SEQ.to_string()).unwrap();
+        let reads = promotion_reads(&store).await.unwrap();
+        assert_eq!(reads.log_seq, 3);
+        assert_eq!(reads.refollowing, None);
+        assert!(reads.quarantined);
+
+        // The same mark over a recorded head, and "head unknown" alone.
+        store.set_refollowing(Refollowing::Head(7)).await.unwrap();
+        assert!(promotion_reads(&store).await.unwrap().quarantined);
+        std::fs::write(dir.0.join(LOG_MARK_FILE), "7").unwrap();
+        assert!(!promotion_reads(&store).await.unwrap().quarantined);
+        store
+            .set_refollowing(Refollowing::HeadUnknown)
+            .await
+            .unwrap();
+        assert!(promotion_reads(&store).await.unwrap().quarantined);
+    }
+}
