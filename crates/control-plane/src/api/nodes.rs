@@ -27,6 +27,7 @@ use utoipa::{IntoParams, ToSchema};
 const SET_TUNNEL_OPERATION: &str = "PUT /api/v1/nodes/{node_id}/tunnel";
 const DELETE_TUNNEL_OPERATION: &str = "DELETE /api/v1/nodes/{node_id}/tunnel";
 const FENCE_ACK_OPERATION: &str = "POST /api/v1/nodes/{node_id}/fence-ack";
+const DECLARE_LOST_OPERATION: &str = "POST /api/v1/nodes/{node_id}/declare-lost";
 
 /// A machine running the Quoro binary (D-0012).
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -918,6 +919,173 @@ async fn fence_ack_tx(
             .hub
             .record_release(&lease.id, node_id, lease.fencing_token);
     }
+    Ok(node)
+}
+
+/// Records a human's statement that a disconnected node is gone, so the apps
+/// it held may start elsewhere (`node-agent-protocol.md` section 8.3, ADR
+/// 0183, ADR 0202).
+#[utoipa::path(
+    post,
+    path = "/api/v1/nodes/{node_id}/declare-lost",
+    tag = "nodes",
+    operation_id = "declareNodeLost",
+    extensions(("x-quoro-scope" = json!("node:declare_lost"))),
+    params(
+        ("node_id" = String, Path, description = "Node id (`nod_...`).", pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    responses(
+        (status = 200, description = "The node was declared lost; it is returned with `lost_at` set.", body = Node,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::Forbidden),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+///
+/// # Errors
+///
+/// `forbidden` for an agent or without `node:declare_lost`, `not_found` for
+/// an unknown node, `conflict` for a removed node or one that is connected,
+/// or a database error.
+pub async fn declare_node_lost(
+    State(state): State<AppState>,
+    identity: Identity,
+    headers: HeaderMap,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Path(node_id): Path<String>,
+) -> Result<Json<Node>, ApiError> {
+    // audit-log-format.md section 3.7: `params` is `{}`.
+    let params = json!({});
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.clone(),
+    };
+    let ctx = CallCtx::new(identity, request_id, DECLARE_LOST_OPERATION, &headers);
+    ctx.authorize_human(&state, Scope::NodeDeclareLost, Some(&target), None, &params)
+        .await?;
+    match declare_lost_tx(&state, &ctx, &node_id, &params).await {
+        Ok(node) => {
+            // Nothing is granted here (section 8.4, "Grants of a marked
+            // row"): a restore or failover that waits for the lease finds it
+            // released on its next check.
+            state.hub.node_changed(&node_id);
+            Ok(Json(node))
+        }
+        Err(error) => {
+            ctx.audit_error(
+                &state,
+                Some(Scope::NodeDeclareLost),
+                Some(&target),
+                None,
+                &params,
+                &error,
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+/// Section 8.3, "Declaring a node lost", in one transaction:
+///
+/// 1. increments the `fencing_token` of every lease the node holds, `local`
+///    and `expiring`, and records it revoked in the primary's view, with the
+///    node still named as the last holder ([`crate::leases::bump_tokens`]);
+/// 2. sets `nodes.lost_at`; the node stays enrolled and a voter;
+/// 3. writes the change-log entries and the audit record.
+///
+/// The checks run in the contract's order: an unknown node is `not_found`,
+/// a `removed` one and a connected one `conflict`, and one already declared
+/// lost changes nothing and is returned as it is.
+///
+/// Only rows that name the node and are not revoked yet change: a lease whose
+/// row names another node already carries a higher token than this node's,
+/// and a revoked row is not held. `fence_failure` is left as it is (ADR 0202),
+/// and no release is recorded ([`crate::leases::Releases`]): a lease moves on
+/// `lost_at` through [`crate::leases::is_released`], which keeps an
+/// `expiring` lease behind its gate.
+async fn declare_lost_tx(
+    state: &AppState,
+    ctx: &CallCtx,
+    node_id: &str,
+    params: &Value,
+) -> Result<Node, ApiError> {
+    let mut w = state.store.begin_write().await?;
+    if !is_id(Prefix::Node, node_id) {
+        return Err(ApiError::not_found("node"));
+    }
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT status, lost_at FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(&mut *w.tx)
+            .await?;
+    let Some((status, lost_at)) = row else {
+        return Err(ApiError::not_found("node"));
+    };
+    if status == "removed" {
+        return Err(ApiError::conflict("the node is removed"));
+    }
+    // The predicate `failoverApp` uses for a connected node: the primary
+    // then revokes over the session instead (section 5.13).
+    if state.hub.is_connected(node_id) {
+        return Err(ApiError::conflict(
+            "the node is connected: its leases are revoked over its session",
+        ));
+    }
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.to_string(),
+    };
+    let change_seq = if lost_at.is_some() {
+        // ADR 0202: a repeat changes nothing and is still recorded.
+        None
+    } else {
+        let actor = ctx.identity.actor();
+        let held: Vec<String> = crate::leases::held_by_node(&mut w.tx, node_id)
+            .await?
+            .into_iter()
+            .map(|lease| lease.id)
+            .collect();
+        crate::leases::bump_tokens(&mut w.tx, &held, node_id, &actor).await?;
+        // Taken after the revokes, so `revoked_at <= lost_at` holds for each
+        // of them ([`crate::leases::is_released`]).
+        sqlx::query("UPDATE nodes SET lost_at = ? WHERE id = ?")
+            .bind(now_rfc3339())
+            .bind(node_id)
+            .execute(&mut *w.tx)
+            .await?;
+        let payload = crate::driver::node_payload(&mut w.tx, node_id).await?;
+        Some(changelog::append(&mut w.tx, &actor, "node", node_id, Op::Update, payload).await?)
+    };
+    ctx.append_ok(
+        &mut w.tx,
+        Some(Scope::NodeDeclareLost),
+        Some(&target),
+        None,
+        params,
+        change_seq,
+    )
+    .await?;
+    let row = sqlx::query(&format!(
+        "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?"
+    ))
+    .bind(node_id)
+    .fetch_one(&mut *w.tx)
+    .await?;
+    let mut node = node_from_row(&row)?;
+    node.tunnel = tunnel_of(&mut *w.tx, node_id).await?;
+    attach_log_position(&mut *w.tx, &state.hub, std::slice::from_mut(&mut node)).await?;
+    attach_custody(
+        &mut *w.tx,
+        &state.keyring(),
+        std::slice::from_mut(&mut node),
+    )
+    .await?;
+    w.commit().await?;
     Ok(node)
 }
 

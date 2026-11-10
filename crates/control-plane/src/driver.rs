@@ -457,6 +457,7 @@ pub(crate) async fn node_payload(conn: &mut SqliteConnection, id: &str) -> Resul
         "created_at": row.try_get::<String, _>("created_at")?,
         "fence_failure": optional_json_value(row.try_get("fence_failure")?)?,
         "fence_ack_pending": optional_json_value(row.try_get("fence_ack_pending")?)?,
+        "lost_at": row.try_get::<Option<String>, _>("lost_at")?,
     }))
 }
 

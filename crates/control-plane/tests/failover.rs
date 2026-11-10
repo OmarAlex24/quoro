@@ -776,6 +776,113 @@ async fn a_disconnected_sources_local_lease_is_held_until_it_is_declared_lost() 
     none_of(s.on_warm(), "lease_grant", "local row").await;
 }
 
+/// `declareNodeLost` of the source (section 8.3, ADR 0183): returns the
+/// node it answers.
+async fn declare_source_lost(s: &Setup) -> Value {
+    let res = s
+        .owner
+        .post(
+            s.server
+                .url(&format!("/api/v1/nodes/{}/declare-lost", s.source.node_id)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    res.json().await.unwrap()
+}
+
+/// The lease row's `(holder, token, revoked)`.
+async fn lease_now(s: &Setup) -> (String, i64, bool) {
+    let (holder, token, revoked_at): (String, i64, Option<String>) =
+        sqlx::query_as("SELECT holder_node_id, fencing_token, revoked_at FROM leases")
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    (holder, token, revoked_at.is_some())
+}
+
+/// Section 8.3 through the API: the source's `local` lease is held while it
+/// is away, and once `declareNodeLost` revoked it at token 5 the failover
+/// goes on. The grant to the warm node raises the stored duration of a
+/// `local` row, so the change writes the row marked at a token above the
+/// declaration's and holds the grant, which waits on the source, declared
+/// lost but not removed (section 8.4, "Grants of a marked row").
+#[tokio::test]
+async fn a_failover_goes_on_once_the_source_is_declared_lost_through_the_api() {
+    let mut s = Setup::new().await;
+    s.report_copy().await;
+    set_support(&s.server, true);
+    s.disconnect_source().await;
+    refused(s.failover().await, 409, "conflict", Some("lease_held")).await;
+    s.unmoved(false, "local row, source not lost").await;
+
+    let node = declare_source_lost(&s).await;
+    assert!(node["lost_at"].is_string(), "{node}");
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 5, true));
+
+    let res = s.failover().await;
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let app: Value = res.json().await.unwrap();
+    let lease = &app["lease"];
+    assert_eq!(lease["holder_node_id"], s.warm.node_id.as_str(), "{lease}");
+    assert_eq!(
+        lease["fencing_token"], 6,
+        "above the declaration's: {lease}"
+    );
+    assert_eq!(lease["unsettled"], true, "{lease}");
+    assert_eq!(lease["grant_pending"], true, "{lease}");
+    let waiting_on: Vec<&str> = lease["grant_waiting_on"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{lease}"))
+        .iter()
+        .map(|id| id.as_str().unwrap())
+        .collect();
+    assert!(
+        waiting_on.contains(&s.source.node_id.as_str()),
+        "the lost source stays in the required set: {lease}"
+    );
+    assert_eq!(lease_now(&s).await, (s.warm.node_id.clone(), 6, false));
+    none_of(s.on_warm(), "lease_grant", "held grant").await;
+}
+
+/// Sections 8.3 and 8.4 through the API: declaring the source lost leaves an
+/// `expiring` lease's gate in place. The failover answers `lease_held` until
+/// the gate has passed, then moves the lease to the warm node above the
+/// declaration's token.
+#[tokio::test]
+async fn a_lost_sources_expiring_lease_still_waits_for_its_gate() {
+    let mut s = Setup::new().await;
+    s.ready().await;
+    s.disconnect_source().await;
+    // The gate passes 5 s from now (3 s and two margins of 1 s).
+    s.server
+        .state
+        .hub
+        .authority()
+        .seed(LEASE_ID, &s.source.node_id, Some(3_000));
+    let passes = tokio::time::Instant::now() + Duration::from_millis(5_000);
+    declare_source_lost(&s).await;
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 5, true));
+
+    let body = refused(s.failover().await, 409, "conflict", Some("lease_held")).await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("gate"), "{detail}");
+    assert!(
+        tokio::time::Instant::now() < passes,
+        "the test ran too slowly"
+    );
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 5, true));
+
+    tokio::time::sleep_until(passes).await;
+    let res = s.failover().await;
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let grant = grant_of(s.on_warm()).await;
+    assert_eq!(grant["body"]["lease_id"], LEASE_ID);
+    assert_eq!(grant["body"]["fencing_token"], 6);
+    assert_eq!(lease_now(&s).await, (s.warm.node_id.clone(), 6, false));
+}
+
 /// ADR 0292, ADR 0303. With support, a failover whose grant must wait for
 /// its write to be replicated over the machines with the `node` role goes
 /// on: the connected source gets its revoke, and once it answered, the
