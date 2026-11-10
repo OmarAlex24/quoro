@@ -1,5 +1,5 @@
 import { getRouteApi, Link } from '@tanstack/react-router';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useGetApproval, useListApprovals } from '../api/generated/approvals/approvals';
 import type { Approval } from '../api/generated/model';
 import { expiryWords } from '../lib/agency-format';
@@ -102,6 +102,9 @@ export function ApprovalsScreen() {
   const now = useNow(true, 30_000);
   const [notice, setNotice] = useState<DecisionNotice | null>(null);
   const [decisionProblem, setDecisionProblem] = useState<ProblemView | null>(null);
+  // After a decision its buttons leave with the request, so focus goes to what the screen says about it.
+  const heading = useRef<HTMLHeadingElement>(null);
+  const noticeBox = useRef<HTMLDivElement>(null);
 
   const enabled = me !== undefined;
   const pending = useListApprovals(
@@ -158,14 +161,22 @@ export function ApprovalsScreen() {
   return (
     <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
       <div className="page-h">
-        <h1>Approvals</h1>
+        <h1 ref={heading} tabIndex={-1}>
+          Approvals
+        </h1>
       </div>
       <p className="-mt-3 mb-4 max-w-2xl text-[13px] leading-snug text-ink-2">
         Agents ask before any delete. Approving lets that one call run once, within 10 minutes.
       </p>
 
       {notice ? (
-        <div role="status" aria-live="polite" className="box mb-4 px-3.5 py-2.5 text-[14px] leading-snug text-ink">
+        <div
+          ref={noticeBox}
+          tabIndex={-1}
+          role="status"
+          aria-live="polite"
+          className="box mb-4 px-3.5 py-2.5 text-[14px] leading-snug text-ink"
+        >
           {notice.kind === 'approve' ? (
             <>
               Approved. The one-time grant is valid for 10 minutes.{' '}
@@ -239,6 +250,7 @@ export function ApprovalsScreen() {
                 setDecisionProblem(null);
                 setNotice({ kind, approval: decidedApproval });
               }}
+              focusAfter={() => noticeBox.current ?? heading.current}
             />
           ) : search.approval && direct.isError ? (
             <ProblemBanner view={problemView(direct.error, 'see this request')} />

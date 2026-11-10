@@ -211,26 +211,36 @@ export function drawRamp({ ctx, w, h }: DitherSurface, read: TokenReader = readT
   dither2(ctx, w, h, 2, read('--accent'), read('--ion'), (x) => x / w, (x) => clamp((x / w - 0.3) * 1.1));
 }
 
+/** The tone of a project's preview: the two dither tones, or amber or red when the project needs a look. */
+export type PreviewTone = 'accent' | 'shift' | 'fault';
+
 /**
- * A project's preview: a two-tone radial glow behind its service tiles,
- * wider the more services it has.
+ * A project's field: a coarse two-tone glow behind its service tiles, wider
+ * the more services it has, accent at its heart and ion at its edge. An open
+ * incident draws it in amber and a failed build in red, one colour each.
  */
-export function drawPreview({ ctx, w, h }: DitherSurface, services: number, read: TokenReader = readToken): void {
-  const rx = Math.min(0.46, 0.16 + services * 0.065) * w;
-  const ry = 0.5 * h;
+export function drawPreview(
+  { ctx, w, h }: DitherSurface,
+  services: number,
+  read: TokenReader = readToken,
+  tone: PreviewTone = 'accent',
+): void {
+  const rx = Math.min(w * 0.46, 46 + Math.max(1, services) * 26);
+  const ry = h * 0.56;
   const distance = (x: number, y: number) => Math.hypot((x - w / 2) / rx, (y - h / 2) / ry);
+  const state = tone === 'accent' ? null : read(tone === 'fault' ? '--fault' : '--shift');
   dither2(
     ctx,
     w,
     h,
-    2,
-    read('--accent'),
-    read('--ion'),
+    4,
+    state ?? read('--ion'),
+    state ?? read('--accent'),
     (x, y) => {
       const d = distance(x, y);
-      return d < 1 ? 0.26 * Math.pow(1 - d, 1.7) : 0;
+      return d < 1 ? 0.5 * Math.pow(1 - d, 1.2) : 0;
     },
-    (x, y) => clamp(0.2 + 0.55 * (1 - distance(x, y))),
+    (x, y) => clamp(1.2 - 1.6 * distance(x, y)),
   );
 }
 
@@ -447,28 +457,47 @@ const CHART_FONT = '500 11px "Archivo Variable", Archivo, ui-sans-serif, system-
  * a dot on the newest sample. Each run of samples is drawn on its own, so a
  * gap stays empty.
  */
-export function drawMetricArea({ ctx, w, h }: DitherSurface, plot: AreaPlot, read: TokenReader = readToken): void {
+/**
+ * How much of the chart is drawn: the full chart has its grid, labels and the
+ * newest dot; a bare one (the cluster band, a spark in a row) is the area and
+ * the line alone, with or without the dot.
+ */
+export interface MetricAreaLook {
+  labels?: boolean;
+  dot?: boolean;
+  lineWidth?: number;
+}
+
+export function drawMetricArea(
+  { ctx, w, h }: DitherSurface,
+  plot: AreaPlot,
+  read: TokenReader = readToken,
+  look: MetricAreaLook = {},
+): void {
   const { box } = plot;
+  const { labels = true, dot = true, lineWidth = 2 } = look;
   const accent = read('--accent');
   const ion = read('--ion');
   const faint = read('--ink-3');
 
-  ctx.font = CHART_FONT;
-  ctx.textBaseline = 'middle';
-  ctx.textAlign = 'right';
-  for (const tick of plot.ticks) {
-    ctx.fillStyle = read('--line');
-    ctx.fillRect(box.left, Math.round(tick.y), box.right - box.left, 1);
+  if (labels) {
+    ctx.font = CHART_FONT;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'right';
+    for (const tick of plot.ticks) {
+      ctx.fillStyle = read('--line');
+      ctx.fillRect(box.left, Math.round(tick.y), box.right - box.left, 1);
+      ctx.fillStyle = faint;
+      ctx.fillText(tick.label, box.left - 8, tick.y);
+    }
     ctx.fillStyle = faint;
-    ctx.fillText(tick.label, box.left - 8, tick.y);
+    ctx.textAlign = 'left';
+    ctx.fillText('−10 min', box.left, h - 7);
+    ctx.textAlign = 'center';
+    ctx.fillText('−5 min', (box.left + box.right) / 2, h - 7);
+    ctx.textAlign = 'right';
+    ctx.fillText('now', box.right, h - 7);
   }
-  ctx.fillStyle = faint;
-  ctx.textAlign = 'left';
-  ctx.fillText('−10 min', box.left, h - 7);
-  ctx.textAlign = 'center';
-  ctx.fillText('−5 min', (box.left + box.right) / 2, h - 7);
-  ctx.textAlign = 'right';
-  ctx.fillText('now', box.right, h - 7);
 
   // The line's height at every whole pixel; NaN where no run covers it.
   const lineAt = new Float32Array(Math.ceil(w) + 2).fill(Number.NaN);
@@ -528,7 +557,7 @@ export function drawMetricArea({ ctx, w, h }: DitherSurface, plot: AreaPlot, rea
   gradient.addColorStop(1, ion);
   ctx.strokeStyle = gradient;
   ctx.fillStyle = gradient;
-  ctx.lineWidth = 2;
+  ctx.lineWidth = lineWidth;
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
   for (const run of plot.runs) {
@@ -543,7 +572,7 @@ export function drawMetricArea({ ctx, w, h }: DitherSurface, plot: AreaPlot, rea
     ctx.stroke();
   }
 
-  if (plot.newest) {
+  if (dot && plot.newest) {
     ctx.fillStyle = read('--surface');
     ctx.beginPath();
     ctx.arc(plot.newest.x, plot.newest.y, 6, 0, Math.PI * 2);

@@ -13,12 +13,16 @@ import { useSession } from '../../session';
 
 /** Approvals waiting for a person; refreshed every 10 s. One query for every view that shows them. */
 export function usePendingApprovals(): Approval[] {
+  return usePendingApprovalsQuery().data?.items ?? [];
+}
+
+/** The same list as a query, for a screen that shows a skeleton while it loads. */
+export function usePendingApprovalsQuery() {
   const { user } = useSession();
-  const pending = useListApprovals(
+  return useListApprovals(
     { status: 'pending' },
     { query: { enabled: user !== undefined, refetchInterval: 10_000, retry: false } },
   );
-  return pending.data?.items ?? [];
 }
 
 /** How many approvals wait for a person. */

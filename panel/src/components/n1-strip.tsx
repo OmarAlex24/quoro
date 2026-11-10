@@ -13,8 +13,20 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
  * node, from the primary's own simulation of that loss (`getClusterCapacity`,
  * ADR 0178). "Simulate losing" asks the same question about another node; it
  * is a read, and nothing is reserved. With no answer, the strip is not shown.
+ * Without the picker (`picker={false}`, the Projects rail) it is the sentence
+ * about the biggest node alone.
  */
-export function N1Strip({ nodes, apps }: { nodes: readonly Node[]; apps: readonly App[] }) {
+export function N1Strip({
+  nodes,
+  apps,
+  picker = true,
+  className,
+}: {
+  nodes: readonly Node[];
+  apps: readonly App[];
+  picker?: boolean;
+  className?: string;
+}) {
   const candidates = lossCandidates(nodes);
   const biggest = biggestNode(nodes);
   const [picked, setPicked] = useState<string | null>(null);
@@ -35,7 +47,7 @@ export function N1Strip({ nodes, apps }: { nodes: readonly Node[]; apps: readonl
   const Icon = readout.tone === 'run' ? ShieldCheck : ShieldAlert;
   return (
     <section
-      className={cn('n1', `n1-${readout.tone}`)}
+      className={cn('n1', `n1-${readout.tone}`, className)}
       aria-label="If a node goes down"
       aria-busy={capacity.isPlaceholderData || undefined}
     >
@@ -47,7 +59,7 @@ export function N1Strip({ nodes, apps }: { nodes: readonly Node[]; apps: readonl
           typeof segment === 'string' ? segment : <b key={index}>{segment.strong}</b>,
         )}
       </p>
-      {candidates.length > 1 && chosen ? (
+      {picker && candidates.length > 1 && chosen ? (
         <Select value={chosen.id} onValueChange={setPicked}>
           <SelectTrigger className="n1-pick" aria-label="Node to simulate losing">
             <SelectValue />

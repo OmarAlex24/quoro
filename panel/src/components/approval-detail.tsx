@@ -3,7 +3,7 @@ import { Link } from '@tanstack/react-router';
 import { useListAgents } from '../api/generated/agents/agents';
 import type { Approval } from '../api/generated/model';
 import type { RecordContext } from '../lib/activity';
-import { shortHash } from '../lib/agency-format';
+import { shortHash, shortId } from '../lib/agency-format';
 import { relativeTime } from '../lib/app-status';
 import {
   approvalMeter,
@@ -24,6 +24,7 @@ import { ApprovalDecision } from './approval-decision';
 import { Avatar } from './avatar';
 import { CopyButton } from './copy-button';
 import { DitherMeter } from './dither-meter';
+import { SkelName } from './skeleton';
 import { UserName } from './identity-name';
 import { Tag, type TagTone } from './ui/tag';
 
@@ -47,18 +48,24 @@ export function ApprovalDetail({
   canDecide,
   onDecided,
   onConflict,
+  focusAfter,
 }: {
   approval: Approval;
   ctx: RecordContext;
   canDecide: boolean;
   onDecided: (kind: Decision, decided: Approval) => void;
   onConflict: (view: ProblemView) => void;
+  /** Where focus goes once the decision is sent. */
+  focusAfter?: () => HTMLElement | null | undefined;
 }) {
   const pending = approval.status === 'pending';
   const now = useNow(pending, 15_000);
   const agents = useListAgents(AGENCY_LIST, { query: { staleTime: 30_000, retry: false } });
   const agent = agents.data?.items.find((candidate) => candidate.id === approval.agent_id);
-  const agentName = agent?.name ?? ctx.name?.('agent', approval.agent_id) ?? 'An agent';
+  // The name, a bar while the agents list loads, and the id once it has loaded without this agent.
+  const knownName = agent?.name ?? ctx.name?.('agent', approval.agent_id);
+  const naming = knownName === undefined && agents.isPending;
+  const agentName = knownName ?? (naming ? 'An agent' : shortId(approval.agent_id));
   const name = (type: string, id: string) => ctx.name?.(type, id);
   const state = askState(approval, ctx);
   const meter = approvalMeter(approval, now);
@@ -74,7 +81,8 @@ export function ApprovalDetail({
         <Avatar kind="agent" seed={approval.agent_id} size="lg" />
         <div className="min-w-0">
           <h2>
-            {agentName} {approvalWants(approval, name, state)}
+            {naming ? <SkelName label="Loading the agent’s name" width="7em" /> : agentName}{' '}
+            {approvalWants(approval, name, state)}
           </h2>
           <p className="apr-tags">
             <Tag tone="code">{approval.scope}</Tag>
@@ -130,7 +138,7 @@ export function ApprovalDetail({
             share={meter.share}
           />
           {canDecide ? (
-            <ApprovalDecision approval={approval} onDecided={onDecided} onConflict={onConflict} />
+            <ApprovalDecision approval={approval} onDecided={onDecided} onConflict={onConflict} focusAfter={focusAfter} />
           ) : (
             <p className="box px-3.5 py-2.5 text-[13px] leading-snug text-ink-2">{DECIDER_ONLY_SENTENCE}</p>
           )}

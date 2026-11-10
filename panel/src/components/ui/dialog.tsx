@@ -12,11 +12,14 @@ export function DialogContent({
   className,
   title,
   description,
+  onCloseAutoFocus,
 }: {
   children: ReactNode;
   className?: string;
   title: string;
   description?: string;
+  /** Where focus goes on close, for a dialog opened without a `DialogTrigger`. */
+  onCloseAutoFocus?: (event: Event) => void;
 }) {
   return (
     <DialogPrimitive.Portal>
@@ -26,6 +29,7 @@ export function DialogContent({
           'dialog-content fixed left-1/2 top-1/2 z-50 flex max-h-[calc(100dvh-32px)] w-[min(92vw,560px)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-y-auto border border-line-2 bg-surface p-5 sm:p-6',
           className,
         )}
+        onCloseAutoFocus={onCloseAutoFocus}
       >
         <div className="mb-4 flex items-start justify-between gap-4 border-b border-line pb-3">
           <div>

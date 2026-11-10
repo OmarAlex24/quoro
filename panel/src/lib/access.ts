@@ -1,5 +1,5 @@
 import type { Approval, Grant, Project, Scope } from '../api/generated/model';
-import { expiryWords, shortId } from './agency-format';
+import { shortId } from './agency-format';
 
 /*
  * Who else can act on a project, and what an agent asks for, in plain words.
@@ -140,11 +140,4 @@ export const approvalAsk = (
     wants: `wants to ${words}`,
     target: targetName ?? `${approval.target.type} ${shortId(approval.target.id)}`,
   };
-};
-
-/** "Expires in 49 min." or "Expired 2 min ago." */
-export const approvalExpiry = (iso: string, now: number = Date.now()): string => {
-  const at = Date.parse(iso);
-  if (Number.isNaN(at)) return '';
-  return `${at > now ? 'Expires' : 'Expired'} ${expiryWords(iso, now)}.`;
 };
