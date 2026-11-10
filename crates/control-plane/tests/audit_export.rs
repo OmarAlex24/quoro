@@ -5,6 +5,7 @@
 mod common;
 
 use common::Server;
+use common::replay;
 use quoro_control_plane::api::audit_exports::{
     AuditExport, CreateAuditExportRequest, LockStrength,
 };
@@ -237,6 +238,35 @@ async fn create_probes_and_refuses_a_second_or_a_wrong_provider() {
     .await
     .unwrap_err();
     assert_eq!(error.code, Code::ValidationFailed);
+}
+
+/// Section 7.3 step 4 (ADR 0297): the export's change-log entries, its
+/// create and the probe's update, rebuild its row when replayed in `seq`
+/// order into an empty database, `target` included. The provider row is
+/// inserted directly here, so only `audit_export` entries are replayed.
+#[tokio::test]
+async fn export_entries_rebuild_the_row() {
+    let (server, _export) = setup(&MemoryStore::new()).await;
+    let rebuilt = replay::rebuild(&server, &["audit_export"], &[]).await;
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "audit_exports",
+        &[
+            "id",
+            "target",
+            "provider_id",
+            "lock_strength",
+            "probed_at",
+            "probe_detail",
+            "last_exported_seq",
+            "last_exported_hash",
+            "last_error",
+            "updated_at",
+        ],
+        1,
+    )
+    .await;
 }
 
 #[tokio::test]

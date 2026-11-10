@@ -523,7 +523,7 @@ pub async fn create_with<S: ObjectStore>(
         json!({
             "id": id,
             "provider_id": row.provider_id,
-            "prefix": row.target,
+            "target": row.target,
             "lock_strength": "none",
             "last_exported_seq": 0,
             "updated_at": at,

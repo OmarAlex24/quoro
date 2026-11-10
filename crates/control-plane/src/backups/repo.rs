@@ -45,7 +45,13 @@ pub(crate) struct Repository {
 }
 
 impl Repository {
-    /// The change-log payload of the row. The key is never part of it.
+    /// The change-log payload of the row, without `repo_key_enc`. Every
+    /// machine with the `node` role can open its own seal of the cluster
+    /// data-encryption key (`node-agent-protocol.md` section 7.2), so the
+    /// encrypted repository key in the log would put the repository key on
+    /// every follower's disk, and the contract says a node never gets it. The
+    /// key stays out of the log until the maintainer decides how a promoted
+    /// primary gets it back.
     #[must_use]
     pub(crate) fn payload(&self) -> Value {
         json!({
