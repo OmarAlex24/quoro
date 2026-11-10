@@ -11,14 +11,17 @@ use quoro_engine::{
     VmId, VmSpec, VolumeAttach, VolumeId, VolumeSnapshot,
 };
 use quoro_engine::{FakeOp, FakeRanges};
-use quoro_proto::wire::{DesiredStatus, QuarantineStatus, SpecVm, SpecVolume};
+use quoro_proto::wire::{DesiredStatus, QuarantineStatus, SpecNetwork, SpecVm, SpecVolume};
 
 use super::*;
 use crate::kept::{self, KeepPurpose};
+use crate::lease::LeaseView;
+use crate::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler};
 use crate::store::{HandOverMark, VolumeQuarantineRecord};
 use crate::warm::quarantine::Quarantines;
 use crate::warm::quarantine::tests::{assert_primary_accepts, assert_rfc3339, plain_sha256};
 use crate::warm::receiver::handover::{HandOver, REFUSALS_BEFORE_ERROR};
+use crate::warm::sender::{SenderOptions, WarmSender};
 
 fn vol() -> VolumeId {
     VolumeId(VOL.to_owned())
@@ -65,6 +68,13 @@ fn free_port(h: &Harness) {
     h.set_warm(|warm| warm.port = port);
 }
 
+impl Harness {
+    /// The rev of the current desired state.
+    fn rev(&self) -> u64 {
+        self.desired.borrow().as_ref().expect("a snapshot").rev
+    }
+}
+
 /// The returning source as the harness finds it: the live file with data
 /// and the node's own row.
 async fn returning_source(h: &Harness) -> PathBuf {
@@ -86,11 +96,14 @@ async fn returning_source(h: &Harness) -> PathBuf {
         .save_volume(&own_row(VolumeState::Ready))
         .await
         .expect("own row");
-    // The warm row each pass adds for a target entry.
-    h.store
-        .add_warm_target(VOL, APP, 1)
-        .await
-        .expect("warm row");
+    // The warm row and the returning flag each pass writes for a target
+    // entry of a volume the node holds as its own.
+    assert!(
+        h.store
+            .add_return_pending_target(VOL, APP, 1, h.rev())
+            .await
+            .expect("warm row")
+    );
     info.path
 }
 
@@ -1292,4 +1305,495 @@ async fn a_failed_hash_is_tried_again_without_a_restart() {
         quarantined(&h).await[0].sha256.as_deref(),
         Some(expected.as_str())
     );
+}
+
+// A `deleted` entry reaches a returning source only through the stale-copy
+// rule of section 5.11 (ADR 0267), which never removes a volume of the
+// node's own: the node keeps its file, its row and its kept snapshots, and
+// only the warm record goes.
+
+/// The old VM of the app, on the engine and in the spec as `standby`.
+const OLD_VM: &str = "vm_01JD0WARM0000000000000001";
+
+/// The node's reconciler, on the harness's engine, store and locks.
+fn node_reconciler(h: &Harness) -> Reconciler<FakeEngine> {
+    let (reconciler, _observed) = Reconciler::new(
+        Arc::clone(&h.engine),
+        h.store.clone(),
+        ReconcileConfig {
+            bridge: "quoro0".to_owned(),
+            dns: Vec::new(),
+        },
+        ReconcileOptions {
+            tick: Duration::from_millis(10),
+            stop_timeout: Duration::from_millis(20),
+            backoff_base: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(8),
+            healthy_after: Duration::from_secs(60),
+        },
+    );
+    reconciler.with_warm_locks(h.locks.clone())
+}
+
+/// The node's sender, on the harness's engine, store and locks.
+fn node_sender(h: &Harness) -> WarmSender<FakeEngine> {
+    let (board, _) = StatusBoard::new();
+    WarmSender::new(
+        Arc::clone(&h.engine),
+        h.store.clone(),
+        h.desired.subscribe(),
+        LeaseView::default(),
+        h.locks.clone(),
+        board,
+        SenderOptions::quick(),
+    )
+}
+
+/// A new revision with `vms` and `volumes`, and a network so the reconciler
+/// applies it; returns it.
+fn send_spec(h: &Harness, vms: Vec<SpecVm>, volumes: Vec<SpecVolumeFile>) -> Snapshot {
+    h.desired.send_modify(|current| {
+        let snapshot = current.as_mut().expect("a snapshot");
+        snapshot.rev += 1;
+        snapshot.state.rev = snapshot.rev;
+        snapshot.state.spec.vms = vms;
+        snapshot.state.spec.volumes = volumes;
+        snapshot.state.spec.network = Some(SpecNetwork {
+            subnet: "10.42.1.0/24".to_owned(),
+            gateway: "10.42.1.1".to_owned(),
+        });
+    });
+    h.desired.borrow().clone().expect("a snapshot")
+}
+
+/// A returning source before its hand-over finished.
+struct Returning {
+    /// Its `present` target entry.
+    target: SpecVolumeFile,
+    base: VolumeSnapshot,
+    shipping: VolumeSnapshot,
+    /// The old VM, which holds the hand-over back.
+    old: VmId,
+    /// The live file's bytes where a divergent write goes.
+    live: Vec<u8>,
+}
+
+/// The returning source as the failover leaves it: its own row and live
+/// file, holding a write the target lacks when `diverged`, the kept base and
+/// shipping snapshots, and the old VM. A pass records the target, flags the
+/// own row and reports the copy; the hand-over waits for the VM.
+async fn returning_before_its_hand_over(
+    h: &Harness,
+    listeners: &mut BTreeMap<SocketAddr, JoinHandle<()>>,
+    diverged: bool,
+) -> Returning {
+    let path = returning_source(h).await;
+    // The pass writes the flag, not the setup.
+    h.store
+        .clear_volume_return_pending(VOL)
+        .await
+        .expect("clear");
+    let base = keep_snapshot(h, KeepPurpose::WarmBase, 1).await;
+    let shipping = keep_snapshot(h, KeepPurpose::WarmShipping, 2).await;
+    if diverged {
+        diverge(&path);
+    }
+    let old = engine_vm(&h.engine, OLD_VM, false).await;
+    let target = h
+        .desired
+        .borrow()
+        .as_ref()
+        .expect("a snapshot")
+        .state
+        .spec
+        .volumes[0]
+        .clone();
+    send_spec(h, vec![standby_vm(OLD_VM)], vec![target.clone()]);
+    pass(h, listeners).await;
+    assert!(h.store.volume_return_pending(VOL).await.expect("store"));
+    assert!(h.volume_path.exists(), "the hand-over waits for the old VM");
+    assert_eq!(h.status().volume_id, VOL, "the copy is reported");
+    assert!(h.status().error.is_none(), "{:?}", h.status());
+    let live = read_at(&path, 7 * CELL + 512, 8192);
+    Returning {
+        target,
+        base,
+        shipping,
+        old,
+        live,
+    }
+}
+
+/// The stale-copy rule's `deleted` entry, without `warm`, in the revision
+/// that also drops the old VM, which the engine no longer holds.
+async fn deleted_entry_arrives(h: &Harness, returning: &Returning) -> Snapshot {
+    h.engine.delete(&returning.old).await.expect("delete");
+    send_spec(
+        h,
+        Vec::new(),
+        vec![SpecVolumeFile {
+            state: SpecVolumeState::Deleted,
+            warm: None,
+            ..returning.target.clone()
+        }],
+    )
+}
+
+/// The file with its bytes, the own row, the flag and the kept snapshots are
+/// all still there, and no copy was taken.
+async fn assert_own_volume_kept(h: &Harness, returning: &Returning, what: &str) {
+    assert!(h.volume_path.exists(), "{what}: the live file stays");
+    assert_eq!(
+        read_at(&h.volume_path, 7 * CELL + 512, 8192),
+        returning.live,
+        "{what}: with its bytes"
+    );
+    let row = h.store.volume(VOL).await.expect("store");
+    assert_eq!(
+        row.map(|row| row.state),
+        Some(VolumeState::Ready),
+        "{what}: the own row stays"
+    );
+    assert!(
+        h.store.volume_return_pending(VOL).await.expect("store"),
+        "{what}"
+    );
+    assert_eq!(
+        kept_purposes(h).await,
+        vec!["warm_base", "warm_shipping"],
+        "{what}: the kept snapshots stay"
+    );
+    assert!(
+        returning.base.location.exists() && returning.shipping.location.exists(),
+        "{what}"
+    );
+    assert!(quarantined(h).await.is_empty(), "{what}");
+    assert!(
+        !h.store.volume_handing_over(VOL).await.expect("store"),
+        "{what}"
+    );
+}
+
+/// The state the reconciler reports for the volume in `status_report.volumes`.
+fn reported(reconciler: &Reconciler<FakeEngine>) -> Option<VolumeState> {
+    reconciler
+        .volume_statuses()
+        .borrow()
+        .iter()
+        .find(|status| status.volume_id == VOL)
+        .map(|status| status.state)
+}
+
+/// No VM exists or was stopped: nothing touched a VM for the volume.
+async fn assert_no_vm_call(h: &Harness, what: &str) {
+    assert!(
+        h.engine.list().await.expect("list").is_empty(),
+        "{what}: no VM"
+    );
+    assert!(h.engine.stop_calls().is_empty(), "{what}: no stop");
+}
+
+/// All three cases of the stale-copy rule reach the node as the same
+/// `deleted` entry without `warm`, with the old VM gone from `spec.vms`: the
+/// app has another warm node, it left `warm`, or it or its volume is being
+/// deleted.
+#[tokio::test]
+async fn a_deleted_entry_keeps_a_returning_source_s_own_volume() {
+    for trigger in [
+        "the app has another warm node",
+        "the app left warm",
+        "the app or the volume is being deleted",
+    ] {
+        let tag: String = trigger.split(' ').skip(2).collect::<Vec<_>>().join("-");
+        let h = Harness::new(&format!("returning-deleted-{tag}")).await;
+        let mut listeners = BTreeMap::new();
+        let returning = returning_before_its_hand_over(&h, &mut listeners, true).await;
+        let mut reconciler = node_reconciler(&h);
+        let sender = node_sender(&h);
+        let deleted = deleted_entry_arrives(&h, &returning).await;
+
+        // The reconciler first, while the warm row still stands; then the
+        // receiver and the sender; then the reconciler again.
+        reconciler.reconcile_once(Some(&deleted)).await;
+        pass(&h, &mut listeners).await;
+        sender.pass_once().await;
+        reconciler.reconcile_once(Some(&deleted)).await;
+        assert_own_volume_kept(&h, &returning, trigger).await;
+        assert!(h.row().await.removed, "{trigger}: the warm row is removed");
+        assert!(
+            h.statuses.borrow().is_empty(),
+            "{trigger}: the copy is no longer reported: {:?}",
+            h.statuses.borrow()
+        );
+        assert_eq!(
+            reported(&reconciler),
+            Some(VolumeState::Ready),
+            "{trigger}: reported with its state"
+        );
+        assert_eq!(
+            h.store.applied_rev().await.expect("store"),
+            deleted.rev,
+            "{trigger}: the revision is not held"
+        );
+        assert_no_vm_call(&h, trigger).await;
+
+        // The entry leaves the spec: the warm row is forgotten, and the file
+        // is an orphan the node keeps.
+        let gone = send_spec(&h, Vec::new(), Vec::new());
+        pass(&h, &mut listeners).await;
+        sender.pass_once().await;
+        reconciler.reconcile_once(Some(&gone)).await;
+        assert_own_volume_kept(&h, &returning, trigger).await;
+        assert!(h.store.warm_target(VOL).await.expect("store").is_none());
+        assert_eq!(
+            reported(&reconciler),
+            Some(VolumeState::Orphaned),
+            "{trigger}"
+        );
+        assert!(h.statuses.borrow().is_empty(), "{trigger}");
+        assert_no_vm_call(&h, trigger).await;
+    }
+}
+
+/// An older revision `rev`, in which the node runs the volume as its
+/// source, with no VM.
+fn older_source_revision(h: &Harness, returning: &Returning, rev: u64) -> Snapshot {
+    let mut older = h.desired.borrow().clone().expect("a snapshot");
+    older.rev = rev;
+    older.state.rev = rev;
+    older.state.spec.vms = Vec::new();
+    older.state.spec.volumes = vec![SpecVolumeFile {
+        warm: returning.target.warm.clone().map(|warm| SpecWarm {
+            role: WarmRole::Source,
+            ..warm
+        }),
+        ..returning.target.clone()
+    }];
+    older
+}
+
+/// A reconciler pass on an older revision leaves a hand-over's mark alone
+/// while the flag names a newer one, with the flag and the warm row: the
+/// next hand-over finds the mark and takes no second copy.
+#[tokio::test]
+async fn a_reconciler_pass_on_an_older_revision_leaves_the_hand_over_mark() {
+    let h = Harness::new("returning-older-rev-mark").await;
+    let mut listeners = BTreeMap::new();
+    let returning = returning_before_its_hand_over(&h, &mut listeners, true).await;
+    let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
+    let mut reconciler = node_reconciler(&h);
+    let named = h.rev();
+    h.engine.delete(&returning.old).await.expect("delete");
+    // A hand-over on N quarantined the file and marked the row, and stopped
+    // before it ended.
+    let copy = marked_copy(&h).await;
+
+    let older = older_source_revision(&h, &returning, named - 1);
+    reconciler.reconcile_once(Some(&older)).await;
+    assert_eq!(
+        h.store.volume_hand_over_mark(VOL).await.expect("store"),
+        Some(HandOverMark::Copy(copy.quarantine_id.clone())),
+        "the mark stays"
+    );
+    assert_eq!(
+        h.store.volume_return_pending_rev(VOL).await.expect("store"),
+        Some(named),
+        "the flag stays"
+    );
+    assert!(h.store.warm_target(VOL).await.expect("store").is_some());
+    assert_ne!(h.store.applied_rev().await.expect("store"), older.rev);
+
+    // The next hand-over goes on from the mark: no second copy.
+    assert_eq!(hand_over(&h).await, HandOver::Done(None));
+    assert_handed_over(&h).await;
+    assert_eq!(quarantined(&h).await, vec![copy]);
+}
+
+/// A reconciler pass on an older revision, where the node still runs the
+/// volume as its source, does not clear a flag a newer revision set: the
+/// volume waits for a newer revision, and the `deleted` entry that follows
+/// keeps the file and the base.
+#[tokio::test]
+async fn a_reconciler_pass_on_an_older_revision_leaves_the_flag() {
+    let h = Harness::new("returning-older-rev").await;
+    let mut listeners = BTreeMap::new();
+    let returning = returning_before_its_hand_over(&h, &mut listeners, true).await;
+    let mut reconciler = node_reconciler(&h);
+    let sender = node_sender(&h);
+    let named = h.rev();
+    assert_eq!(
+        h.store.volume_return_pending_rev(VOL).await.expect("store"),
+        Some(named)
+    );
+    h.engine.delete(&returning.old).await.expect("delete");
+
+    let older = older_source_revision(&h, &returning, named - 1);
+    reconciler.reconcile_once(Some(&older)).await;
+    assert!(h.store.volume_return_pending(VOL).await.expect("store"));
+    assert!(h.store.warm_target(VOL).await.expect("store").is_some());
+    assert_ne!(
+        h.store.applied_rev().await.expect("store"),
+        older.rev,
+        "the stale revision is not applied"
+    );
+
+    // N + 1: the stale-copy rule's `deleted` entry.
+    let deleted = send_spec(
+        &h,
+        Vec::new(),
+        vec![SpecVolumeFile {
+            state: SpecVolumeState::Deleted,
+            warm: None,
+            ..returning.target.clone()
+        }],
+    );
+    reconciler.reconcile_once(Some(&deleted)).await;
+    pass(&h, &mut listeners).await;
+    sender.pass_once().await;
+    reconciler.reconcile_once(Some(&deleted)).await;
+    assert_own_volume_kept(&h, &returning, "older revision").await;
+    assert_eq!(reported(&reconciler), Some(VolumeState::Ready));
+    assert_eq!(h.store.applied_rev().await.expect("store"), deleted.rev);
+}
+
+/// A reconciler pass on the `deleted` revision that runs only after the
+/// receiver forgot its warm row reads the flag fresh, and keeps the file.
+#[tokio::test]
+async fn a_reconciler_pass_behind_the_receiver_still_keeps_the_file() {
+    let h = Harness::new("returning-lagging").await;
+    let mut listeners = BTreeMap::new();
+    let returning = returning_before_its_hand_over(&h, &mut listeners, true).await;
+    let mut reconciler = node_reconciler(&h);
+    let deleted = deleted_entry_arrives(&h, &returning).await;
+    pass(&h, &mut listeners).await;
+    assert!(h.row().await.removed);
+    send_spec(&h, Vec::new(), Vec::new());
+    pass(&h, &mut listeners).await;
+    assert!(h.store.warm_target(VOL).await.expect("store").is_none());
+
+    reconciler.reconcile_once(Some(&deleted)).await;
+    assert_own_volume_kept(&h, &returning, "lagging").await;
+    assert_eq!(reported(&reconciler), Some(VolumeState::Ready));
+    assert_eq!(h.store.applied_rev().await.expect("store"), deleted.rev);
+    assert_no_vm_call(&h, "lagging").await;
+}
+
+/// Named the volume's target again after a `deleted` entry and the orphan
+/// that followed, the node runs the hand-over against the base it kept: an
+/// unchanged file goes, a changed one is kept as a quarantined copy.
+#[tokio::test]
+async fn named_the_target_again_the_hand_over_compares_with_the_kept_base() {
+    for diverged in [false, true] {
+        let what = if diverged { "changed" } else { "unchanged" };
+        let h = Harness::new(&format!("returning-again-{what}")).await;
+        let mut listeners = BTreeMap::new();
+        let returning = returning_before_its_hand_over(&h, &mut listeners, diverged).await;
+        let mut reconciler = node_reconciler(&h);
+        let deleted = deleted_entry_arrives(&h, &returning).await;
+        reconciler.reconcile_once(Some(&deleted)).await;
+        pass(&h, &mut listeners).await;
+        let gone = send_spec(&h, Vec::new(), Vec::new());
+        pass(&h, &mut listeners).await;
+        reconciler.reconcile_once(Some(&gone)).await;
+        assert_eq!(reported(&reconciler), Some(VolumeState::Orphaned), "{what}");
+        assert_own_volume_kept(&h, &returning, what).await;
+        let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
+
+        let again = send_spec(&h, Vec::new(), vec![returning.target.clone()]);
+        reconciler.reconcile_once(Some(&again)).await;
+        pass(&h, &mut listeners).await;
+        assert_handed_over(&h).await;
+        let records = quarantined(&h).await;
+        if diverged {
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(
+                read_at(&records[0].path, 7 * CELL + 512, 8192),
+                pattern(8192, 4),
+                "the copy keeps the divergent write"
+            );
+            assert_eq!(
+                kept_purposes(&h).await,
+                vec!["quarantine", "warm_base", "warm_shipping"]
+            );
+        } else {
+            assert!(records.is_empty(), "{records:?}");
+            assert_eq!(kept_purposes(&h).await, vec!["warm_base", "warm_shipping"]);
+        }
+        assert!(h.status().error.is_none(), "{what}: {:?}", h.status());
+        reconciler.reconcile_once(Some(&again)).await;
+        assert_eq!(reported(&reconciler), None, "{what}: a warm copy now");
+        assert_no_vm_call(&h, what).await;
+    }
+}
+
+/// The flag is durable before `status_report.warm` lists the target: a
+/// publish that finds the own row without it leaves the entry out, and a
+/// pass that cannot write it neither reports the target nor hands it over.
+#[tokio::test]
+async fn the_target_is_reported_only_once_the_returning_flag_is_durable() {
+    let h = Harness::new("returning-flag-order").await;
+    let mut listeners = BTreeMap::new();
+    returning_source(&h).await;
+    keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+    // The warm row as a stream's record leaves it, without the flag.
+    h.store
+        .clear_volume_return_pending(VOL)
+        .await
+        .expect("clear");
+    let snapshots = h.engine.volume_snapshots().len();
+    let model = first_model();
+    h.post(
+        stream(&header(5, 1, None), &model, &model.allocated()),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_refused("busy", None);
+    assert!(h.statuses.borrow().is_empty(), "{:?}", h.statuses.borrow());
+
+    // The flag cannot be written.
+    sqlx::query(
+        "CREATE TRIGGER no_return_pending BEFORE UPDATE OF return_pending ON volumes \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END",
+    )
+    .execute(h.store.pool())
+    .await
+    .expect("trigger");
+    pass(&h, &mut listeners).await;
+    assert!(!h.store.volume_return_pending(VOL).await.expect("store"));
+    assert!(h.volume_path.exists(), "no hand-over");
+    assert!(h.store.volume(VOL).await.expect("store").is_some());
+    assert!(!h.store.volume_handing_over(VOL).await.expect("store"));
+    assert!(quarantined(&h).await.is_empty());
+    assert_eq!(h.engine.volume_snapshots().len(), snapshots);
+    assert!(h.statuses.borrow().is_empty(), "{:?}", h.statuses.borrow());
+
+    // Once it can be written, the pass writes it before it publishes: while
+    // the old VM holds the hand-over back, the target is reported flagged.
+    sqlx::query("DROP TRIGGER no_return_pending")
+        .execute(h.store.pool())
+        .await
+        .expect("drop trigger");
+    let old = engine_vm(&h.engine, OLD_VM, false).await;
+    let target = h
+        .desired
+        .borrow()
+        .as_ref()
+        .expect("a snapshot")
+        .state
+        .spec
+        .volumes[0]
+        .clone();
+    send_spec(&h, vec![standby_vm(OLD_VM)], vec![target.clone()]);
+    pass(&h, &mut listeners).await;
+    assert!(h.store.volume_return_pending(VOL).await.expect("store"));
+    assert_eq!(h.status().volume_id, VOL);
+    assert!(h.volume_path.exists());
+
+    // And the hand-over runs once the VM is gone.
+    h.engine.delete(&old).await.expect("delete");
+    send_spec(&h, Vec::new(), vec![target]);
+    pass(&h, &mut listeners).await;
+    assert_handed_over(&h).await;
+    assert_eq!(h.status().volume_id, VOL);
 }

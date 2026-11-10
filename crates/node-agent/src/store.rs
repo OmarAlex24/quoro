@@ -162,7 +162,9 @@ CREATE TABLE IF NOT EXISTS volumes (
     error           TEXT,
     allocated_bytes INTEGER,
     handing_over    INTEGER NOT NULL DEFAULT 0,
-    hand_over_basis TEXT
+    hand_over_basis TEXT,
+    return_pending  INTEGER NOT NULL DEFAULT 0,
+    return_pending_rev INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS backups (
     backup_id       TEXT PRIMARY KEY,
@@ -1866,6 +1868,190 @@ impl NodeStore {
         .map_err(store_error)?;
         tx.commit().await.map_err(store_error)?;
         Ok(dropped > 0)
+    }
+
+    /// Records that this node is the target of a warm volume it holds as its
+    /// own, a returning source (section 9), in one transaction: the warm
+    /// target row, as [`Self::add_warm_target`] writes it, and the flag on
+    /// the own row that the node is returning, with the desired-state `rev`
+    /// that named it the target. That rev is raised, never lowered: only a
+    /// newer revision clears the flag ([`Self::end_return_pending`]). Returns
+    /// whether an own row, not `deleted`, carries the flag now; nothing is
+    /// flagged without one.
+    ///
+    /// While the flag is set, a `deleted` entry never removes the own file
+    /// and the sender keeps the volume's warm snapshots: the stale-copy rule
+    /// of section 5.11 never removes a volume of the node's own (ADR 0267).
+    /// The flag goes with the row at the end of a hand-over
+    /// ([`Self::finish_hand_over`]), or when the node runs the volume again
+    /// ([`Self::end_return_pending`]).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure; nothing is written then.
+    pub async fn add_return_pending_target(
+        &self,
+        volume_id: &str,
+        app_id: &str,
+        size_gb: u32,
+        rev: u64,
+    ) -> Result<bool, AgentError> {
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        sqlx::query(
+            "INSERT INTO warm_targets (volume_id, app_id, size_gb) VALUES (?, ?, ?) \
+             ON CONFLICT(volume_id) DO UPDATE SET removed = 0 WHERE warm_targets.removed = 1",
+        )
+        .bind(volume_id)
+        .bind(app_id)
+        .bind(i64::from(size_gb))
+        .execute(&mut *tx)
+        .await
+        .map_err(store_error)?;
+        let flagged = sqlx::query(
+            "UPDATE volumes SET return_pending = 1, \
+             return_pending_rev = MAX(return_pending_rev, ?) \
+             WHERE volume_id = ? AND state <> 'deleted'",
+        )
+        .bind(i64::try_from(rev).unwrap_or(i64::MAX))
+        .bind(volume_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        tx.commit().await.map_err(store_error)?;
+        Ok(flagged > 0)
+    }
+
+    /// Whether the node's own row of `volume_id` carries the flag that the
+    /// node is returning as the volume's warm target (section 9); `false`
+    /// without a row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn volume_return_pending(&self, volume_id: &str) -> Result<bool, AgentError> {
+        let flag: Option<i64> =
+            sqlx::query_scalar("SELECT return_pending FROM volumes WHERE volume_id = ?")
+                .bind(volume_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_error)?;
+        Ok(flag.is_some_and(|flag| flag != 0))
+    }
+
+    /// The node's own volumes that are not `deleted`, each with whether its
+    /// row carries the returning flag, read in one statement.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn own_volumes_return_pending(&self) -> Result<BTreeMap<String, bool>, AgentError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT volume_id, return_pending FROM volumes WHERE state <> 'deleted'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(volume_id, flag)| (volume_id, flag != 0))
+            .collect())
+    }
+
+    /// The desired-state rev that last named the node the target of
+    /// `volume_id` while it holds the volume as its own, when its own row
+    /// carries the returning flag (section 9); `None` without the flag or a
+    /// row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn volume_return_pending_rev(
+        &self,
+        volume_id: &str,
+    ) -> Result<Option<u64>, AgentError> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT return_pending, return_pending_rev FROM volumes WHERE volume_id = ?",
+        )
+        .bind(volume_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(row
+            .filter(|(flag, _)| *flag != 0)
+            .map(|(_, rev)| u64::try_from(rev).unwrap_or(0)))
+    }
+
+    /// The node runs `volume_id` again (section 9) under a desired state of
+    /// rev `newer_than`: in one transaction, clears the returning flag on
+    /// its own row when the flag was set by an older revision, and then
+    /// forgets the warm target row beside it, whose copy the hand-over never
+    /// took (the store row only, never a file). Returns whether the flag was
+    /// cleared; a flag set by `newer_than` or a later revision stays, and so
+    /// does the warm row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure; nothing changes then.
+    pub async fn end_return_pending(
+        &self,
+        volume_id: &str,
+        newer_than: u64,
+    ) -> Result<bool, AgentError> {
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        let cleared = sqlx::query(
+            "UPDATE volumes SET return_pending = 0 \
+             WHERE volume_id = ? AND return_pending = 1 AND return_pending_rev < ?",
+        )
+        .bind(volume_id)
+        .bind(i64::try_from(newer_than).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await
+        .map_err(store_error)?
+        .rows_affected()
+            > 0;
+        if cleared {
+            sqlx::query("DELETE FROM warm_targets WHERE volume_id = ?")
+                .bind(volume_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(store_error)?;
+        }
+        tx.commit().await.map_err(store_error)?;
+        Ok(cleared)
+    }
+
+    /// Forgets the warm target row of `volume_id` when it holds no copy:
+    /// no complete copy and nothing pending. The store row only, never a
+    /// file. Returns whether a row went.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn forget_copyless_warm_target(&self, volume_id: &str) -> Result<bool, AgentError> {
+        sqlx::query(
+            "DELETE FROM warm_targets \
+             WHERE volume_id = ? AND complete_seq IS NULL AND pending_seq IS NULL",
+        )
+        .bind(volume_id)
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|done| done.rows_affected() > 0)
+    }
+
+    /// Clears the returning flag whatever revision set it; for the tests.
+    #[cfg(test)]
+    pub(crate) async fn clear_volume_return_pending(
+        &self,
+        volume_id: &str,
+    ) -> Result<(), AgentError> {
+        sqlx::query("UPDATE volumes SET return_pending = 0 WHERE volume_id = ?")
+            .bind(volume_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
     }
 
     /// Records a snapshot the node keeps, or updates its purpose, `seq` and
@@ -4072,9 +4258,10 @@ async fn buffer_event(
 
 /// Adds the columns newer agents need to a database an older agent created:
 /// `desired_state.body_enc` (bodies encrypted), the two validity columns of
-/// `leases`, `backups.guest_flush` (M5b, ADR 0282), `volumes.handing_over`
-/// and `volumes.hand_over_basis`, and the volume columns of `quarantine` with
-/// their unique `qrn_` index (M5b, section 9). New databases get the columns from [`SCHEMA`]; existing ones
+/// `leases`, `backups.guest_flush` (M5b, ADR 0282), `volumes.handing_over`,
+/// `volumes.hand_over_basis`, `volumes.return_pending` and
+/// `volumes.return_pending_rev`, and the volume columns
+/// of `quarantine` with their unique `qrn_` index (M5b, section 9). New databases get the columns from [`SCHEMA`]; existing ones
 /// are altered once, and the old rows keep loading.
 async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
     let columns = sqlx::query("PRAGMA table_info(desired_state)")
@@ -4135,17 +4322,63 @@ async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
     // row and what it stands for, and the quarantined copies of a volume beside those of the change
     // log (section 12 `quarantine`). Rows written before read as not handed
     // over, and as change-log copies.
-    add_missing_columns(
-        pool,
+    //
+    // The returning flag (section 9) is backfilled once, when its column is
+    // new, in the transaction that adds it, so a crash leaves both or
+    // neither: an own row that is not `deleted` and has a warm target row,
+    // removed or not, was named this node's target, so a node in the middle
+    // of a return at the upgrade keeps its file on a `deleted` entry too. Its
+    // rev is 0, so the reconciler's next pass that runs the volume clears it.
+    // `IMMEDIATE`: a write of another process between the column read and
+    // the `ALTER` waits, instead of failing the start.
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(store_error)?;
+    let added = add_missing_columns(
+        &mut tx,
         "volumes",
         &[
             ("handing_over", "INTEGER NOT NULL DEFAULT 0"),
             ("hand_over_basis", "TEXT"),
+            ("return_pending", "INTEGER NOT NULL DEFAULT 0"),
+            ("return_pending_rev", "INTEGER NOT NULL DEFAULT 0"),
         ],
     )
     .await?;
+    let backfilled: Vec<String> = if added.iter().any(|column| column == "return_pending") {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT volume_id FROM volumes WHERE state <> 'deleted' \
+             AND volume_id IN (SELECT volume_id FROM warm_targets) ORDER BY volume_id",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(store_error)?;
+        sqlx::query(
+            "UPDATE volumes SET return_pending = 1, return_pending_rev = 0 \
+             WHERE state <> 'deleted' AND volume_id IN (SELECT volume_id FROM warm_targets)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(store_error)?;
+        ids
+    } else {
+        Vec::new()
+    };
+    tx.commit().await.map_err(store_error)?;
+    for volume_id in &backfilled {
+        warn!(
+            volume_id,
+            "the volume is kept as a returning source's volume of this node's own, \
+             until the node is named its warm target or runs it again"
+        );
+    }
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(store_error)?;
     add_missing_columns(
-        pool,
+        &mut tx,
         "quarantine",
         &[
             ("quarantine_id", "TEXT"),
@@ -4157,6 +4390,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
         ],
     )
     .await?;
+    tx.commit().await.map_err(store_error)?;
     // After the columns: an older database gains `quarantine_id` only above.
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS quarantine_by_id ON quarantine (quarantine_id) \
@@ -4257,28 +4491,32 @@ async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
     Ok(())
 }
 
-/// Adds each of `columns` (name and declaration) that `table` lacks.
+/// Adds each of `columns` (name and declaration) that `table` lacks, on
+/// `conn`, so a caller's transaction holds the change, and returns the names
+/// it added.
 async fn add_missing_columns(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     table: &str,
     columns: &[(&str, &str)],
-) -> Result<(), AgentError> {
+) -> Result<Vec<String>, AgentError> {
     let present: Vec<String> = sqlx::query(&format!("PRAGMA table_info({table})"))
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(store_error)?
         .iter()
         .filter_map(|row| row.try_get::<String, _>("name").ok())
         .collect();
+    let mut added = Vec::new();
     for (column, kind) in columns {
         if !present.iter().any(|name| name == column) {
             sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))
-                .execute(pool)
+                .execute(&mut *conn)
                 .await
                 .map_err(store_error)?;
+            added.push((*column).to_owned());
         }
     }
-    Ok(())
+    Ok(added)
 }
 
 /// Encrypts every desired-state row still stored as plaintext by an older
@@ -4936,6 +5174,243 @@ mod tests {
         assert!(store.volume_handing_over("vol_a").await.unwrap());
         assert_eq!(store.volume_quarantines().await.unwrap().len(), 1);
         assert_eq!(quarantine_rows(&store).await.len(), 2);
+    }
+
+    /// Section 9: a database from before the returning flag gains it once.
+    /// An own row that is not `deleted` and has a warm target row, removed or
+    /// not, carries it; every other row does not. A later start backfills
+    /// nothing again.
+    #[tokio::test]
+    async fn an_older_database_flags_the_own_volumes_it_was_named_the_target_of() {
+        let dir = TempDir::new();
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(dir.0.join("node.db"))
+                .create_if_missing(true);
+            let pool = SqlitePool::connect_with(options).await.unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE node_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE TABLE volumes (volume_id TEXT PRIMARY KEY, app_id TEXT NOT NULL, \
+                 size_gb INTEGER NOT NULL, state TEXT NOT NULL, error TEXT, \
+                 allocated_bytes INTEGER, handing_over INTEGER NOT NULL DEFAULT 0, \
+                 hand_over_basis TEXT); \
+                 CREATE TABLE warm_targets (volume_id TEXT PRIMARY KEY, \
+                 app_id TEXT NOT NULL, size_gb INTEGER NOT NULL, \
+                 removed INTEGER NOT NULL DEFAULT 0); \
+                 INSERT INTO volumes (volume_id, app_id, size_gb, state) VALUES \
+                 ('vol_target', 'app_a', 1, 'ready'), \
+                 ('vol_removed', 'app_a', 1, 'failed'), \
+                 ('vol_plain', 'app_a', 1, 'ready'), \
+                 ('vol_gone', 'app_a', 1, 'deleted'); \
+                 INSERT INTO warm_targets (volume_id, app_id, size_gb, removed) VALUES \
+                 ('vol_target', 'app_a', 1, 0), ('vol_removed', 'app_a', 1, 1), \
+                 ('vol_gone', 'app_a', 1, 0), ('vol_copy', 'app_a', 1, 0);",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let store = NodeStore::open(&dir.0).await.expect("the store opens");
+        let flagged = |store: NodeStore| async move {
+            let mut out = Vec::new();
+            for id in [
+                "vol_target",
+                "vol_removed",
+                "vol_plain",
+                "vol_gone",
+                "vol_copy",
+            ] {
+                if store.volume_return_pending(id).await.unwrap() {
+                    out.push(id);
+                }
+            }
+            out
+        };
+        assert_eq!(
+            flagged(store.clone()).await,
+            vec!["vol_target", "vol_removed"]
+        );
+        assert_eq!(
+            store.own_volumes_return_pending().await.unwrap(),
+            BTreeMap::from([
+                ("vol_plain".to_owned(), false),
+                ("vol_removed".to_owned(), true),
+                ("vol_target".to_owned(), true),
+            ])
+        );
+        assert_eq!(
+            store.volume("vol_target").await.unwrap().unwrap().state,
+            VolumeState::Ready
+        );
+        assert_eq!(
+            store.volume_return_pending_rev("vol_target").await.unwrap(),
+            Some(0),
+            "any revision that runs the volume ends it"
+        );
+
+        // Once: a flag cleared after the upgrade stays cleared.
+        store
+            .clear_volume_return_pending("vol_target")
+            .await
+            .unwrap();
+        drop(store);
+        let store = NodeStore::open(&dir.0).await.expect("the store reopens");
+        assert_eq!(flagged(store.clone()).await, vec!["vol_removed"]);
+    }
+
+    /// The columns of the returning flag and its backfill are one
+    /// transaction: a start that stops between the `ALTER` and the backfill,
+    /// here by a backfill that fails, leaves neither, and the next start does
+    /// both.
+    #[tokio::test]
+    async fn a_start_cut_before_the_backfill_adds_no_column_and_the_next_one_backfills() {
+        let dir = TempDir::new();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.0.join("node.db"))
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE node_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+             CREATE TABLE volumes (volume_id TEXT PRIMARY KEY, app_id TEXT NOT NULL, \
+             size_gb INTEGER NOT NULL, state TEXT NOT NULL, error TEXT, \
+             allocated_bytes INTEGER); \
+             CREATE TABLE warm_targets (volume_id TEXT PRIMARY KEY, \
+             app_id TEXT NOT NULL, size_gb INTEGER NOT NULL, \
+             removed INTEGER NOT NULL DEFAULT 0); \
+             INSERT INTO volumes (volume_id, app_id, size_gb, state) \
+             VALUES ('vol_target', 'app_a', 1, 'ready'); \
+             INSERT INTO warm_targets (volume_id, app_id, size_gb) \
+             VALUES ('vol_target', 'app_a', 1); \
+             CREATE TRIGGER cut BEFORE UPDATE ON volumes \
+             BEGIN SELECT RAISE(ABORT, 'the agent stopped'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(NodeStore::open(&dir.0).await.is_err(), "the start stops");
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(volumes)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("name").ok())
+            .collect();
+        for column in [
+            "handing_over",
+            "hand_over_basis",
+            "return_pending",
+            "return_pending_rev",
+        ] {
+            assert!(!columns.iter().any(|name| name == column), "{column}");
+        }
+
+        sqlx::query("DROP TRIGGER cut")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let store = NodeStore::open(&dir.0).await.expect("the store opens");
+        assert_eq!(
+            store.volume_return_pending_rev("vol_target").await.unwrap(),
+            Some(0)
+        );
+    }
+
+    /// Section 9: the returning flag is written with the warm target row,
+    /// only on an own row that is not `deleted`, with the highest rev that
+    /// named the node the target; saving the row keeps it, clearing the
+    /// hand-over mark keeps it, only a newer revision ends it, with the warm
+    /// row, and the end of a hand-over drops it with the row.
+    #[tokio::test]
+    async fn the_returning_flag_survives_the_row_s_writes_and_goes_with_it() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let row = |state| VolumeRecord {
+            volume_id: "vol_a".to_owned(),
+            app_id: "app_a".to_owned(),
+            size_gb: 1,
+            state,
+            error: None,
+            allocated_bytes: None,
+        };
+        // No own row: the warm row alone.
+        assert!(
+            !store
+                .add_return_pending_target("vol_a", "app_a", 1, 3)
+                .await
+                .unwrap()
+        );
+        assert!(store.warm_target("vol_a").await.unwrap().is_some());
+        assert!(!store.volume_return_pending("vol_a").await.unwrap());
+        // A `deleted` own row is no volume of the node's own.
+        store.save_volume(&row(VolumeState::Deleted)).await.unwrap();
+        assert!(
+            !store
+                .add_return_pending_target("vol_a", "app_a", 1, 3)
+                .await
+                .unwrap()
+        );
+        assert!(!store.volume_return_pending("vol_a").await.unwrap());
+
+        store.save_volume(&row(VolumeState::Ready)).await.unwrap();
+        store.mark_warm_removed("vol_a").await.unwrap();
+        assert!(
+            store
+                .add_return_pending_target("vol_a", "app_a", 1, 3)
+                .await
+                .unwrap()
+        );
+        assert!(store.volume_return_pending("vol_a").await.unwrap());
+        assert!(
+            !store.warm_target("vol_a").await.unwrap().unwrap().removed,
+            "a removed copy's row is a target again"
+        );
+        store.save_volume(&row(VolumeState::Failed)).await.unwrap();
+        assert!(store.volume_return_pending("vol_a").await.unwrap());
+        store
+            .mark_volume_handing_over("vol_a", &HandOverMark::Unchanged)
+            .await
+            .unwrap();
+        store.clear_volume_handing_over("vol_a").await.unwrap();
+        assert!(store.volume_return_pending("vol_a").await.unwrap());
+        // The rev that named the node the target is raised, never lowered.
+        assert!(
+            store
+                .add_return_pending_target("vol_a", "app_a", 1, 2)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.volume_return_pending_rev("vol_a").await.unwrap(),
+            Some(3)
+        );
+        // Only a newer revision ends it, and the warm row with it.
+        assert!(!store.end_return_pending("vol_a", 3).await.unwrap());
+        assert!(store.volume_return_pending("vol_a").await.unwrap());
+        assert!(store.warm_target("vol_a").await.unwrap().is_some());
+        assert!(store.end_return_pending("vol_a", 4).await.unwrap());
+        assert!(!store.volume_return_pending("vol_a").await.unwrap());
+        assert_eq!(
+            store.volume_return_pending_rev("vol_a").await.unwrap(),
+            None
+        );
+        assert!(store.warm_target("vol_a").await.unwrap().is_none());
+        assert!(!store.end_return_pending("vol_a", 5).await.unwrap());
+
+        assert!(
+            store
+                .add_return_pending_target("vol_a", "app_a", 1, 3)
+                .await
+                .unwrap()
+        );
+        store
+            .mark_volume_handing_over("vol_a", &HandOverMark::Unchanged)
+            .await
+            .unwrap();
+        assert!(store.finish_hand_over("vol_a").await.unwrap());
+        assert!(!store.volume_return_pending("vol_a").await.unwrap());
+        assert!(store.own_volumes_return_pending().await.unwrap().is_empty());
     }
 
     /// A quarantined copy of `volume_id` and its kept snapshot.

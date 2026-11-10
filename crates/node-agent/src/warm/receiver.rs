@@ -438,20 +438,20 @@ impl<E: Engine + 'static> WarmReceiver<E> {
             return;
         };
         let targets = targets(&spec);
+        // A volume the node holds as its own and whose own row does not carry
+        // the returning flag yet: no hand-over this pass.
+        let mut unflagged: BTreeSet<String> = BTreeSet::new();
         for (file, _) in &targets {
-            if let Err(e) = self
-                .inner
-                .store
-                .add_warm_target(&file.volume_id, &file.app_id, file.size_gb)
-                .await
-            {
-                warn!(volume_id = %file.volume_id, error = %e, "could not record a warm target");
+            if !self.inner.record_target(file).await {
+                unflagged.insert(file.volume_id.clone());
             }
         }
         // Before any stream of it is accepted: a stream finds the volume
         // still the node's own until its hand-over ends.
         for (file, _) in &targets {
-            self.inner.hand_over(&file.volume_id).await;
+            if !unflagged.contains(&file.volume_id) {
+                self.inner.hand_over(&file.volume_id).await;
+            }
         }
         self.inner
             .quarantines
@@ -660,6 +660,17 @@ impl<E: Engine + 'static> Inner<E> {
             .into_iter()
             .find(|(file, _)| file.volume_id == volume_id)
             .map(|(file, warm)| (file.clone(), warm.clone()))
+    }
+
+    /// The rev of the desired state when it names this node the target of
+    /// `volume_id` in a `present` entry.
+    fn target_rev(&self, volume_id: &str) -> Option<u64> {
+        let desired = self.desired.borrow();
+        let snapshot = desired.as_ref()?;
+        targets(&snapshot.state.spec)
+            .iter()
+            .any(|(file, _)| file.volume_id == volume_id)
+            .then_some(snapshot.rev)
     }
 
     /// The checks that need no lock: the target, the peer, the lease and the
@@ -1328,6 +1339,61 @@ impl<E: Engine + 'static> Inner<E> {
         }
     }
 
+    /// Records the warm target row of a `present` target entry. For a volume
+    /// the node holds as its own, a returning source (section 9), the row
+    /// and the returning flag on the own row are written in one transaction,
+    /// under the volume's lock and only while the desired state still names
+    /// the node as the target, with that desired state's rev: the reconciler
+    /// clears the flag under the same lock once it runs the volume under a
+    /// newer revision, so neither an older revision here nor a reconciler
+    /// pass on one undoes the other. Returns `false` when the volume is the node's own and
+    /// its flag could not be made durable: its hand-over waits for a later
+    /// pass, and [`Self::publish`] leaves its entry out until then.
+    async fn record_target(&self, file: &SpecVolumeFile) -> bool {
+        let volume_id = file.volume_id.as_str();
+        match self.own_volume(volume_id).await {
+            Ok(false) => {
+                if let Err(e) = self
+                    .store
+                    .add_warm_target(volume_id, &file.app_id, file.size_gb)
+                    .await
+                {
+                    warn!(volume_id, error = %e, "could not record a warm target");
+                }
+                return true;
+            }
+            Ok(true) => {}
+            Err(e) => {
+                warn!(volume_id, error = %e, "could not read the volume row");
+                return false;
+            }
+        }
+        let Some(_guard) = self.locks.try_lock(volume_id) else {
+            debug!(
+                volume_id,
+                "the volume is busy; its returning flag waits for the next pass"
+            );
+            return false;
+        };
+        // Under the lock: the entry as it is now, and the rev that names it.
+        let Some(rev) = self.target_rev(volume_id) else {
+            return false;
+        };
+        match self
+            .store
+            .add_return_pending_target(volume_id, &file.app_id, file.size_gb, rev)
+            .await
+        {
+            // Flagged, or the own row went meanwhile: there is then nothing
+            // to hand over and nothing to leave out of the report.
+            Ok(_) => true,
+            Err(e) => {
+                warn!(volume_id, error = %e, "could not record the node's own volume as returning; its hand-over waits for the next pass");
+                false
+            }
+        }
+    }
+
     /// Whether the node holds `volume_id` as a volume of its own: the
     /// reconciler created or keeps its file (it was the source, or the volume
     /// is a plain one). No stream ever writes that file: a node that turns
@@ -1427,6 +1493,12 @@ impl<E: Engine + 'static> Inner<E> {
     /// A volume the node holds as its own is never reported the second way:
     /// its file is that volume, not a warm copy, and a `deleted` entry for it
     /// would reach the reconciler, which would remove it (section 9).
+    ///
+    /// Nor is it reported the first way until its own row carries the
+    /// returning flag ([`NodeStore::add_return_pending_target`]): the primary
+    /// sends a stale-copy `deleted` entry only for a copy the node reported
+    /// (section 5.11, ADR 0267), so the flag that keeps the own file on such
+    /// an entry is always durable before the entry can arrive.
     async fn publish(&self) {
         let _publishing = self.publishing.lock().await;
         let spec = self
@@ -1449,12 +1521,10 @@ impl<E: Engine + 'static> Inner<E> {
                     return;
                 }
             };
-        let own: BTreeSet<String> = match self.store.volumes().await {
-            Ok(volumes) => volumes
-                .into_iter()
-                .filter(|volume| volume.state != VolumeState::Deleted)
-                .map(|volume| volume.volume_id)
-                .collect(),
+        // Every own volume that is not `deleted`, with its returning flag,
+        // in one read.
+        let own: BTreeMap<String, bool> = match self.store.own_volumes_return_pending().await {
+            Ok(own) => own,
             Err(e) => {
                 warn!(error = %e, "could not read the volume rows");
                 return;
@@ -1469,6 +1539,7 @@ impl<E: Engine + 'static> Inner<E> {
         let named = targets(&spec);
         let mut entries: Vec<WarmStatus> = named
             .iter()
+            .filter(|(file, _)| own.get(&file.volume_id).is_none_or(|flagged| *flagged))
             .map(|(file, warm)| {
                 let listen_error = match ip {
                     None => Some("this node has no mesh address yet".to_owned()),
@@ -1484,7 +1555,7 @@ impl<E: Engine + 'static> Inner<E> {
             .collect();
         let held = rows.values().filter(|row| {
             !row.removed
-                && !own.contains(&row.volume_id)
+                && !own.contains_key(&row.volume_id)
                 && !named
                     .iter()
                     .any(|(file, _)| file.volume_id == row.volume_id)

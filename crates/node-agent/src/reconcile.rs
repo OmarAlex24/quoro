@@ -382,6 +382,10 @@ pub struct Reconciler<E: Engine> {
     /// volume this node holds a warm copy of is created, adopted or removed
     /// here only between two streams (section 6.13).
     warm_locks: Option<crate::warm::VolumeLocks>,
+    /// The own volumes whose file the last pass kept on a `deleted` entry
+    /// because the node is returning as their warm target (section 9), so
+    /// that is logged once.
+    kept_returning: HashSet<String>,
     /// The `standby` VMs of the current snapshot (sections 5.11 and 6.4,
     /// ADR 0174): never created or started here, and reported `stopped`.
     standby: BTreeSet<String>,
@@ -468,6 +472,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 inventory: None,
                 edge: None,
                 warm_locks: None,
+                kept_returning: HashSet::new(),
                 standby: BTreeSet::new(),
                 standby_images: HashMap::new(),
                 standby_held: BTreeSet::new(),
@@ -686,7 +691,7 @@ impl<E: Engine + 'static> Reconciler<E> {
         }
 
         // Step 4, first half (section 6.2): volumes, before any VM starts.
-        if !self.reconcile_volumes(spec).await {
+        if !self.reconcile_volumes(snapshot.rev, spec).await {
             reached = false;
         }
 
@@ -847,7 +852,7 @@ impl<E: Engine + 'static> Reconciler<E> {
     /// A file `spec.volumes` does not name is `orphaned` and never removed
     /// here; only a `deleted` entry removes one. Returns `false` while some
     /// volume work is still pending, so `applied_rev` is not recorded.
-    async fn reconcile_volumes(&mut self, spec: &Spec) -> bool {
+    async fn reconcile_volumes(&mut self, rev: u64, spec: &Spec) -> bool {
         let stored = match self.store.volumes().await {
             Ok(rows) => rows,
             Err(e) => {
@@ -944,17 +949,27 @@ impl<E: Engine + 'static> Reconciler<E> {
             .flat_map(|vm| vm.volumes.iter().map(|volume| volume.volume_id.as_str()))
             .collect();
         let mut reached = true;
+        // The returning sources' files this pass kept on a `deleted` entry.
+        let mut kept_returning: HashSet<String> = HashSet::new();
 
         for entry in spec.volumes.iter().filter(|entry| !is_warm_copy(entry)) {
             let row = rows.get(&entry.volume_id);
             // The node runs its own volume again: a hand-over to the warm
             // receiver that marked the row and did not finish (section 9) is
             // cleared under the volume's lock, which the hand-over holds from
-            // its comparison to its end. Almost always unmarked.
+            // its comparison to its end, and so is the returning flag, which
+            // keeps the file on a `deleted` entry while the node is named its
+            // warm target as a returning source. Almost always neither is set.
             let own_present = entry.state == SpecVolumeState::Present && row.is_some();
-            let marked = if own_present {
-                match self.store.volume_handing_over(&entry.volume_id).await {
-                    Ok(marked) => marked,
+            let (marked, returning) = if own_present {
+                let read = async {
+                    Ok::<_, crate::AgentError>((
+                        self.store.volume_handing_over(&entry.volume_id).await?,
+                        self.store.volume_return_pending(&entry.volume_id).await?,
+                    ))
+                };
+                match read.await {
+                    Ok(flags) => flags,
                     Err(e) => {
                         warn!(volume_id = %entry.volume_id, error = %e, "could not read the volume row");
                         reached = false;
@@ -962,14 +977,14 @@ impl<E: Engine + 'static> Reconciler<E> {
                     }
                 }
             } else {
-                false
+                (false, false)
             };
             // A volume this node holds a warm copy of (it turns from target
-            // into source), or a marked one: its file is adopted, removed or
-            // cleared only while no stream or hand-over holds it; a busy one
-            // is retried on the next pass.
+            // into source), or a marked or flagged one: its file is adopted,
+            // removed or cleared only while no stream or hand-over holds it; a
+            // busy one is retried on the next pass.
             let warm_lock = match &self.warm_locks {
-                Some(locks) if marked || warm_copies.contains(&entry.volume_id) => {
+                Some(locks) if marked || returning || warm_copies.contains(&entry.volume_id) => {
                     match locks.try_lock(&entry.volume_id) {
                         Some(guard) => Some(guard),
                         None => {
@@ -992,7 +1007,34 @@ impl<E: Engine + 'static> Reconciler<E> {
                     // hand-over compares the file again (section 9). Read
                     // again under the lock: a hand-over may have marked the
                     // row since the read above.
-                    if own_present && (marked || warm_lock.is_some()) {
+                    if own_present && (marked || returning || warm_lock.is_some()) {
+                        // A returning source (section 9): only a revision
+                        // newer than the one that named the node the target
+                        // decides that it runs the volume again. This pass
+                        // may run on an older snapshot than the warm
+                        // receiver's; then it touches neither the flag nor
+                        // the mark, and the volume waits for a newer one.
+                        let named = match self
+                            .store
+                            .volume_return_pending_rev(&entry.volume_id)
+                            .await
+                        {
+                            Ok(named) => named,
+                            Err(e) => {
+                                warn!(volume_id = %entry.volume_id, error = %e, "could not read the volume row");
+                                reached = false;
+                                continue;
+                            }
+                        };
+                        if named.is_some_and(|named| rev <= named) {
+                            debug!(
+                                volume_id = %entry.volume_id,
+                                rev,
+                                "a newer revision named the node the volume's warm target; waiting for a newer one"
+                            );
+                            reached = false;
+                            continue;
+                        }
                         let cleared = match self.store.volume_handing_over(&entry.volume_id).await {
                             Ok(false) => Ok(false),
                             Ok(true) => self
@@ -1012,6 +1054,54 @@ impl<E: Engine + 'static> Reconciler<E> {
                                 warn!(volume_id = %entry.volume_id, error = %e, "could not clear an unfinished hand-over");
                                 reached = false;
                                 continue;
+                            }
+                        }
+                        // The node is no longer returning: a later `deleted`
+                        // entry removes the file as for any own volume, and
+                        // the warm row the hand-over never ended goes, so the
+                        // sender ships the volume.
+                        if named.is_some() {
+                            match self.store.end_return_pending(&entry.volume_id, rev).await {
+                                Ok(true) => info!(
+                                    volume_id = %entry.volume_id,
+                                    "the node runs its volume again; it is no longer returning as the warm target"
+                                ),
+                                Ok(false) => {
+                                    reached = false;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(volume_id = %entry.volume_id, error = %e, "could not clear the returning flag");
+                                    reached = false;
+                                    continue;
+                                }
+                            }
+                        }
+                        // A warm row beside the own row that holds no copy
+                        // (a stale stream's record, or a target row written
+                        // while the warm node was made the source) would keep
+                        // the sender from shipping the volume for good: the
+                        // store row goes, never a file. One that holds a copy
+                        // stays, as before. Not beside a `deleted` own row,
+                        // which holds no file: there the row keeps the guard
+                        // against starting the app on an empty volume. A
+                        // failed forget only delays the sender, never the VM.
+                        let forget = if row.is_some_and(|row| row.state != VolumeState::Deleted) {
+                            self.store
+                                .forget_copyless_warm_target(&entry.volume_id)
+                                .await
+                        } else {
+                            Ok(false)
+                        };
+                        match forget {
+                            Ok(false) => {}
+                            Ok(true) => info!(
+                                volume_id = %entry.volume_id,
+                                "forgot a warm target row without a copy beside the node's own volume"
+                            ),
+                            Err(e) => {
+                                warn!(volume_id = %entry.volume_id, error = %e, "could not forget a warm target row without a copy");
+                                reached = false;
                             }
                         }
                     }
@@ -1135,6 +1225,31 @@ impl<E: Engine + 'static> Reconciler<E> {
                     if attached.contains(entry.volume_id.as_str()) {
                         continue;
                     }
+                    // A returning source's own file (section 9): a `deleted`
+                    // entry reaches it only through the stale-copy rule,
+                    // which never removes a volume of the node's own
+                    // (section 5.11, ADR 0267). Read fresh, not from the rows
+                    // read at the start: the warm receiver may have forgotten
+                    // its warm row since. The row keeps its state, and is
+                    // reported `orphaned` once the entry leaves the spec.
+                    match self.store.volume_return_pending(&entry.volume_id).await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            if self.kept_returning.insert(entry.volume_id.clone()) {
+                                info!(
+                                    volume_id = %entry.volume_id,
+                                    "kept the file of a `deleted` entry: it is a volume of the node's own, named its warm target as a returning source"
+                                );
+                            }
+                            kept_returning.insert(entry.volume_id.clone());
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(volume_id = %entry.volume_id, error = %e, "could not read the volume row");
+                            reached = false;
+                            continue;
+                        }
+                    }
                     match self
                         .engine
                         .delete_volume(&VolumeId(entry.volume_id.clone()))
@@ -1169,6 +1284,9 @@ impl<E: Engine + 'static> Reconciler<E> {
                 }
             }
         }
+
+        // Logged once while the entry keeps the file; again for a later one.
+        self.kept_returning = kept_returning;
 
         // A `deleted` row the primary stopped naming is forgotten; every other
         // row it does not name stays as an orphan (section 6.7).
