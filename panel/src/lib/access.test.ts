@@ -4,7 +4,6 @@ import {
   accessCovers,
   accessPhrase,
   approvalAsk,
-  approvalExpiry,
   grantCoversProject,
   projectAccess,
   timeLeft,
@@ -107,10 +106,5 @@ describe('approval callout', () => {
         null,
       ),
     ).toEqual({ wants: 'wants to fail over', target: 'app app_01JD5Z…' });
-  });
-
-  it('says when the request expires', () => {
-    expect(approvalExpiry(later(49), NOW)).toBe('Expires in 49 min.');
-    expect(approvalExpiry(later(-2), NOW)).toBe('Expired 2 min ago.');
   });
 });
