@@ -33,7 +33,17 @@
 //!   while the policy is `warm`, the first renewal after an `expiring` grant
 //!   with a new token, such as a failover's or a regrant's ("The mark").
 //!
-//! Not built here: sending the conversion grant, R and the same-token `local`
+//! - **From R** (section 8.4, "From R until the holder has taken the
+//!   grant"). R writes the row `local` and marks it in `updateApp`'s
+//!   transaction ([`leases::end_renewals`]). A renewal of such a row at its
+//!   token is answered as for an `expiring` lease while the policy is off
+//!   `warm`, with no write, its gate counted at the stored duration, until
+//!   the session sends the same-token `local` grant; from then on none is
+//!   answered on that session (ADR 0256) until a conversion grant follows.
+//!   Back on `warm` before that grant, the renewal is a settle's ("While R
+//!   waits").
+//!
+//! Not built here: sending the conversion grant, and the same-token `local`
 //! grant with its `ping` (issue #555). The holder's `local` report is
 //! [`super::local_report`].
 
@@ -94,27 +104,52 @@ pub(super) enum Plan {
     Ended(InFlight),
     /// The first answer after the conversion.
     Converted(InFlight),
-    /// A settle's answer, from the holder's `hello`, at the holder's token.
+    /// A renewal of a marked row that reads `local` at its token while the
+    /// policy is off `warm`: R wrote it, and this session has not sent the
+    /// `local` grant. Answered as for an `expiring` lease, with no write
+    /// (section 8.4, "From R until the holder has taken the grant").
+    FromR,
+    /// A settle's answer: from the holder's `hello`, at the holder's token,
+    /// or of a marked row that reads `local` at its token after the policy
+    /// returned to `warm` ("While R waits").
     Settle,
     /// The answer to an `expiring` row at its token. `settle` when the row
     /// carries the mark and the policy is `warm`: a `ping` follows.
     Ordinary { settle: bool },
 }
 
+/// What this session knows of a lease when one of its renewals arrives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Seen {
+    /// This session's conversion of the lease in flight.
+    pub in_flight: Option<InFlight>,
+    /// The token this session's `hello` registered a settle at.
+    pub reported: Option<u64>,
+    /// The token of the same-token `local` grant this session sent, which
+    /// ended the renewals on it (ADR 0256).
+    pub local_sent: Option<u64>,
+}
+
 /// How a renewal at `token` of `row` is answered, once the row names the node
 /// unrevoked at a token no higher than `token` (`renewal_revoke` found
-/// nothing to revoke). `in_flight` is this session's conversion of the
-/// lease, `reported` the token this session's `hello` registered a settle at,
-/// and `warm` whether the app's policy is `warm`.
-pub(super) fn plan(
-    row: &Lease,
-    token: u64,
-    in_flight: Option<InFlight>,
-    reported: Option<u64>,
-    warm: bool,
-) -> Plan {
+/// nothing to revoke). `seen` is what this session knows of the lease, and
+/// `warm` whether the app's policy is `warm`.
+pub(super) fn plan(row: &Lease, token: u64, seen: Seen, warm: bool) -> Plan {
+    let Seen {
+        in_flight,
+        reported,
+        local_sent,
+    } = seen;
     let row_token = lease_token(row);
     let local = row.mode != "expiring";
+    // Section 8.4, "From R until the holder has taken the grant": once the
+    // session sent the same-token `local` grant, it answers no renewal of the
+    // lease on that session (ADR 0256), until a conversion grant follows,
+    // which lifts this ([`NodeHub::note_conversion_sent`]). A renewal at a
+    // higher token answers a later grant.
+    if local_sent.is_some_and(|sent| token <= sent) {
+        return Plan::Unanswered("the local grant ended the renewals on this session");
+    }
     // A conversion keeps the row's token (ADR 0258): one in flight at a token
     // the row does not hold is answered neither as the first renewal nor as
     // ended, and the renewal falls through to the arms below.
@@ -137,6 +172,15 @@ pub(super) fn plan(
     if warm && reported == Some(token) && (row.unsettled || (local && row_token == token)) {
         return Plan::Settle;
     }
+    // A marked row that reads `local` at the renewal's token: the renewal
+    // proves the holder holds the lease `expiring` there (only an `expiring`
+    // lease renews), so R wrote the row while it did. Off `warm`, its
+    // renewals are answered until the `local` grant goes out ("From R …",
+    // Renewals); back on `warm`, the lease is settled at this renewal ("While
+    // R waits": "settles the lease").
+    if local && row.unsettled && row_token == token {
+        return if warm { Plan::Settle } else { Plan::FromR };
+    }
     if !local && row_token == token {
         return Plan::Ordinary {
             settle: row.unsettled && warm,
@@ -149,7 +193,8 @@ pub(super) fn plan(
     })
 }
 
-/// The duration of a first answer or a settle's answer: `D`, or the stored
+/// The duration of a first answer, a settle's answer or an answer from R:
+/// `D`, or the stored
 /// duration when it is shorter. A grant longer than the stored duration
 /// waits until its raise is replicated, and the fallback is the shorter
 /// duration (ADR 0268); the conversion raised the stored duration to at
@@ -168,7 +213,9 @@ pub(super) fn answer_ms(row: &Lease) -> Option<u64> {
 /// it, and the side that grants less is a longer gate. A settle's answer from `hello` counts
 /// the stored duration, which bounds every duration an earlier grant may have
 /// carried, the conversion's included (section 8.4, "What the authority must
-/// enforce").
+/// enforce"); so does an answer from R, which "as for an `expiring` lease"
+/// gives no other count, and whose stored duration bounds the holder's
+/// earlier grants (ADR 0268).
 pub(super) fn counted(plan: Plan, row: &Lease) -> Option<GrantKind> {
     let stored = row.duration_ms.and_then(|ms| u64::try_from(ms).ok());
     match plan {
@@ -180,7 +227,9 @@ pub(super) fn counted(plan: Plan, row: &Lease) -> Option<GrantKind> {
         Plan::Ended(in_flight) => Some(GrantKind::CountedRenewal {
             counted_ms: in_flight.duration_ms,
         }),
-        Plan::Settle => stored.map(|counted_ms| GrantKind::CountedRenewal { counted_ms }),
+        Plan::Settle | Plan::FromR => {
+            stored.map(|counted_ms| GrantKind::CountedRenewal { counted_ms })
+        }
         Plan::Ordinary { .. } => Some(GrantKind::Renewal),
         Plan::Unanswered(_) => None,
     }
@@ -214,7 +263,58 @@ impl NodeHub {
         handle
             .conversions
             .insert(lease_id.to_string(), InFlight { token, duration_ms });
+        // "From R …", Renewals: the `local` grant's refusal of renewals ends
+        // when a conversion grant follows.
+        handle.local_sent.remove(lease_id);
         true
+    }
+
+    /// Records that `generation` queued the same-token `local` grant of
+    /// `lease_id` at `token`: from then on no renewal of the lease at that
+    /// token or below is answered on that session (section 8.4, "From R until
+    /// the holder has taken the grant", ADR 0256). Returns whether
+    /// `generation` is still the node's session.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the local grant that ends the renewals is the next layer (#555)"
+        )
+    )]
+    pub(super) fn note_local_grant_sent(
+        &self,
+        node_id: &str,
+        generation: u64,
+        lease_id: &str,
+        token: u64,
+    ) -> bool {
+        let mut sessions = self.0.sessions.lock().expect("session lock");
+        let Some(handle) = sessions
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+        else {
+            return false;
+        };
+        let sent = handle.local_sent.entry(lease_id.to_string()).or_insert(0);
+        *sent = (*sent).max(token);
+        true
+    }
+
+    /// The token of the same-token `local` grant `generation` sent for
+    /// `lease_id`, if it sent one and no conversion grant followed.
+    pub(super) fn local_grant_sent(
+        &self,
+        node_id: &str,
+        generation: u64,
+        lease_id: &str,
+    ) -> Option<u64> {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(node_id)
+            .filter(|handle| handle.generation == generation)
+            .and_then(|handle| handle.local_sent.get(lease_id).copied())
     }
 
     /// `generation`'s conversion of `lease_id` in flight, if any.
@@ -433,7 +533,7 @@ pub(super) async fn app_is_warm(
 #[cfg(test)]
 pub(super) mod tests {
     use super::super::tests::hub_with_node;
-    use super::{InFlight, Plan, plan};
+    use super::{InFlight, Plan, Seen, plan};
     use crate::AppState;
     use crate::authority::{ManualClock, MonotonicClock, VoterSupport};
     use crate::changelog::{self, Actor, ActorType, Op};
@@ -897,14 +997,19 @@ pub(super) mod tests {
     /// (R, which marks the row) ends a conversion in flight. The holder's
     /// renewal is answered as for an `expiring` lease, with no write: the
     /// row stays `local` and marked, and the conversion is no longer in
-    /// flight. Its gate counts the conversion's duration, the longer.
+    /// flight. Its gate counts the conversion's duration, the longer. The
+    /// renewals after it are answered "From R" with no write either, where
+    /// only the first was answered before: the app keeps running.
     #[tokio::test]
     async fn a_policy_change_off_warm_ends_a_conversion_in_flight() {
-        let f = fixture("none", "local", Some(30_000), true).await;
-        let (mut session, _) = f.session(None).await;
-        f.state
-            .hub
-            .note_conversion_sent(&f.node_id, session.generation, LEASE, 3, 30_000);
+        let f = fixture("warm", "local", Some(30_000), false).await;
+        let (mut session, _) = f.session(Some(("held", LeaseMode::Local, 3))).await;
+        assert!(
+            f.state
+                .hub
+                .note_conversion_sent(&f.node_id, session.generation, LEASE, 3, 30_000)
+        );
+        end_renewals(&f).await;
         let writes = f.writes().await;
 
         let answer = renew(&mut session, "msg_r1", 3).await;
@@ -924,6 +1029,15 @@ pub(super) mod tests {
             Some(Duration::from_secs(36))
         );
         assert!(f.held_while_away().await.is_some(), "marked: lease_held");
+
+        for id in ["msg_r2", "msg_r3"] {
+            let later = renew(&mut session, id, 3).await;
+            assert_answer(&later, id, 3, D);
+            assert!(of_type(&later, "ping").is_empty());
+        }
+        assert_eq!(f.writes().await, writes, "still no write");
+        let row = f.row().await;
+        assert_eq!((row.mode.as_str(), row.unsettled), ("local", true));
         f.done();
     }
 
@@ -1317,30 +1431,225 @@ pub(super) mod tests {
         f.done();
     }
 
-    /// The renewal after the one a policy change off `warm` ended a
-    /// conversion for: no grant, no write, and the gate as the `Ended`
-    /// answer left it. This pins today's behaviour on purpose: section 8.4
-    /// "From R until the holder has taken the grant" has the primary answer
-    /// these renewals, and a later change (PR 3 of #555) builds that.
-    #[tokio::test]
-    async fn the_renewal_after_an_ended_conversion_is_not_answered_yet() {
-        let f = fixture("none", "local", Some(30_000), true).await;
-        let (mut session, _) = f.session(None).await;
-        f.state
-            .hub
-            .note_conversion_sent(&f.node_id, session.generation, LEASE, 3, 30_000);
-        assert_answer(&renew(&mut session, "msg_r1", 3).await, "msg_r1", 3, D);
-        let writes = f.writes().await;
-        let gate = f.state.hub.authority().gate_remaining(LEASE);
-        assert_eq!(gate, Some(Duration::from_secs(36)));
+    /// R, as `updateApp` writes it when the policy leaves `warm`: the policy
+    /// and the row in one single-writer transaction.
+    pub(in crate::session) async fn end_renewals(f: &Fixture) {
+        let mut w = f.state.store.begin_write().await.unwrap();
+        sqlx::query("UPDATE apps SET ha_policy = 'none' WHERE id = ?")
+            .bind(APP)
+            .execute(&mut *w.tx)
+            .await
+            .unwrap();
+        leases::end_renewals(&mut w.tx, APP, &actor())
+            .await
+            .unwrap()
+            .unwrap();
+        w.commit().await.unwrap();
+    }
 
-        let next = renew(&mut session, "msg_r2", 3).await;
-        assert!(of_type(&next, "lease_grant").is_empty(), "{next:?}");
-        assert_eq!(f.writes().await, writes);
-        assert_eq!(f.state.hub.authority().gate_remaining(LEASE), gate);
+    async fn set_policy(f: &Fixture, policy: &str) {
+        sqlx::query("UPDATE apps SET ha_policy = ? WHERE id = ?")
+            .bind(policy)
+            .bind(APP)
+            .execute(f.state.store.pool())
+            .await
+            .unwrap();
+    }
+
+    /// R ("Ending the renewals" step 1): the row reads `local`, marked, at
+    /// its token, `duration_ms` kept, with one change-log entry, and
+    /// `Lease.local_pending` is true. R over a row that already reads `local`
+    /// with the mark writes nothing. A revoked row is not written.
+    #[tokio::test]
+    async fn r_writes_the_row_local_and_marked_and_keeps_the_duration() {
+        let f = fixture("warm", "expiring", Some(30_000), false).await;
+        let writes = f.writes().await;
+        end_renewals(&f).await;
         let row = f.row().await;
-        assert_eq!((row.mode.as_str(), row.unsettled), ("local", true));
+        assert_eq!(
+            (
+                row.mode.as_str(),
+                row.fencing_token,
+                row.duration_ms,
+                row.unsettled
+            ),
+            ("local", 3, Some(30_000), true)
+        );
+        assert_eq!(f.writes().await, writes + 1);
+        let view = crate::api::leases::Lease::from_row(row, false, Vec::new()).unwrap();
+        assert!(view.local_pending);
+
+        let mut w = f.state.store.begin_write().await.unwrap();
+        let again = leases::end_renewals(&mut w.tx, APP, &actor())
+            .await
+            .unwrap()
+            .unwrap();
+        w.commit().await.unwrap();
+        assert_eq!((again.mode.as_str(), again.unsettled), ("local", true));
+        assert_eq!(f.writes().await, writes + 1, "already local and marked");
+
+        let mut w = f.state.store.begin_write().await.unwrap();
+        leases::revoke_app_lease(&mut w.tx, APP, &actor())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            leases::end_renewals(&mut w.tx, APP, &actor())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        w.commit().await.unwrap();
         f.done();
+    }
+
+    /// "From R until the holder has taken the grant", Renewals: after R,
+    /// the holder's renewals at the row's token are answered `expiring` at
+    /// that token for `min(D, stored)`, with no write, the gate counted at
+    /// the stored 30 s; none without majority support; and none once the
+    /// session sent the same-token `local` grant (ADR 0256), which a
+    /// conversion grant lifts.
+    #[tokio::test]
+    async fn renewals_after_r_are_answered_with_no_write_until_the_local_grant() {
+        #[derive(Debug)]
+        struct NoSupport;
+        impl VoterSupport for NoSupport {
+            fn supports(&self, _duration_ms: u64) -> bool {
+                false
+            }
+        }
+        let f = fixture("warm", "expiring", Some(30_000), false).await;
+        let (mut session, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
+        end_renewals(&f).await;
+        let writes = f.writes().await;
+        for id in ["msg_r1", "msg_r2", "msg_r3"] {
+            let answer = renew(&mut session, id, 3).await;
+            assert_answer(&answer, id, 3, D);
+            assert!(of_type(&answer, "ping").is_empty(), "no settle off warm");
+        }
+        assert_eq!(f.writes().await, writes, "these answers write nothing");
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.duration_ms, row.unsettled),
+            ("local", Some(30_000), true)
+        );
+        assert_eq!(
+            f.state.hub.authority().gate_remaining(LEASE),
+            Some(Duration::from_secs(36)),
+            "counted at the stored duration"
+        );
+
+        f.state.hub.set_voter_support(Arc::new(NoSupport));
+        assert!(of_type(&renew(&mut session, "msg_r4", 3).await, "lease_grant").is_empty());
+        f.state.hub.set_voter_support(Arc::new(EverySupport));
+
+        assert!(
+            f.state
+                .hub
+                .note_local_grant_sent(&f.node_id, session.generation, LEASE, 3)
+        );
+        for id in ["msg_r5", "msg_r6"] {
+            assert!(of_type(&renew(&mut session, id, 3).await, "lease_grant").is_empty());
+        }
+        assert_eq!(f.writes().await, writes);
+
+        // A newer session sent no `local` grant: its renewals are answered.
+        let (mut newer, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
+        assert_answer(&renew(&mut newer, "msg_r7", 3).await, "msg_r7", 3, D);
+        f.done();
+    }
+
+    /// A row R wrote over a `local` row stores no duration (a conversion
+    /// never answered): there is no shorter duration to fall back to, so a
+    /// renewal gets no answer (ADR 0289), and nothing is written.
+    #[tokio::test]
+    async fn a_renewal_after_r_over_a_row_with_no_duration_gets_no_answer() {
+        let f = fixture("warm", "local", None, false).await;
+        let (mut session, _) = f.session(None).await;
+        end_renewals(&f).await;
+        let writes = f.writes().await;
+        assert!(of_type(&renew(&mut session, "msg_r1", 3).await, "lease_grant").is_empty());
+        assert_eq!(f.writes().await, writes);
+        f.done();
+    }
+
+    /// "While R waits", last sentence: the policy returns to `warm` on a
+    /// live session before the `local` grant went out. The next renewal is
+    /// answered and a `ping` follows; its `pong` settles the row `expiring`,
+    /// unmarked, at the holder's token, and no `local` grant goes out.
+    #[tokio::test]
+    async fn a_return_to_warm_before_the_local_grant_settles_at_the_next_renewal() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        let (mut session, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
+        end_renewals(&f).await;
+        let off = renew(&mut session, "msg_r1", 3).await;
+        assert_answer(&off, "msg_r1", 3, D);
+        assert!(of_type(&off, "ping").is_empty());
+
+        set_policy(&f, "warm").await;
+        let writes = f.writes().await;
+        let answer = renew(&mut session, "msg_r2", 3).await;
+        assert_answer(&answer, "msg_r2", 3, D);
+        let ping = ping_of(&answer);
+        assert_eq!(f.row().await.mode, "local", "not before the pong");
+        assert_eq!(f.writes().await, writes);
+        pong(&mut session, &ping).await;
+        let row = f.row().await;
+        assert_eq!(
+            (
+                row.mode.as_str(),
+                row.fencing_token,
+                row.duration_ms,
+                row.unsettled
+            ),
+            ("expiring", 3, Some(D as i64), false)
+        );
+        assert_eq!(f.writes().await, writes + 1);
+        f.done();
+    }
+
+    /// The unsafe direction while R waits. `failoverApp` finds the lease
+    /// held while its holder is neither connected nor declared lost, for a
+    /// marked row whatever its mode. A primary restart seeds the start gate
+    /// `start + 30 s + 2 x 3 s`, which covers the holder's last answer, and
+    /// once that gate has passed the marked row still does not move on it.
+    #[tokio::test]
+    async fn a_row_r_marked_never_moves_on_a_gate_across_a_restart() {
+        for mode in ["expiring", "local"] {
+            let f = fixture("warm", mode, Some(30_000), mode == "local").await;
+            let (mut session, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
+            end_renewals(&f).await;
+            assert_answer(&renew(&mut session, "msg_r1", 3).await, "msg_r1", 3, D);
+            assert!(f.held_while_away().await.is_some(), "{mode}: lease_held");
+            f.clock.advance(Duration::from_secs(36));
+            assert!(f.passed());
+            assert!(
+                f.held_while_away().await.is_some(),
+                "{mode}: not on its gate"
+            );
+
+            let (after, clock) = restart(&f).await;
+            assert_eq!(
+                after.hub.authority().gate_remaining(LEASE),
+                Some(Duration::from_secs(36)),
+                "{mode}"
+            );
+            let lease = f.row().await;
+            let mut conn = after.store.pool().acquire().await.unwrap();
+            for advance in [0, 36] {
+                clock.advance(Duration::from_secs(advance));
+                assert!(
+                    crate::failover::held_while_away(&mut conn, after.hub.authority(), &lease)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "{mode}: lease_held after {advance} s"
+                );
+            }
+            assert!(after.hub.authority().passed(LEASE));
+            drop(conn);
+            f.done();
+        }
     }
 
     /// A primary restart between the settle's answer and its `pong`. For a
@@ -1477,54 +1786,85 @@ pub(super) mod tests {
         let expiring = row("expiring", 3, false);
         let marked = row("expiring", 3, true);
         let unanswered = |plan: Plan| matches!(plan, Plan::Unanswered(_));
+        let p = |row: &Lease, token, in_flight, reported, warm| {
+            plan(
+                row,
+                token,
+                Seen {
+                    in_flight,
+                    reported,
+                    local_sent: None,
+                },
+                warm,
+            )
+        };
         // The first answer, and only at the conversion's token.
-        assert_eq!(
-            plan(&local, 3, Some(conv), None, true),
-            Plan::Converted(conv)
-        );
-        assert!(unanswered(plan(&local, 4, Some(conv), None, true)));
-        assert!(
-            unanswered(plan(&local, 3, None, None, true)),
-            "no conversion"
-        );
+        assert_eq!(p(&local, 3, Some(conv), None, true), Plan::Converted(conv));
+        assert!(unanswered(p(&local, 4, Some(conv), None, true)));
+        assert!(unanswered(p(&local, 3, None, None, true)), "no conversion");
         // Ended by the policy change (section 8.4 "Changing the mode").
         assert_eq!(
-            plan(&marked_local, 3, Some(conv), None, true),
+            p(&marked_local, 3, Some(conv), None, true),
             Plan::Ended(conv)
         );
-        assert_eq!(plan(&local, 3, Some(conv), None, false), Plan::Ended(conv));
+        assert_eq!(p(&local, 3, Some(conv), None, false), Plan::Ended(conv));
         // Neither ends a conversion at a token the row does not hold: the
         // plan falls through to the later arms.
         let below = row("local", 2, false);
         let marked_below = row("local", 2, true);
-        assert!(unanswered(plan(&marked_below, 3, Some(conv), None, true)));
-        assert!(unanswered(plan(&below, 3, Some(conv), None, false)));
-        assert_eq!(
-            plan(&marked_below, 3, Some(conv), Some(3), true),
-            Plan::Settle
-        );
+        assert!(unanswered(p(&marked_below, 3, Some(conv), None, true)));
+        assert!(unanswered(p(&below, 3, Some(conv), None, false)));
+        assert_eq!(p(&marked_below, 3, Some(conv), Some(3), true), Plan::Settle);
         // The settle from `hello`, at the holder's token.
-        assert_eq!(plan(&local, 3, None, Some(3), true), Plan::Settle);
-        assert_eq!(plan(&marked, 5, None, Some(5), true), Plan::Settle);
-        assert!(
-            unanswered(plan(&local, 3, None, Some(3), false)),
-            "off warm"
-        );
-        assert!(unanswered(plan(&local, 4, None, Some(4), true)), "unmarked");
-        assert!(unanswered(plan(&expiring, 5, None, Some(5), true)));
+        assert_eq!(p(&local, 3, None, Some(3), true), Plan::Settle);
+        assert_eq!(p(&marked, 5, None, Some(5), true), Plan::Settle);
+        assert!(unanswered(p(&local, 3, None, Some(3), false)), "off warm");
+        assert!(unanswered(p(&local, 4, None, Some(4), true)), "unmarked");
+        assert!(unanswered(p(&expiring, 5, None, Some(5), true)));
         // Ordinary answers, settling a marked row while `warm`.
         assert_eq!(
-            plan(&expiring, 3, None, None, true),
+            p(&expiring, 3, None, None, true),
             Plan::Ordinary { settle: false }
         );
         assert_eq!(
-            plan(&marked, 3, None, None, true),
+            p(&marked, 3, None, None, true),
             Plan::Ordinary { settle: true }
         );
         assert_eq!(
-            plan(&marked, 3, None, None, false),
+            p(&marked, 3, None, None, false),
             Plan::Ordinary { settle: false }
         );
-        assert!(unanswered(plan(&expiring, 4, None, None, true)));
+        assert!(unanswered(p(&expiring, 4, None, None, true)));
+        // From R (section 8.4, "From R until the holder has taken the
+        // grant"): a marked row that reads `local` at the renewal's token is
+        // answered off `warm`, and settled on `warm` ("While R waits").
+        assert_eq!(p(&marked_local, 3, None, None, false), Plan::FromR);
+        assert_eq!(p(&marked_local, 3, None, None, true), Plan::Settle);
+        assert!(unanswered(p(&marked_local, 4, None, None, false)));
+        assert!(unanswered(p(&marked_below, 3, None, None, false)));
+        // Once the session sent the `local` grant, nothing at its token or
+        // below is answered (ADR 0256); a higher token answers a later grant.
+        let sent = |row: &Lease, token, in_flight, warm| {
+            plan(
+                row,
+                token,
+                Seen {
+                    in_flight,
+                    reported: Some(token),
+                    local_sent: Some(3),
+                },
+                warm,
+            )
+        };
+        assert!(unanswered(sent(&marked_local, 3, None, false)));
+        assert!(unanswered(sent(&marked_local, 3, None, true)));
+        assert!(unanswered(sent(&marked_local, 3, Some(conv), false)));
+        assert!(unanswered(sent(&expiring, 3, None, true)));
+        assert!(unanswered(sent(&marked_below, 2, None, false)));
+        let above = row("expiring", 4, false);
+        assert_eq!(
+            sent(&above, 4, None, true),
+            Plan::Ordinary { settle: false }
+        );
     }
 }

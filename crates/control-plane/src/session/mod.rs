@@ -484,6 +484,12 @@ struct SessionHandle {
     /// The conversion grants this session sent whose first renewal is not
     /// answered yet (section 8.4, "Changing the mode"; [`conversion`]).
     conversions: HashMap<String, conversion::InFlight>,
+    /// The leases this session sent the same-token `local` grant that ends
+    /// the renewals, at the token it carried: from then on no renewal of the
+    /// lease at that token or below is answered on this session, until a
+    /// conversion grant follows (section 8.4, "From R until the holder has
+    /// taken the grant", ADR 0256; [`conversion`]).
+    local_sent: HashMap<String, u64>,
 }
 
 /// A follower's position in the change log, kept in memory for its live
@@ -1914,6 +1920,7 @@ impl NodeHub {
                 held_revokes: 0,
                 start_done: false,
                 conversions: HashMap::new(),
+                local_sent: HashMap::new(),
             },
         );
         (generation, rx, closed_rx, changed)
@@ -4042,6 +4049,14 @@ impl Session {
     ///     answered as for an `expiring` lease, with no write, and the
     ///     conversion is no longer in flight (section 8.4, "Changing the
     ///     mode", #555);
+    ///   - a marked row that reads `local` at the renewal's token (R wrote
+    ///     it, section 8.4 "Ending the renewals") is answered as for an
+    ///     `expiring` lease, with no write, while the policy is off `warm`
+    ///     ("From R until the holder has taken the grant"), and settled
+    ///     while it is `warm` ("While R waits");
+    ///   - once this session sent the same-token `local` grant of the lease,
+    ///     no renewal at its token or below is answered (ADR 0256), until a
+    ///     conversion grant follows;
     ///   - a `local` row otherwise gets no answer (ADR 0256 part 2), and the
     ///     node's validity runs out.
     /// - Anything else gets no answer, and the lease runs out on the node: a
@@ -4106,11 +4121,17 @@ impl Session {
         let in_flight = self
             .hub
             .conversion_in_flight(&self.node_id, self.generation, lease_id);
+        let local_sent = self
+            .hub
+            .local_grant_sent(&self.node_id, self.generation, lease_id);
         let plan = conversion::plan(
             &lease,
             token,
-            in_flight,
-            self.reported_settle(lease_id),
+            conversion::Seen {
+                in_flight,
+                reported: self.reported_settle(lease_id),
+                local_sent,
+            },
             warm,
         );
         match plan {
@@ -4132,7 +4153,7 @@ impl Session {
                      answered with no write"
                 );
             }
-            Plan::Converted(_) | Plan::Settle | Plan::Ordinary { .. } => {}
+            Plan::Converted(_) | Plan::FromR | Plan::Settle | Plan::Ordinary { .. } => {}
         }
         // A failed fence this primary could not record refuses the answer
         // as a recorded one does (section 8.5 step 1).
@@ -4174,9 +4195,10 @@ impl Session {
             }
             (duration_ms, lease)
         } else {
-            // The first answer, a settle's answer and the answer after a
-            // policy change ended a conversion carry the stored duration
-            // when it is shorter than `D` (ADR 0268), and need no raise.
+            // The first answer, a settle's answer, the answer after a policy
+            // change ended a conversion and the answers from R carry the
+            // stored duration when it is shorter than `D` (ADR 0268), and
+            // need no raise: they write nothing.
             let Some(duration_ms) = conversion::answer_ms(&lease) else {
                 tracing::error!(lease_id, "the lease stores no valid duration; no answer");
                 return;

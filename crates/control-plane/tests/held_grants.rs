@@ -15,9 +15,11 @@
 //!
 //! The holder's `local` report, which clears the mark at its next session
 //! start (#555), is checked here over the case 2 row; its other cases are
-//! the `session::local_report` unit tests. Out of scope here, as in the
-//! code: the `pong` after a same-token `local` grant, R, the conversion
-//! grant and the same-token resend.
+//! the `session::local_report` unit tests. R in `updateApp`'s transaction
+//! (#555) is checked here too; its renewals are the `session::conversion`
+//! unit tests. Out of scope here, as in the code: the `pong` after a
+//! same-token `local` grant, the conversion grant and the same-token
+//! resend.
 
 mod common;
 
@@ -2168,4 +2170,84 @@ async fn an_unrecorded_failed_fence_holds_an_unmarked_rows_grant_at_the_session_
         row(&server, &lease_id).await,
         (2, "local".to_string(), None, 0, false)
     );
+}
+
+/// The number of change-log entries of `lease_id`.
+async fn lease_entries(server: &Server, lease_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM change_log WHERE entity_type = 'lease' AND entity_id = ?",
+    )
+    .bind(lease_id)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap()
+}
+
+/// The app's stored `ha_policy`.
+async fn policy_of(server: &Server, app_id: &str) -> String {
+    sqlx::query_scalar("SELECT ha_policy FROM apps WHERE id = ?")
+        .bind(app_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
+/// #555, R (section 8.4, "Ending the renewals" step 1, ADR 0280): an
+/// `updateApp` that takes the policy off `warm` writes, in its own
+/// transaction, the lease row `local` with the unsettled mark, at its token
+/// and with its `duration_ms` kept, in one change-log entry, and
+/// `Lease.local_pending` turns true. An `updateApp` that fails later in the
+/// same transaction (a placement for a stateful app) writes neither the
+/// policy nor R.
+#[tokio::test]
+async fn leaving_warm_writes_r_in_the_policy_changes_transaction() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    // As a `warm` app's lease reads once converted.
+    set_policy(&server, &app_id, "warm").await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    let before = lease_entries(&server, &lease_id).await;
+
+    let res = owner
+        .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+        .json(&json!({ "ha_policy": "none", "placement": { "node_ids": [] } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 409, "{}", res.text().await.unwrap());
+    assert_eq!(policy_of(&server, &app_id).await, "warm");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "expiring".to_string(), Some(15_000), 0, false),
+        "no R"
+    );
+    assert_eq!(lease_entries(&server, &lease_id).await, before);
+
+    let res = owner
+        .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+        .json(&json!({ "ha_policy": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    assert_eq!(policy_of(&server, &app_id).await, "none");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 1, false)
+    );
+    assert_eq!(lease_entries(&server, &lease_id).await, before + 1);
+    let view = lease_view(&server, &owner, &app_id).await;
+    assert_eq!(view["local_pending"], true, "{view}");
+    assert_eq!(view["unsettled"], true, "{view}");
 }
