@@ -182,6 +182,14 @@ export function AuditRecordBody({ seq }: { seq: number }) {
         );
       case 'params':
         return <Parameters params={value.params} />;
+      case 'params_digest':
+        return hasText(value.params_sha256) && typeof value.params_bytes === 'number' ? (
+          <span className="type-code break-all text-[11px] leading-snug">
+            sha256 {value.params_sha256} · {value.params_bytes} bytes
+          </span>
+        ) : (
+          <NotRecorded />
+        );
       case 'justification':
         return hasText(value.justification) ? (
           <span>{value.justification}</span>
