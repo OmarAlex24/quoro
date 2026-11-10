@@ -82,7 +82,10 @@ pub async fn get_cluster(state: &AppState, ctx: &CallCtx) -> Result<Cluster, Api
             // term so far is 1.
             term: 1,
             votes: votes(state).await?,
-            signing_key_id: None,
+            // The current signing key (section 5.21). No rotation runs
+            // before signing-key rotation ships (#76), so its field stays
+            // absent.
+            signing_key_id: Some(state.keys.key_id().to_string()),
             signing_key_rotation: None,
             created_at,
         })

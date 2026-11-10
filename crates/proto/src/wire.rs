@@ -2296,4 +2296,18 @@ mod tests {
             json!("not_available")
         );
     }
+
+    /// Section 5.18: `custody_key_changed` is a non-fatal code from M5b.
+    #[test]
+    fn custody_key_changed_round_trips() {
+        let changed = ControlMessage::Error(ProtocolError {
+            code: crate::ErrorCode::CustodyKeyChanged,
+            message: "the custody key differs from the bound one".to_owned(),
+            fatal: false,
+            term: None,
+        });
+        let raw = RawFrame::parse(&changed.to_frame("msg_1", Some("msg_0")).to_text()).unwrap();
+        assert_eq!(raw.body["code"], "custody_key_changed");
+        assert_eq!(ControlMessage::from_raw(&raw).unwrap(), changed);
+    }
 }

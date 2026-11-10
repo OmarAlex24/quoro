@@ -37,13 +37,13 @@ pub struct Cluster {
     pub term: i64,
     /// The voters of the cluster and whether HA is ready (ADR 0170).
     pub votes: ClusterVotes,
-    /// Id of the current cluster signing key; absent until the promotion and
-    /// custody work ships (`node-agent-protocol.md` section 7.5).
+    /// Id of the current cluster signing key: the lowercase hex SHA-256 of
+    /// its public key (`node-agent-protocol.md` section 5.21).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(pattern = "^[0-9a-f]{64}$", required = false, nullable = false)]
     pub signing_key_id: Option<String>,
-    /// The running signing-key rotation, or null; absent until the promotion
-    /// and custody work ships (`node-agent-protocol.md` section 7.5).
+    /// The running signing-key rotation, or null; absent until signing-key
+    /// rotation ships (`node-agent-protocol.md` section 7.5).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(required = false)]
     pub signing_key_rotation: Option<Option<SigningKeyRotation>>,

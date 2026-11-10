@@ -104,3 +104,7 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["h
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # State-machine tests of the draining tunnel routes (ADR 0194).
 proptest = { version = "1", default-features = false, features = ["std"] }
+# A self-signed TLS pair for every test that builds an `AppState`, whose
+# custody seals carry the primary's certificate and key as PEM (ADR 0181).
+# Already in the lock file through the binary, with the same provider.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

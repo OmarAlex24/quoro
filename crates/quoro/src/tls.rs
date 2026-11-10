@@ -9,6 +9,7 @@
 //! The provider is `ring` throughout: `rustls` and `rcgen` are built without
 //! `aws-lc-rs` because its license tree is outside the D-0080 allowlist.
 
+use quoro_control_plane::custody::TlsIdentity;
 use quoro_control_plane::store::sha256_hex;
 use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
 use rustls::ServerConfig;
@@ -17,6 +18,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// The listener's rustls configuration and the certificate's fingerprint.
 pub struct Material {
@@ -24,6 +26,10 @@ pub struct Material {
     pub config: Arc<ServerConfig>,
     /// `sha256:<lowercase hex>` of the certificate DER, as `quoro join` pins it.
     pub fingerprint: String,
+    /// The certificate and key as the PEM text of the files, which the
+    /// control plane seals to every machine with the `node` role
+    /// (node-agent-protocol.md section 7.2, ADR 0181).
+    pub identity: TlsIdentity,
 }
 
 /// Loads `<data_dir>/tls/cert.pem` and `key.pem`, generating both on first
@@ -43,27 +49,45 @@ pub fn load_or_generate(
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
 
-    let (cert_der, key_der) = match (std::fs::read(&cert_path), std::fs::read(&key_path)) {
-        (Ok(cert_pem), Ok(key_pem)) => (
-            decode_pem(&cert_pem, "CERTIFICATE")?,
-            decode_pem(&key_pem, "PRIVATE KEY")?,
-        ),
+    let (cert_pem, key_pem) = match (std::fs::read(&cert_path), std::fs::read(&key_path)) {
+        (Ok(cert_pem), Ok(key_pem)) => (cert_pem, Zeroizing::new(key_pem)),
         _ => generate(&cert_path, &key_path, node_name, listen)?,
     };
+    let cert_der = decode_pem(&cert_pem, "CERTIFICATE")?;
+    let key_der = decode_pem(&key_pem, "PRIVATE KEY")?;
+    let identity = TlsIdentity::from_pem(
+        pem_text(cert_pem, &cert_path)?,
+        pem_text(key_pem.to_vec(), &key_path)?,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     Ok(Material {
         config: server_config(cert_der.clone(), key_der)?,
         fingerprint: format!("sha256:{}", sha256_hex(&cert_der)),
+        identity,
     })
 }
 
-/// Writes a new self-signed certificate and key and returns their DER.
+/// The text of a PEM file, which must be UTF-8.
+fn pem_text(bytes: Vec<u8>, path: &Path) -> io::Result<String> {
+    String::from_utf8(bytes).map_err(|e| {
+        let mut bytes = e.into_bytes();
+        bytes.zeroize();
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8", path.display()),
+        )
+    })
+}
+
+/// Writes a new self-signed certificate and key and returns them as the PEM
+/// bytes written.
 fn generate(
     cert_path: &Path,
     key_path: &Path,
     node_name: &str,
     listen: SocketAddr,
-) -> io::Result<(Vec<u8>, Vec<u8>)> {
+) -> io::Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     // The node name and the loopback names are always valid; the listen
     // address joins them unless the listener accepts on every interface.
     let mut names = vec![
@@ -88,11 +112,11 @@ fn generate(
     let key_pair = KeyPair::generate().map_err(io::Error::other)?;
     let certificate = params.self_signed(&key_pair).map_err(io::Error::other)?;
 
-    let cert_der = certificate.der().to_vec();
-    let key_der = key_pair.serialize_der();
-    write_private(key_path, key_pair.serialize_pem().as_bytes())?;
-    write_file(cert_path, certificate.pem().as_bytes())?;
-    Ok((cert_der, key_der))
+    let cert_pem = certificate.pem().into_bytes();
+    let key_pem = Zeroizing::new(key_pair.serialize_pem().into_bytes());
+    write_private(key_path, &key_pem)?;
+    write_file(cert_path, &cert_pem)?;
+    Ok((cert_pem, key_pem))
 }
 
 /// Builds the rustls server configuration: ring provider, TLS 1.2+1.3, HTTP/1.1
@@ -224,6 +248,24 @@ mod tests {
             first.fingerprint, second.fingerprint,
             "reload, do not regenerate"
         );
+
+        // The control plane seals the files' exact text, and its `tls` key id
+        // is the fingerprint every node pins (node-agent-protocol.md section
+        // 7.2), on the generating start and on the reloading one.
+        for material in [&first, &second] {
+            assert_eq!(
+                material.identity.key_id(),
+                material.fingerprint.strip_prefix("sha256:").unwrap()
+            );
+            assert_eq!(
+                material.identity.cert_pem(),
+                std::fs::read_to_string(dir.join("tls/cert.pem")).unwrap()
+            );
+            assert_eq!(
+                material.identity.key_pem(),
+                std::fs::read_to_string(dir.join("tls/key.pem")).unwrap()
+            );
+        }
 
         #[cfg(unix)]
         {

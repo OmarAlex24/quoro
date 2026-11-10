@@ -100,6 +100,12 @@ impl ClusterKeys {
     pub fn key_id(&self) -> &str {
         &self.key_id
     }
+
+    /// The 32-byte Ed25519 seed, wiped when the returned value is dropped.
+    /// Only the custody seals read it (`node-agent-protocol.md` section 7.2).
+    pub(crate) fn seed(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(self.signing.to_bytes())
+    }
 }
 
 /// Writes `seed` to the key file atomically and mode `0600`.

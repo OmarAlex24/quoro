@@ -19,6 +19,9 @@ pub mod backups;
 pub mod build;
 pub mod changelog;
 pub mod crypto;
+/// Key custody: binding each node's custody key and sealing the cluster keys
+/// to it (ADR 0180, ADR 0231).
+pub mod custody;
 pub mod deploy;
 pub mod dispatcher;
 pub mod driver;
@@ -96,6 +99,10 @@ pub struct ServerConfig {
     /// SHA-256 of the listener's certificate DER, exactly as the binary
     /// prints it: `sha256:<64 lowercase hex>`.
     pub tls_fingerprint: String,
+    /// The listener's certificate chain and private key as PEM text, which
+    /// the custody seals carry (`node-agent-protocol.md` section 7.2, ADR
+    /// 0181).
+    pub tls: custody::TlsIdentity,
     /// The configured guest network. The oldest node with the `node` role
     /// keeps it; every other node gets its own `/24` (ADR 0144).
     pub node_network: NodeNetwork,
@@ -266,6 +273,24 @@ impl AppState {
         // Nodes enrolled before the per-node subnet existed get theirs before
         // any session can ask for a desired state (ADR 0144).
         subnet::backfill(&store, &config.node_network).await?;
+        // Section 7.2, "When": every start seals what is missing and deletes
+        // the seals of retired keys and removed machines, before any session
+        // or request. A failure is logged and does not stop the start.
+        let keyring = custody::Keyring {
+            cluster_id: &cluster_id,
+            keys: &keys,
+            data_key: &data_key,
+            tls: &config.tls,
+        };
+        match custody::reconcile(&store, keyring).await {
+            Ok(done) if done != custody::Reconciled::default() => tracing::info!(
+                sealed = done.sealed,
+                deleted = done.deleted,
+                "custody seals reconciled"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(%e, "cannot reconcile the custody seals; the start goes on"),
+        }
         let config = Arc::new(config);
         let hub = NodeHub::new(
             store.clone(),
@@ -342,6 +367,17 @@ impl AppState {
     ) -> Self {
         self.hub.set_advertised_urls(std::sync::Arc::new(provider));
         self
+    }
+
+    /// The keys this primary holds, for the custody seals and `Node.custody`
+    /// (`node-agent-protocol.md` section 7.2).
+    pub(crate) fn keyring(&self) -> custody::Keyring<'_> {
+        custody::Keyring {
+            cluster_id: &self.cluster_id,
+            keys: &self.keys,
+            data_key: &self.data_key,
+            tls: &self.config.tls,
+        }
     }
 
     /// Tells the session hub that `vm_id` needs reconciling. The rebuild runs

@@ -910,6 +910,7 @@ fn server_config(data_dir: &Path) -> ServerConfig {
         secure_cookies: false,
         public_url: Some("https://primary.example:8443".to_string()),
         tls_fingerprint: common::TLS_FINGERPRINT.to_string(),
+        tls: common::tls_identity(data_dir),
         node_network: NodeNetwork {
             subnet: "10.42.1.0/24".to_string(),
             gateway: "10.42.1.1".to_string(),

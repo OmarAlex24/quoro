@@ -84,6 +84,7 @@ pub async fn run(config: Config, skip_upgrade_backup: bool) -> Result<i32, Strin
             secure_cookies: true,
             public_url: config.public_url.clone(),
             tls_fingerprint: material.fingerprint.clone(),
+            tls: material.identity.clone(),
             // The configured guest network. The oldest node with the `node`
             // role keeps it; every other node gets its own /24 of
             // 10.42.0.0/16 (ADR 0144).

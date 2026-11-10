@@ -55,6 +55,11 @@ pub async fn start() -> Primary {
         rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
     let cert = certified.cert.der().clone();
     let fingerprint = format!("sha256:{}", sha256_hex(&cert));
+    let identity = quoro_control_plane::custody::TlsIdentity::from_pem(
+        certified.cert.pem(),
+        certified.key_pair.serialize_pem(),
+    )
+    .unwrap();
     let key = PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
     let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -72,6 +77,7 @@ pub async fn start() -> Primary {
             secure_cookies: true,
             public_url: None,
             tls_fingerprint: fingerprint.clone(),
+            tls: identity,
             node_network: NodeNetwork {
                 subnet: "10.42.1.0/24".to_string(),
                 gateway: "10.42.1.1".to_string(),
