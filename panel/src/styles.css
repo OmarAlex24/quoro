@@ -850,6 +850,97 @@
   }
 
   /*
+   * A skeleton: bars in the shape of the coming content, with a dither band
+   * sweeping across them while data loads, instead of the word "Loading".
+   * Bars are the raised surface on the page; on a card (white in light) they
+   * mix in the rule colour so they still show.
+   */
+  .skel-field {
+    display: grid;
+    gap: 10px;
+    --skel-bar: var(--raised);
+  }
+
+  .box .skel-field,
+  .skel-field .box,
+  .skel-field.box {
+    --skel-bar: color-mix(in oklab, var(--line) 45%, var(--raised));
+  }
+
+  .skel {
+    position: relative;
+    display: block;
+    height: 12px;
+    overflow: hidden;
+    border-radius: 5px;
+    background-color: var(--skel-bar, var(--raised));
+  }
+
+  .skel::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image: conic-gradient(from 270deg at 2px 2px, var(--line-2) 25%, transparent 0);
+    background-size: 4px 4px;
+    /* A mask reads alpha only; any opaque token will do. */
+    -webkit-mask: linear-gradient(90deg, transparent, var(--ink) 45%, var(--ink) 55%, transparent) no-repeat;
+    mask: linear-gradient(90deg, transparent, var(--ink) 45%, var(--ink) 55%, transparent) no-repeat;
+    -webkit-mask-size: 60% 100%;
+    mask-size: 60% 100%;
+    -webkit-mask-position: -75% 0;
+    mask-position: -75% 0;
+    animation: sweep 1.4s linear infinite;
+  }
+
+  .skel-rows {
+    display: grid;
+    gap: 0;
+  }
+
+  .skel-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    border-top: 1px solid var(--line);
+  }
+
+  .skel-row:first-child {
+    border-top: 0;
+  }
+
+  .skel-row-t {
+    display: grid;
+    flex: 1;
+    gap: 7px;
+    min-width: 0;
+  }
+
+  .skel.skel-glyph {
+    flex: none;
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+  }
+
+  .skel-card {
+    display: grid;
+    align-content: start;
+    gap: 10px;
+    padding: 16px;
+    border-radius: 11px;
+  }
+
+  .skel-page {
+    gap: 12px;
+  }
+
+  .skel-page > div > .skel-rows,
+  .skel-page .skel-rows {
+    margin-top: 10px;
+  }
+
+  /*
    * The shell. Outside a project: a 236 px sidebar with the workspace, six
    * sections and the cluster at its foot. Inside one: a 52 px top bar with the
    * breadcrumb and a 56 px rail. Below 768 px the sidebar folds into a menu
@@ -1433,11 +1524,6 @@
     text-decoration: none;
   }
 
-  .ptile-ghost {
-    height: 222px;
-    opacity: 0.6;
-  }
-
   .ptile-h {
     display: flex;
     align-items: center;
@@ -1824,33 +1910,49 @@
     height: 15px;
   }
 
-  /* Nothing here yet. */
+  /*
+   * Nothing here yet: a dashed box with a dithered cube, what is missing,
+   * what adding it does and the action. The cube's canvas is wider than it is
+   * tall so the panel's cube (sized by height) fills the proposal's 64 px.
+   */
   .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    max-width: 360px;
-    margin-inline: auto;
+    display: grid;
+    justify-items: center;
+    gap: 8px;
+    padding: 26px 20px 24px;
+    border: 1px dashed var(--line-2);
+    border-radius: 10px;
     text-align: center;
   }
 
   .empty-cube {
     display: block;
-    width: 120px;
-    height: 78px;
+    width: 96px;
+    height: 64px;
+    margin-bottom: 4px;
   }
 
   .empty-title {
-    margin-top: 14px;
     font-size: 14.5px;
     font-weight: 620;
     color: var(--ink);
   }
 
   .empty-text {
-    margin-top: 6px;
+    max-width: 44ch;
     font-size: 13px;
+    line-height: 1.45;
     color: var(--ink-2);
+  }
+
+  .empty-action {
+    margin-top: 6px;
+  }
+
+  /* Over the dotted canvas the box takes the surface, as the proposal draws it. */
+  .canvas-empty .empty-state {
+    width: min(100%, 440px);
+    background-color: var(--surface);
   }
 
   /* The Add menu: a typed filter over what can be added. */
@@ -4446,13 +4548,6 @@
     padding-right: 16px;
   }
 
-  .list-empty {
-    padding: 2px 16px 8px 0;
-    font-size: 13px;
-    line-height: 1.45;
-    color: var(--ink-2);
-  }
-
   .split-detail {
     min-width: 0;
   }
@@ -5186,30 +5281,6 @@
     color: var(--ink-2);
   }
 
-  .set-empty {
-    padding: 22px 16px;
-    border: 1px dashed var(--line-2);
-    border-radius: 10px;
-    text-align: center;
-  }
-
-  .set-empty-t {
-    font-size: var(--type-body);
-    font-weight: 540;
-    color: var(--ink);
-  }
-
-  .set-empty-x {
-    margin-top: 4px;
-    font-size: var(--type-small);
-    color: var(--ink-2);
-  }
-
-  .set-loading {
-    height: 118px;
-    background-color: color-mix(in oklab, var(--surface) 60%, transparent);
-  }
-
   .set-form {
     display: grid;
     gap: 12px;
@@ -5484,13 +5555,15 @@
     .lamp-pulse,
     .sweep,
     .aura-breathe,
-    .btn[data-busy]::after {
+    .btn[data-busy]::after,
+    .skel::after {
       animation: none;
     }
 
     /* A still sweep sits in the middle instead of vanishing off one edge. */
     .sweep,
-    .btn[data-busy]::after {
+    .btn[data-busy]::after,
+    .skel::after {
       -webkit-mask-position: 50% 0;
       mask-position: 50% 0;
     }

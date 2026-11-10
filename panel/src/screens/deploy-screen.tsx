@@ -44,6 +44,7 @@ import { Input } from '../components/ui/input';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 import { LoginScreen } from './login-screen';
+import { PageSkeleton } from '../components/skeleton';
 
 const APP_NAME_PATTERN = /^[a-z0-9-]{1,40}$/;
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -417,7 +418,7 @@ export function DeployScreen({
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-3xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-2">Loading…</p>
+        <PageSkeleton />
       </main>
     );
   }

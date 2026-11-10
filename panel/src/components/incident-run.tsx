@@ -32,6 +32,7 @@ import { Field } from './ui/field';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { Tag } from './ui/tag';
 import { Textarea } from './ui/textarea';
+import { SkeletonRows } from './skeleton';
 
 const linkClass =
   'text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';
@@ -353,7 +354,7 @@ export function IncidentRun({
       <Ribbon layout={layout} />
 
       {records.isPending ? (
-        <p className="mt-5 text-[13px] text-ink-2">Reading the incident’s records…</p>
+        <SkeletonRows label="Loading the incident’s records" rows={3} className="mt-5" />
       ) : records.isError ? (
         <ProblemBanner view={problemView(records.error, 'read the audit log')} className="mt-5" />
       ) : (

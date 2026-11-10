@@ -58,6 +58,8 @@ import { Field } from './ui/field';
 import { Input } from './ui/input';
 import { ProblemBanner } from './ui/problem-banner';
 import { Tag } from './ui/tag';
+import { EmptyState } from './empty-state';
+import { SkeletonCards } from './skeleton';
 
 /**
  * The Storage tab: the app's volume and how full it is, a warm app's copy on
@@ -99,9 +101,9 @@ export function StorageTab({
       {volumesQuery.error ? (
         <ProblemBanner view={problemView(volumesQuery.error, 'see the volume')} />
       ) : volumesQuery.isPending ? (
-        <div className="box h-[104px] opacity-60" aria-hidden="true" />
+        <SkeletonCards label="Loading the volume" height={104} lines={2} />
       ) : volumes.length === 0 ? (
-        <p className="box px-4 py-4 text-[13px] text-ink-2">No volume is attached to this app right now.</p>
+        <EmptyState title="No volume is attached to this app right now" />
       ) : (
         volumes.map((volume) => (
           <VolumeBox key={volume.id} volume={volume} node={nodeNames[volume.node_id] ?? 'an unknown node'} />

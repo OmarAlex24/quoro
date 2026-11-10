@@ -25,6 +25,7 @@ import { Group, Rows } from './sheet-settings';
 import { Button } from './ui/button';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { DeleteVmDialog, useVmAction, VmActionsMenu, vmActionNotice } from './vm-actions';
+import { SkeletonCards } from './skeleton';
 
 const TAB_WORDS: Record<VmTab, string> = {
   overview: 'Overview',
@@ -95,7 +96,7 @@ export function VmSheet({
             </div>
             <div className="sh-body">
               {vmQuery.isPending ? (
-                <div className="box h-[220px] opacity-60" aria-hidden="true" />
+                <SkeletonCards label="Loading the VM" height={220} lines={4} />
               ) : (
                 <ProblemBanner view={problemView(vmQuery.error, 'see this VM')} />
               )}

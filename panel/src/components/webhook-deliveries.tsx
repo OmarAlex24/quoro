@@ -10,6 +10,8 @@ import {
 } from '../lib/webhooks';
 import { CopyButton } from './copy-button';
 import { ToneLamp } from './tone-lamp';
+import { EmptyState } from './empty-state';
+import { SettingsLoading } from './settings-parts';
 
 /** The delivery history of one webhook, newest first, one row per attempt. */
 export function WebhookDeliveries({ webhookId }: { webhookId: string }) {
@@ -27,14 +29,12 @@ export function WebhookDeliveries({ webhookId }: { webhookId: string }) {
       </h3>
 
       {deliveries.isPending ? (
-        <div className="box set-loading" role="status">
-          <span className="sr-only">Loading deliveries</span>
-        </div>
+        <SettingsLoading label="Loading deliveries" />
       ) : items.length === 0 ? (
-        <div className="set-empty">
-          <p className="set-empty-t">No deliveries yet.</p>
-          <p className="set-empty-x">Send a test delivery to check the receiver.</p>
-        </div>
+        <EmptyState title="No deliveries yet">
+          Each event this webhook sends shows here with the receiver&rsquo;s answer. Send a test delivery to
+          check the receiver.
+        </EmptyState>
       ) : (
         <ul className="box">
           {items.map((delivery) => {

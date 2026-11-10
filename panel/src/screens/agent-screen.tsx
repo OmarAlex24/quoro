@@ -47,6 +47,8 @@ import { Dialog, DialogContent } from '../components/ui/dialog';
 import { NoticeLine, ProblemBanner } from '../components/ui/problem-banner';
 import { Tag } from '../components/ui/tag';
 import { LoginScreen } from './login-screen';
+import { EmptyState } from '../components/empty-state';
+import { PageSkeleton, SkeletonCards, SkeletonRows } from '../components/skeleton';
 
 const agentsRoute = getRouteApi('/shell/agents');
 
@@ -74,7 +76,7 @@ export function AgentScreen({ agentId }: { agentId: string }) {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-2">Loading…</p>
+        <PageSkeleton />
       </main>
     );
   }
@@ -108,7 +110,7 @@ export function AgentScreen({ agentId }: { agentId: string }) {
 
       <section className="agent-pane" aria-label="Agent">
         {agentQuery.isPending ? (
-          <div className="h-[160px] rounded-[10px] border border-line bg-surface/60" />
+          <SkeletonCards label="Loading the agent" height={160} />
         ) : agentQuery.error ? (
           <div>
             <Link to="/agents" className={cn('text-[13px]', linkClass)}>
@@ -318,11 +320,13 @@ function AgentOverview({ agent, facts, ctx: records }: { agent: Agent; facts: Ag
           </Link>
         </h3>
         {calls.isPending ? (
-          <div className="h-[120px] rounded-[10px] border border-line bg-surface/60" />
+          <SkeletonRows label="Loading its recent activity" rows={2} />
         ) : calls.isError ? (
           <ProblemBanner view={problemView(calls.error, 'read the audit log')} />
         ) : recent.length === 0 ? (
-          <p className="box px-4 py-3 text-[13px] text-ink-2">Nothing recorded yet. Its calls will show here.</p>
+          <EmptyState title="Nothing recorded yet">
+            Every call this agent makes, allowed or refused, will show here.
+          </EmptyState>
         ) : (
           <ol className="feed feed-box">
             {recentItems.map((item) => {
@@ -397,10 +401,11 @@ function AgentOverview({ agent, facts, ctx: records }: { agent: Agent; facts: Ag
             Manage keys
           </Link>
         </h3>
+        {keys.isPending ? (
+          <SkeletonRows label="Loading its keys" rows={1} glyph={false} />
+        ) : (
         <p className="box px-4 py-3 text-[13px] text-ink-2">
-          {keys.isPending
-            ? 'Reading its keys…'
-            : keys.isError
+          {keys.isError
               ? problemView(keys.error, 'see its keys').message
               : liveKeys.length === 0
                 ? 'No active key. It cannot get a token until it has one.'
@@ -408,6 +413,7 @@ function AgentOverview({ agent, facts, ctx: records }: { agent: Agent; facts: Ag
                     lastUsed ? `last used ${relativeTime(lastUsed, now)}` : 'never used'
                   }`}
         </p>
+        )}
       </section>
 
       {canManage ? (
@@ -478,11 +484,11 @@ function AgentGrants({ agent, canManage }: { agent: Agent; canManage: boolean })
       <section aria-label="Active grants" className="grid gap-2">
         <h3 className="sec-h">Active</h3>
         {grants.isPending ? (
-          <div className="h-[140px] rounded-[10px] border border-line bg-surface/60" />
+          <SkeletonCards label="Loading its grants" height={140} />
         ) : active.length === 0 ? (
-          <p className="box px-4 py-3 text-[13px] text-ink-2">
-            No active grants. Without one it can get tokens but do nothing.
-          </p>
+          <EmptyState title="No active grants">
+            Without one it can get tokens but do nothing. A grant lets it act within its scopes until it expires.
+          </EmptyState>
         ) : (
           <GrantCards grants={active} canManage={canManage} onNotice={setNotice} />
         )}

@@ -44,6 +44,8 @@ import { StorageTab } from './sheet-storage';
 import { Button } from './ui/button';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { Tag } from './ui/tag';
+import { EmptyState } from './empty-state';
+import { SkeletonCards, SkeletonRows } from './skeleton';
 
 const TAB_WORDS: Record<ProjectTab, string> = {
   deployments: 'Deployments',
@@ -155,7 +157,7 @@ export function ServiceSheet({
             </div>
             <div className="sh-body">
               {appQuery.isPending ? (
-                <div className="box h-[220px] opacity-60" aria-hidden="true" />
+                <SkeletonCards label="Loading the app" height={220} lines={4} />
               ) : (
                 <ProblemBanner view={problemView(appQuery.error, 'see this app')} />
               )}
@@ -503,11 +505,9 @@ function VariablesTab({
       {envQuery.error ? (
         <ProblemBanner view={problemView(envQuery.error, 'see variables')} />
       ) : envQuery.isPending ? (
-        <div className="box h-[120px] opacity-60" aria-hidden="true" />
+        <SkeletonRows label="Loading variables" rows={2} glyph={false} />
       ) : env.length === 0 ? (
-        <p className="box px-4 py-4 text-[13px] text-ink-2">
-          No variables yet. Add one to pass configuration to the app.
-        </p>
+        <EmptyState title="No variables yet">Add one to pass configuration to the app.</EmptyState>
       ) : (
         <ul className="box" aria-label="Variables">
           {env.map((item) => (

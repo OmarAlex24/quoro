@@ -25,6 +25,8 @@ import { Avatar } from '../components/avatar';
 import { AgentName, UserName } from '../components/identity-name';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
+import { EmptyState } from '../components/empty-state';
+import { PageSkeleton, SkeletonRows } from '../components/skeleton';
 
 const approvalsRoute = getRouteApi('/shell/approvals');
 
@@ -142,7 +144,7 @@ export function ApprovalsScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-2">Loading…</p>
+        <PageSkeleton />
       </main>
     );
   }
@@ -193,9 +195,11 @@ export function ApprovalsScreen() {
         <nav className="split-list" aria-label="Requests">
           <h2 className="list-h">Waiting</h2>
           {pending.isPending ? (
-            <div className="mx-4 h-[60px] rounded-[10px] border border-line bg-surface/60" />
+            <SkeletonRows label="Loading waiting requests" rows={1} className="mr-4" />
           ) : waiting.length === 0 ? (
-            <p className="list-empty">Nothing waits. When an agent asks to delete something, it shows up here.</p>
+            <EmptyState title="Nothing waits" className="mr-4">
+              When an agent asks to delete something, the request shows up here for a person to approve or deny.
+            </EmptyState>
           ) : (
             <ul>
               {waiting.map((approval) => (
@@ -205,10 +209,12 @@ export function ApprovalsScreen() {
           )}
 
           <h2 className="list-h mt-4">Decided</h2>
-          {decided.length === 0 ? (
-            <p className="list-empty">
-              {loadingDecided ? 'Loading…' : 'Nothing decided yet. Approved, denied and expired requests stay here.'}
-            </p>
+          {decided.length === 0 && loadingDecided ? (
+            <SkeletonRows label="Loading decided requests" rows={2} className="mr-4" />
+          ) : decided.length === 0 ? (
+            <EmptyState title="Nothing decided yet" className="mr-4">
+              Approved, denied and expired requests stay here, so you can see what an agent was allowed to do.
+            </EmptyState>
           ) : (
             <ul>
               {decided.map((approval) => (

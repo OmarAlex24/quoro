@@ -41,6 +41,7 @@ import {
 import { ToneLamp } from './tone-lamp';
 import { Button } from './ui/button';
 import { ProblemBanner } from './ui/problem-banner';
+import { SkeletonLines } from './skeleton';
 
 const PAGE_SIZE = 50;
 
@@ -414,9 +415,7 @@ export function ClusterVulnerabilities({
       {error ? (
         <ProblemBanner view={error} className="mt-3" />
       ) : summaryQuery.isPending ? (
-        <p className="mt-3 text-[13px] text-ink-2">
-          Reading the vulnerability summary…
-        </p>
+        <SkeletonLines label="Loading the vulnerability summary" lines={4} className="mt-3" />
       ) : summary === undefined ? null : (
         <SummaryBody
           summary={summary}

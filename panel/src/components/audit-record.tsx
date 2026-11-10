@@ -19,6 +19,7 @@ import { CopyButton } from './copy-button';
 import { AgentName, UserName } from './identity-name';
 import { ToneLamp } from './tone-lamp';
 import { ProblemBanner } from './ui/problem-banner';
+import { SkeletonLines } from './skeleton';
 
 /** A record field the format omits when it has no value. */
 const hasText = (value: string | null | undefined): value is string =>
@@ -272,7 +273,7 @@ export function AuditRecordBody({ seq }: { seq: number }) {
     }
   };
 
-  if (recordQuery.isPending) return <p className="text-[13px] text-ink-2">Reading entry {seq}…</p>;
+  if (recordQuery.isPending) return <SkeletonLines label={`Loading entry ${seq}`} lines={6} heading={false} />;
   if (missing) return <p className="text-[13px] text-ink">No entry with that sequence number.</p>;
   if (recordQuery.error) return <ProblemBanner view={problemView(recordQuery.error, 'read this entry')} />;
   if (!record) return null;

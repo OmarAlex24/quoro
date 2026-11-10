@@ -12,6 +12,8 @@ import { GrantDialog } from '../components/grant-dialog';
 import { Button } from '../components/ui/button';
 import { NoticeLine, ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
+import { EmptyState } from '../components/empty-state';
+import { PageSkeleton, SkeletonCards } from '../components/skeleton';
 
 const agentsRoute = getRouteApi('/shell/agents');
 
@@ -54,7 +56,7 @@ export function GrantsScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-2">Loading…</p>
+        <PageSkeleton />
       </main>
     );
   }
@@ -172,22 +174,26 @@ export function GrantsScreen() {
 
       <div className="mt-4">
         {grantsQuery.isPending ? (
-          <div className="h-[128px] rounded-[10px] border border-line bg-surface/60" />
+          <SkeletonCards label="Loading grants" height={128} />
         ) : grants.length === 0 ? (
-          <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
-            <p className="text-[15px] text-ink">
-              {hasFilters ? 'No grants match these filters.' : 'No grants yet. Issue one to let an agent act.'}
-            </p>
-            {hasFilters ? (
-              <Button variant="default" className="mt-4" onClick={clearFilters}>
-                Clear filters
-              </Button>
-            ) : canManage ? (
-              <Button variant="primary" className="mt-4" onClick={() => setDialogOpen(true)}>
-                Issue a grant
-              </Button>
-            ) : null}
-          </div>
+          <EmptyState
+            title={hasFilters ? 'No grants match these filters' : 'No grants yet'}
+            action={
+              hasFilters ? (
+                <Button variant="default" onClick={clearFilters}>
+                  Clear filters
+                </Button>
+              ) : canManage ? (
+                <Button variant="primary" onClick={() => setDialogOpen(true)}>
+                  Issue a grant
+                </Button>
+              ) : undefined
+            }
+          >
+            {hasFilters
+              ? 'Clear the filters to see every grant again.'
+              : 'A grant lets one agent act on the cluster, within its scopes and until it expires. Issue one to let an agent act.'}
+          </EmptyState>
         ) : (
           <GrantCards grants={grants} canManage={canManage} showAgent onNotice={setNotice} />
         )}
