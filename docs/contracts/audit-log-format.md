@@ -284,6 +284,7 @@ Volumes, backups and the audit export add calls and system actions (ADR 0145 to 
 | `createBackupRepository` | `backup:manage` | `backup_repository` / the new repository | Human only. The recovery key is in the response, never in `params`, and never in any record |
 | `updateBackupRepository` | `backup:manage` | `backup_repository` / the repository | |
 | `rotateBackupRecoveryKey` | `backup:manage` | `backup_repository` / the repository | `params` is `{}`; the new key's fingerprint is in the change log |
+| `restoreBackupRepositoryKey` | `backup:manage` | `backup_repository` / the repository | Human only. `params` is `{"recovery_key": "[redacted]"}` (section 4). The repository key is written on this primary only: the call appends no change-log entry besides the record's own (ADR 0322) |
 | `createAuditExport` | `provider:manage` | `audit_export` / the new export | |
 | `probeAuditExport` | `provider:manage` | `audit_export` / the export | `result_detail` absent on success; the observed strength is in the change log |
 

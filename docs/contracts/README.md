@@ -181,7 +181,7 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `backup:read` | List and read backups and backup repositories | |
 | `backup:write` | Take a backup of an app's volume now | |
 | `backup:restore` | Restore a backup onto a node, which moves the app there | destructive |
-| `backup:manage` | Create a backup repository, rotate its recovery key, set the control-plane backup schedule | human-only |
+| `backup:manage` | Create a backup repository, rotate its recovery key, restore its repository key on a promoted primary, set the control-plane backup schedule | human-only |
 | `agent:read` | List and read agents | |
 | `agent:write` | Create, update, disable agents; rotate agent keys | human-only |
 | `grant:read` | List and read grants | |

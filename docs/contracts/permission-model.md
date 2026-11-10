@@ -71,7 +71,7 @@ Consequences of the bundles:
 
 - A `viewer` can read apps, deployments, nodes, events, incidents, grants, approvals and the audit log, and can stream app logs, but cannot mutate anything (README.md, "Scopes").
 - An `operator` cannot create or change human users; that is `user:write` and owner-only (README.md, "Scopes").
-- An `operator` cannot create a backup repository or replace its recovery key; that is `backup:manage` and owner-only, because the recovery key opens every backup in the repository, including those of the control-plane database and its secrets (ADR 0147). An `operator` takes backups and restores them (`backup:write`, `backup:restore`).
+- An `operator` cannot create a backup repository, replace its recovery key or restore its repository key; that is `backup:manage` and owner-only, because the recovery key opens every backup in the repository, including those of the control-plane database and its secrets (ADR 0147). An `operator` takes backups and restores them (`backup:write`, `backup:restore`).
 - An `operator` cannot rotate the cluster signing key; that is `cluster:manage` and owner-only, because the signing key decides what every node runs (node-agent-protocol.md section 7.5).
 - Every role holds `user:read`, so an `operator` or `viewer` can list users and turn a user id (`owner_user_id`, `on_behalf_of`, `decided_by`, `created_by`) into a name. `user:read` is human-only: agents never list users.
 - `app:terminal` and `vm:console` are in the `owner` and `operator` bundles and not in `viewer`, because neither is a `:read` scope (ADR 0114). A `viewer` can read a build's log (`app:logs`) but cannot start a build.
@@ -121,7 +121,7 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | `backup:read` | List and read backups and backup repositories (ADR 0147) | |
 | `backup:write` | Take a backup of an app's volume now | |
 | `backup:restore` | Restore a backup onto a node, which replaces the app's data and moves the app there | destructive |
-| `backup:manage` | Create a backup repository, rotate its recovery key, set the control-plane backup schedule (ADR 0147, ADR 0148) | human-only |
+| `backup:manage` | Create a backup repository, rotate its recovery key, restore its repository key on a promoted primary, set the control-plane backup schedule (ADR 0147, ADR 0148, ADR 0322) | human-only |
 | `agent:read` | List and read agents | |
 | `agent:write` | Create, update, disable agents; rotate agent keys | human-only |
 | `grant:read` | List and read grants | |

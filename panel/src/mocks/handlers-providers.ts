@@ -258,6 +258,7 @@ export const providersHandlers: HttpHandler[] = [
       prefix,
       recovery_key_fingerprint: fingerprint(),
       recovery_key_rotated_at: null,
+      repository_key_present: true,
       control_plane_schedule: body.control_plane_schedule
         ? { ...body.control_plane_schedule }
         : { interval_h: 6, keep: 7 },

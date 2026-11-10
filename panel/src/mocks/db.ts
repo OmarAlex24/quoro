@@ -637,6 +637,7 @@ const seed = (): void => {
     prefix: 'quoro-backups',
     recovery_key_fingerprint: '9f2c4e6a1b8d3057',
     recovery_key_rotated_at: null,
+    repository_key_present: true,
     control_plane_schedule: { interval_h: 6, keep: 7 },
     created_by: 'usr_01JC9Z6Q5W7X8Y9Z0A1B2C3D4E',
     created_at: createdAt,
