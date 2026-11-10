@@ -1508,7 +1508,8 @@
    * The projects board: full width, the cluster band and the project tiles on
    * the left, a rail with what needs a person, the nodes and the activity on
    * the right. 316 px of rail from 1181 px, 280 px and one column of tiles
-   * down to 768 px, and one column below that with Needs you first.
+   * down to 900 px, and one column below that: Needs you, the band and the
+   * tiles, then the nodes and the activity.
    */
   .board-page {
     position: relative;
@@ -1543,7 +1544,8 @@
     align-items: center;
     gap: 8px;
     height: 32px;
-    width: 232px;
+    flex: 0 1 232px;
+    min-width: 150px;
     padding: 0 8px 0 10px;
     border-radius: 7px;
     border: 1px solid var(--line-2);
@@ -1607,7 +1609,6 @@
   /* The cluster band: the area fills the card, the words sit over its quiet left side. */
   .band {
     position: relative;
-    height: 132px;
     overflow: hidden;
   }
 
@@ -1631,10 +1632,11 @@
     );
   }
 
+  /* The words lie in the flow, so a narrow band grows to hold them instead of piling them up. */
   .band-in {
-    position: absolute;
+    position: relative;
     z-index: 1;
-    inset: 0;
+    min-height: 132px;
     display: flex;
     justify-content: space-between;
     gap: 16px;
@@ -1729,6 +1731,7 @@
     flex-direction: column;
     min-width: 0;
     color: var(--ink);
+    container: ptile / inline-size;
   }
 
   .ptile-warn {
@@ -1761,6 +1764,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    line-height: 24px;
     font-size: var(--type-card);
     font-stretch: 106%;
     font-weight: 620;
@@ -1902,9 +1906,12 @@
     list-style: none;
   }
 
+  /*
+   * A row gives way from the middle: the node tags drop whole (the ones that
+   * no longer fit wrap onto a hidden line) and the name keeps its width.
+   */
   .prow {
-    display: grid;
-    grid-template-columns: 20px minmax(0, 1fr) auto 56px 12px;
+    display: flex;
     align-items: center;
     gap: 9px;
     height: 30px;
@@ -1924,11 +1931,17 @@
     outline-offset: -2px;
   }
 
-  .prow-n {
+  .prow > * {
+    flex: none;
+  }
+
+  /* The name never shrinks for the tags; only a name longer than the row is cut. Glyph, spark, lamp and gaps: 124 px. */
+  .prow .prow-n {
     display: flex;
     align-items: baseline;
     gap: 6px;
     min-width: 0;
+    max-width: calc(100% - 124px);
     font-weight: 560;
   }
 
@@ -1945,9 +1958,16 @@
     color: var(--ink-2);
   }
 
-  .prow-on {
+  .prow .prow-on {
     display: flex;
+    flex: 0 1 auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 4px;
+    min-width: 0;
+    height: 20px;
+    margin-left: auto;
+    overflow: hidden;
   }
 
   .prow canvas.prow-spark {
@@ -1956,6 +1976,7 @@
   }
 
   .prow-cpu {
+    width: 56px;
     font-size: var(--type-min);
     font-weight: 500;
     color: var(--ink-2);
@@ -2066,6 +2087,7 @@
     position: relative;
     z-index: 1;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 9px;
     margin: 8px 10px 2px;
@@ -2081,12 +2103,22 @@
     font-weight: 600;
   }
 
+  /* The words keep at least a line's worth of room; Review moves under them first. */
+  .callout-t {
+    flex: 1 1 150px;
+    min-width: 0;
+  }
+
+  .callout > a {
+    margin-left: auto;
+  }
+
   /* The rail's sections. */
   .psec-h {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 11px 14px 9px;
+    padding: 8px 14px 6px;
   }
 
   .psec-h h2 {
@@ -2096,6 +2128,9 @@
   }
 
   .psec-link {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
     margin-left: auto;
     font-size: var(--type-small);
     font-weight: 500;
@@ -2374,7 +2409,27 @@
     animation: pev-in var(--motion-change) var(--ease) backwards;
   }
 
-  @media (min-width: 768px) and (max-width: 1180px) {
+  /* A narrow tile drops what the rows and the header can spare before a name shrinks. */
+  @container ptile (max-width: 290px) {
+    .ptile-count {
+      display: none;
+    }
+  }
+
+  @container ptile (max-width: 250px) {
+    .prow .prow-on {
+      display: none;
+    }
+  }
+
+  @container ptile (max-width: 230px) {
+    .prow canvas.prow-spark,
+    .prow .prow-cpu {
+      display: none;
+    }
+  }
+
+  @media (min-width: 900px) and (max-width: 1180px) {
     .board {
       grid-template-columns: minmax(0, 1fr) 280px;
     }
@@ -2384,15 +2439,8 @@
     }
   }
 
-  @media (max-width: 767.98px) {
-    .board-page {
-      padding: 16px 14px 22px;
-    }
-
-    .psearch {
-      display: none;
-    }
-
+  /* Below 900 px the rail cannot stand beside the tiles; everything stacks, Needs you first. */
+  @media (max-width: 899.98px) {
     .board {
       grid-template-columns: minmax(0, 1fr);
       gap: 14px;
@@ -2416,14 +2464,33 @@
       grid-template-columns: minmax(0, 1fr);
       gap: 14px;
     }
+  }
 
+  @media (max-width: 767.98px) {
+    .board-page {
+      padding: 16px 14px 22px;
+    }
+
+    .psearch {
+      display: none;
+    }
+
+    /* The words on top and the area under them, each in its own room. */
     .band {
-      height: 176px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .band-in {
+      min-height: 84px;
+      padding-bottom: 8px;
     }
 
     .band canvas.band-chart {
-      top: 84px;
-      height: calc(100% - 84px);
+      position: relative;
+      inset: auto;
+      order: 1;
+      height: 92px;
     }
 
     .band::after {

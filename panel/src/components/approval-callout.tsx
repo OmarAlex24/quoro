@@ -22,7 +22,7 @@ export function ApprovalCallout({
   return (
     <div className="callout">
       <Avatar kind="agent" seed={approval.agent_id} />
-      <p className="min-w-0 flex-1">
+      <p className="callout-t">
         <b>
           <AgentName id={approval.agent_id} link={false} />
         </b>{' '}
