@@ -590,29 +590,18 @@ async fn a_renewal_is_answered_while_two_of_three_voters_support_and_not_after()
     );
 }
 
-/// #604 under real support: a `warm` app's new token over a released lease
-/// row that already reads `expiring` for `D` and carries no unsettled mark
-/// goes out `expiring` for `D` while two of three voters support the
-/// primary, and is held, writing nothing, while none does.
-#[tokio::test]
-async fn a_warm_apps_new_token_goes_out_expiring_under_real_support() {
-    let server = start_with_patient_node_session().await;
-    let owner = server.owner().await;
-    manual_clock(&server);
-    let a = enroll(&server, &owner, "node-a", &["node"]).await;
-    let b = enroll(&server, &owner, "node-b", &["node"]).await;
-    enroll(&server, &owner, "node-c", &["node"]).await;
-    let mut on_a = Machine::connect(&server, &a).await;
-    let mut on_b = Machine::connect(&server, &b).await;
-    heartbeat(&mut on_a).await;
-    let project_id = project(&server, &owner).await;
-    let app_id = app(&server, &owner, &project_id, "web").await;
-
-    // A first volume while the policy is `none`, deleted and its revoke
-    // answered; then the row reads as an `expiring` lease's whose gate has
-    // passed, and the policy becomes `warm`.
-    set_policy(&server, &app_id, "none").await;
-    let res = create_volume(&server, &owner, &app_id).await;
+/// Gives `app_id` a released lease whose row reads `expiring` for `D`, as
+/// one whose gate has passed: a first volume on A while the policy is
+/// `none`, deleted and its revoke answered; then the row reads as an
+/// `expiring` lease's, and the policy becomes `warm`. Returns the lease id.
+async fn released_expiring_lease(
+    server: &Server,
+    owner: &reqwest::Client,
+    on_a: &mut Machine,
+    app_id: &str,
+) -> String {
+    set_policy(server, app_id, "none").await;
+    let res = create_volume(server, owner, app_id).await;
     assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
     let volume_id = res.json::<Value>().await.unwrap()["id"]
         .as_str()
@@ -634,32 +623,46 @@ async fn a_warm_apps_new_token_goes_out_expiring_under_real_support() {
         .execute(server.state.store.pool())
         .await
         .unwrap();
-    set_policy(&server, &app_id, "warm").await;
-    let row = || {
+    set_policy(server, app_id, "warm").await;
+    lease_id
+}
+
+/// #604 under real support: a `warm` app's new token over a released lease
+/// row that already reads `expiring` for `D` and carries no unsettled mark
+/// goes out `expiring` for `D` while two of three voters support the
+/// primary, and the row stays unmarked. Once their support has run out, a
+/// second app's new token over such a row is written `expiring` for `D`
+/// with the mark, and its grant is held (section 8.4, "Grants of a marked
+/// row"; issue #703): it goes out only once a majority supports `D` and the
+/// write is replicated over the machines with the `node` role, and C never
+/// connects. Before #703 that write was not made and `createVolume`
+/// answered `conflict`.
+#[tokio::test]
+async fn a_warm_apps_new_token_goes_out_expiring_under_real_support() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let clock = manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let b = enroll(&server, &owner, "node-b", &["node"]).await;
+    let c = enroll(&server, &owner, "node-c", &["node"]).await;
+    let mut on_a = Machine::connect(&server, &a).await;
+    let mut on_b = Machine::connect(&server, &b).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let row = |lease_id: &str| {
         sqlx::query_as::<_, (String, Option<i64>, i64, i64)>(
             "SELECT mode, duration_ms, unsettled, fencing_token FROM leases WHERE id = ?",
         )
-        .bind(&lease_id)
+        .bind(lease_id.to_string())
         .fetch_one(server.state.store.pool())
     };
+
+    let app_id = app(&server, &owner, &project_id, "web").await;
+    let lease_id = released_expiring_lease(&server, &owner, &mut on_a, &app_id).await;
     assert_eq!(
-        row().await.unwrap(),
+        row(&lease_id).await.unwrap(),
         ("expiring".to_string(), Some(15_000), 0, 1)
     );
-
-    // No voter answered yet: the grant is held and nothing is written.
-    let res = create_volume(&server, &owner, &app_id).await;
-    assert_eq!(res.status(), 409);
-    let body: Value = res.json().await.unwrap();
-    assert!(
-        body["detail"]
-            .as_str()
-            .unwrap()
-            .contains("cannot be granted yet"),
-        "{body}"
-    );
-    assert_eq!(row().await.unwrap().3, 1, "nothing was written");
-
     on_a.support().await;
     on_b.support().await;
     assert!(supports(&server, D));
@@ -671,7 +674,37 @@ async fn a_warm_apps_new_token_goes_out_expiring_under_real_support() {
     assert_eq!(grant["body"]["mode"], "expiring");
     assert_eq!(grant["body"]["duration_ms"], 15_000);
     assert_eq!(
-        row().await.unwrap(),
+        row(&lease_id).await.unwrap(),
         ("expiring".to_string(), Some(15_000), 0, 2)
     );
+
+    // The voters answer nothing more, and their support runs out.
+    let web2 = app(&server, &owner, &project_id, "web-2").await;
+    let lease_2 = released_expiring_lease(&server, &owner, &mut on_a, &web2).await;
+    clock.advance(WINDOW);
+    assert!(!supports(&server, D));
+    let res = create_volume(&server, &owner, &web2).await;
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+    assert_eq!(
+        row(&lease_2).await.unwrap(),
+        ("expiring".to_string(), Some(15_000), 1, 2),
+        "written with the mark"
+    );
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let frames = on_a.settle().await;
+    assert!(
+        !frames.iter().any(|frame| frame["type"] == "lease_grant"),
+        "{frames:?}"
+    );
+    let app: Value = owner
+        .get(server.url(&format!("/api/v1/apps/{web2}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(app["lease"]["grant_pending"], true, "{app}");
+    let waiting = app["lease"]["grant_waiting_on"].as_array().unwrap();
+    assert!(waiting.contains(&json!(c.node_id)), "{app}");
 }
