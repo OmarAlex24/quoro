@@ -6,8 +6,10 @@
 
 mod common;
 
+use common::replay;
 use common::{Server, problem, start, start_with_cloudflare};
 use futures_util::{SinkExt, StreamExt};
+use quoro_control_plane::deploy;
 use quoro_control_plane::store::now_rfc3339;
 use quoro_proto::sign;
 use quoro_proto::wire::{
@@ -724,6 +726,136 @@ async fn a_git_app_builds_its_image_and_deploys_it() {
     assert_eq!(page["items"][0]["id"], build_id);
     let snapshot = recv_build_snapshot(&mut socket, &overridden_id).await;
     assert_eq!(snapshot["body"]["spec"]["builds"][0]["ref"], "release");
+}
+
+/// Section 7.3 step 4 (ADR 0297): the change-log entries of a build that
+/// succeeds, of the deployment it starts and of a running build that is
+/// cancelled rebuild their rows when replayed in `seq` order into an empty
+/// database: the build's `deployment_id`, the deployment's `phase` cleared
+/// by its success, and the cancel marker in `error`.
+#[tokio::test]
+async fn build_and_deployment_entries_rebuild_their_rows() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let project_id = create_project(&server, &owner).await;
+    let node = enrolled(&server, &owner).await;
+    let (mut socket, _) = open(&server, &node).await;
+    let app = create_git_app(&server, &owner, &project_id).await;
+    let app_id = app["id"].as_str().unwrap().to_string();
+    set_token_env(&server, &owner, &app_id).await;
+
+    let build = start_build(&server, &owner, &app_id).await;
+    let build_id = build["id"].as_str().unwrap().to_string();
+    send(
+        &mut socket,
+        report(vec![build_status(&build_id, BuildState::Building)]),
+    )
+    .await;
+    wait_for_status(&server, &owner, &build_id, "building").await;
+    let mut succeeded = build_status(&build_id, BuildState::Succeeded);
+    succeeded.commit = Some("a".repeat(40));
+    succeeded.image_digest = Some(DIGEST.to_string());
+    succeeded.finished_at = Some(now_rfc3339());
+    send(&mut socket, report(vec![succeeded])).await;
+    let built = wait_for_status(&server, &owner, &build_id, "succeeded").await;
+    let deployment_id = built["deployment_id"].as_str().unwrap().to_string();
+
+    // The node starts the VM, then reports it running and healthy: the
+    // deployment passes `boot` and succeeds, which clears its phase.
+    let (vm_id,): (String,) = sqlx::query_as("SELECT id FROM vms WHERE app_id = ?")
+        .bind(&app_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    for (observed_status, health) in [
+        (wire::ObservedStatus::Starting, wire::Health::Unknown),
+        (wire::ObservedStatus::Running, wire::Health::Passing),
+    ] {
+        deploy::on_vm_observed(
+            &server.state.store,
+            &node.node_id,
+            &wire::VmStatus {
+                vm_id: vm_id.clone(),
+                observed_status,
+                health,
+                ip: None,
+                restart_count: 0,
+                last_exit_code: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let (status, phase): (String, Option<String>) =
+        sqlx::query_as("SELECT status, phase FROM deployments WHERE id = ?")
+            .bind(&deployment_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!((status.as_str(), phase), ("succeeded", None));
+
+    // A running build is cancelled through the marker in `error`.
+    let running = start_build(&server, &owner, &app_id).await;
+    let running_id = running["id"].as_str().unwrap().to_string();
+    send(
+        &mut socket,
+        report(vec![build_status(&running_id, BuildState::Building)]),
+    )
+    .await;
+    wait_for_status(&server, &owner, &running_id, "building").await;
+    let res = owner
+        .post(server.url(&format!("/api/v1/builds/{running_id}/cancel")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "cancel: {}", res.text().await.unwrap());
+    let (marker,): (Option<String>,) = sqlx::query_as("SELECT error FROM builds WHERE id = ?")
+        .bind(&running_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(marker.as_deref(), Some("cancel requested"));
+
+    let rebuilt = replay::rebuild(&server, &["build", "deployment"], &[]).await;
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "builds",
+        &[
+            "id",
+            "app_id",
+            "node_id",
+            "status",
+            "commit",
+            "image",
+            "image_digest",
+            "error",
+            "deployment_id",
+            "started_at",
+            "finished_at",
+        ],
+        2,
+    )
+    .await;
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "deployments",
+        &[
+            "id",
+            "app_id",
+            "image",
+            "image_digest",
+            "status",
+            "phase",
+            "error",
+            "trigger",
+            "created_at",
+            "finished_at",
+        ],
+        1,
+    )
+    .await;
 }
 
 #[tokio::test]
