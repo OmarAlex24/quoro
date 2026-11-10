@@ -11,6 +11,7 @@ use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, watch};
 
@@ -53,6 +54,9 @@ pub struct Store {
     /// is held, and never cleared: from then on [`Store::begin_write`]
     /// refuses. Readable without the database.
     demoted: Arc<watch::Sender<bool>>,
+    /// Whether [`Store::demote`] recorded `meta.demoted_by_term`. Until it
+    /// does, every later demotion tries the write again.
+    demotion_recorded: Arc<AtomicBool>,
     /// Test seam: the next demotion waits here, after its `meta` write and
     /// before it sets the flag, with the gate held
     /// ([`Store::hold_next_demotion`]).
@@ -263,6 +267,7 @@ impl Store {
             migrations: Arc::from(MIGRATIONS),
             head: Arc::new(watch::channel(head).0),
             demoted: Arc::new(watch::channel(false).0),
+            demotion_recorded: Arc::new(AtomicBool::new(false)),
             demotion_hold: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -372,7 +377,9 @@ impl Store {
 
     /// Whether a background loop must stop because the primary is demoted,
     /// logging one line naming `what` when it must. A loop calls it once per
-    /// pass and stops on `true`, so it logs at most once.
+    /// pass and stops on `true`, so it logs at most once. Work that calls
+    /// outside (a provider, a bucket) also calls it right before each call,
+    /// since the demotion may land while that work runs.
     #[must_use]
     pub fn stops_for_demotion(&self, what: &str) -> bool {
         if self.is_demoted() {
@@ -403,18 +410,23 @@ impl Store {
 
     /// Demotes this primary: a machine answered it with `stale_term`, so a
     /// higher term exists (`node-agent-protocol.md` sections 7.4 and 8.8, ADR
-    /// 0230). Returns `None` when it was already demoted: the first demotion
-    /// wins, and its term stays.
+    /// 0230). Returns `None` when it was already demoted and its term is
+    /// recorded: the first recorded term stays.
     ///
     /// It takes the writer gate and, in one transaction, records
-    /// `meta.demoted_by_term`: the error's `node_term` when it is above
-    /// `meta.term`, else `meta.term + 1`. The contract gives no rule for a
-    /// `stale_term` without a usable term; that case is logged at `error`
-    /// and the primary is demoted all the same, as section 8.8 sets no
-    /// condition. The flag is set after the commit and before the gate is
+    /// `meta.demoted_by_term`: the error's `node_term` when it is usable,
+    /// else `meta.term + 1` ([`record_demotion`]). The contract gives no rule
+    /// for a `stale_term` without a usable term; that case is logged at
+    /// `error` and the primary is demoted all the same, as section 8.8 sets
+    /// no condition. The flag is set after the commit and before the gate is
     /// released, so no writer queued on the gate commits after the `meta`
-    /// write. A failed `meta` write still sets the flag: this process is
-    /// demoted, though a restart would not be.
+    /// write.
+    ///
+    /// A failed `meta` write still sets the flag: this process is demoted,
+    /// though a restart would not be. Every later `stale_term` then tries the
+    /// write again, under the gate and with the same rule, until one is
+    /// recorded. That write is the one write a demoted primary makes: it goes
+    /// straight to the pool, past the refusal of [`Store::begin_write`].
     ///
     /// Section 8.8 excepts a primary restored with `quoro restore
     /// --accept-loss` that has sent no `lease_grant` yet, which would start
@@ -423,16 +435,19 @@ impl Store {
     /// demotes here.
     pub async fn demote(&self, node_term: Option<u64>) -> Option<Demotion> {
         let gate = Arc::clone(&self.writer).lock_owned().await;
-        if self.is_demoted() {
+        if self.is_demoted() && self.demotion_recorded.load(Ordering::SeqCst) {
             return None;
         }
         let demotion = match record_demotion(&self.pool, node_term).await {
-            Ok(term) => Demotion::Recorded(term),
+            Ok(term) => {
+                self.demotion_recorded.store(true, Ordering::SeqCst);
+                Demotion::Recorded(term)
+            }
             Err(error) => {
                 tracing::error!(
                     %error,
                     ?node_term,
-                    "cannot record meta.demoted_by_term: this process is demoted, but a restart would not stay demoted"
+                    "cannot record meta.demoted_by_term: this process is demoted, but a restart would not stay demoted until a later stale_term records it"
                 );
                 Demotion::NotRecorded
             }
@@ -467,26 +482,43 @@ impl Store {
 
 /// Writes `meta.demoted_by_term` in one transaction and returns the term
 /// written ([`Store::demote`], which holds the writer gate).
+///
+/// The term is `node_term` when it is present and above `meta.term`, or
+/// present while `meta.term` cannot be read as a number. Otherwise it is
+/// `meta.term + 1` (a missing `meta.term` reads as 1), logged at `error`
+/// because the `stale_term` carried no usable term. With neither usable
+/// nothing is written.
 async fn record_demotion(pool: &SqlitePool, node_term: Option<u64>) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let stored: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'term'")
         .fetch_optional(&mut *tx)
         .await?;
-    let current = match stored {
-        None => 1,
-        Some(value) => value
-            .parse::<u64>()
-            .map_err(|_| sqlx::Error::Protocol(format!("bad meta.term {value:?}")))?,
+    let current = match &stored {
+        None => Some(1),
+        Some(value) => value.parse::<u64>().ok(),
     };
-    let term = match node_term {
-        Some(term) if term > current => term,
-        _ => {
+    let term = match (node_term, current) {
+        (Some(term), Some(current)) if term > current => term,
+        (Some(term), None) => {
+            tracing::error!(
+                node_term = term,
+                meta_term = ?stored,
+                "meta.term is not a number; recording the stale_term's term"
+            );
+            term
+        }
+        (_, Some(current)) => {
             tracing::error!(
                 ?node_term,
                 meta_term = current,
                 "the stale_term carried no term above this primary's; recording meta.term + 1"
             );
             current.saturating_add(1)
+        }
+        (None, None) => {
+            return Err(sqlx::Error::Protocol(format!(
+                "the stale_term carried no term and meta.term {stored:?} is not a number: no term to record"
+            )));
         }
     };
     sqlx::query(

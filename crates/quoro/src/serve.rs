@@ -210,7 +210,7 @@ async fn run_demoted(config: Config, term: &str) -> Result<i32, String> {
     info!("listening on https://{address}");
     info!("tls fingerprint: {}", material.fingerprint);
     warn!(
-        "this host is a demoted primary at term {term}: it answers every request with 503 not_primary; 'quoro node rejoin' makes it a node"
+        "this host is a demoted primary at term {term}: it answers every request with 503 not_primary"
     );
     let local_node = start_local_node(&config, stop_rx);
     serve_until_stopped(
@@ -413,5 +413,90 @@ mod tests {
         assert_eq!(loopback(any6), "[::1]:8443".parse().unwrap());
         let fixed: SocketAddr = "10.0.0.5:9000".parse().unwrap();
         assert_eq!(loopback(fixed), fixed);
+    }
+
+    /// A running primary that demotes itself answers every route of the
+    /// service `quoro serve` composes with `503` `not_primary`: the API, MCP,
+    /// the panel and its assets (`node-agent-protocol.md` section 7.4).
+    #[tokio::test]
+    async fn the_composed_service_answers_not_primary_once_demoted() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let data_dir = std::env::temp_dir().join(format!(
+            "quoro-serve-demotion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let material = tls::load_or_generate(&data_dir, "primary", listen).unwrap();
+        let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
+        let state = AppState::open(
+            store,
+            ServerConfig {
+                data_dir: data_dir.clone(),
+                secure_cookies: false,
+                public_url: None,
+                tls_fingerprint: material.fingerprint.clone(),
+                tls: material.identity.clone(),
+                node_network: NodeNetwork {
+                    subnet: "10.42.1.0/24".to_string(),
+                    gateway: "10.42.1.1".to_string(),
+                },
+                heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+                session_timeout_ms: SESSION_TIMEOUT_MS,
+            },
+            Arc::new(ReferenceAsDigest),
+            Arc::new(DataKey::ephemeral()),
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind(listen).await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = service(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let mcp = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+
+        let health = client
+            .get(format!("{base}/api/v1/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), 200);
+        let before = client
+            .post(format!("{base}/mcp"))
+            .json(&mcp)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(before.status(), 503, "MCP answers before the demotion");
+
+        state.hub.stale_term(Some(5)).await;
+        for (what, request) in [
+            ("health", client.get(format!("{base}/api/v1/health"))),
+            ("an API route", client.get(format!("{base}/api/v1/nodes"))),
+            ("MCP", client.post(format!("{base}/mcp")).json(&mcp)),
+            ("the panel root", client.get(format!("{base}/"))),
+            ("a panel asset", client.get(format!("{base}/assets/app.js"))),
+            ("a panel page", client.get(format!("{base}/apps"))),
+        ] {
+            let res = request.send().await.unwrap();
+            assert_eq!(res.status(), 503, "{what}");
+            let content_type = res
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(content_type, "application/problem+json", "{what}");
+            let body: serde_json::Value = res.json().await.unwrap();
+            assert_eq!(body["code"], "not_primary", "{what}: {body}");
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

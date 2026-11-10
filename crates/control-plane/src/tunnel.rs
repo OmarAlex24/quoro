@@ -232,6 +232,14 @@ impl TunnelManager {
         }
     }
 
+    /// Whether the primary is demoted, checked right before each Cloudflare
+    /// write: the demotion may land in the middle of a [`Self::sync_now`]
+    /// pass, and a demoted primary changes no tunnel and no DNS record
+    /// (`node-agent-protocol.md` section 7.4).
+    fn stops_for_demotion(&self) -> bool {
+        self.inner.store.stops_for_demotion("a tunnel sync")
+    }
+
     /// The per-node reconcile lock.
     fn lock_for(&self, node_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.inner.locks.lock().expect("tunnel lock map");
@@ -434,6 +442,9 @@ impl TunnelManager {
                 let Some(name) = name else {
                     return Ok(());
                 };
+                if self.stops_for_demotion() {
+                    return Ok(());
+                }
                 let (tunnel, token) = controller
                     .ensure_tunnel(&name)
                     .await
@@ -512,6 +523,9 @@ impl TunnelManager {
             .await?;
         for hostname in handoff.keys() {
             published.remove(hostname);
+        }
+        if self.stops_for_demotion() {
+            return Ok(());
         }
         match controller
             .sync_routes_draining(&tunnel_id, origin_port, &normal, &draining, &mut published)
@@ -684,11 +698,17 @@ impl TunnelManager {
         };
         let mut published = state.published.clone();
         let empty = BTreeSet::new();
+        if self.stops_for_demotion() {
+            return false;
+        }
         if let Err(e) = controller
             .sync_routes(tunnel_id, state.origin_port, &empty, &mut published)
             .await
         {
             tracing::warn!(node_id, error = %e, "cannot remove the tunnel hostnames");
+            return false;
+        }
+        if self.stops_for_demotion() {
             return false;
         }
         if let Err(e) = controller.delete_tunnel(tunnel_id).await {

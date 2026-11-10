@@ -144,6 +144,63 @@ impl BucketFactory for SealFailBuckets {
     }
 }
 
+/// A factory whose bucket demotes the primary as the manifest lands: the
+/// demotion comes while the upload runs, after its first check
+/// (`node-agent-protocol.md` section 7.4).
+struct DemotingBuckets {
+    bucket: Arc<MemoryStore>,
+    store: Store,
+}
+
+impl BucketStore for DemotingBuckets {
+    fn put_new<'a>(
+        &'a self,
+        key: &'a str,
+        body: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ObjectStoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            let put = self.bucket.put_new(key, body, None).await.map(|_| ());
+            if key.contains("manifests/") {
+                let _ = self.store.demote(Some(5)).await;
+            }
+            put
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ObjectStoreError>> + Send + 'a>> {
+        Box::pin(self.bucket.get(key))
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ObjectInfo>, ObjectStoreError>> + Send + 'a>> {
+        Box::pin(self.bucket.list(prefix))
+    }
+
+    fn delete<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ObjectStoreError>> + Send + 'a>> {
+        Box::pin(self.bucket.delete(key))
+    }
+}
+
+impl BucketFactory for DemotingBuckets {
+    fn open(
+        &self,
+        _target: &RepositoryTarget,
+    ) -> Result<Bucket, quoro_control_plane::error::ApiError> {
+        Ok(Arc::new(DemotingBuckets {
+            bucket: Arc::clone(&self.bucket),
+            store: self.store.clone(),
+        }))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -654,6 +711,39 @@ async fn a_refused_bucket_fails_the_row_and_leaves_no_temporary_file() {
     .unwrap();
     assert_eq!(result, "error");
     assert_eq!(reason.as_deref(), Some(error.as_str()));
+}
+
+/// A primary demoted while its backup uploads writes no seal: the upload
+/// that was running reaches the seal after the demotion and stops there.
+#[tokio::test]
+async fn an_upload_running_at_the_demotion_writes_no_seal() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (server, owner, _node_id, project_id) = setup(&bucket).await;
+    create_app(&owner, &server, &project_id, "web").await;
+    create_repository(&owner, &server, 1, 7).await;
+    let now = at("2026-11-05T02:00:00Z");
+    let queued = queue_if_due(&server.state, now).await.unwrap().unwrap();
+    server.state.backups.set_factory(Arc::new(DemotingBuckets {
+        bucket: Arc::clone(&bucket),
+        store: server.state.store.clone(),
+    }));
+
+    // The run ends without a seal; recording its end is refused as well.
+    let _ = run_control_plane_backup(&server.state, &queued.id, now).await;
+
+    assert!(server.state.store.is_demoted());
+    let root = root(&server);
+    let manifest = format!(
+        "{root}{}",
+        layout::manifest(&server.state.cluster_id, &queued.id)
+    );
+    assert!(
+        !object(&bucket, &manifest).await.is_empty(),
+        "the upload ran up to its manifest"
+    );
+    let seals = bucket.list(&format!("{root}seals/")).await.unwrap();
+    assert!(seals.is_empty(), "no seal after the demotion: {seals:?}");
+    assert_eq!(row(&server, &queued.id).await.status, "running");
 }
 
 #[tokio::test]

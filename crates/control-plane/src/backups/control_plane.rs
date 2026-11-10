@@ -406,6 +406,9 @@ pub async fn backup_before_upgrade(
         sealed_at: created_at.clone(),
         signature: String::new(),
     };
+    if store.is_demoted() {
+        return Err(crate::store::DEMOTED_REFUSAL.to_string());
+    }
     match seal::put_seal(&bucket, &target, keys, seal).await {
         Ok(()) => {}
         Err(seal::SealError::Failed(reason)) => return Err(reason),
@@ -804,6 +807,11 @@ async fn upload_database(
         .map_err(|error| format!("could not write the manifest: {error}"))?;
     let manifest_key = layout::manifest(source_id, backup_id);
     let key = object_key(&target.root, &manifest_key);
+    // The manifest commits the uploaded chunks; a primary demoted during the
+    // upload writes it no more.
+    if store.is_demoted() {
+        return Err(crate::store::DEMOTED_REFUSAL.to_string());
+    }
     match bucket.put_new(&key, object).await {
         Ok(()) => {}
         Err(ObjectStoreError::AlreadyExists) => {

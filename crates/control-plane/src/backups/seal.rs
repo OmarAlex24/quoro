@@ -273,6 +273,12 @@ pub(crate) async fn seal(
         sealed_at: now.clone(),
         signature: String::new(),
     };
+    // A demoted primary seals nothing (`node-agent-protocol.md` section
+    // 7.4): checked right before the write, as an upload that was running
+    // when the demotion landed reaches this point afterwards.
+    if store.stops_for_demotion("backup seal") {
+        return Ok(false);
+    }
     match put_seal(&bucket, &target, keys, seal).await {
         Ok(()) => {}
         Err(SealError::Failed(reason)) => {

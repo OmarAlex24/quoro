@@ -13,7 +13,7 @@ use common::{Server, start_with_patient_node_session};
 use futures_util::StreamExt;
 use quoro_control_plane::events::{self, NewEvent, Source};
 use quoro_control_plane::store::DEMOTED_REFUSAL;
-use quoro_proto::wire::NodeMessage;
+use quoro_proto::wire::{ControlMessage, NodeMessage};
 use quoro_proto::{ErrorCode, ProtocolError};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -107,8 +107,10 @@ async fn refused_upgrade(server: &Server, credential: &str) -> (u16, Value) {
 /// Serves the harness's state the way `quoro serve` composes it: the API,
 /// with an MCP route and a panel fallback merged in, all behind the
 /// demotion guard. The MCP route and the panel are stand-ins here: this
-/// crate cannot depend on `quoro-mcp` or the binary's panel. The MCP crate
-/// tests the real `/mcp` behind the guard.
+/// crate cannot depend on `quoro-mcp` or the binary's panel. The binary's
+/// own `serve::tests::the_composed_service_answers_not_primary_once_demoted`
+/// serves the real composition, and the MCP crate tests the real `/mcp`
+/// behind the guard.
 async fn whole_service(server: &Server) -> String {
     let service = quoro_control_plane::demotion::guard(
         quoro_control_plane::router(server.state.clone())
@@ -579,6 +581,110 @@ async fn a_failed_meta_write_still_demotes_the_running_process() {
     .await;
     let (status, body) = refused_upgrade(&server, &a.credential).await;
     assert_eq!((status, &body["code"]), (503, &json!("not_primary")));
+
+    // A later stale_term that fails to record again changes nothing.
+    server.state.hub.stale_term(Some(6)).await;
+    assert_eq!(meta(&server, "demoted_by_term").await, None);
+
+    // Once the write can go through, the next stale_term records it, past
+    // the refusal every other write gets, with the same term rule.
+    sqlx::query("DROP TRIGGER refuse_demotion")
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    server.state.hub.stale_term(Some(7)).await;
+    assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("7"));
+    assert_eq!(
+        server
+            .state
+            .store
+            .demoted_by_term()
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("7")
+    );
+    assert!(server.state.store.begin_write().await.is_err());
+    // Recorded once: the first recorded term stays.
+    server.state.hub.stale_term(Some(9)).await;
+    assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("7"));
+}
+
+/// A `meta.term` that is not a number cannot rule the term: the error's own
+/// term is recorded. Without one there is no term to record, so nothing is
+/// recorded, the process is demoted all the same, and a later `stale_term`
+/// with a term records it.
+#[tokio::test]
+async fn a_bad_meta_term_records_the_errors_term_or_nothing() {
+    for node_term in [Some(5), None] {
+        let server = start_with_patient_node_session().await;
+        sqlx::query("UPDATE meta SET value = 'bad' WHERE key = 'term'")
+            .execute(server.state.store.pool())
+            .await
+            .unwrap();
+        server.state.hub.stale_term(node_term).await;
+        assert!(server.state.store.is_demoted(), "{node_term:?}");
+        assert!(server.state.store.begin_write().await.is_err());
+        match node_term {
+            Some(_) => {
+                assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
+            }
+            None => {
+                assert_eq!(meta(&server, "demoted_by_term").await, None);
+                server.state.hub.stale_term(Some(8)).await;
+                assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("8"));
+            }
+        }
+    }
+}
+
+/// From the demotion on a session sends `not_primary` and nothing else:
+/// frames queued for the node before its session task ran again are
+/// dropped, though they were queued while the session still lived.
+#[tokio::test]
+async fn a_frame_queued_at_the_demotion_never_reaches_the_node() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let mut on_a = Machine::connect(&server, &a).await;
+    on_a.settle().await;
+
+    // This runtime has one thread: nothing else runs between the demotion
+    // and the queued frames, so they wait together for the session task.
+    server.state.hub.stale_term(Some(5)).await;
+    for _ in 0..8 {
+        assert!(
+            server
+                .state
+                .hub
+                .queue_control_for_test(&a.node_id, &ControlMessage::Ping),
+            "the session is still registered"
+        );
+    }
+
+    let mut frames = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(10), on_a.socket.next())
+            .await
+            .expect("the session closes within 10 s")
+        {
+            None | Some(Err(_) | Ok(WsMessage::Close(_))) => break,
+            Some(Ok(WsMessage::Text(text))) => {
+                frames.push(serde_json::from_str::<Value>(text.as_str()).unwrap());
+            }
+            Some(Ok(_)) => {}
+        }
+    }
+    // A frame the session sent before the demotion may still be on the
+    // wire; none of the queued ones is, and nothing follows `not_primary`.
+    assert!(
+        frames.iter().all(|frame| frame["type"] != "ping"),
+        "a queued frame reached the node: {frames:?}"
+    );
+    let last = frames.last().expect("not_primary");
+    assert_eq!(last["type"], "error", "{frames:?}");
+    assert_eq!(last["body"]["code"], "not_primary", "{frames:?}");
+    assert_eq!(last["body"]["fatal"], true, "{frames:?}");
 }
 
 /// The harness serves the guard as `quoro serve` does: before a demotion

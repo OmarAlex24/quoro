@@ -196,6 +196,12 @@ pub async fn step<S: ObjectStore>(
     let lock = (row.lock_strength == quoro_providers::object_store::LockStrength::Compliance)
         .then(|| compliance_lock(now));
     let segment = segment_key(&root, first, last);
+    // A demoted primary writes no object (`node-agent-protocol.md` section
+    // 7.4): checked right before each write, as the demotion may land while
+    // a pass runs.
+    if state.store.stops_for_demotion("the audit export") {
+        return Ok(());
+    }
     if let Err(error) = store.put_new(&segment, body, lock.as_ref()).await {
         match error {
             ObjectStoreError::AlreadyExists => {
@@ -226,6 +232,9 @@ pub async fn step<S: ObjectStore>(
 
     let head = head_key(&root, last);
     let body = head_body(last, &head_hash, now);
+    if state.store.stops_for_demotion("the audit export") {
+        return Ok(());
+    }
     if let Err(error) = store.put_new(&head, body, lock.as_ref()).await {
         match error {
             ObjectStoreError::AlreadyExists => {
@@ -368,6 +377,9 @@ async fn recover<S: ObjectStore>(
             let lock = (row.lock_strength
                 == quoro_providers::object_store::LockStrength::Compliance)
                 .then(|| compliance_lock(now));
+            if state.store.stops_for_demotion("the audit export") {
+                return Ok(Recovery::Stop);
+            }
             if let Err(error) = store
                 .put_new(&head, head_body(last, &hash, now), lock.as_ref())
                 .await

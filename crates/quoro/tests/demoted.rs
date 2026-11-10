@@ -195,7 +195,7 @@ async fn a_demoted_primary_starts_without_writing_and_answers_not_primary() {
                             .and_then(|p| p.parse::<u16>().ok());
                     }
                     let demoted = line.contains("demoted primary at term 5")
-                        && line.contains("quoro node rejoin");
+                        && line.contains("503 not_primary");
                     log.push(line);
                     if demoted {
                         return port.expect("the address is logged first");

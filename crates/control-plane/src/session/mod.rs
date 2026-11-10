@@ -1372,6 +1372,18 @@ impl NodeHub {
         });
     }
 
+    /// Test seam: queues `message` on `node_id`'s session as
+    /// [`NodeHub::send_control`] does, for a test that a demotion drops what
+    /// was queued.
+    #[doc(hidden)]
+    pub fn queue_control_for_test(
+        &self,
+        node_id: &str,
+        message: &quoro_proto::wire::ControlMessage,
+    ) -> bool {
+        self.send_control(node_id, message)
+    }
+
     /// Queues one control frame to `node_id`'s live session, whatever its
     /// generation. Returns whether a session took the frame; a node without
     /// one receives the change with its next snapshot.
@@ -2766,10 +2778,23 @@ async fn run_session(
     tokio::pin!(retry);
 
     'session: loop {
+        // Section 7.4: from the demotion on, the node receives `not_primary`
+        // and nothing else. Whatever this pass or an earlier one queued is
+        // dropped, though it was queued before the flag was set.
+        if session.hub.0.store.is_demoted() {
+            outbox.clear();
+            while rx.try_recv().is_ok() {}
+            let _ = socket.send(Message::Text(not_primary_frame().into())).await;
+            break;
+        }
         while let Ok(text) = rx.try_recv() {
             outbox.push(text);
         }
         for text in outbox.drain(..) {
+            // A demotion during an earlier send drops the rest.
+            if session.hub.0.store.is_demoted() {
+                continue 'session;
+            }
             if socket.send(Message::Text(text.into())).await.is_err() {
                 break 'session;
             }
@@ -2782,6 +2807,15 @@ async fn run_session(
         let follow_due = tokio::time::sleep_until(session.follow_retry.unwrap_or(deadline));
         let support_due = tokio::time::sleep_until(session.support_due.unwrap_or(deadline));
         tokio::select! {
+            // The demotion goes first: a frame or a timer ready in the same
+            // pass must not run before it.
+            biased;
+            seen = async { demoted.wait_for(|demoted| *demoted).await.is_ok() }, if demoted_open => {
+                // The top of the loop sends `not_primary` and ends the session.
+                if !seen {
+                    demoted_open = false;
+                }
+            }
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
@@ -2813,14 +2847,6 @@ async fn run_session(
                 match queued {
                     Some(text) => outbox.push(text),
                     None => break,
-                }
-            }
-            seen = async { demoted.wait_for(|demoted| *demoted).await.is_ok() }, if demoted_open => {
-                if seen {
-                    outbox.push(not_primary_frame());
-                    close_after_error = true;
-                } else {
-                    demoted_open = false;
                 }
             }
             changed_result = closed.changed() => {
@@ -4962,6 +4988,12 @@ async fn dns_challenge(
                 Ok(dns) => dns,
                 Err(message) => return failed_challenge(&message),
             };
+            // A demoted primary calls no provider (section 7.4): checked
+            // right before the call, as the demotion may land while this
+            // task runs.
+            if hub.0.store.stops_for_demotion("dns challenge") {
+                return failed_challenge("this primary is demoted");
+            }
             let name = format!("_acme-challenge.{}", challenge.hostname);
             match dns.create_txt(&name, value).await {
                 Ok(record_id) => {
@@ -4998,6 +5030,9 @@ async fn dns_challenge(
                 Ok(dns) => dns,
                 Err(message) => return failed_challenge(&message),
             };
+            if hub.0.store.stops_for_demotion("dns challenge") {
+                return failed_challenge("this primary is demoted");
+            }
             match dns
                 .delete_record(&quoro_providers::RecordId(record_id.to_string()))
                 .await
