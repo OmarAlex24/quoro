@@ -683,7 +683,7 @@ A `lease_revoke` whose fence failed:
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | `cluster_id` | string (`cls_`) | yes | Cluster the session belongs to |
-| `term` | integer | yes | Cluster term: `1` until the first promotion, then higher with each promotion (section 8.9) and with each restore (section 8.8). A node that has seen a higher term refuses this session with `stale_term` (section 8.8) |
+| `term` | integer | yes | Cluster term: `1` until the first promotion, then higher with each promotion (section 8.9) and with each restore (section 8.8). A node that has seen a higher term refuses this session with `stale_term`. At most 2^53 - 1 (section 8.8) |
 | `server_time` | string | yes | Primary's wall-clock time |
 | `heartbeat_interval_ms` | integer | yes | 5 000 in v1 |
 | `session_timeout_ms` | integer | yes | 15 000 in v1 |
@@ -728,7 +728,7 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | --- | --- | --- | --- |
 | `rev` | integer | yes | Monotonic revision of the node's desired state |
 | `issued_at` | string | yes | When the primary produced it |
-| `term` | integer | yes | Cluster term at issue time. A node refuses a snapshot whose term is lower than the highest term it has seen with `error` code `stale_term` (section 8.8) |
+| `term` | integer | yes | Cluster term at issue time. A node refuses a snapshot whose term is lower than the highest term it has seen with `error` code `stale_term`. At most 2^53 - 1 (section 8.8) |
 | `spec` | object | yes | `vms`, `routes`, `network`, `ingress` when the node runs a tunnel, `builds` when the node has builds to run (ADR 0117), `volumes` when the node holds volumes (ADR 0145), `backups` with `backup_repository` when it has backup jobs (ADR 0147), `mesh` once the machine is on the mesh, `edge` on a machine with the `edge` role (ADR 0143, ADR 0144), and from M5b `votes` on every voter and `witness` on a machine with the `witness` role (section 6.12, ADR 0170), and `quarantine_deletes` when the operator deleted quarantined copies the node keeps (section 9). An edge-only or witness-only machine gets `vms` and `routes` as empty lists and no `network` |
 | `signature` | string | yes | Base64 Ed25519 signature by the cluster signing key |
 
@@ -1280,7 +1280,7 @@ Restarts and stops are **never** commands. They are changes of desired state —
 | `code` | string | yes | One of the codes below |
 | `message` | string | yes | Human-readable detail |
 | `fatal` | boolean | yes | Whether the session ends |
-| `term` | integer | no | From M5b: the sender's term, the highest it has seen. Carried with code `stale_term` (section 8.8, ADR 0261), and with the `bad_message` a voter sends to a `support_request` because it voted in that term for another candidate (section 5.27, ADR 0280) |
+| `term` | integer | no | From M5b: the sender's term, the highest it has seen. Carried with code `stale_term` (section 8.8, ADR 0261), and with the `bad_message` a voter sends to a `support_request` because it voted in that term for another candidate (section 5.27, ADR 0280). At most 2^53 - 1 (section 8.8) |
 | `re` | string (`msg_`) | no | The message that caused it, in the envelope |
 
 | Code | Fatal | Meaning |
@@ -1573,13 +1573,13 @@ The primary acknowledges nothing: completeness is checked through `status_report
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `term` | integer | yes | The primary's term |
+| `term` | integer | yes | The primary's term, at most 2^53 - 1 (section 8.8) |
 | `primary_node_id` | string (`nod_`) | yes | The node holding the primary status, as in `welcome` |
 | `support_ms` | integer | yes | `S`, the support window asked for; 15 000 by default, at least 3 000 |
 | `max_lease_ms` | integer | yes | `L`, the longest `duration_ms` the primary may grant while this support lasts: `D` normally, `W` while a maintenance window is open (section 8.11) |
 | `voters_version` | integer | yes | The voter-set version the primary counts against (section 8.10) |
 
-The voter answers with `support_grant` (section 5.28) once its promise is stored, or with `error`: `stale_term`, fatal, when `term` is lower than the highest term it has seen (section 8.8); `bad_message`, non-fatal, when it voted in this term for another candidate than `primary_node_id`, or when `support_ms` is below the floor. The `bad_message` for a vote in this term carries the voter's `term` (section 5.18), so a restored primary learns of that term (section 8.8, ADR 0280). A machine that is not a voter ignores the message.
+The voter answers with `support_grant` (section 5.28) once its promise is stored, or with `error`: `stale_term`, fatal, when `term` is lower than the highest term it has seen (section 8.8); `bad_message`, non-fatal, when it voted in this term for another candidate than `primary_node_id`, when `support_ms` is below the floor, or when `term` is above 2^53 - 1 (section 8.8). The `bad_message` for a vote in this term carries the voter's `term` (section 5.18), so a restored primary learns of that term (section 8.8, ADR 0280). A machine that is not a voter ignores the message.
 
 ```json
 {
@@ -1603,7 +1603,7 @@ The voter answers with `support_grant` (section 5.28) once its promise is stored
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `term` | integer | yes | The term supported, equal to the request's |
+| `term` | integer | yes | The term supported, equal to the request's, at most 2^53 - 1 (section 8.8) |
 | `support_ms` | integer | yes | The window granted, equal to the request's |
 | `max_lease_ms` | integer | yes | The `L` recorded with the promise, equal to the request's |
 | `voters_version` | integer | yes | The voter-set version of the voter's stored desired state; the primary counts the support only when it equals its own (section 8.10) |
@@ -1734,6 +1734,7 @@ The mesh is kernel WireGuard driven over netlink, with no `wg` or `wg-quick` pro
 - **Keys.** The machine generates its WireGuard key pair on its first M5a start, keeps the private key root-only next to its credential, and sends the public key in `hello`. A machine never receives another machine's private key.
 - **Interface.** The node agent creates the WireGuard interface `quoro-wg0` with `address`, `listen_port` and `peers`, and keeps it equal to them on every apply. A peer that disappears from `peers` is removed. On the edge, the kernel routes each node's guest subnet to that node's peer through `allowed_ips`.
 - **Firewall.** On a node, traffic that arrives on the mesh interface is dropped unless it comes from an `allow` entry's `source` and goes to its `address` and `port` over TCP. The mesh carries no traffic between guests, and none to the host's own services except, on a voter, the vote listener: TCP to its own mesh address on `spec.votes.port`, from the mesh address of each voter with the `node` role in `spec.votes.voters` (section 8.9). That rule follows from `spec.votes` and is not repeated in `allow`. From M5b the target of a warm volume also admits the replication listener: TCP to its own mesh address on the warm entry's `port`, from the source's mesh address, through the `allow` entry the primary sends it (section 6.13). The isolation of guests from each other (ADR 0084) is unchanged.
+- **New connections.** On every machine with `spec.mesh`, the edge included, a new connection leaves through the mesh interface only when one of that machine's own root processes opens it: nothing forwarded opens one there.
 - **NAT.** A machine without an `endpoint` in the other side's peer entry dials the peer that has one and keeps the tunnel open with `persistent_keepalive_s`. WireGuard follows a peer whose address changed (roaming), which also covers a node whose address changed after a reboot.
 - **Endpoints (ADR 0144, ADR 0266).** The primary takes a machine's `endpoint` from the source address of its session, with `listen_port` as the port: for the edge from M5a, and for every voter from M5b. When that address is loopback or unspecified, the machine runs on the primary's host, and the primary takes the first non-loopback IPv4 host of `welcome.primary_urls` instead. A machine whose session the primary has not seen since it started has no endpoint. The primary keeps endpoints in memory only and does not detect NAT. A voter behind NAT therefore gets its NAT's public address as its endpoint: handshakes sent there fail, which is harmless, because WireGuard follows the voter's real address once the voter's own keepalive arrives, as long as the other side is reachable. Every peer entry between two voters carries `persistent_keepalive_s` 25.
 - **Voters that cannot reach each other.** Two voters that both have no endpoint get no peer entry for each other. Two voters that are both really behind NAT get entries that never carry traffic, and the primary cannot tell that case apart. In both cases a candidate on one of them cannot count the other's vote (section 8.9), and the two cannot replicate a warm volume to each other: a warm copy between them stays `syncing` or goes `failed` (`openapi.yaml`, `App.warm`).
@@ -1905,7 +1906,7 @@ Before it changes anything, the command refuses when:
 Then it:
 
 1. **Shows the log position:** the agent's last verified `seq`, the `head_seq` the primary last reported with its time, and the difference. Entries the old primary wrote and this machine never received are lost to the cluster. That holds only for entries that some machine with the `node` role never acknowledged: a machine that passes the refusals above holds every entry the old primary counted as replicated (section 8.4, ADR 0261), unless it promotes with `--accept-loss`. With `--dry-run` the command stops after the vote pre-check of step 2, having changed nothing, so an operator can compare candidates.
-2. **Takes the term.** It asks every voter for a term `T` over the mesh (section 8.9): first with `check`, then for real. `T` is one above the highest term this machine has seen or that any vote answer carries, `check` answers included (ADR 0261). When a `check` answer carries a term at or above `T`, the command raises `T` to one above that term and checks again at the new `T` before any real vote. A rerun of the command starts from the highest term it then sees (ADR 0280). Only the command uses that term: the agent stores a term only when it grants a real vote. Before the first real vote request, it freezes its own agent (below). It goes on only when a majority answers `granted`; otherwise it prints each voter's answer and stops, and no voter moved, because only the pre-check ran.
+2. **Takes the term.** It asks every voter for a term `T` over the mesh (section 8.9): first with `check`, then for real. `T` is one above the highest term this machine has seen or that any vote answer carries, `check` answers included (ADR 0261). When a `check` answer carries a term at or above `T`, the command raises `T` to one above that term and checks again at the new `T` before any real vote. When `T` would be above 2^53 - 1, the term ceiling (section 8.8), the command stops there, before any real vote request and so before the freeze, and changes nothing. A rerun of the command starts from the highest term it then sees (ADR 0280). Only the command uses that term: the agent stores a term only when it grants a real vote. Before the first real vote request, it freezes its own agent (below). It goes on only when a majority answers `granted`; otherwise it prints each voter's answer and stops, and no voter moved, because only the pre-check ran.
 3. **Waits for the old primary's grants:** until the latest receipt time plus `lease_wait_ms` over the granting answers (section 8.9), printing the time left. `--ack-fence` skips this wait (below).
 4. **Builds the database (ADR 0228, ADR 0229, ADR 0297).** In a new database file it creates the schema of this binary (`db-schema.sql` and every migration), then applies the followed entries in `seq` order, folded per entity (ADR 0317):
    - In memory, each entity has one row. A `create` replaces it with the payload's row. An `update` merges the payload over it, so a field absent from the payload keeps its value. A `delete` removes it and ignores its payload.
@@ -2350,6 +2351,18 @@ Definitions, each on the clock of the machine that uses it:
 - A primary that receives `stale_term` stops granting and renewing `expiring` leases at once, and demotes itself: it ends its sessions with `not_primary` and answers every later request with `503` `not_primary` (section 7.4, ADR 0182). The error carries the sender's `term` (section 5.18). A primary restored with `quoro restore --accept-loss` that has sent no `lease_grant` yet starts again at one above that term instead of demoting itself (`backup-format.md` section 8.2, ADR 0261).
 - A voter that voted in the primary's term for another candidate answers its `support_request` with `bad_message`, which carries the voter's `term` (section 5.27). A primary restored with `--accept-loss` that has sent no `lease_grant` yet treats it like `stale_term`: it starts again at one above that term. A plain restore lacks that voter's support, and `backup-format.md` section 8.2 gives the way out (ADR 0280).
 
+**The term ceiling.** A term never exceeds 2^53 - 1, the highest integer the change log's canonical JSON carries (section 8.5). No machine sends, stores or adopts a higher term: not as its own term, a vote, `demoted_by_term` (section 7.4) or the highest term it has seen.
+
+- After a `welcome` whose `term` is above it, the node adopts nothing, answers `bad_message` and ends the session, then dials again (section 4.4).
+- A `desired_state` or `support_request` whose `term` is above it is answered with `error` code `bad_message` and changes nothing (section 5.18).
+- An `error` whose `term` is above it is malformed. The primary does not demote itself on it, records nothing from it and logs it, and a primary restored with `--accept-loss` does not start again from it.
+- A vote request whose `term` is above it is answered `400` before any write, and a vote answer whose `term` is above it counts as no answer (section 8.9).
+- A promotion whose `T` would pass it stops before any real vote request and changes nothing (section 7.3).
+- A primary restored with `--accept-loss` whose new term, one above an error's `term`, would pass it has no exception left, and demotes itself as any other primary does (section 7.4).
+- A restored primary whose first term would pass it writes nothing (`backup-format.md` section 8.2).
+
+A cluster whose term has reached the ceiling has no recovery path: no promotion and no restore can take a higher term. This is a stated limit, as is the demotion of a primary restored with `--accept-loss` above.
+
 **Restarts.** Before it answers, the voter stores:
 
 - its term and the candidate it voted for;
@@ -2378,15 +2391,15 @@ Manual promotion (ADR 0182) takes a term `T` from a majority of voters. `T` is a
 
 Every two voters are therefore peers unless both are witness-only (section 6.9). Two voters that both have no endpoint get no peer entry for each other, and two voters both really behind NAT get entries that carry no traffic (section 6.9). A candidate on one of them cannot count the other, and needs its majority among the voters it reaches.
 
-**Listener.** The node agent of every voter listens on its own mesh address, TCP port `spec.votes.port` (51821 by default), and on no other address. Requests are HTTP/1.1 with JSON bodies inside the WireGuard tunnel, which encrypts and authenticates them. The voter answers only requests that come from the mesh address of a voter with the `node` role in its `spec.votes.voters`, because only such a machine holds custody seals and can be promoted (ADR 0180); any other source is answered `not_allowed`. The candidate asks every voter in the same way, its own agent included.
+**Listener.** The node agent of every voter listens on its own mesh address, TCP port `spec.votes.port` (51821 by default), and on no other address. Requests are HTTP/1.1 with JSON bodies inside the WireGuard tunnel, which encrypts and authenticates them. The voter answers only requests that come from the mesh address of a voter with the `node` role in its `spec.votes.voters`, because only such a machine holds custody seals and can be promoted (ADR 0180); any other source is answered `not_allowed`. The candidate asks every voter in the same way, its own agent included. A connection from the voter's own host to its mesh address carries that address as its source, whichever process opened it. The voter takes such a connection as coming from that address only when its client socket belongs to root (uid 0), as the promotion command's does (section 7.3). It answers any other owner `not_allowed`, and answers `503` when it cannot read the owner (below).
 
 **Request.** `POST /v1/vote`:
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | `cluster_id` | string (`cls_`) | yes | The cluster |
-| `term` | integer | yes | The term asked for, `T`: above the highest term the candidate has seen or any vote answer carried, `check` answers included (section 7.3) |
-| `candidate_node_id` | string (`nod_`) | yes | The candidate; must be the node whose mesh address sent the request |
+| `term` | integer | yes | The term asked for, `T`: above the highest term the candidate has seen or any vote answer carried, `check` answers included (section 7.3). At most 2^53 - 1 (section 8.8) |
+| `candidate_node_id` | string (`nod_`) | yes | The candidate; must be the node whose mesh address sent the request, otherwise the request is refused `not_allowed` |
 | `voters_version` | integer | yes | The voter-set version the candidate counts against (section 8.10) |
 | `check` | boolean | no | `true`: answer as for a real vote and change nothing. A candidate checks first and votes only when a majority would grant, so a promotion that cannot win moves no voter to a higher term |
 
@@ -2395,9 +2408,9 @@ Every two voters are therefore peers unless both are witness-only (section 6.9).
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | `node_id` | string (`nod_`) | yes | The voter |
-| `term` | integer | yes | The voter's current term after this request |
+| `term` | integer | yes | The voter's current term after this request. An answer whose `term` is above 2^53 - 1 counts as no answer (section 8.8) |
 | `vote` | string | yes | `granted` or `refused` (with `check`, what a real vote would answer) |
-| `reason` | string | no | With `refused`: `stale_term` (the term asked for is not above the voter's term, unless the voter already granted that term to this candidate), `support_held` (the voter's promise to the primary it supports has not run out), `voters_changed` (the request's `voters_version` differs from the voter's), `not_allowed` (another cluster, or the source is not a voter with the `node` role) |
+| `reason` | string | no | With `refused`: `stale_term` (the term asked for is not above the voter's term, unless the voter already granted that term to this candidate), `support_held` (the voter's promise to the primary it supports has not run out), `voters_changed` (the request's `voters_version` differs from the voter's), `not_allowed` (another cluster, the source is not a voter with the `node` role, `candidate_node_id` is not the node the request comes from, or the request comes from the voter's own host through a socket that is not root's) |
 | `retry_after_ms` | integer | no | With `support_held`: time until the promise runs out |
 | `lease_wait_ms` | integer | no | With `granted`: `max(0, lease horizon - now)` on the voter's clock |
 | `voters_version` | integer | yes | The voter's voter-set version |
@@ -2420,6 +2433,12 @@ Every two voters are therefore peers unless both are witness-only (section 6.9).
 3. the request's `voters_version` equals its own.
 
 It then stores `T` and `C` (section 12) before it answers `granted`, and from then on refuses every lower term: its session with an older primary ends with `stale_term`.
+
+**Order of the refusals.** The voter checks the reasons in this order, and the first that applies decides the answer: `not_allowed`, `stale_term`, `voters_changed`, `support_held`. A `check` follows the same order.
+
+**When the voter cannot tell.** A voter that cannot tell whether it may grant answers `503` with the body `{"error": "<text>"}`: when its store fails or the work that answers the request fails, when its stored desired state carries no `spec.votes`, when it cannot read its boot clock or its boot id, when its stored support is from another boot and it has not yet restarted that support on this one (section 8.8, "Restarts"), or when it cannot read the owner of a connection from its own host (above). It grants nothing and writes nothing. A `503` may come before a refusal that would otherwise apply. The candidate counts it as no answer, neither granted nor refused, and may ask again.
+
+**A request outside this section.** A body that is not a vote request, or whose `term` is above 2^53 - 1 (section 8.8), is answered `400` with the same body, before any write. A candidate never asks for such a term (section 7.3).
 
 **Candidate rules.** The candidate may act as primary at term `T` only when voters forming a majority of the voter set of its `voters_version` answered `granted`, and it has then waited until the latest `(receipt time of the answer) + lease_wait_ms` over those answers, on its own monotonic clock. An operator can skip that wait by acknowledging the fence (`--ack-fence`, section 7.3, ADR 0182), which declares the old primary's node lost (section 8.3) and leaves every lease's own gate in place.
 

@@ -787,7 +787,8 @@ components:
             Term of the current primary: 1 until the first promotion, then one
             more with each promotion, which takes it from a majority of voters
             (node-agent-protocol.md sections 7.3 and 8.8). Automatic elections
-            are M6.
+            are M6. It never exceeds 2^53 - 1 (node-agent-protocol.md
+            section 8.8).
         votes:
           $ref: '#/components/schemas/ClusterVotes'
         signing_key_id:
