@@ -99,7 +99,7 @@ export interface MockDb {
 /**
  * A deploy that mock mode keeps in progress, so the deploying states show in
  * demos: one redeploy of an app after another, each walking its phases over
- * about two minutes, the next starting a few seconds after the last succeeded.
+ * three minutes, the next starting a few seconds after the last succeeded.
  */
 export interface DeployCycle {
   appId: string;
@@ -500,7 +500,7 @@ const CYCLE_QUEUE_S = 2;
 /**
  * A cycle's phases: their status, how long each takes and what the
  * deployment's log says when it begins. Slower than the seeded history's
- * rollouts, so a demo can watch each phase: about two minutes in all.
+ * rollouts, so a demo can watch each phase: three minutes in all.
  */
 export const CYCLE_PHASES: ReadonlyArray<{
   phase: NonNullable<Deployment['phase']>;
@@ -508,13 +508,13 @@ export const CYCLE_PHASES: ReadonlyArray<{
   seconds: number;
   message: (image: string, port: number) => string;
 }> = [
-  { phase: 'pull', status: 'preparing', seconds: 18, message: (image) => `Pulling ${image}` },
-  { phase: 'rootfs', status: 'preparing', seconds: 28, message: () => 'Preparing the root filesystem' },
-  { phase: 'boot', status: 'starting', seconds: 42, message: () => 'Booting the microVM' },
+  { phase: 'pull', status: 'preparing', seconds: 35, message: (image) => `Pulling ${image}` },
+  { phase: 'rootfs', status: 'preparing', seconds: 45, message: () => 'Preparing the root filesystem' },
+  { phase: 'boot', status: 'starting', seconds: 50, message: () => 'Booting the microVM' },
   {
     phase: 'health',
     status: 'starting',
-    seconds: 30,
+    seconds: 48,
     message: (_image, port) => `Waiting for the health check on port ${port}`,
   },
 ];
@@ -524,7 +524,7 @@ export const CYCLE_SECONDS =
   CYCLE_QUEUE_S + CYCLE_PHASES.reduce((total, step) => total + step.seconds, 0);
 
 /** Seconds between one cycle's success and the next redeploy. */
-export const CYCLE_GAP_S = 8;
+export const CYCLE_GAP_S = 10;
 
 const isDeploymentLive = (status: Deployment['status']): boolean =>
   status === 'pending' || status === 'preparing' || status === 'starting';

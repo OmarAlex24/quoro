@@ -126,7 +126,7 @@ describe("Atlas's web in the seed", () => {
     const web = await appNamed('web', 'atlas');
     const id = db.deployCycle?.deploymentIds[0];
     const seen: Array<[string, string | null | undefined]> = [];
-    for (const seconds of [10, 25, 40, 50, 80, 95, 110]) {
+    for (const seconds of [10, 30, 50, 75, 100, 140, 170]) {
       at(seconds);
       const detail = await read<AppDetail>(`/apps/${web.id}`);
       const deployment = (await deploymentsOf(web.id)).find((item) => item.id === id);
@@ -137,9 +137,9 @@ describe("Atlas's web in the seed", () => {
     }
     expect(seen).toEqual([
       ['preparing', 'pull'],
+      ['preparing', 'pull'],
       ['preparing', 'rootfs'],
       ['preparing', 'rootfs'],
-      ['starting', 'boot'],
       ['starting', 'boot'],
       ['starting', 'health'],
       ['starting', 'health'],
@@ -150,7 +150,7 @@ describe("Atlas's web in the seed", () => {
     expect(times).toEqual([...times].sort((left, right) => left - right));
   });
 
-  it('succeeds after about two minutes, becomes current, and the next redeploy starts after the gap', async () => {
+  it('succeeds after three minutes, becomes current, and the next redeploy starts after the gap', async () => {
     const web = await appNamed('web', 'atlas');
     const first = db.deployCycle?.deploymentIds[0];
 
@@ -190,14 +190,14 @@ describe("Atlas's web in the seed", () => {
 
   it('after a long pause starts only the redeploy that would run now', async () => {
     const web = await appNamed('web', 'atlas');
-    at(3_600);
+    at(3_650);
     await read<AppDetail>(`/apps/${web.id}`);
     const ids = db.deployCycle?.deploymentIds ?? [];
     expect(ids).toHaveLength(3);
     const [live] = await deploymentsOf(web.id);
     expect(live?.id).toBe(ids[2]);
     expect(live?.status === 'pending' || live?.status === 'preparing' || live?.status === 'starting').toBe(true);
-    expect(3_600_000 - (Date.parse(live!.created_at) - cycleStart)).toBeLessThan((CYCLE_SECONDS + CYCLE_GAP_S) * 1_000);
+    expect(3_650_000 - (Date.parse(live!.created_at) - cycleStart)).toBeLessThan((CYCLE_SECONDS + CYCLE_GAP_S) * 1_000);
     expect(eventsOf('deployment.succeeded')).toHaveLength(2);
     expect(verifyAuditChain().ok).toBe(true);
   });
@@ -208,7 +208,7 @@ describe("Atlas's web in the seed", () => {
     expect(response.status).toBe(202);
     const theirs = (await response.json()) as Deployment;
 
-    at(3_600 + 10 * (CYCLE_SECONDS + CYCLE_GAP_S));
+    at(3_650 + 10 * (CYCLE_SECONDS + CYCLE_GAP_S));
     await vi.runAllTimersAsync();
     const list = await deploymentsOf(web.id);
     expect(list[0]?.id).toBe(theirs.id);
