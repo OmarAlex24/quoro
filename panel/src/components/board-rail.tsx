@@ -217,7 +217,13 @@ export function RailNodes({ nodes, apps }: { nodes: readonly Node[]; apps: reado
         const memoryMark = last ? capacityShare(last.memory_used_bytes, last.memory_total_bytes) : null;
         const tag = nodeTags(node)[0];
         return (
-          <div key={node.id} className="pnd">
+          <Link
+            key={node.id}
+            to="/nodes"
+            search={{ tab: 'vms', node: node.id }}
+            className="pnd"
+            aria-label={`${node.name}, ${readout.words}${last ? `, ${Math.round(last.cpu_usage * 100)}% busy` : ''}. Its VMs`}
+          >
             <LampDot ring={readout.tone} core={readout.tone} pulse={readout.pulse} size={11} label={readout.words} />
             <div className="pnd-n">
               <b>{node.name}</b>
@@ -248,7 +254,7 @@ export function RailNodes({ nodes, apps }: { nodes: readonly Node[]; apps: reado
                 </div>
               </div>
             ) : null}
-          </div>
+          </Link>
         );
       })}
       <N1Strip nodes={nodes} apps={apps} picker={false} className="pfit" />

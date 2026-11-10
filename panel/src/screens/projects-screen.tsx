@@ -204,6 +204,8 @@ function ProjectsBoard() {
     const onKey = (event: KeyboardEvent) => {
       if (event.key.toLowerCase() !== 'k' || !(event.metaKey || event.ctrlKey)) return;
       if (event.altKey || event.shiftKey) return;
+      // Another dialog (New project, a Deny confirm) keeps the keys to itself.
+      if (document.querySelector('[role="dialog"]:not(.cmd)')) return;
       event.preventDefault();
       setSearching((open) => !open);
     };

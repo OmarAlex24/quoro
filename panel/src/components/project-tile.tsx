@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router';
 import { AlertTriangle, ChevronRight, GitBranch } from 'lucide-react';
-import { memo, useCallback, useMemo } from 'react';
+import { useCallback, useMemo } from 'react';
 import type { Approval, Vm } from '../api/generated/model';
 import { useGetAppMetrics } from '../api/generated/metrics/metrics';
 import { shortId } from '../lib/agency-format';
@@ -38,7 +38,7 @@ export interface TileContext {
  * app and standalone VM; and at its foot what happened last. The name links to
  * the project and its box takes the click; each row opens its service.
  */
-export const ProjectTile = memo(function ProjectTile({
+export function ProjectTile({
   tile,
   status,
   foot,
@@ -98,7 +98,7 @@ export const ProjectTile = memo(function ProjectTile({
       {foot ? <TileFootLine foot={foot} when={footWhen} /> : null}
     </article>
   );
-});
+}
 
 function ServiceRow({
   service,

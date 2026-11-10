@@ -10,6 +10,8 @@ import { DitherCanvas } from './dither-canvas';
 import { LampDot } from './lamp';
 import { useLiveNodes } from './live-nodes';
 
+/** Room at the right for the newest sample's dot. */
+const BAND_PAD = { ...BARE_PAD, right: 6 };
 const INTERVAL_MS = 5_000;
 const LOOK = { labels: false, dot: true, lineWidth: 1.5 } as const;
 
@@ -49,7 +51,7 @@ export function ClusterBand({ apps, vms }: { apps: readonly App[]; vms: readonly
           axis: { max, ticks: [] },
           tickLabel: String,
           intervalMs: INTERVAL_MS,
-          pad: BARE_PAD,
+          pad: BAND_PAD,
         }),
         read,
         LOOK,
