@@ -4502,113 +4502,560 @@
     }
   }
 
-  /* The nodes: a card per machine, three across on a wide screen. */
-  .nodes {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
-    gap: 14px;
+  /*
+   * The Nodes page (issue 786): the cluster band, a wide card per machine,
+   * two across from 768 px and one under that, then the node events beside
+   * the invitation to add a node.
+   */
+  .tabbed-head {
+    position: relative;
+    padding: 22px 28px 0;
   }
 
-  .node {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
+  .tabbed-wide::before {
+    content: '';
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 260px;
+    pointer-events: none;
+    background: radial-gradient(900px 260px at 30% -40px, var(--glow), transparent 70%);
+  }
+
+  .tabbed-wide {
+    position: relative;
+  }
+
+  .tabbed-wide .tabs {
+    margin-bottom: 0;
+  }
+
+  .nodes-page {
+    position: relative;
+    padding-bottom: 28px;
+    container: nodes-page / inline-size;
+  }
+
+  /* The band: the N+1 sentence and the simulation on the left, the cluster's facts on the right. */
+  .nband {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    margin-bottom: 16px;
     overflow: hidden;
   }
 
-  .node-h {
+  .nband-ha {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 6px 10px;
-    padding: 14px 16px 0;
+    gap: 12px;
+    min-width: 0;
+    padding: 12px 14px;
   }
 
-  .node-h b {
+  .nband-sh {
+    width: 30px;
+    height: 30px;
+    flex: none;
+    display: grid;
+    place-items: center;
+    border-radius: 7px;
+    color: var(--run);
+    border: 1px solid color-mix(in oklab, var(--run) 40%, var(--line));
+    background-color: color-mix(in oklab, var(--run) 10%, var(--surface));
+    transition:
+      color var(--motion-change) var(--ease),
+      border-color var(--motion-change) var(--ease),
+      background-color var(--motion-change) var(--ease);
+  }
+
+  .nband-sh svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .nband-shift .nband-sh {
+    color: var(--shift);
+    border-color: color-mix(in oklab, var(--shift) 45%, var(--line));
+    background-color: color-mix(in oklab, var(--shift) 10%, var(--surface));
+  }
+
+  .nband-fault .nband-sh {
+    color: var(--fault);
+    border-color: color-mix(in oklab, var(--fault) 45%, var(--line));
+    background-color: color-mix(in oklab, var(--fault) 10%, var(--surface));
+  }
+
+  .nband-t {
+    flex: 1 1 200px;
+    min-width: 0;
+    font-size: var(--type-body);
+    line-height: 1.5;
+    color: var(--ink);
+  }
+
+  .nband-t b {
+    font-weight: 620;
+  }
+
+  .nband-act {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .nband-act .btn[aria-pressed='true'] {
+    border-color: var(--line-2);
+  }
+
+  /* The chevron that picks which node the question is about: a small square beside the button. */
+  .field.nband-pick {
+    width: 28px;
+    height: 28px;
+    min-height: 0;
+    padding: 0;
+    justify-content: center;
+    border-radius: 7px;
+  }
+
+  .nband-cl {
+    display: flex;
+    margin: 0;
+    border-left: 1px solid var(--line);
+    background-color: var(--sunk);
+  }
+
+  .nband-cl > div {
+    display: grid;
+    align-content: center;
+    gap: 1px;
+    padding: 9px 16px;
+    border-left: 1px solid var(--line);
+  }
+
+  .nband-cl > div:first-child {
+    border-left: 0;
+  }
+
+  .nband-cl dt,
+  .nband-skel-k {
+    font-size: var(--type-min);
+    color: var(--ink-2);
+  }
+
+  .nband-cl dd {
+    margin: 0;
+    font-size: var(--type-body);
+    font-weight: 600;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .skel.nband-skel-sh {
+    width: 30px;
+    height: 30px;
+    flex: none;
+    border-radius: 7px;
+  }
+
+  /* The cards. */
+  .ncards {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    align-items: start;
+  }
+
+  .ncard {
+    min-width: 0;
+    transition:
+      opacity var(--motion-change) var(--ease),
+      filter var(--motion-change) var(--ease),
+      border-color var(--motion-feedback) var(--ease),
+      box-shadow var(--motion-feedback) var(--ease);
+  }
+
+  .ncard:hover {
+    border-color: var(--line-2);
+    box-shadow: var(--card-up);
+  }
+
+  /* The node whose loss is simulated: dimmed and drained of colour until the simulation stops. */
+  .ncard[data-lost] {
+    opacity: 0.5;
+    filter: saturate(0.3);
+  }
+
+  .ncard-h {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 9px;
+    padding: 14px 16px 4px;
+  }
+
+  .ncard-name {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-stretch: 106%;
+    font-size: 17px;
     font-weight: 620;
-    font-size: var(--type-card);
-    letter-spacing: -0.003em;
+    font-stretch: 110%;
+    letter-spacing: -0.005em;
   }
 
-  .node-word {
+  .ncard-conn {
     margin-left: auto;
     font-size: var(--type-small);
     color: var(--ink-2);
   }
 
-  .node-b {
-    flex: 1;
-    display: grid;
-    align-content: start;
-    gap: 12px;
-    padding: 12px 16px 14px;
+  .ncard-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    padding: 0 16px 12px;
+    font-size: var(--type-small);
+    color: var(--ink-2);
   }
 
-  .node-note {
+  .ncard-meta > span {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .ncard-meta svg {
+    width: 14px;
+    height: 14px;
+    flex: none;
+    color: var(--ink-3);
+  }
+
+  .ncard-meta .text-fault svg {
+    color: inherit;
+  }
+
+  .ncard-ver {
+    white-space: nowrap;
+  }
+
+  .ncard-b {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+    gap: 16px;
+    padding: 12px 16px 14px;
+    border-top: 1px solid var(--line);
+  }
+
+  .ncard-mt {
+    display: grid;
+    align-content: start;
+    gap: 11px;
+  }
+
+  .ncard-mt .meter {
+    gap: 5px;
+  }
+
+  .ncard-mt .meter-h b {
+    font-weight: 600;
+  }
+
+  .ncard-u {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--type-min);
+    color: var(--ink-2);
+  }
+
+  .ncard-u i {
+    display: inline-block;
+    width: 2px;
+    height: 9px;
+    background-color: var(--ink);
+  }
+
+  .ncard-note {
     font-size: var(--type-small);
     line-height: 1.45;
     color: var(--ink-2);
   }
 
-  /* The node's own reading of its host, under the meters. */
-  .node-live {
+  .ncard-ch {
+    display: grid;
+    align-content: start;
+    gap: 10px;
+  }
+
+  /* The small live charts inside a card. */
+  .chart.chart-sm {
+    display: grid;
+    gap: 6px;
+    padding: 9px 12px 8px;
+    background-color: var(--sunk);
+    box-shadow: inset 0 1px 0 var(--hi);
+  }
+
+  .chart-sm .chart-h {
+    flex-wrap: nowrap;
+    gap: 8px;
+    margin-bottom: 0;
+    font-size: var(--type-small);
+  }
+
+  .chart-sm .chart-h b {
+    font-size: 13.5px;
+  }
+
+  .chart-sm .chart-v {
+    margin-left: auto;
+    font-weight: 600;
+    font-size: var(--type-small);
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .chart-sm .chart-plot {
+    height: 54px;
+  }
+
+  .chart-sm .chart-empty {
+    inset: 0;
+    font-size: var(--type-min);
+  }
+
+  .chart-sm .tip {
+    top: -2px;
+    padding: 3px 7px;
+    font-size: var(--type-min);
+  }
+
+  /* What the node runs: a strip of cells, each as wide as its VM's vCPUs. */
+  .ncard-r {
+    display: grid;
+    gap: 7px;
+    padding: 11px 16px 13px;
+    border-top: 1px solid var(--line);
+  }
+
+  .ncard-r-h {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: var(--type-small);
+    color: var(--ink-2);
+  }
+
+  .ncard-r-h b {
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .vcells {
     display: flex;
     flex-wrap: wrap;
+    gap: 3px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .vcell {
+    --kind: var(--k-git);
+    position: relative;
+    display: flex;
     align-items: center;
-    gap: 4px 8px;
-    padding-top: 10px;
-    border-top: 1px dashed var(--line);
-    font-size: 12px;
+    justify-content: center;
+    gap: 4px;
+    flex: var(--u, 1) 0 0;
+    min-width: 22px;
+    max-width: calc(var(--u, 1) * 74px);
+    height: 26px;
+    padding: 0 4px;
+    overflow: hidden;
+    white-space: nowrap;
+    border-radius: 4px;
+    border: 1px solid color-mix(in oklab, var(--kind) 45%, var(--line));
+    background-color: color-mix(in oklab, var(--kind) 16%, var(--sunk));
+    background-image: conic-gradient(
+      from 270deg at 1px 1px,
+      color-mix(in oklab, var(--kind) 30%, transparent) 25%,
+      transparent 0
+    );
+    background-size: 3px 3px;
+    font-size: 11px;
+    color: color-mix(in oklab, var(--kind) 45%, var(--ink));
+    cursor: default;
+    transition:
+      transform var(--motion-feedback) var(--ease),
+      border-color var(--motion-feedback) var(--ease);
+  }
+
+  .vcell > span:not(.sr-only) {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .vcell[data-k='image'] {
+    --kind: var(--k-image);
+  }
+
+  .vcell[data-k='vm'] {
+    --kind: var(--k-vm);
+  }
+
+  .vcell:hover {
+    z-index: 1;
+    transform: translateY(-2px);
+    border-color: var(--kind);
+  }
+
+  /* An app that would arrive in the simulated loss: a dashed outline that rises into place. */
+  .vcell-ghost {
+    border-style: dashed;
+    background: transparent;
+    animation: vcell-in var(--motion-change) var(--ease) both;
+  }
+
+  .vcell-ghost + .vcell-ghost {
+    animation-delay: 80ms;
+  }
+
+  @keyframes vcell-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+  }
+
+  /* Where the node stands on the change log and the desired state. */
+  .ncard-f {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    padding: 9px 16px;
+    border-top: 1px solid var(--line);
+    border-radius: 0 0 10px 10px;
+    background-color: color-mix(in oklab, var(--surface) 60%, var(--sunk));
+    font-size: var(--type-small);
     color: var(--ink-2);
+  }
+
+  .ncard-f > span {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .ncard-f b {
+    font-weight: 560;
+    color: var(--ink);
     font-variant-numeric: tabular-nums;
   }
 
-  .node-live-t {
-    min-width: 0;
+  .skel.ncard-skel-lamp {
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
   }
 
-  .node-live-go {
-    margin-left: auto;
-    color: var(--accent);
-    font-size: 12px;
-    text-underline-offset: 3px;
+  .skel.ncard-skel-chart {
+    border-radius: 10px;
   }
 
-  .node-live-go:hover {
-    text-decoration: underline;
+  /* Under the cards: the node events and the invitation to add a node. */
+  .nunder {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 316px;
+    align-items: start;
+    gap: 16px;
+    margin-top: 16px;
   }
 
-  .node-live-go:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-    border-radius: 3px;
+  .nevents .psec-h {
+    padding: 11px 14px 9px;
   }
 
-  .svc-foot.node-foot {
-    flex-wrap: wrap;
-    row-gap: 4px;
+  .nev {
+    cursor: default;
   }
 
-  .node-foot-link {
-    color: var(--ink-2);
-    text-decoration: none;
+  .nev-lamp {
+    display: grid;
+    place-items: center;
+    height: 20px;
   }
 
-  .node-foot-link:hover {
-    color: var(--ink);
-    text-decoration: underline;
-    text-underline-offset: 3px;
+  .skel.nev-skel-lamp {
+    width: 10px;
+    height: 10px;
+    margin: 5px auto 0;
+    border-radius: 50%;
   }
 
-  .node-foot-link:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-    border-radius: 3px;
+  .nevents-empty {
+    padding: 8px 16px 18px;
+  }
+
+  .pghost.ninvite {
+    align-items: center;
+  }
+
+  /* From 768 to 1180 px: the meters above the charts in each card, and the events above the invitation. */
+  @media (max-width: 1180px) {
+    .ncard-b,
+    .nunder {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  @media (max-width: 767.98px) {
+    .tabbed-head {
+      padding: 16px 14px 0;
+    }
+  }
+
+  /*
+   * A page narrower than 560 px (a phone, or a tablet beside the sidebar):
+   * one card across, the band's facts in a grid under its sentence.
+   */
+  @container nodes-page (max-width: 559.98px) {
+    .ncards {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .nband {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .nband-ha {
+      flex-wrap: wrap;
+    }
+
+    .nband-cl {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border-left: 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .nband-cl > div:nth-child(3) {
+      border-left: 0;
+    }
+
+    .nband-cl > div:nth-child(n + 3) {
+      border-top: 1px solid var(--line);
+    }
+
+    .ncard-conn {
+      width: 100%;
+      margin-left: 22px;
+    }
   }
 
   .stats.stats-2 {
@@ -6692,6 +7139,15 @@
 
     .pev-new {
       animation: none;
+    }
+
+    /* A ghost cell is just there; a cell answers the pointer with its border only. */
+    .vcell-ghost {
+      animation: none;
+    }
+
+    .vcell:hover {
+      transform: none;
     }
 
     .btn:active {

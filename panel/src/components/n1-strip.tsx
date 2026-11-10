@@ -9,6 +9,31 @@ import { cn } from '../lib/utils';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 
 /**
+ * The question the N+1 strip asks the primary (`getClusterCapacity`, ADR
+ * 0178): what if this node were lost. The node is the biggest one until
+ * another is picked; the answer is polled every 30 s and, while another
+ * node's answer loads, the last one stays (`isPlaceholderData`). It is a
+ * read: nothing is reserved. The Nodes page draws the same answer on its
+ * cards.
+ */
+export function useLossSimulation(nodes: readonly Node[]) {
+  const candidates = lossCandidates(nodes);
+  const biggest = biggestNode(nodes);
+  const [picked, setPicked] = useState<string | null>(null);
+  const chosen = candidates.find((node) => node.id === picked) ?? biggest;
+  const ask = chosen !== undefined && candidates.length > 1;
+
+  const capacity = useGetClusterCapacity(
+    { lost_node_id: chosen?.id ?? '' },
+    { query: { enabled: ask, retry: false, refetchInterval: 30_000, placeholderData: keepPreviousData } },
+  );
+  const answer = capacity.error ? undefined : capacity.data;
+  // While another node's answer loads, the sentence about the last one stays, dimmed.
+  const lost = (answer && nodes.find((node) => node.id === answer.lost_node_id)) || chosen;
+  return { candidates, chosen, setPicked, answer, lost, loading: capacity.isPlaceholderData };
+}
+
+/**
  * The N+1 strip: one sentence on whether the cluster can lose its biggest
  * node, from the primary's own simulation of that loss (`getClusterCapacity`,
  * ADR 0178). "Simulate losing" asks the same question about another node; it
@@ -27,19 +52,7 @@ export function N1Strip({
   picker?: boolean;
   className?: string;
 }) {
-  const candidates = lossCandidates(nodes);
-  const biggest = biggestNode(nodes);
-  const [picked, setPicked] = useState<string | null>(null);
-  const chosen = candidates.find((node) => node.id === picked) ?? biggest;
-  const ask = chosen !== undefined && candidates.length > 1;
-
-  const capacity = useGetClusterCapacity(
-    { lost_node_id: chosen?.id ?? '' },
-    { query: { enabled: ask, retry: false, refetchInterval: 30_000, placeholderData: keepPreviousData } },
-  );
-  const answer = capacity.error ? undefined : capacity.data;
-  // While another node's answer loads, the sentence about the last one stays, dimmed.
-  const lost = (answer && nodes.find((node) => node.id === answer.lost_node_id)) || chosen;
+  const { candidates, chosen, setPicked, answer, lost, loading } = useLossSimulation(nodes);
   if (!lost) return null;
   const readout = n1Readout({ lost, nodes, answer, apps });
   if (!readout) return null;
@@ -49,7 +62,7 @@ export function N1Strip({
     <section
       className={cn('n1', `n1-${readout.tone}`, className)}
       aria-label="If a node goes down"
-      aria-busy={capacity.isPlaceholderData || undefined}
+      aria-busy={loading || undefined}
     >
       <span className="n1-gl" aria-hidden="true">
         <Icon strokeWidth={1.7} />
