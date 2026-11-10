@@ -28,7 +28,7 @@
 //! [`leases::grant_app_lease`] can grant at once: the row carries no unsettled
 //! mark and already reads `expiring` for at least `D`, and the primary holds
 //! majority support. A grant that would wait for its write to be replicated
-//! over the machines with the `node` role ([`leases::NewGrant::Held`]) is
+//! over the machines with the `node` role ([`leases::NewGrant::Waiting`]) is
 //! refused with `no_support` before anything is written ([`held_grant`]),
 //! where ADR 0292 would answer `202` and send the grant later. The shared
 //! machinery that holds such a grant is not built yet. Support that lapses
@@ -421,7 +421,7 @@ async fn held_while_away(
 }
 
 /// Why the warm node's grant would wait for its write to be replicated over
-/// the machines with the `node` role ([`leases::NewGrant::Held`]).
+/// the machines with the `node` role ([`leases::NewGrant::Waiting`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Held {
     /// The row carries the unsettled mark (section 8.4, "Grants of a marked
@@ -779,7 +779,9 @@ async fn change(
                 tokio::time::sleep(remaining).await;
                 continue;
             }
-            NewGrant::Held => {
+            // The interim rule of ADR 0303 Q1: a grant that must wait is
+            // refused, and dropping `w` rolls its write back.
+            NewGrant::Waiting(_) => {
                 return Err(conflict(
                     Reason::NoSupport,
                     "the primary does not hold the support of a majority of voters, so it \
@@ -1039,7 +1041,7 @@ mod tests {
                     .await
                     .unwrap();
             match (&granted, guess) {
-                (NewGrant::Held, Some(_)) => {}
+                (NewGrant::Waiting(_), Some(_)) => {}
                 (NewGrant::Granted(lease), None) => {
                     assert_eq!(lease.fencing_token, 5, "{case}");
                     assert_eq!(lease.mode, "expiring", "{case}");
