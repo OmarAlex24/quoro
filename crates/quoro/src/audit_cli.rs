@@ -107,12 +107,13 @@ async fn verify_database(path: &Path) -> ExitCode {
         Ok(pool) => pool,
         Err(error) => return read_error(path, &error),
     };
-    let rows = match sqlx::query(&format!(
-        "SELECT {} FROM audit_log ORDER BY seq",
-        audit::COLUMNS
-    ))
-    .fetch_all(&pool)
-    .await
+    let columns = match stored_columns(&pool).await {
+        Ok(columns) => columns,
+        Err(error) => return read_error(path, &error),
+    };
+    let rows = match sqlx::query(&format!("SELECT {columns} FROM audit_log ORDER BY seq"))
+        .fetch_all(&pool)
+        .await
     {
         Ok(rows) => rows,
         Err(error) => return read_error(path, &error),
@@ -131,4 +132,29 @@ async fn verify_database(path: &Path) -> ExitCode {
         .and_then(Value::as_i64)
         .unwrap_or(1);
     report(&audit::verify_records(records, first_seq, GENESIS_HASH))
+}
+
+/// The columns to select for [`audit::record_value_from_row`]. A database
+/// from before migration 0014 has no `params_sha256` and no `params_bytes`;
+/// none of its records keeps a digest, so both are selected as NULL and the
+/// records verify with both fields absent, as they were hashed. The database
+/// is read-only, so it is not migrated.
+///
+/// # Errors
+///
+/// A database error while reading the table's columns.
+async fn stored_columns(pool: &sqlx::SqlitePool) -> Result<String, sqlx::Error> {
+    let digest: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pragma_table_info('audit_log') \
+         WHERE name IN ('params_sha256', 'params_bytes')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(if digest == 2 {
+        audit::COLUMNS.to_string()
+    } else {
+        audit::COLUMNS
+            .replace("params_sha256", "NULL AS params_sha256")
+            .replace("params_bytes", "NULL AS params_bytes")
+    })
 }

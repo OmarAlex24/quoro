@@ -14,7 +14,7 @@ use crate::store::now_rfc3339;
 use axum::body::Body;
 use axum::extract::{FromRequest, MatchedPath, OptionalFromRequest, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt as _;
@@ -59,14 +59,20 @@ pub enum Limited {
     /// The body is within the limit: the request, with its body in memory.
     Within(Request),
     /// The body is above the limit: the request's parts. The body was read
-    /// no further than the limit and is dropped unparsed.
+    /// no further than the limit, or not at all when its declared
+    /// `Content-Length` is above it, and is dropped unparsed.
     Above(Parts),
 }
 
 /// Reads `request`'s body into memory, but no more of it than
-/// [`MAX_BODY_BYTES`] and the chunk that passes it. The count is of the bytes
-/// that arrive, so a body without a `Content-Length`, such as a chunked one,
-/// is held to the limit too. The parts, upgrade handles included, are kept.
+/// [`MAX_BODY_BYTES`] and the chunk that passes it. The parts, upgrade
+/// handles included, are kept.
+///
+/// A body whose declared `Content-Length` is above the limit is refused
+/// before any of it is read. The server sends `100 Continue` only when the
+/// body is first read, so a client that waits for it gets the 413 instead.
+/// Otherwise the count is of the bytes that arrive, so a body without a
+/// `Content-Length`, such as a chunked one, is held to the limit too.
 ///
 /// # Errors
 ///
@@ -74,6 +80,9 @@ pub enum Limited {
 /// answers it.
 pub async fn read_limited(request: Request) -> Result<Limited, ApiError> {
     let (parts, body) = request.into_parts();
+    if declared_length(&parts.headers).is_some_and(|length| length > MAX_BODY_BYTES as u64) {
+        return Ok(Limited::Above(parts));
+    }
     let mut stream = body.into_data_stream();
     let mut read = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -89,6 +98,18 @@ pub async fn read_limited(request: Request) -> Result<Limited, ApiError> {
         parts,
         Body::from(read),
     )))
+}
+
+/// The body size a request declares in its `Content-Length`, if it declares
+/// one. The HTTP server has already refused a malformed one.
+fn declared_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// The answer to a body above the limit, `413 payload_too_large`. When
@@ -140,12 +161,44 @@ enum Credentials {
     Caller,
 }
 
-/// The [`Credentials`] of `operation` (`POST /api/v1/vms` style), read once
+/// What the request body limit needs to know about an operation of the
+/// generated document to decide whether section 3 of `audit-log-format.md`
+/// records a call of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Operation {
+    credentials: Credentials,
+    /// Whether the operation is a read: one of the document's `get`
+    /// operations. No read's handler records a human's call, except those in
+    /// [`HUMAN_READS_RECORDED`]: most authorize through
+    /// [`CallCtx::authorize_read`], which never does, and the rest never
+    /// refuse a human. Every other operation is a mutating call, whose
+    /// handler records it for every identity.
+    read: bool,
+}
+
+/// The reads section 3 records for a human too: the transcript fetch
+/// (section 3.3). Its handler records its call under the same name.
+const HUMAN_READS_RECORDED: [&str; 1] = [crate::api::interactive::TRANSCRIPT_OPERATION];
+
+impl Operation {
+    /// Whether section 3 records a call of `operation` by `identity`: every
+    /// call by an agent, reads included, and a human's mutating call, but a
+    /// human's read only when it is in [`HUMAN_READS_RECORDED`]. A refusal of
+    /// a call section 3 records is recorded too, so the 413 of such a call
+    /// is. The handlers follow the same rule, with one exception: `getMe`
+    /// records no call, an agent's included, while its 413 is recorded for
+    /// an agent as section 3 says.
+    fn records(self, operation: &str, identity: &Identity) -> bool {
+        !identity.is_human() || !self.read || HUMAN_READS_RECORDED.contains(&operation)
+    }
+}
+
+/// The [`Operation`] named `operation` (`POST /api/v1/vms` style), read once
 /// from the operations' annotations (`crate::openapi`, which
-/// `tests/openapi_diff.rs` holds to the contract). An operation the document
-/// does not name takes the usual credentials.
-fn credentials_of(operation: &str) -> Credentials {
-    static OPERATIONS: OnceLock<HashMap<String, Credentials>> = OnceLock::new();
+/// `tests/openapi_diff.rs` holds to the contract), or `None` when the
+/// document has no such operation.
+fn operation_of(operation: &str) -> Option<Operation> {
+    static OPERATIONS: OnceLock<HashMap<String, Operation>> = OnceLock::new();
     let operations = OPERATIONS.get_or_init(|| {
         use utoipa::OpenApi as _;
         let document = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap_or_default();
@@ -162,24 +215,25 @@ fn credentials_of(operation: &str) -> Credentials {
                 };
                 operations.insert(
                     format!("{} {path}", method.to_ascii_uppercase()),
-                    credentials,
+                    Operation {
+                        credentials,
+                        read: method == "get",
+                    },
                 );
             }
         }
         operations
     });
-    operations
-        .get(operation)
-        .copied()
-        .unwrap_or(Credentials::Caller)
+    operations.get(operation).copied()
 }
 
-/// The context of an API call whose body is above the limit, when the audit
-/// log records the call: the request is authenticated as the operation
-/// authenticates it, without its body. `None` for a call with no identity (a
-/// public operation, a missing or unknown credential, a path no operation
-/// matched) and for a human's read, which is not recorded
-/// (`audit-log-format.md` section 3).
+/// The context of an API call whose body is above the limit, when section 3
+/// of `audit-log-format.md` records the call ([`Operation::records`]): the
+/// request is authenticated as the operation authenticates it, without its
+/// body. `None` for a request that matched no operation (an unknown path, or
+/// a method its path does not have), for a call with no identity (a public
+/// operation, a missing or unknown credential) and for a human's read that
+/// is not recorded.
 ///
 /// # Errors
 ///
@@ -188,8 +242,18 @@ async fn oversized_caller(state: &AppState, parts: &Parts) -> Result<Option<Call
     let Some(path) = parts.extensions.get::<MatchedPath>() else {
         return Ok(None);
     };
-    let operation = format!("{} {}", parts.method, path.as_str());
-    let resolved = match credentials_of(&operation) {
+    // The router answers `HEAD` with the `GET` handler, which records its
+    // call under the `GET` operation.
+    let method = if parts.method == Method::HEAD {
+        &Method::GET
+    } else {
+        &parts.method
+    };
+    let operation = format!("{method} {}", path.as_str());
+    let Some(spec) = operation_of(&operation) else {
+        return Ok(None);
+    };
+    let resolved = match spec.credentials {
         Credentials::None => return Ok(None),
         Credentials::AgentKey => crate::auth::authenticate_agent_key(state, &parts.headers)
             .await
@@ -201,7 +265,7 @@ async fn oversized_caller(state: &AppState, parts: &Parts) -> Result<Option<Call
         Err(error) if error.code == Code::Unauthenticated => return Ok(None),
         Err(error) => return Err(error),
     };
-    if identity.is_human() && matches!(parts.method, Method::GET | Method::HEAD) {
+    if !spec.records(&operation, &identity) {
         return Ok(None);
     }
     Ok(Some(CallCtx::new(
@@ -1067,6 +1131,14 @@ impl CallCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{Credential, UserIdentity};
+    use quoro_types::Role;
+
+    fn credentials_of(operation: &str) -> Credentials {
+        operation_of(operation)
+            .unwrap_or_else(|| panic!("{operation} is an operation"))
+            .credentials
+    }
 
     #[test]
     fn which_calls_have_an_identity_comes_from_the_operations() {
@@ -1095,6 +1167,67 @@ mod tests {
                 Credentials::Caller,
                 "{operation}"
             );
+        }
+        // A method a path does not have, and a path the document does not
+        // have, are no operation.
+        assert_eq!(operation_of("PUT /api/v1/projects"), None);
+        assert_eq!(operation_of("POST /api/v1/no-such-thing"), None);
+    }
+
+    #[test]
+    fn a_humans_read_is_recorded_only_when_section_3_records_it() {
+        let human = Identity {
+            principal: Principal::User(UserIdentity {
+                user_id: "usr_01JC9Z6Q5W8N3K4T7R2M1XHB0D".into(),
+                email: "a@example.com".into(),
+                name: "A".into(),
+                role: Role::Owner,
+            }),
+            credential: Credential::Session {
+                session_id: "ses_1".into(),
+            },
+        };
+        let agent = Identity {
+            principal: Principal::Agent(AgentIdentity {
+                agent_id: "agt_01JC9Z6Q5W8N3K4T7R2M1XHB0D".into(),
+                name: "operator".into(),
+                model: "m".into(),
+                owner_user_id: "usr_01JC9Z6Q5W8N3K4T7R2M1XHB0D".into(),
+                disabled: false,
+            }),
+            credential: Credential::AccessToken {
+                token_id: "atk_1".into(),
+            },
+        };
+        let records = |operation: &str, identity: &Identity| {
+            operation_of(operation)
+                .unwrap_or_else(|| panic!("{operation} is an operation"))
+                .records(operation, identity)
+        };
+        // A human's transcript fetch is recorded (section 3.3); other reads
+        // are not.
+        assert!(records(
+            "GET /api/v1/interactive-sessions/{session_id}/transcript",
+            &human
+        ));
+        for read in [
+            "GET /api/v1/projects",
+            "GET /api/v1/audit",
+            "GET /api/v1/users",
+            "GET /api/v1/tokens",
+        ] {
+            assert!(!records(read, &human), "{read}");
+            assert!(records(read, &agent), "{read}");
+        }
+        // Every mutating call is recorded, for both.
+        for call in [
+            "POST /api/v1/projects",
+            "POST /api/v1/audit/verify",
+            "DELETE /api/v1/interactive-sessions/{session_id}",
+            "PUT /api/v1/apps/{app_id}/env",
+        ] {
+            assert!(records(call, &human), "{call}");
+            assert!(records(call, &agent), "{call}");
         }
     }
 }

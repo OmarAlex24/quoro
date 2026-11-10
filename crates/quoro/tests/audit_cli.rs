@@ -138,7 +138,7 @@ async fn verify_accepts_records_that_keep_a_digest() {
     .unwrap();
     let segment: String = rows
         .iter()
-        .map(|row| format!("{}\n", audit::record_value_from_row(row).unwrap()))
+        .map(|row| format!("{}\n", audit::export_line(row).unwrap()))
         .collect();
     assert!(
         segment.contains("\"params_sha256\":"),
@@ -167,6 +167,90 @@ async fn verify_accepts_records_that_keep_a_digest() {
             "{source}: {stdout}"
         );
     }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Runs `quoro audit verify <source> <path>` and returns its exit status and
+/// standard output.
+fn verify(source: &str, path: &std::path::Path) -> (Option<i32>, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_quoro"))
+        .args(["audit", "verify", source])
+        .arg(path)
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+/// Makes the WAL part of the database file, so a copy or a read-only open
+/// sees every committed record.
+async fn checkpoint(store: &Store) {
+    sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
+        .execute(store.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn db_verify_reads_a_database_from_before_the_digest_columns() {
+    // A database from before migration 0014 has no `params_sha256` and no
+    // `params_bytes`. Its records verify with both fields absent, and the
+    // read-only database is not migrated.
+    let dir = std::env::temp_dir().join(format!("quoro-audit-0013-{}", random_secret()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("quoro.db");
+
+    let store = Store::open(&database).await.unwrap();
+    let mut w = store.begin_write().await.unwrap();
+    for _ in 0..3 {
+        audit::append(&mut w.tx, &record()).await.unwrap();
+    }
+    w.commit().await.unwrap();
+    // `params_bytes` first: its CHECK names `params_sha256`.
+    for statement in [
+        "ALTER TABLE audit_log DROP COLUMN params_bytes",
+        "ALTER TABLE audit_log DROP COLUMN params_sha256",
+        "UPDATE meta SET value = '14' WHERE key = 'schema_version'",
+    ] {
+        sqlx::query(statement).execute(store.pool()).await.unwrap();
+    }
+    let digest: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pragma_table_info('audit_log') \
+         WHERE name IN ('params_sha256', 'params_bytes')",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(digest, 0, "the columns are gone");
+    checkpoint(&store).await;
+    drop(store);
+
+    let (code, out) = verify("--db", &database);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.starts_with("ok: checked 3 records, head "), "{out}");
+
+    // Nothing was migrated.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(SqliteConnectOptions::new().filename(&database))
+        .await
+        .unwrap();
+    let digest: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pragma_table_info('audit_log') \
+         WHERE name IN ('params_sha256', 'params_bytes')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(digest, 0, "the database was not migrated");
+    pool.close().await;
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

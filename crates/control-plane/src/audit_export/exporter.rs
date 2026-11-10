@@ -18,7 +18,6 @@ use crate::AppState;
 use crate::audit;
 use crate::changelog::{self, Actor, Op};
 use crate::error::ApiError;
-use crate::jcs;
 use quoro_providers::object_store::{ObjectStore, ObjectStoreError};
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -484,13 +483,11 @@ fn seqs_are_contiguous(rows: &[SqliteRow], first: i64) -> bool {
 }
 
 /// Canonical JSON Lines of the rows: one RFC 8785 object per line, in `seq`
-/// order (section 8.1).
+/// order, `params` as stored ([`audit::export_line`], section 8.1).
 fn segment_body(rows: &[SqliteRow]) -> Result<Vec<u8>, ApiError> {
     let mut out = Vec::new();
     for row in rows {
-        let value = audit::record_value_from_row(row)?;
-        let line = jcs::canonicalize(&value)
-            .map_err(|error| ApiError::internal(&format!("canonical record: {error:?}")))?;
+        let line = audit::export_line(row)?;
         out.extend_from_slice(line.as_bytes());
         out.push(b'\n');
     }

@@ -288,6 +288,58 @@ pub fn record_value_from_row(row: &SqliteRow) -> Result<Value, sqlx::Error> {
     Ok(fields.value_with_hash(&hash))
 }
 
+/// One stored record as a line of an exported segment (section 8.1), without
+/// the newline: the complete record in RFC 8785 form, with `params` written
+/// as the text stored for them.
+///
+/// `quoro audit verify --file` then reads each line's `params` from the same
+/// text `--db` reads from the row, so for every record the line reads back
+/// exactly as the stored record does, and verifies offline (section 6.1)
+/// exactly when the stored record verifies. Writing `params` in the RFC 8785
+/// form of the value read back from that text instead can give another text:
+/// a float can read back as a number whose RFC 8785 form differs from the
+/// stored one (`72096104873994100000` reads back as a number written
+/// `72096104873994090000`).
+///
+/// # Errors
+///
+/// A missing or mistyped column, `params` that does not parse as JSON, or a
+/// field with no RFC 8785 form.
+pub fn export_line(row: &SqliteRow) -> Result<String, sqlx::Error> {
+    let params_text: String = row.try_get("params")?;
+    let record = record_value_from_row(row)?;
+    let Value::Object(members) = record else {
+        return Err(sqlx::Error::Protocol(
+            "an audit record is a JSON object".into(),
+        ));
+    };
+    // RFC 8785 orders members by the UTF-16 code units of their names; the
+    // record's names are ASCII, so their byte order is that order.
+    let mut names: Vec<&String> = members.keys().collect();
+    names.sort();
+    let mut line = String::from("{");
+    for (index, name) in names.into_iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        line.push_str(&canonical(&Value::String(name.clone()))?);
+        line.push(':');
+        if name == "params" {
+            line.push_str(&params_text);
+        } else {
+            line.push_str(&canonical(&members[name])?);
+        }
+    }
+    line.push('}');
+    Ok(line)
+}
+
+/// [`jcs::canonicalize`] with its error as a row error, for [`export_line`].
+fn canonical(value: &Value) -> Result<String, sqlx::Error> {
+    jcs::canonicalize(value)
+        .map_err(|e| sqlx::Error::Protocol(format!("audit record field: {}", e.0)))
+}
+
 /// Appends `record` and returns its audit `seq`. Must run in the same write
 /// transaction as the change it describes (section 3.1).
 ///

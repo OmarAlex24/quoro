@@ -678,3 +678,103 @@ async fn a_float_a_node_reads_as_another_number_is_audited_with_a_digest() {
     assert_eq!(verified["ok"], true, "{verified}");
     assert_eq!(verified["checked"].as_i64(), Some(seq));
 }
+
+#[tokio::test]
+async fn a_humans_transcript_fetch_above_the_limit_is_recorded() {
+    // Section 3.3 records every transcript fetch, a human's too, so its 413
+    // is recorded like any refusal of it.
+    let server = common::start().await;
+    let owner = server.owner().await;
+    let before = audit_count(&server).await;
+    let res = owner
+        .get(server.url("/api/v1/interactive-sessions/trm_01JC9Z6Q5W8N3K4T7R2M1XHB0D/transcript"))
+        .header("Content-Type", "application/json")
+        .body(project_body(LIMIT + 1))
+        .send()
+        .await
+        .unwrap();
+    let (status, code, _) = common::problem(res).await;
+    assert_eq!((status, code.as_str()), (413, "payload_too_large"));
+    assert_eq!(audit_count(&server).await, before + 1);
+    let record = newest(&server, &owner).await;
+    assert_too_large_record(
+        &record,
+        "GET /api/v1/interactive-sessions/{session_id}/transcript",
+    );
+    assert_eq!(record["actor_type"], "user");
+}
+
+#[tokio::test]
+async fn a_request_that_matched_no_operation_is_not_recorded() {
+    // An unknown path, and a method its path does not have, are no call the
+    // audit log records, whatever the size of the body.
+    let server = common::start().await;
+    let owner = server.owner().await;
+    let before = audit_count(&server).await;
+    for (method, path) in [
+        (reqwest::Method::POST, "/api/v1/no-such-thing"),
+        (reqwest::Method::PUT, "/api/v1/projects"),
+        (reqwest::Method::PATCH, "/api/v1/audit"),
+    ] {
+        let res = owner
+            .request(method.clone(), server.url(path))
+            .header("Content-Type", "application/json")
+            .body(project_body(LIMIT + 1))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            res.status().is_client_error(),
+            "{method} {path}: {}",
+            res.status()
+        );
+    }
+    assert_eq!(audit_count(&server).await, before);
+}
+
+/// Sends `head` and then `body` exactly as given on a new connection, and
+/// returns what the server sends back within ten seconds. A server that waits
+/// for the rest of a body sends nothing more in that time.
+async fn send_raw(server: &common::Server, head: &str, body: &[u8]) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::TcpStream::connect(server.address())
+        .await
+        .unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut response),
+    )
+    .await;
+    String::from_utf8_lossy(&response).to_string()
+}
+
+#[tokio::test]
+async fn a_declared_length_above_the_limit_is_refused_before_the_body_is_read() {
+    // A Content-Length of 262,145 with a two-byte body: the server refuses it
+    // from the header, without waiting for bytes that never come, and before
+    // it would send `100 Continue` to a client that waits for one.
+    let server = common::start().await;
+    let owner = server.owner().await;
+    let cookie = session_cookie(&server).await;
+    for expect in ["", "Expect: 100-continue\r\n"] {
+        let before = audit_count(&server).await;
+        let head = format!(
+            "POST /api/v1/projects HTTP/1.1\r\nHost: {}\r\nCookie: {cookie}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n{expect}\
+             Connection: close\r\n\r\n",
+            server.address(),
+            LIMIT + 1
+        );
+        let text = send_raw(&server, &head, b"{}").await;
+        assert!(
+            text.starts_with("HTTP/1.1 413 "),
+            "{expect:?}: the first answer is the 413: {text:?}"
+        );
+        assert!(text.contains("payload_too_large"), "{text}");
+        assert_eq!(audit_count(&server).await, before + 1, "{expect:?}");
+        assert_too_large_record(&newest(&server, &owner).await, "POST /api/v1/projects");
+    }
+}

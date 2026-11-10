@@ -26,7 +26,7 @@ Branch on these; they never change meaning.
 | `approval_required` | 403 | 3 | The answer names the `scope` and `target`. File the approval: `--request-approval --wait`, or MCP `request_approval`. |
 | `not_found` | 404 | 5 | The id or name does not exist, or your grant's selector hides it. |
 | `conflict` | 409 | 6 | The state does not allow the call: a deploy or build in progress, an image given to a Git app (use `quoro up`), a name in use. |
-| `payload_too_large` | 413 | 1 | The request body is larger than 256 KiB, so the primary did not read it; the call is still recorded in the audit log. Send less at once: split the change into smaller calls. Repeating the same call cannot succeed. |
+| `payload_too_large` | 413 | 1 | The request body is larger than 256 KiB, so the primary did not read it. The call is recorded in the audit log only when the caller has an identity: with a missing or invalid credential it is answered the same and not recorded. Send less at once: split the change into smaller calls. Repeating the same call cannot succeed. |
 | `validation_failed` | 422 | 1 | The input is invalid; the message names the field. Fix it and repeat. |
 | `rate_limited` | 429 | 1 | Wait and repeat once. |
 | `not_primary` | 503 | 1 | The call reached a node that is not the primary. Retry; if it persists, tell the human. |
