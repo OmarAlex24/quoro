@@ -1205,6 +1205,199 @@ mod tests {
         f.done();
     }
 
+    /// A marked `expiring` row while `policy`, renewed on a session that
+    /// lists nothing: the answer at `D`, and its settling `ping`'s id.
+    async fn settling_answer(policy: &str, stored: i64) -> (Fixture, Session, String) {
+        let f = fixture(policy, "expiring", Some(stored), true).await;
+        let (mut session, _) = f.session(None).await;
+        let answer = renew(&mut session, "msg_r1", 3).await;
+        assert_answer(&answer, "msg_r1", 3, D);
+        let ping = ping_of(&answer);
+        (f, session, ping)
+    }
+
+    /// A revoke between the settle's answer and its `pong` (a failover with
+    /// the source connected, a restore, a deletion): no settle. The row stays
+    /// revoked and marked, and the `pong` adds no change-log entry.
+    #[tokio::test]
+    async fn a_revoke_before_the_pong_refuses_the_settle() {
+        let (f, mut session, ping) = settling_answer("warm", D as i64).await;
+        let mut w = f.state.store.begin_write().await.unwrap();
+        leases::revoke_app_lease(&mut w.tx, APP, &actor())
+            .await
+            .unwrap()
+            .unwrap();
+        w.commit().await.unwrap();
+        let writes = f.writes().await;
+        pong(&mut session, &ping).await;
+        let row = f.row().await;
+        assert!(row.is_revoked());
+        assert_eq!((row.mode.as_str(), row.unsettled), ("expiring", true));
+        assert_eq!(f.writes().await, writes);
+        f.done();
+    }
+
+    /// A token raise between the settle's answer and its `pong`, as a fence
+    /// acknowledgement or a declaration writes it (`leases::bump_tokens`):
+    /// no settle, and the row keeps the raised token and the mark.
+    #[tokio::test]
+    async fn a_token_raise_before_the_pong_refuses_the_settle() {
+        let (f, mut session, ping) = settling_answer("warm", D as i64).await;
+        let mut w = f.state.store.begin_write().await.unwrap();
+        let bumped = leases::bump_tokens(&mut w.tx, &[LEASE.to_string()], &f.node_id, &actor())
+            .await
+            .unwrap();
+        assert_eq!(bumped.len(), 1);
+        w.commit().await.unwrap();
+        let writes = f.writes().await;
+        pong(&mut session, &ping).await;
+        let row = f.row().await;
+        assert_eq!((row.fencing_token, row.unsettled), (4, true));
+        assert_eq!(f.writes().await, writes);
+        f.done();
+    }
+
+    /// A failed fence of the lease between the settle's answer and its
+    /// `pong`, recorded in the node's `fence_failure` or noted unrecorded
+    /// (section 8.5 step 1): no settle. Neither writes the lease's row, so
+    /// only the failed-fence check refuses it.
+    #[tokio::test]
+    async fn a_failed_fence_before_the_pong_refuses_the_settle() {
+        for recorded in [true, false] {
+            let (f, mut session, ping) = settling_answer("warm", D as i64).await;
+            if recorded {
+                let mut w = f.state.store.begin_write().await.unwrap();
+                let failed = crate::fences::Failed {
+                    lease_ids: &[LEASE.to_string()],
+                    app_ids: &[APP.to_string()],
+                    vm_ids: &[],
+                };
+                assert!(
+                    crate::fences::record_failure(&mut w.tx, &f.node_id, &failed, &actor())
+                        .await
+                        .unwrap()
+                );
+                w.commit().await.unwrap();
+            } else {
+                f.state.hub.note_failure_recorded(&f.node_id, LEASE, false);
+            }
+            let writes = f.writes().await;
+            pong(&mut session, &ping).await;
+            let row = f.row().await;
+            assert!(row.unsettled, "recorded: {recorded}");
+            assert_eq!(f.writes().await, writes, "recorded: {recorded}");
+            f.done();
+        }
+    }
+
+    /// The settle never lowers the stored duration: the row stores 30 s,
+    /// the answer carries `D` = 15 s, and after the `pong` the row still
+    /// stores 30 s (section 8.4, "What the authority must enforce").
+    #[tokio::test]
+    async fn the_settle_never_lowers_the_duration() {
+        let (f, mut session, ping) = settling_answer("warm", 30_000).await;
+        pong(&mut session, &ping).await;
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.duration_ms, row.unsettled),
+            ("expiring", Some(30_000), false)
+        );
+        f.done();
+    }
+
+    /// The renewal after the one a policy change off `warm` ended a
+    /// conversion for: no grant, no write, and the gate as the `Ended`
+    /// answer left it. This pins today's behaviour on purpose: section 8.4
+    /// "From R until the holder has taken the grant" has the primary answer
+    /// these renewals, and a later change (PR 3 of #555) builds that.
+    #[tokio::test]
+    async fn the_renewal_after_an_ended_conversion_is_not_answered_yet() {
+        let f = fixture("none", "local", Some(30_000), true).await;
+        let (mut session, _) = f.session(None).await;
+        f.state
+            .hub
+            .note_conversion_sent(&f.node_id, session.generation, LEASE, 3, 30_000);
+        assert_answer(&renew(&mut session, "msg_r1", 3).await, "msg_r1", 3, D);
+        let writes = f.writes().await;
+        let gate = f.state.hub.authority().gate_remaining(LEASE);
+        assert_eq!(gate, Some(Duration::from_secs(36)));
+
+        let next = renew(&mut session, "msg_r2", 3).await;
+        assert!(of_type(&next, "lease_grant").is_empty(), "{next:?}");
+        assert_eq!(f.writes().await, writes);
+        assert_eq!(f.state.hub.authority().gate_remaining(LEASE), gate);
+        let row = f.row().await;
+        assert_eq!((row.mode.as_str(), row.unsettled), ("local", true));
+        f.done();
+    }
+
+    /// A primary restart between the settle's answer and its `pong`. For a
+    /// marked `expiring` row storing 30 s, the restarted primary's start gate
+    /// counts `start + 30 s + 2 x 3 s`, and a failover finds the lease held
+    /// whether or not that gate has passed, since the row is still marked.
+    #[tokio::test]
+    async fn a_restart_before_the_pong_keeps_a_marked_rows_start_gate() {
+        let (f, _session, _ping) = settling_answer("warm", 30_000).await;
+        let (after, clock) = restart(&f).await;
+        assert_eq!(
+            after.hub.authority().gate_remaining(LEASE),
+            Some(Duration::from_secs(36))
+        );
+        let lease = f.row().await;
+        assert!(lease.unsettled);
+        let mut conn = after.store.pool().acquire().await.unwrap();
+        for advance in [0, 36] {
+            clock.advance(Duration::from_secs(advance));
+            assert!(
+                crate::failover::held_while_away(&mut conn, after.hub.authority(), &lease)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "lease_held after {advance} s"
+            );
+        }
+        drop(conn);
+        f.done();
+    }
+
+    /// A primary restart between the settle's answer and its `pong`, for an
+    /// unmarked row that reads `local`, settled from the holder's `hello`:
+    /// the restarted primary seeds no gate, and a failover finds the lease
+    /// held as a `local` one (`lease_held`).
+    #[tokio::test]
+    async fn a_restart_before_the_pong_leaves_a_local_row_held() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        let (mut session, _) = f.session(Some(("uncertain", LeaseMode::Expiring, 3))).await;
+        let answer = renew(&mut session, "msg_r1", 3).await;
+        assert_answer(&answer, "msg_r1", 3, D);
+        ping_of(&answer);
+        let (after, _clock) = restart(&f).await;
+        assert_eq!(after.hub.authority().gate_remaining(LEASE), None);
+        let lease = f.row().await;
+        assert_eq!((lease.mode.as_str(), lease.unsettled), ("local", false));
+        let mut conn = after.store.pool().acquire().await.unwrap();
+        assert!(
+            crate::failover::held_while_away(&mut conn, after.hub.authority(), &lease)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(conn);
+        f.done();
+    }
+
+    /// Policy `hot` is read as `warm` (section 8.4, as `grant_app_lease`
+    /// reads it): a marked `expiring` row's renewal is answered, a `ping`
+    /// follows, and its `pong` settles the row.
+    #[tokio::test]
+    async fn a_hot_apps_marked_row_is_settled_as_a_warm_ones() {
+        let (f, mut session, ping) = settling_answer("hot", D as i64).await;
+        pong(&mut session, &ping).await;
+        let row = f.row().await;
+        assert_eq!((row.mode.as_str(), row.unsettled), ("expiring", false));
+        f.done();
+    }
+
     /// The one settling `ping` among `frames`: its message id.
     fn ping_of(frames: &[Value]) -> String {
         let pings = of_type(frames, "ping");
