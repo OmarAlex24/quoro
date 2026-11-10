@@ -738,13 +738,15 @@ mod tests {
                 .note_conversion_sent(&f.node_id, old.generation, LEASE, 3, D)
         );
         let writes = f.writes().await;
-        let (_new, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
-        assert_eq!(
-            f.state
-                .hub
-                .conversion_in_flight(&f.node_id, old.generation, LEASE),
-            None
-        );
+        let (mut new, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
+        for generation in [old.generation, new.generation] {
+            assert_eq!(
+                f.state
+                    .hub
+                    .conversion_in_flight(&f.node_id, generation, LEASE),
+                None
+            );
+        }
         assert!(
             !f.state
                 .hub
@@ -756,6 +758,11 @@ mod tests {
         assert_eq!(f.writes().await, writes);
         assert!(f.passed());
         assert!(f.held_while_away().await.is_some());
+        // The newer session's renewal is a settle's, not a first answer: it
+        // writes nothing before the pong.
+        renew(&mut new, "msg_r2", 3).await;
+        assert_eq!(f.row().await.mode, "local");
+        assert_eq!(f.writes().await, writes);
         f.done();
     }
 
