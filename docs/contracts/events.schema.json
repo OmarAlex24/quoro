@@ -775,7 +775,7 @@
 
     "data_volume_quarantined": {
       "type": "object",
-      "description": "A node that lost a warm app's lease to a failover kept its divergent volume as a quarantined copy on its own disk (ADR 0176, node-agent-protocol.md section 9). Emitted by the control plane when it records the copy, with the system audit record `volume.quarantine`. Opens no incident. Payload fields are additive within schema_version 1.",
+      "description": "A node that lost a warm app's lease to a failover kept its divergent volume as a quarantined copy on its own disk (ADR 0176, node-agent-protocol.md section 9). Emitted by the control plane when it records the copy, with the system audit record `volume.quarantine`, and once per quarantine_id for a copy of a volume that is gone, which gets no row (ADR 0316). Opens no incident. Payload fields are additive within schema_version 1.",
       "required": ["volume_id", "app_id", "node_id", "quarantine_id", "size_bytes", "sha256"],
       "properties": {
         "volume_id": { "$ref": "#/$defs/VolumeId" },
