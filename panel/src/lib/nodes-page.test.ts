@@ -200,6 +200,30 @@ describe('the simulated loss of a node', () => {
     );
   });
 
+  it('tells the moves of one kind to one node in one clause, and the apps left without a node in their own sentence', () => {
+    const many: ClusterCapacity = {
+      ...answer,
+      fits: false,
+      apps: [
+        { app_id: 'app_blog', policy: 'none', action: 'restore', node_id: 'nod_4', reason: null },
+        { app_id: 'app_pg', policy: 'warm', action: 'failover', node_id: 'nod_4', reason: null },
+        { app_id: 'app_docs', policy: 'none', action: 'start', node_id: 'nod_4', reason: null },
+        { app_id: 'app_web', policy: 'warm', action: 'failover', node_id: 'nod_4', reason: null },
+        { app_id: 'app_x', policy: 'warm', action: 'failover', node_id: null, reason: 'no_warm_copy' },
+      ],
+    };
+    expect(n1Text({ segments: simulationSentence({ lost: lab3, answer: many, nodes, apps }) })).toBe(
+      'Without lab-3: docs-site starts on lab-4, the warm copies of postgres and web start there and blog is restored there from its latest backup. an app has no complete warm copy.',
+    );
+    const single: ClusterCapacity = {
+      ...answer,
+      apps: [{ app_id: 'app_pg', policy: 'warm', action: 'failover', node_id: 'nod_4', reason: null }],
+    };
+    expect(n1Text({ segments: simulationSentence({ lost: lab3, answer: single, nodes, apps }) })).toBe(
+      'Without lab-3: the warm copy of postgres starts on lab-4.',
+    );
+  });
+
   it('says which apps get no node, and when none has to move', () => {
     const short: ClusterCapacity = {
       ...answer,

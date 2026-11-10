@@ -256,57 +256,73 @@ export const simulationSentence = ({
   const appName = (id: string) => apps.find((app) => app.id === id)?.name ?? 'an app';
   const nodeName = (id: string) => nodes.find((node) => node.id === id)?.name ?? 'another node';
 
-  const clauses: Segment[][] = [];
-  let lastTarget: string | null = null;
+  const named = (names: readonly string[]): Segment[] =>
+    names.flatMap((name, index) => [
+      ...(index === 0 ? [] : [index === names.length - 1 ? ' and ' : ', ']),
+      { strong: name },
+    ]);
+  const joined = (clauses: readonly Segment[][]): Segment[] =>
+    clauses.flatMap((clause, index) => [
+      ...(index === 0 ? [] : [index === clauses.length - 1 ? ' and ' : ', ']),
+      ...clause,
+    ]);
+
+  // The moves, one clause per action and node, starts first: `docs-site starts on lab-4,
+  // the warm copies of orders and media start there and blog is restored there from its latest backup`.
+  const groups: { action: 'start' | 'failover' | 'restore'; nodeId: string; names: string[] }[] = [];
   for (const entry of moves(answer)) {
-    const where = entry.node_id === lastTarget ? 'there' : `on ${nodeName(entry.node_id)}`;
-    lastTarget = entry.node_id;
-    const name = { strong: appName(entry.app_id) };
-    if (entry.action === 'start') clauses.push([name, ` starts ${where}`]);
-    else if (entry.action === 'failover') clauses.push([name, `’s warm copy starts ${where}`]);
-    else clauses.push([name, ` is restored ${where} from its latest backup`]);
+    const group = groups.find((item) => item.action === entry.action && item.nodeId === entry.node_id);
+    if (group) group.names.push(appName(entry.app_id));
+    else groups.push({ action: entry.action, nodeId: entry.node_id, names: [appName(entry.app_id)] });
   }
-  // The apps that get no node, grouped by why: `postgres and worker find no node with room`.
+  const moved: Segment[][] = [];
+  let lastTarget: string | null = null;
+  for (const { action, nodeId, names } of groups) {
+    const where = nodeId === lastTarget ? 'there' : `on ${nodeName(nodeId)}`;
+    lastTarget = nodeId;
+    const one = names.length === 1;
+    if (action === 'start') moved.push([...named(names), one ? ` starts ${where}` : ` start ${where}`]);
+    else if (action === 'failover')
+      moved.push([one ? 'the warm copy of ' : 'the warm copies of ', ...named(names), one ? ` starts ${where}` : ` start ${where}`]);
+    else
+      moved.push([
+        ...named(names),
+        one ? ` is restored ${where} from its latest backup` : ` are restored ${where} from their latest backups`,
+      ]);
+  }
+
+  // The apps that get no node, grouped by why, in a sentence of their own after the moves:
+  // `postgres and worker find no node with room`.
   const stranded = answer.apps.filter((app) => app.node_id === null);
   const reasons = [
     { reason: 'no_capacity', one: ' finds no node with room', many: ' find no node with room' },
     { reason: 'no_backup', one: ' has no backup to restore', many: ' have no backup to restore' },
     { reason: 'no_warm_copy', one: ' has no complete warm copy', many: ' have no complete warm copy' },
   ] as const;
+  const left: Segment[][] = [];
   for (const { reason, one, many } of reasons) {
-    const names = stranded
-      .filter((app) => (app.reason ?? 'no_capacity') === reason)
-      .map((app) => appName(app.app_id));
-    if (names.length === 0) continue;
-    const named: Segment[] = [];
-    names.forEach((item, index) => {
-      if (index > 0) named.push(index === names.length - 1 ? ' and ' : ', ');
-      named.push({ strong: item });
-    });
-    clauses.push([...named, names.length === 1 ? one : many]);
+    const names = stranded.filter((app) => (app.reason ?? 'no_capacity') === reason).map((app) => appName(app.app_id));
+    if (names.length > 0) left.push([...named(names), names.length === 1 ? one : many]);
   }
 
   const segments: Segment[] = ['Without ', { strong: lost.name }, ': '];
-  if (clauses.length === 0) segments.push('no app has to move');
-  clauses.forEach((clause, index) => {
-    if (index > 0) segments.push(index === clauses.length - 1 ? ' and ' : ', ');
-    segments.push(...clause);
-  });
-  segments.push('.');
+  if (moved.length === 0 && left.length === 0) segments.push('no app has to move.');
+  if (moved.length > 0) segments.push(...joined(moved), '.');
+  if (left.length > 0) segments.push(...(moved.length > 0 ? [' '] : []), ...joined(left), '.');
 
   const kept = answer.apps.filter((app) => app.action === 'keep' && app.node_id !== null);
   if (kept.length > 0) {
     const one = kept.length === 1;
-    const left = (appId: string) =>
+    const remaining = (appId: string) =>
       vms.filter((vm) => vm.app_id === appId && vm.node_id !== answer.lost_node_id && vm.observed_status !== 'deleted')
         .length;
-    const single = kept.every((app) => left(app.app_id) === 1);
+    const single = kept.every((app) => remaining(app.app_id) === 1);
     const names = listWords(kept.map((app) => appName(app.app_id)));
     segments.push(
       single
         ? ` ${names} ${one ? 'keeps one replica' : 'keep one replica each'}.`
         : one
-          ? ` ${names} keeps running on its other ${left(kept[0]!.app_id) > 1 ? 'replicas' : 'replica'}.`
+          ? ` ${names} keeps running on its other ${remaining(kept[0]!.app_id) > 1 ? 'replicas' : 'replica'}.`
           : ` ${names} keep running on their other replicas.`,
     );
   }
