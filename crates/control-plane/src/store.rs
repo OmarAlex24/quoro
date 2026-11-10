@@ -262,6 +262,16 @@ impl Store {
         w.commit().await
     }
 
+    /// The database's `meta.schema_version`, which `welcome` carries to every
+    /// node (`node-agent-protocol.md` section 5.10, ADR 0229).
+    ///
+    /// # Errors
+    ///
+    /// Any database error, or a stored value that is not a number.
+    pub async fn schema_version(&self) -> Result<usize, sqlx::Error> {
+        read_version(&mut *self.pool.acquire().await?).await
+    }
+
     /// The read pool. Reads never take the writer gate.
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {

@@ -15,6 +15,7 @@ pub mod build;
 pub mod edge;
 pub mod enroll;
 pub mod follow;
+pub mod freeze;
 pub mod health;
 pub mod identity;
 pub mod ingress;
@@ -227,6 +228,10 @@ pub enum AgentError {
     Engine(String),
     /// The session ended in a way that must stop the agent (section 4.4).
     Fatal(FatalReason),
+    /// Another process holds the promotion lock
+    /// ([`freeze::PromotionLock`]): a promotion runs on this host (section
+    /// 7.3 "`--abort`", ADR 0280).
+    PromotionRunning,
 }
 
 impl AgentError {
@@ -268,6 +273,7 @@ impl fmt::Display for AgentError {
             Self::LocalKey(reason) => write!(f, "node-local key: {reason}"),
             Self::Engine(reason) => write!(f, "engine: {reason}"),
             Self::Fatal(reason) => write!(f, "session ended: {reason}"),
+            Self::PromotionRunning => f.write_str("a promotion runs on this host"),
         }
     }
 }

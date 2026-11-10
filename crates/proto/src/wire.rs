@@ -853,6 +853,13 @@ pub struct Welcome {
     /// first (section 5.10). Optional: an absent or empty list is valid.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub primary_urls: Vec<String>,
+    /// From M5b: the schema version of the primary's database (`meta`
+    /// `schema_version`). The node keeps the newest it saw, and `quoro
+    /// cluster promote` refuses to rebuild a database from a log newer than
+    /// its binary (sections 5.10 and 7.3, ADR 0229). Absent from an older
+    /// primary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
 }
 
 /// `desired_status` of a VM.
@@ -1893,9 +1900,21 @@ mod tests {
             session_timeout_ms: SESSION_TIMEOUT_MS,
             primary_node_id: "nod_1".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         });
         let raw = RawFrame::parse(&welcome.to_frame("msg_1", None).to_text()).unwrap();
         assert_eq!(ControlMessage::from_raw(&raw).unwrap(), welcome);
+        // An absent `schema_version` is left out, as an older primary sends
+        // it (section 5.10); a present one survives the wire.
+        assert!(raw.body.get("schema_version").is_none(), "{}", raw.body);
+        let ControlMessage::Welcome(mut versioned) = welcome else {
+            unreachable!()
+        };
+        versioned.schema_version = Some(14);
+        let versioned = ControlMessage::Welcome(versioned);
+        let raw = RawFrame::parse(&versioned.to_frame("msg_1", None).to_text()).unwrap();
+        assert_eq!(raw.body["schema_version"], 14);
+        assert_eq!(ControlMessage::from_raw(&raw).unwrap(), versioned);
         assert_eq!(
             RawFrame::parse(&ControlMessage::Ping.to_frame("msg_2", None).to_text())
                 .unwrap()

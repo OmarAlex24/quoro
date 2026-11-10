@@ -2881,6 +2881,17 @@ impl Session {
             };
 
             self.welcome_primary = Some(primary_node_id.clone());
+            // Section 5.10 (ADR 0229): the database's schema version, which
+            // the node keeps for a promotion's refusal (section 7.3). The
+            // field is optional, so a version that cannot be read is left
+            // out and the node keeps the one it has.
+            let schema_version = match self.hub.0.store.schema_version().await {
+                Ok(version) => u32::try_from(version).ok(),
+                Err(e) => {
+                    tracing::warn!(%e, node_id = %self.node_id, "cannot read the database schema version; welcome goes without it");
+                    None
+                }
+            };
             // Everything the session start queues from here on goes out only
             // if its pass over the leases is complete.
             let start_frames = outbox.len();
@@ -2893,6 +2904,7 @@ impl Session {
                     session_timeout_ms: self.hub.0.config.session_timeout_ms,
                     primary_node_id,
                     primary_urls: self.hub.advertised_urls(),
+                    schema_version,
                 })
                 .to_frame(&new_msg_id(), Some(&raw.id))
                 .to_text(),

@@ -8,21 +8,24 @@ mod common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_common::{
-    GATEWAY, SUBNET, TempDir, facts, identity_files, snapshot, snapshot_full, spec_vm, stateful_vm,
+    GATEWAY, SUBNET, TempDir, facts, identity_files, identity_files_pinned, self_signed,
+    server_config, snapshot, snapshot_full, spec_vm, stateful_vm,
 };
 use futures_util::{SinkExt as _, StreamExt as _};
 use quoro_engine::{Engine as _, FakeEngine, VmState};
 use quoro_ingress::cloudflared::CloudflaredConfig;
 use quoro_ingress::proxy::BackendObserver as _;
 use quoro_node_agent::edge::EdgeManager;
+use quoro_node_agent::freeze;
 use quoro_node_agent::identity::{CUSTODY_KEY_FILE, LOG_MARK_FILE};
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::session::{Session, SessionEnd, SessionSetup};
-use quoro_node_agent::store::{NodeStore, Refollowing, VOTE};
+use quoro_node_agent::store::{FreezeChecked, NodeStore, PROMOTION_FREEZE, Refollowing, VOTE};
+use quoro_node_agent::tls;
 use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, ManualHostClock, start_local_leases};
 use quoro_proto::custody::CustodyKey;
 use quoro_proto::sign::{self, SigningKey};
@@ -38,7 +41,9 @@ use quoro_proto::{
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::io::DuplexStream;
-use tokio::sync::watch;
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, client_async};
 
@@ -119,6 +124,7 @@ async fn fake_primary(mut ws: WebSocketStream<DuplexStream>, key: SigningKey) {
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -249,6 +255,7 @@ async fn quiet_primary(server: DuplexStream) {
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -314,6 +321,7 @@ async fn listening_primary(server: DuplexStream, events: tokio::sync::mpsc::Send
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -420,6 +428,7 @@ async fn primary_with_primary_urls(
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls,
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -685,6 +694,7 @@ impl EdgeSession {
                 session_timeout_ms: 5_000,
                 primary_node_id: "nod_primary".to_owned(),
                 primary_urls: Vec::new(),
+                schema_version: None,
             })
             .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
             .to_text(),
@@ -946,6 +956,7 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
             session_timeout_ms: 15_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -1174,6 +1185,7 @@ async fn a_revoke_takes_effect_even_when_the_session_ends_at_once() {
             session_timeout_ms: 15_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -1272,6 +1284,7 @@ async fn the_session_carries_renewals_and_its_end_makes_the_lease_uncertain() {
             session_timeout_ms: 15_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -1411,6 +1424,7 @@ async fn a_fence_ack_over_the_session_clears_only_below_its_tokens() {
             session_timeout_ms: 15_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -1569,6 +1583,7 @@ async fn welcome(ws: &mut WebSocketStream<DuplexStream>, hello: &Value) {
             session_timeout_ms: 15_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -2073,10 +2088,13 @@ async fn a_copy_under_head_unknown_is_quarantined_before_hello() {
         let (setup, _observed) = follow_node(&dir).await;
         let store = setup.store.clone();
         seed_log(&store, &log_chain(1, ZEROS, 3, "old")).await;
-        store
-            .set_refollowing(Refollowing::HeadUnknown)
-            .await
-            .unwrap();
+        assert_eq!(
+            store
+                .set_refollowing(Refollowing::HeadUnknown)
+                .await
+                .unwrap(),
+            FreezeChecked::Written
+        );
         if let Some(mark) = mark {
             seed_mark(&dir, mark);
         }
@@ -2110,7 +2128,10 @@ async fn a_quarantine_mark_over_a_recorded_head_finishes_the_quarantine_before_h
     let store = setup.store.clone();
     let old = log_chain(1, ZEROS, 3, "old");
     seed_log(&store, &old).await;
-    store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+    assert_eq!(
+        store.set_refollowing(Refollowing::Head(5)).await.unwrap(),
+        FreezeChecked::Written
+    );
     seed_mark(&dir, MAX_SEQ_TEXT);
 
     let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
@@ -2151,7 +2172,10 @@ async fn a_mark_above_the_recorded_head_is_lowered_to_it_before_the_next_batch()
     let dir = TempDir::new();
     let (setup, _observed) = follow_node(&dir).await;
     let store = setup.store.clone();
-    store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+    assert_eq!(
+        store.set_refollowing(Refollowing::Head(5)).await.unwrap(),
+        FreezeChecked::Written
+    );
 
     let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
     assert_eq!(hello["body"]["log_seq"], 0);
@@ -2450,7 +2474,10 @@ async fn the_batch_that_reaches_the_head_ends_refollowing_and_raises_the_mark() 
     let store = setup.store.clone();
     let new = log_chain(1, ZEROS, 2, "new");
     seed_log(&store, &new).await;
-    store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+    assert_eq!(
+        store.set_refollowing(Refollowing::Head(5)).await.unwrap(),
+        FreezeChecked::Written
+    );
     seed_mark(&dir, "5");
 
     let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
@@ -2681,6 +2708,7 @@ fn welcome_frame(term: u64, re: &str) -> String {
         session_timeout_ms: 15_000,
         primary_node_id: "nod_primary".to_owned(),
         primary_urls: Vec::new(),
+        schema_version: None,
     })
     .to_frame("msg_welcome", Some(re))
     .to_text()
@@ -3397,4 +3425,643 @@ async fn an_edge_that_gains_the_witness_role_votes_on_its_next_desired_state() {
         "no answer once the role is gone: {frames:?}"
     );
     end_session(ws, serving).await;
+}
+
+// --- `welcome.schema_version` and the promotion freeze (sections 5.10, 7.3) --
+
+/// A `welcome` answering `re` that carries `schema_version`, or none.
+fn welcome_with_schema(re: &str, schema_version: Option<u32>) -> String {
+    ControlMessage::Welcome(Welcome {
+        cluster_id: "cls_test".to_owned(),
+        term: 1,
+        server_time: "2026-11-02T10:15:30Z".to_owned(),
+        heartbeat_interval_ms: 100,
+        session_timeout_ms: 15_000,
+        primary_node_id: "nod_primary".to_owned(),
+        primary_urls: Vec::new(),
+        schema_version,
+    })
+    .to_frame("msg_welcome", Some(re))
+    .to_text()
+}
+
+/// Section 5.10 (ADR 0229): the node keeps the newest
+/// `welcome.schema_version` it saw. A lower one does not lower it, and a
+/// `welcome` without the field keeps what is stored.
+#[tokio::test]
+async fn the_newest_welcome_schema_version_is_kept_and_never_lowered() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let mut session = Session::new(setup);
+    for (sent, kept) in [
+        (None, None),
+        (Some(14), Some(14)),
+        (Some(12), Some(14)),
+        (None, Some(14)),
+        (Some(15), Some(15)),
+    ] {
+        let (mut ws, hello, serving) = open_session(session).await;
+        send(
+            &mut ws,
+            welcome_with_schema(hello["id"].as_str().unwrap(), sent),
+        )
+        .await;
+        read_until(&mut ws, "status_report").await;
+        assert_eq!(
+            store.welcome_schema_version().await.unwrap(),
+            kept,
+            "after a welcome with {sent:?}"
+        );
+        session = end_session(ws, serving).await;
+    }
+}
+
+/// Every frame the node sends until its session ends, which must happen
+/// within `limit`.
+async fn frames_until_closed_within(
+    ws: &mut WebSocketStream<DuplexStream>,
+    limit: Duration,
+) -> Vec<Value> {
+    tokio::time::timeout(limit, frames_until_closed(ws))
+        .await
+        .unwrap_or_else(|_| panic!("the session did not close within {limit:?}"))
+}
+
+/// Asserts that no frame in `frames` is a `hello` or a `log_ack`.
+fn assert_no_hello_or_ack(frames: &[Value]) {
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame["type"] != "hello" && frame["type"] != "log_ack"),
+        "no hello or log_ack after the freeze: {frames:?}"
+    );
+}
+
+/// The session's end and the session, once the socket closed.
+async fn ended_with(serving: Serving) -> (Session, SessionEnd) {
+    let (session, end) = tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("the session ended")
+        .unwrap();
+    (session, end.unwrap())
+}
+
+/// Section 7.3 "The freeze" (ADR 0261): a freeze set from another process,
+/// here its own connection to `node.db`, while a session is up ends the
+/// session within 2 s even though nothing arrives; nothing after the freeze
+/// is a `hello` or a `log_ack`. While the flag is set a new session sends no
+/// `hello` at all; once it ends, `hello` reports the log as it stood.
+#[tokio::test]
+async fn a_freeze_from_another_process_ends_the_session_within_2_s() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    let entries = log_chain(1, ZEROS, 3, "a");
+    send(
+        &mut ws,
+        log_entries_frame(entries.clone(), Some(3), "msg_log_1"),
+    )
+    .await;
+    assert_eq!(reply_to(&mut ws, "msg_log_1").await["type"], "log_ack");
+
+    freeze::freeze(dir.path()).await.unwrap();
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert_no_hello_or_ack(&frames);
+    let (session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+    assert_eq!(stored_log(&store).await, entries);
+
+    // A session that starts while the flag is set sends nothing.
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let mut ws = accept.await.unwrap().unwrap();
+    let mut session = session;
+    let serving = tokio::spawn(async move {
+        let end = session.serve(client_ws, std::future::pending::<()>()).await;
+        (session, end)
+    });
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert!(frames.is_empty(), "no hello while frozen: {frames:?}");
+    let (session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+
+    freeze::unfreeze(dir.path()).await.unwrap();
+    let (ws, hello, serving) = follow_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 3);
+    assert_eq!(hello["body"]["log_hash"], entries[2]["hash"]);
+    end_session(ws, serving).await;
+}
+
+/// Section 7.3 "The freeze" (ADR 0261): a `log_entries` delivered after the
+/// freeze committed is not stored and not acknowledged, and the log's newest
+/// `seq` is unchanged; the session ends without answering it.
+#[tokio::test]
+async fn log_entries_after_the_freeze_are_neither_stored_nor_acknowledged() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    let first = log_chain(1, ZEROS, 3, "a");
+    send(
+        &mut ws,
+        log_entries_frame(first.clone(), Some(5), "msg_log_1"),
+    )
+    .await;
+    assert_eq!(reply_to(&mut ws, "msg_log_1").await["type"], "log_ack");
+
+    freeze::freeze(dir.path()).await.unwrap();
+    let second = log_chain(4, first[2]["hash"].as_str().unwrap(), 2, "a");
+    send(&mut ws, log_entries_frame(second, Some(5), "msg_log_2")).await;
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert_no_hello_or_ack(&frames);
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_log_2"),
+        "no answer: {frames:?}"
+    );
+    let (_session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+    assert_eq!(
+        store.log_position().await.unwrap(),
+        (3, first[2]["hash"].as_str().unwrap().to_owned())
+    );
+    assert_eq!(stored_log(&store).await, first);
+}
+
+/// What the pinned TLS primary of the dial tests saw, in order.
+#[derive(Debug)]
+enum Seen {
+    /// A TCP connection was accepted: the node dialed.
+    Dial,
+    /// A text frame from the node.
+    Frame(Value),
+    /// A connection ended.
+    Closed,
+}
+
+/// A pinned TLS primary on `127.0.0.1` that answers `hello` with `welcome`
+/// and `ping` with `pong`, and reports every dial, frame and closed
+/// connection. Returns its URL, its certificate's pin and the reports.
+async fn counting_primary() -> (
+    String,
+    String,
+    mpsc::UnboundedReceiver<Seen>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (cert, key) = self_signed();
+    let pin = tls::cert_fingerprint(cert.as_ref());
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let url = format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let _ = seen_tx.send(Seen::Dial);
+            let acceptor = acceptor.clone();
+            let seen = seen_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(stream) = acceptor.accept(tcp).await
+                    && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+                {
+                    while let Some(Ok(message)) = ws.next().await {
+                        let Message::Text(text) = message else {
+                            continue;
+                        };
+                        let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) else {
+                            continue;
+                        };
+                        let id = frame["id"].as_str().unwrap_or_default().to_owned();
+                        let reply = match frame["type"].as_str() {
+                            Some("hello") => Some(welcome_frame(1, &id)),
+                            Some("ping") => Some(
+                                ControlMessage::Pong
+                                    .to_frame("msg_pong", Some(&id))
+                                    .to_text(),
+                            ),
+                            _ => None,
+                        };
+                        let _ = seen.send(Seen::Frame(frame));
+                        if let Some(reply) = reply
+                            && ws.send(Message::Text(reply.into())).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                let _ = seen.send(Seen::Closed);
+            });
+        }
+    });
+    (url, pin, seen_rx, task)
+}
+
+/// The next report of the primary, which must come within `limit`.
+async fn next_seen(seen: &mut mpsc::UnboundedReceiver<Seen>, limit: Duration) -> Seen {
+    tokio::time::timeout(limit, seen.recv())
+        .await
+        .unwrap_or_else(|_| panic!("the primary saw nothing within {limit:?}"))
+        .expect("the primary runs")
+}
+
+/// Waits until the primary sees a frame of type `kind`, within `limit`.
+async fn seen_frame(seen: &mut mpsc::UnboundedReceiver<Seen>, kind: &str, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if let Seen::Frame(frame) = next_seen(seen, left).await
+            && frame["type"] == kind
+        {
+            return;
+        }
+    }
+}
+
+/// Asserts that the primary sees nothing at all for `quiet`: no dial, no
+/// frame.
+async fn nothing_seen_for(seen: &mut mpsc::UnboundedReceiver<Seen>, quiet: Duration) {
+    if let Ok(report) = tokio::time::timeout(quiet, seen.recv()).await {
+        panic!("the primary saw {report:?} while the agent was frozen");
+    }
+}
+
+/// The dialing agent of a freeze test: a session over `dir` pinned to the
+/// primary at `url`, with `advertised` as the primary's other addresses, run
+/// until `stop`, and the store it holds.
+async fn dialing_agent(
+    dir: &TempDir,
+    url: &str,
+    pin: &str,
+    advertised: &[String],
+) -> (
+    NodeStore,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<Result<(), quoro_node_agent::AgentError>>,
+) {
+    let key = sign::signing_key_from_seed(&[8; 32]);
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (observed_tx, observed_rx) = watch::channel(Vec::new());
+    let identity = identity_files_pinned(dir.path(), &key, url, pin);
+    identity.set_primary_urls(advertised).unwrap();
+    let mut session = Session::new(SessionSetup {
+        identity,
+        store: store.clone(),
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+        builds: None,
+    });
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let running = tokio::spawn(async move {
+        let _observed = observed_tx;
+        session.run(stop_rx).await
+    });
+    (store, stop_tx, running)
+}
+
+/// Section 7.3 "The freeze" and section 4.4 (ADR 0261, ADR 0280): a freeze
+/// from another process ends the running session within 2 s with no `hello`
+/// or `log_ack` after it, and the primary sees no new dial for 3 s. Once the
+/// freeze ends, the agent dials again and sends `hello`.
+#[tokio::test]
+async fn a_frozen_agent_does_not_redial_until_the_freeze_ends() {
+    let dir = TempDir::new();
+    let (url, pin, mut seen, primary) = counting_primary().await;
+    let (store, stop, running) = dialing_agent(&dir, &url, &pin, &[]).await;
+    assert!(matches!(
+        next_seen(&mut seen, Duration::from_secs(5)).await,
+        Seen::Dial
+    ));
+    seen_frame(&mut seen, "status_report", Duration::from_secs(5)).await;
+
+    freeze::freeze(dir.path()).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, seen.recv()).await {
+            Ok(Some(Seen::Closed)) => break,
+            Ok(Some(Seen::Frame(frame))) => assert_no_hello_or_ack(&[frame]),
+            Ok(Some(Seen::Dial)) => panic!("a dial while frozen"),
+            Ok(None) | Err(_) => panic!("the session did not close within 2 s of the freeze"),
+        }
+    }
+    nothing_seen_for(&mut seen, Duration::from_secs(3)).await;
+    assert!(freeze::is_frozen(&store).await.unwrap());
+
+    freeze::unfreeze(dir.path()).await.unwrap();
+    assert!(matches!(
+        next_seen(&mut seen, Duration::from_secs(3)).await,
+        Seen::Dial
+    ));
+    seen_frame(&mut seen, "hello", Duration::from_secs(5)).await;
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    primary.abort();
+}
+
+/// Section 7.3 "The freeze", section 12 `node_meta`: the freeze is in the
+/// agent's store, so an agent that starts with it set (a restart) never
+/// dials until it ends, and then dials at once.
+#[tokio::test]
+async fn an_agent_started_frozen_never_dials_until_the_freeze_ends() {
+    let dir = TempDir::new();
+    let (url, pin, mut seen, primary) = counting_primary().await;
+    // The agent that ran before the restart left its store and a freeze.
+    drop(NodeStore::open(dir.path()).await.unwrap());
+    freeze::freeze(dir.path()).await.unwrap();
+
+    let (_store, stop, running) = dialing_agent(&dir, &url, &pin, &[]).await;
+    nothing_seen_for(&mut seen, Duration::from_secs(3)).await;
+
+    freeze::unfreeze(dir.path()).await.unwrap();
+    assert!(matches!(
+        next_seen(&mut seen, Duration::from_secs(3)).await,
+        Seen::Dial
+    ));
+    seen_frame(&mut seen, "hello", Duration::from_secs(5)).await;
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    primary.abort();
+}
+
+/// Waits until `done` holds, checking every 10 ms, and panics with `what`
+/// after `limit`.
+async fn wait_until(done: impl Fn() -> bool, limit: Duration, what: &str) {
+    let deadline = Instant::now() + limit;
+    while !done() {
+        assert!(Instant::now() < deadline, "{what} within {limit:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Section 7.3 "The freeze" and section 4.4: a dial attempt under way when
+/// the freeze commits ends. Here `primary_url` accepts the TCP connection of
+/// the first dial and never answers its TLS handshake, as a hung primary
+/// does, so that attempt would wait the full connect timeout, 10 s, and then
+/// try the advertised address, which accepts and never answers. The freeze
+/// commits only once that first connection was accepted, so a dial is under
+/// way: the agent closes it within the dial loop's check of the flag, about
+/// a second, and dials nowhere while the freeze lasts. Once it ends, the
+/// agent dials again. `primary_url` now drops each connection, so the
+/// handshake fails at once; unlike a refused connection, `dial_known` does
+/// not dial it again, and the attempt reaches the advertised address.
+#[tokio::test]
+async fn a_freeze_ends_a_dial_attempt_under_way() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt as _;
+
+    let dir = TempDir::new();
+    let hung = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let hung_url = format!("https://127.0.0.1:{}", hung.local_addr().unwrap().port());
+    let hung_accepts = Arc::new(AtomicUsize::new(0));
+    let first_closed = Arc::new(AtomicBool::new(false));
+    let hung_listener = {
+        let accepts = Arc::clone(&hung_accepts);
+        let closed = Arc::clone(&first_closed);
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = hung.accept().await {
+                if accepts.fetch_add(1, Ordering::SeqCst) > 0 {
+                    // Every later connection is dropped at once.
+                    continue;
+                }
+                // The first is held, unanswered, until the agent closes it.
+                let closed = Arc::clone(&closed);
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 1024];
+                    while matches!(tcp.read(&mut buf).await, Ok(read) if read > 0) {}
+                    closed.store(true, Ordering::SeqCst);
+                });
+            }
+        })
+    };
+    let silent = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let silent_url = format!("https://127.0.0.1:{}", silent.local_addr().unwrap().port());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    let listener = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((tcp, _)) = silent.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(tcp);
+        }
+    });
+    let (_store, stop, running) =
+        dialing_agent(&dir, &hung_url, &"0".repeat(64), &[silent_url]).await;
+
+    wait_until(
+        || hung_accepts.load(Ordering::SeqCst) >= 1,
+        Duration::from_secs(5),
+        "the agent dials primary_url",
+    )
+    .await;
+    freeze::freeze(dir.path()).await.unwrap();
+    wait_until(
+        || first_closed.load(Ordering::SeqCst),
+        Duration::from_secs(3),
+        "the dial under way ends after the freeze",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        0,
+        "the attempt under way went on to the advertised address while frozen"
+    );
+    assert_eq!(
+        hung_accepts.load(Ordering::SeqCst),
+        1,
+        "no new dial while frozen"
+    );
+
+    freeze::unfreeze(dir.path()).await.unwrap();
+    wait_until(
+        || accepted.load(Ordering::SeqCst) > 0,
+        Duration::from_secs(6),
+        "a dial reaches the advertised address after the freeze ended",
+    )
+    .await;
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    hung_listener.abort();
+    listener.abort();
+}
+
+/// Section 7.3 "The freeze" (ADR 0261): a `log_diverged` handled after a
+/// freeze committed changes nothing. The freeze is set over another
+/// connection between `hello` and `welcome`, and the error follows
+/// `welcome` at once, so the session handles it before its own timer would
+/// see the flag. The session ends with no `hello` or `log_ack`, and the
+/// mark, the refollowing state and the log's newest `seq` and hash stay as
+/// they were, with no quarantined copy.
+#[tokio::test]
+async fn log_diverged_after_the_freeze_changes_nothing_and_ends_the_session() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let entries = log_chain(1, ZEROS, 3, "a");
+    seed_log(&store, &entries).await;
+    seed_mark(&dir, "3");
+    let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 3);
+
+    freeze::freeze(dir.path()).await.unwrap();
+    send(&mut ws, welcome_frame(1, hello["id"].as_str().unwrap())).await;
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert_no_hello_or_ack(&frames);
+    let (_session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+    assert_eq!(mark_text(&dir).as_deref(), Some("3"));
+    assert_eq!(store.refollowing().await.unwrap(), None);
+    assert_eq!(
+        store.log_position().await.unwrap(),
+        (3, entries[2]["hash"].as_str().unwrap().to_owned())
+    );
+    assert_eq!(stored_log(&store).await, entries);
+    assert_eq!(quarantined(&store).await, 0);
+    assert!(!dir.path().join("quarantine").exists());
+}
+
+/// Waits until the session holds a second connection of `store`'s pool,
+/// besides the one the test holds with SQLite's write lock, for 200 ms in a
+/// row: a transaction waiting on that lock. In WAL mode a read never waits
+/// on it, and while the session's loop handles one message it does nothing
+/// else, so on the `log_entries` path that is the transaction that would
+/// record the head. It panics after 3 s, well inside the store's 5 s busy
+/// timeout.
+async fn waiting_on_the_write_lock(store: &NodeStore) {
+    let pool = store.pool();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut since: Option<Instant> = None;
+    loop {
+        let in_use = usize::try_from(pool.size())
+            .unwrap()
+            .saturating_sub(pool.num_idle());
+        if in_use >= 2 {
+            if since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(200) {
+                return;
+            }
+        } else {
+            since = None;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never waited on the write lock"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Section 7.3 "The freeze", section 7.1 "Refollowing" (ADR 0261, ADR
+/// 0280): a frozen agent refollowing with the head unknown that receives
+/// `log_entries` records no head, leaves the mark at 2^53 - 1, stores
+/// nothing and answers nothing. The test holds SQLite's write lock with the
+/// freeze written but not committed, so the session passes its first read
+/// of the flag and waits in the transaction that would record the head. The
+/// freeze commits only once the session is seen waiting there
+/// ([`waiting_on_the_write_lock`]), and that transaction reads it.
+#[tokio::test]
+async fn a_frozen_agent_refollowing_with_the_head_unknown_records_no_head() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    assert_eq!(
+        store
+            .set_refollowing(Refollowing::HeadUnknown)
+            .await
+            .unwrap(),
+        FreezeChecked::Written
+    );
+    seed_mark(&dir, MAX_SEQ_TEXT);
+    let (mut ws, hello, serving) = follow_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+
+    let mut freezing = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("INSERT INTO node_meta (key, value) VALUES (?, ?)")
+        .bind(PROMOTION_FREEZE)
+        .bind("2026-11-10T00:00:00Z")
+        .execute(&mut *freezing)
+        .await
+        .unwrap();
+    send(
+        &mut ws,
+        log_entries_frame(log_chain(1, ZEROS, 2, "new"), Some(5), "msg_log_1"),
+    )
+    .await;
+    waiting_on_the_write_lock(&store).await;
+    freezing.commit().await.unwrap();
+
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert_no_hello_or_ack(&frames);
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_log_1"),
+        "no answer: {frames:?}"
+    );
+    let (_session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(store.log_head().await.unwrap(), None);
+}
+
+/// Section 7.3 "The freeze", section 7.1 "Refollowing" (ADR 0261): a freeze
+/// that commits after a quarantine's mark and state and before its copy
+/// moves ends the session as `Frozen`, not `Reconnect`, so the agent dials
+/// again within about a second of the freeze's end, with no backoff. A
+/// trigger on the test's store sets the freeze in the transaction that
+/// records "head unknown", so it commits with that state, before the move
+/// reads it. The copy stays where it was, read as quarantined, with no
+/// quarantined copy recorded and no file left.
+#[tokio::test]
+async fn a_freeze_that_stops_the_move_of_a_diverged_log_ends_the_session_as_frozen() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let entries = log_chain(1, ZEROS, 3, "a");
+    seed_log(&store, &entries).await;
+    seed_mark(&dir, "3");
+    let (mut ws, hello, serving) = follow_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 3);
+    assert_eq!(store.refollowing().await.unwrap(), None);
+
+    sqlx::query(&format!(
+        "CREATE TRIGGER freeze_after_the_state AFTER INSERT ON node_meta \
+         WHEN NEW.key = 'log_refollowing' BEGIN \
+         INSERT INTO node_meta (key, value) VALUES ('{PROMOTION_FREEZE}', '2026-11-10T00:00:00Z'); \
+         END;"
+    ))
+    .execute(store.pool())
+    .await
+    .unwrap();
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert_no_hello_or_ack(&frames);
+    let (_session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+    assert!(freeze::is_frozen(&store).await.unwrap());
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert_eq!(stored_log(&store).await, entries);
+    assert_eq!(quarantined(&store).await, 0);
+    let files = std::fs::read_dir(dir.path().join("quarantine")).map_or(0, Iterator::count);
+    assert_eq!(files, 0, "no quarantine file is left");
+    assert!(freeze::promotion_reads(&store).await.unwrap().quarantined);
 }

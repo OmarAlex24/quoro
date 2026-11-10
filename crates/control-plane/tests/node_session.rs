@@ -733,6 +733,32 @@ async fn the_welcome_carries_the_advertised_urls() {
     assert_eq!(urls, &expected, "{welcome}");
 }
 
+/// Section 5.10 (ADR 0229): `welcome` carries the schema version of the
+/// primary's database, `meta.schema_version`, which the node keeps for a
+/// promotion's refusal (section 7.3).
+#[tokio::test]
+async fn the_welcome_carries_the_database_schema_version() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, "node-schema").await;
+    let (stored,): (String,) =
+        sqlx::query_as("SELECT value FROM meta WHERE key = 'schema_version'")
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    let stored: u64 = stored.parse().unwrap();
+    assert_eq!(
+        usize::try_from(stored).unwrap(),
+        quoro_control_plane::store::Store::shipped_schema_version(),
+        "a migrated database is at the newest version"
+    );
+
+    let mut socket = connect(&server, &node.credential).await;
+    send(&mut socket, hello(&node.node_id)).await;
+    let welcome = recv_type(&mut socket, "welcome").await;
+    assert_eq!(welcome["body"]["schema_version"], stored, "{welcome}");
+}
+
 #[tokio::test]
 async fn a_hello_mesh_key_is_stored_with_a_mesh_address() {
     let server = start().await;

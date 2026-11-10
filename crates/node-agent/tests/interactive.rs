@@ -223,6 +223,7 @@ async fn handshake(ws: &mut WebSocketStream<DuplexStream>) {
             session_timeout_ms: 5_000,
             primary_node_id: "nod_primary".to_owned(),
             primary_urls: Vec::new(),
+            schema_version: None,
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
