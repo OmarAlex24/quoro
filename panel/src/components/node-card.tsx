@@ -11,6 +11,7 @@ import { formatBytes, formatPercent } from '../lib/metrics';
 import { liveWords, loadWords, meterTone, nodeMeters, nodeTags, type NodeLoad, type NodeMeter } from '../lib/node-capacity';
 import { logLagLine, nodeReadout } from '../lib/nodes';
 import { useNodeMetricsStream, type MetricsStreamStatus } from '../lib/use-metrics-stream';
+import { useTween } from '../lib/use-tween';
 import { DitherArea } from './dither-area';
 import { DitherCanvas } from './dither-canvas';
 import { LampDot } from './lamp';
@@ -22,7 +23,7 @@ const COLLECTING = 'Collecting samples — the first one arrives within 5 s';
 
 /** One dithered meter: CPU, memory or disk reserved against the node's capacity. */
 function Meter({ meter }: { meter: NodeMeter }) {
-  const share = meter.share ?? 0;
+  const share = useTween(meter.share ?? 0);
   const tone = meterTone(meter.share);
   const paint = useCallback(
     (surface: DitherSurface, read: TokenReader) => drawMeter(surface, share, read, tone),
@@ -60,7 +61,7 @@ export function NodeCard({ node, load }: { node: Node; load: NodeLoad }) {
   const address = node.address ?? (node.behind_nat ? 'Behind NAT' : null);
 
   return (
-    <article className="node" aria-label={node.name}>
+    <article className="card card-hover node" aria-label={node.name}>
       <div className="node-h">
         <ToneLamp tone={readout.tone} pulse={readout.pulse} size={15} label={readout.words} />
         <b>{node.name}</b>
