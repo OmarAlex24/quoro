@@ -185,11 +185,12 @@ pub(crate) async fn run(
     // node. Read once this call holds `Running`, so no failover of the app
     // commits between the check and the refusals. A grant held for another
     // operation (a regrant, a restore, `createVolume`) counts too, the side
-    // that moves less.
+    // that moves less. It is the view `App.lease.grant_pending` shows, read
+    // with the row: a grant of a row since revoked no longer counts.
     let mut conn = state.store.pool().acquire().await?;
     let lease = leases::app_lease(&mut conn, app_id).await?;
     drop(conn);
-    if lease.is_some_and(|lease| state.hub.grant_pending(&lease.id)) {
+    if lease.is_some_and(|lease| state.hub.row_grant_pending(&lease)) {
         return Err(conflict(
             Reason::InProgress,
             "the grant of the app's lease to its holder still waits (App.lease.grant_pending)",

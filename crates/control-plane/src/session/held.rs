@@ -352,10 +352,11 @@ impl NodeHub {
         self.wake_held();
     }
 
-    /// Whether the hub holds a grant of `lease_id` that it has not sent
-    /// (`Lease.grant_pending`, section 8.4, "Grants of a marked row"). While
-    /// it does, a second failover or a switchover of the app answers
-    /// `in_progress` (ADR 0292, ADR 0303).
+    /// Whether the hub holds a grant of `lease_id` that it has not sent,
+    /// whatever row it names. The re-entry checks of a regrant and of
+    /// `createVolume` read it with the row's step-4 test, and reuse the row
+    /// rather than write a second token (ADR 0295). What the API shows, and
+    /// what a failover's `in_progress` reads, is [`Self::row_grant_pending`].
     pub(crate) fn grant_pending(&self, lease_id: &str) -> bool {
         self.0
             .held
@@ -364,6 +365,33 @@ impl NodeHub {
             .entries
             .get(lease_id)
             .is_some_and(HeldGrant::pending)
+    }
+
+    /// The held grant of `lease` as `Lease.grant_pending` shows it: an entry
+    /// not sent yet that names the row as it stands, at its token and
+    /// holder, for a row that carries the mark and is not revoked (section
+    /// 8.4, "Grants of a marked row"). Whichever operation held it counts:
+    /// a failover, a restore, a regrant or `createVolume`.
+    fn held_of_row(&self, lease: &leases::Lease) -> Option<HeldGrant> {
+        if !lease.unsettled || lease.is_revoked() {
+            return None;
+        }
+        self.0
+            .held
+            .lock()
+            .expect("held grant lock")
+            .entries
+            .get(&lease.id)
+            .filter(|held| held.names(lease) && held.pending())
+            .cloned()
+    }
+
+    /// `Lease.grant_pending` of `lease`, the row as just read, with no
+    /// write. While it is true, a second failover or a switchover of the
+    /// app answers `in_progress` (ADR 0292, ADR 0303); it reads what the
+    /// API shows, so a revoked row's grant no longer counts.
+    pub(crate) fn row_grant_pending(&self, lease: &leases::Lease) -> bool {
+        self.held_of_row(lease).is_some()
     }
 
     /// `Lease.grant_pending` and `Lease.grant_waiting_on` of `lease`, read on
@@ -380,15 +408,7 @@ impl NodeHub {
         conn: &mut sqlx::SqliteConnection,
         lease: &leases::Lease,
     ) -> Result<(bool, Vec<String>), ApiError> {
-        let held = {
-            let registry = self.0.held.lock().expect("held grant lock");
-            registry
-                .entries
-                .get(&lease.id)
-                .filter(|held| held.names(lease) && held.pending())
-                .cloned()
-        };
-        let Some(held) = held.filter(|_| lease.unsettled && !lease.is_revoked()) else {
+        let Some(held) = self.held_of_row(lease) else {
             return Ok((false, Vec::new()));
         };
         let mut waiting = BTreeSet::new();
@@ -1024,6 +1044,35 @@ mod tests {
         let held = entry(hub, "lse_one");
         assert_eq!(held.token, 3, "the newer entry stays");
         assert_eq!(held.eligible_on, Some(generation));
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// ADR 0292: what a failover's `in_progress` reads is what
+    /// `Lease.grant_pending` shows. A held grant of the row as it stands
+    /// counts; once the row is revoked, unmarked, or at another token or
+    /// holder, it does not, though the registry still holds the entry.
+    #[tokio::test]
+    async fn the_row_grant_pending_reads_the_row() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let lease = marked("lse_one", &node_id);
+        hub.hold_grant(&lease);
+        assert!(hub.grant_pending("lse_one"));
+        assert!(hub.row_grant_pending(&lease));
+
+        let mut revoked = lease.clone();
+        revoked.revoked_at = Some("2026-11-09T10:01:00Z".to_string());
+        assert!(!hub.row_grant_pending(&revoked), "revoked");
+        let mut unmarked = lease.clone();
+        unmarked.unsettled = false;
+        assert!(!hub.row_grant_pending(&unmarked), "unmarked");
+        let mut moved = lease.clone();
+        moved.fencing_token = 3;
+        assert!(!hub.row_grant_pending(&moved), "another token");
+        let mut other = lease.clone();
+        other.holder_node_id = "nod_other".to_string();
+        assert!(!hub.row_grant_pending(&other), "another holder");
+        assert!(hub.grant_pending("lse_one"), "the entry stays");
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
