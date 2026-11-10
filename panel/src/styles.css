@@ -2742,7 +2742,7 @@
 
   .ha-seats {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 200px), 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
     gap: 10px;
     padding: 14px 16px;
   }
@@ -2885,6 +2885,11 @@
     gap: 6px;
   }
 
+  .ha-quiet-v b {
+    font-weight: 560;
+    color: var(--ink);
+  }
+
   @media (max-width: 719.98px) {
     .ha-offer {
       grid-template-columns: minmax(0, 1fr);
@@ -2892,6 +2897,10 @@
 
     .ha-h {
       flex-wrap: wrap;
+    }
+
+    .ha-ht {
+      flex-basis: calc(100% - 40px);
     }
 
     .ha-tally {

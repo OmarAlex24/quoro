@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ShieldAlert, ShieldCheck, ShieldEllipsis } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { getGetClusterQueryKey, useGetCluster } from '../api/generated/cluster/cluster';
 import type { Node, NodeJoinTokenCreated } from '../api/generated/model';
 import { createNodeJoinToken, getListNodesQueryKey, updateNodeRoles } from '../api/generated/nodes/nodes';
@@ -57,10 +57,17 @@ export function HaVotes({ nodes }: { nodes: readonly Node[] }) {
     mutationFn: () => createNodeJoinToken({}, { headers: { 'Idempotency-Key': crypto.randomUUID() } }),
   });
 
+  const votes = cluster.data?.votes;
+  const short = votes !== undefined && haReadout(votes, nodes).state === 'short';
+  const dropToken = joinToken.reset;
+  // The secret goes with the offer: once HA has its votes, nothing shows it again.
+  useEffect(() => {
+    if (!short) dropToken();
+  }, [short, dropToken]);
+
   if (cluster.error) {
     return <ProblemBanner view={problemView(cluster.error, 'see the voters')} className="mb-4" />;
   }
-  const votes = cluster.data?.votes;
   if (!votes) return null;
 
   return (
@@ -260,9 +267,11 @@ function HaSettled({ readout }: { readout: HaReadout }) {
       </p>
       <ul className="ha-quiet-v" aria-label="Voters">
         {readout.seats.map((seat) => (
-          <li key={seat.nodeId} title={`${seat.roles.join(', ')} · ${seat.words}`}>
+          <li key={seat.nodeId}>
             <ToneLamp tone={seat.tone} size={11} label={seat.words} />
-            {seat.name}
+            <b>{seat.name}</b>
+            <span>{seat.roles.join(', ')}</span>
+            {seat.connected ? null : <span className="text-fault">{seat.words}</span>}
           </li>
         ))}
       </ul>

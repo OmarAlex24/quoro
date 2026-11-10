@@ -122,10 +122,18 @@ describe('HaVotesView with three voters', () => {
     const html = render(votesOf([lab3, lab4, witness], true), nodes);
     expect(html).toContain('HA is ready.');
     expect(html).toContain('3 of 3 votes, and a majority supports the primary.');
-    expect(html).toContain('lab-edge');
+    expect(html).toContain('<b>lab-edge</b><span>edge, witness</span>');
+    expect(html).toContain('<b>lab-4</b><span>node, edge</span>');
     expect(html).not.toContain('witness role');
     expect(html).not.toContain('join token');
     expect(html).not.toContain('<button');
+  });
+
+  it('says which voter is disconnected', () => {
+    const votes = votesOf([lab3, lab4, witness], false);
+    votes.voters[1] = { ...votes.voters[1]!, connected: false };
+    const html = render(votes, nodes);
+    expect(html).toContain('<b>lab-4</b><span>node, edge</span><span class="text-fault">Disconnected</span>');
   });
 
   it('waits for a majority before ha_ready, still without an offer', () => {
