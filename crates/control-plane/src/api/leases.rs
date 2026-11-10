@@ -125,7 +125,11 @@ impl Lease {
             holder_node_id: row.holder_node_id,
             mode,
             fencing_token: row.fencing_token,
-            duration_ms: row.duration_ms,
+            // "Expiring leases only": a `local` row can keep the duration of
+            // its last `expiring` grant (section 8.4, "Ending the renewals"
+            // step 1, and the holder's `local` report), which the view does
+            // not show. The stored column is unchanged.
+            duration_ms: row.duration_ms.filter(|_| mode == LeaseModeView::Expiring),
             granted_at: row.granted_at,
             renewed_at: row.renewed_at,
             expires_at: row.expires_at,

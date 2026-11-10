@@ -321,9 +321,9 @@ async fn node_with_lease(
     (node, app_id, lease_id, token)
 }
 
-/// A new session of `node` whose `hello` lists `lease_id` of `app_id` at
-/// `token` in `state`. Returns the socket and every frame up to the end of
-/// the session start.
+/// A new session of `node` whose `hello` lists `lease_id` of `app_id`
+/// `local` at `token` in `state`. Returns the socket and every frame up to
+/// the end of the session start.
 async fn reconnect(
     server: &Server,
     node: &Enrolled,
@@ -332,12 +332,27 @@ async fn reconnect(
     token: u64,
     state: &str,
 ) -> (Socket, Vec<Value>) {
+    let mode = quoro_proto::LeaseMode::Local;
+    reconnect_in(server, node, app_id, lease_id, (token, state, mode)).await
+}
+
+/// [`reconnect`], with the lease listed in `mode`. A holder of an
+/// `expiring` row lists it `expiring`; one that lists it `local`, `held`
+/// or `uncertain`, reports it `local`, and the row is written `local`
+/// (section 8.4, "Writing the row `local`", #555).
+async fn reconnect_in(
+    server: &Server,
+    node: &Enrolled,
+    app_id: &str,
+    lease_id: &str,
+    (token, state, mode): (u64, &str, quoro_proto::LeaseMode),
+) -> (Socket, Vec<Value>) {
     let mut socket = connect(server, &node.credential).await;
     let listed = wire::HelloLease {
         lease_id: lease_id.to_string(),
         resource_type: quoro_proto::ResourceType::App,
         resource_id: app_id.to_string(),
-        mode: quoro_proto::LeaseMode::Local,
+        mode,
         fencing_token: token,
         state: state.to_string(),
     };
@@ -750,17 +765,17 @@ async fn a_refused_same_token_grant_gives_the_lease_back() {
     assert_eq!(grants_of(&frames, &lease_id), vec![token + 2]);
     drop(socket);
 
-    // An `expiring` row listed `held` gets no same-token grant at all
-    // (section 8.4), so there is nothing to refuse, and nothing is given
-    // back.
+    // An `expiring` row listed `expiring` `held` gets no same-token grant
+    // at all (section 8.4), so there is nothing to refuse, and nothing is
+    // given back.
     run(
         &server,
         "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
         &lease_id,
     )
     .await;
-    let (mut socket, frames) =
-        reconnect(&server, &node, &app_id, &lease_id, token + 2, "held").await;
+    let listed = (token + 2, "held", quoro_proto::LeaseMode::Expiring);
+    let (mut socket, frames) = reconnect_in(&server, &node, &app_id, &lease_id, listed).await;
     assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
     let frames = frames_until_settled(&mut socket).await;
     assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
@@ -986,8 +1001,9 @@ async fn session_listing_nothing(server: &Server, node: &Enrolled) -> (Socket, V
     (socket, frames)
 }
 
-/// Section 8.4: an `expiring` lease the holder's `hello` lists `held` or
-/// `uncertain` at the row's token gets no grant at a session start: the
+/// Section 8.4: an `expiring` lease the holder's `hello` lists `expiring`,
+/// `held` or `uncertain`, at the row's token gets no grant at a session
+/// start: the
 /// node renews it, and a same-token `expiring` grant without `re` has no row
 /// in the node state machine. A holder that does not list the lease gets its
 /// first grant again, without `re`, only when the row carries no unsettled
@@ -1011,7 +1027,8 @@ async fn an_expiring_lease_is_granted_again_only_to_a_holder_that_lacks_it() {
 
     support(&server, true);
     for state in ["held", "uncertain"] {
-        let (socket, frames) = reconnect(&server, &node, &app_id, &lease_id, token, state).await;
+        let listed = (token, state, quoro_proto::LeaseMode::Expiring);
+        let (socket, frames) = reconnect_in(&server, &node, &app_id, &lease_id, listed).await;
         assert!(
             grants_of(&frames, &lease_id).is_empty(),
             "{state}: {frames:?}"

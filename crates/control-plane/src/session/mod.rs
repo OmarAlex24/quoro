@@ -18,6 +18,7 @@ pub mod desired;
 pub mod drain;
 mod follow;
 mod held;
+mod local_report;
 pub(crate) mod mesh;
 pub mod serving;
 mod votes;
@@ -381,6 +382,20 @@ fn lost_at_not_cleared(re: &str) -> String {
     )
 }
 
+/// The non-fatal error that ends a session whose start could not finish:
+/// its pass over the leases was incomplete, or a holder's `local` report
+/// could not be written (section 8.4, "Acknowledgements" and "The holder's
+/// next `hello`"). The node dials again, and its next session runs the
+/// start again.
+fn start_not_finished(re: &str) -> String {
+    protocol_error(
+        quoro_proto::ErrorCode::BadMessage,
+        "the primary could not finish this session's start; dial again",
+        false,
+        Some(re),
+    )
+}
+
 /// The frame that answers a failed decode (section 5.18).
 fn protocol_error(
     code: quoro_proto::ErrorCode,
@@ -614,6 +629,9 @@ pub enum Fault {
     /// The next write that clears the `lost_at` of `node_id`, a node
     /// declared lost that returned (section 8.3), fails.
     ClearLostAt { node_id: String },
+    /// The next write of a `local` report of `node_id` (section 8.4, "The
+    /// holder's next `hello`") fails once its checks held.
+    LocalReport { node_id: String },
     /// The next failover of `app_id` loses the voters' support after its
     /// last support check and before it writes the grant: the hub's support
     /// turns to none from then on.
@@ -3017,21 +3035,23 @@ impl Session {
                 // hub's channel: it registers no held grant on this session,
                 // and a held grant waits for the session's start anyway.
                 outbox.truncate(start_frames);
-                outbox.push(protocol_error(
-                    quoro_proto::ErrorCode::BadMessage,
-                    "the primary could not finish this session's start; dial again",
-                    false,
-                    Some(&raw.id),
-                ));
+                outbox.push(start_not_finished(&raw.id));
                 return true;
             }
             self.bind_custody_key(hello.custody_public_key.as_deref(), &raw.id, outbox)
                 .await;
-            if self.has_pending_fence_ack().await {
+            let goes_on = if self.has_pending_fence_ack().await {
                 self.start_wait = Some(hello.stored_rev);
-                self.advance_start(outbox).await;
+                self.advance_start(outbox).await
             } else {
-                self.finish_start(hello.stored_rev, outbox).await;
+                self.finish_start(hello.stored_rev, outbox).await
+            };
+            // A holder's `local` report that could not be written ends the
+            // session (`local_report`). The pass over the leases ran to its
+            // end, so its welcome and its revokes go out.
+            if !goes_on {
+                outbox.push(start_not_finished(&raw.id));
+                return true;
             }
             return false;
         }
@@ -3123,12 +3143,17 @@ impl Session {
                         .as_ref()
                         .is_some_and(|sent| sent.msg_id == re)
                     {
-                        self.fence_ack_answered(
-                            result.status == quoro_proto::CommandStatus::Ok,
-                            result.detail.as_deref(),
-                            outbox,
-                        )
-                        .await;
+                        if !self
+                            .fence_ack_answered(
+                                result.status == quoro_proto::CommandStatus::Ok,
+                                result.detail.as_deref(),
+                                outbox,
+                            )
+                            .await
+                        {
+                            outbox.push(start_not_finished(&raw.id));
+                            return true;
+                        }
                         return false;
                     }
                     if let Some((lease_id, token)) =
@@ -3149,6 +3174,7 @@ impl Session {
                         // between.
                         self.note_revoke_answer(&lease_id, &result).await;
                         let mut goes_on = true;
+                        let mut started = true;
                         if self
                             .hub
                             .0
@@ -3159,14 +3185,19 @@ impl Session {
                             // A failed clear ends the session: what the
                             // answer would unlock (the `hello` latch, the
                             // held grants, a `fence_ack`, the desired state)
-                            // waits for the next session.
+                            // waits for the next session. So does a session
+                            // start that could not finish.
                             if goes_on {
-                                self.revoke_answered(outbox).await;
+                                started = self.revoke_answered(outbox).await;
                             }
                         }
                         self.hub.0.revoke_answers.notify_waiters();
                         if !goes_on {
                             outbox.push(lost_at_not_cleared(&raw.id));
+                            return true;
+                        }
+                        if !started {
+                            outbox.push(start_not_finished(&raw.id));
                             return true;
                         }
                         return false;
@@ -3239,8 +3270,13 @@ impl Session {
                         .as_ref()
                         .is_some_and(|sent| sent.msg_id == re)
                     {
-                        self.fence_ack_answered(false, Some(&error.message), outbox)
-                            .await;
+                        if !self
+                            .fence_ack_answered(false, Some(&error.message), outbox)
+                            .await
+                        {
+                            outbox.push(start_not_finished(&raw.id));
+                            return true;
+                        }
                     } else if self
                         .hub
                         .0
@@ -3253,7 +3289,10 @@ impl Session {
                             outbox.push(lost_at_not_cleared(&raw.id));
                             return true;
                         }
-                        self.revoke_answered(outbox).await;
+                        if !self.revoke_answered(outbox).await {
+                            outbox.push(start_not_finished(&raw.id));
+                            return true;
+                        }
                     } else if let Some((lease_id, token)) = self.same_token_grants.remove(re)
                         && error.code == quoro_proto::ErrorCode::BadMessage
                         && !self
@@ -4152,10 +4191,11 @@ impl Session {
     /// Section 4.2 rules 4 and 5 at session start: once every revoke is
     /// answered, the pending acknowledgement goes out and the desired state
     /// waits for its answer; with nothing left to acknowledge, the desired
-    /// state goes out.
-    async fn advance_start(&mut self, outbox: &mut Vec<String>) {
+    /// state goes out. Returns whether the session may go on: `false` when
+    /// its start could not finish ([`Session::finish_start`]).
+    async fn advance_start(&mut self, outbox: &mut Vec<String>) -> bool {
         let Some(stored_rev) = self.start_wait else {
-            return;
+            return true;
         };
         if self.fence_ack.is_some()
             || self
@@ -4164,10 +4204,10 @@ impl Session {
                 .revokes_unanswered(&self.node_id, self.generation)
             || self.send_fence_ack(outbox).await
         {
-            return;
+            return true;
         }
         self.start_wait = None;
-        self.finish_start(stored_rev, outbox).await;
+        self.finish_start(stored_rev, outbox).await
     }
 
     /// The `lease_revoke` `re` was answered, `ok`, with an error or refused:
@@ -4245,16 +4285,19 @@ impl Session {
     }
 
     /// A `lease_revoke` this session sent was answered: the session start
-    /// may go on, and a pending acknowledgement may go out.
-    async fn revoke_answered(&mut self, outbox: &mut Vec<String>) {
+    /// may go on, and a pending acknowledgement may go out. Returns whether
+    /// the session may go on: `false` when its start could not finish
+    /// ([`Session::finish_start`]), and the session must then end.
+    async fn revoke_answered(&mut self, outbox: &mut Vec<String>) -> bool {
         // ADR 0299: the answer may be the last one the `hello` position
         // waits for, and a held grant waits for every revoke's answer.
         self.hub.latch_hello(&self.node_id, self.generation);
         self.hub.wake_held();
         if self.start_wait.is_some() {
-            self.advance_start(outbox).await;
+            self.advance_start(outbox).await
         } else {
             self.send_fence_ack(outbox).await;
+            true
         }
     }
 
@@ -4263,14 +4306,17 @@ impl Session {
     /// and lets a newer acknowledgement go out; a refusal stops it for this
     /// session. Either answer lets the session start go on (section 4.2 rule
     /// 5), so a node that refuses the command still gets its desired state.
+    /// Returns whether the session may go on: `false` when its start could
+    /// not finish ([`Session::finish_start`]), and the session must then
+    /// end, with no newer acknowledgement sent.
     async fn fence_ack_answered(
         &mut self,
         ok: bool,
         detail: Option<&str>,
         outbox: &mut Vec<String>,
-    ) {
+    ) -> bool {
         let Some(sent) = self.fence_ack.take() else {
-            return;
+            return true;
         };
         if ok {
             if let Err(e) =
@@ -4287,15 +4333,30 @@ impl Session {
             );
             self.fence_ack_stopped = true;
         }
-        if let Some(stored_rev) = self.start_wait.take() {
-            self.finish_start(stored_rev, outbox).await;
+        if let Some(stored_rev) = self.start_wait.take()
+            && !self.finish_start(stored_rev, outbox).await
+        {
+            return false;
         }
         self.send_fence_ack(outbox).await;
+        true
     }
 
     /// Section 4.2 rule 5 and section 5.12: the first desired state of the
-    /// session, then the app leases this node holds.
-    async fn finish_start(&mut self, stored_rev: u64, outbox: &mut Vec<String>) {
+    /// session, then the app leases this node holds. The holder's `local`
+    /// reports are written first (section 8.4, "The holder's next `hello`";
+    /// [`local_report`]), after the session start's pass over the leases and
+    /// its `declared_lost` revokes, so the desired state and the grants
+    /// follow the rows as written.
+    ///
+    /// Returns whether the session may go on: `false` when a `local` report
+    /// could not be written, and then nothing else goes out, neither the
+    /// desired state nor a grant ([`Session::record_local_reports`]); the
+    /// caller ends the session.
+    async fn finish_start(&mut self, stored_rev: u64, outbox: &mut Vec<String>) -> bool {
+        if !self.record_local_reports().await {
+            return false;
+        }
         match self.refresh(stored_rev, true).await {
             Ok(()) => self.retry_pending = false,
             Err(e) => {
@@ -4304,6 +4365,7 @@ impl Session {
             }
         }
         self.send_grants(outbox).await;
+        true
     }
 
     /// A `lease_revoke` answered with `fence_failed`: the failure is recorded
@@ -4498,9 +4560,11 @@ impl Session {
                     // "Grants of a marked row": every grant of a marked row
                     // other than a renewal's answer goes through the
                     // held-grant path; the regrant above does (its write
-                    // waits). One the node lists `held` or `uncertain` at the
-                    // row's token gets nothing here otherwise: the same-token
-                    // `local` resend and the holder's `local` report are #555.
+                    // waits). A holder's `local` report cleared the mark
+                    // before this pass ([`local_report`]); one the node lists
+                    // `expiring` at the row's token while the policy is off
+                    // `warm` gets nothing here: the same-token `local` resend
+                    // is #555.
                     if lease.unsettled {
                         continue;
                     }

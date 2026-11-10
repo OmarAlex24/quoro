@@ -33,8 +33,9 @@
 //!   while the policy is `warm`, the first renewal after an `expiring` grant
 //!   with a new token, such as a failover's or a regrant's ("The mark").
 //!
-//! Not built here: sending the conversion grant, the holder's `local` report,
-//! R and the same-token `local` grant with its `ping` (issue #555).
+//! Not built here: sending the conversion grant, R and the same-token `local`
+//! grant with its `ping` (issue #555). The holder's `local` report is
+//! [`super::local_report`].
 
 use super::{ControlMessage, NodeHub, Session, lease_token, new_msg_id};
 use crate::authority::{DEFAULT_DURATION_MS, GrantKind, MIN_DURATION_MS};
@@ -430,7 +431,7 @@ pub(super) async fn app_is_warm(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::tests::hub_with_node;
     use super::{InFlight, Plan, plan};
     use crate::AppState;
@@ -444,8 +445,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    const LEASE: &str = "lse_01JC9Z8K2M4P6R8T0V2X4Z6B8D";
-    const APP: &str = "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E";
+    pub(in crate::session) const LEASE: &str = "lse_01JC9Z8K2M4P6R8T0V2X4Z6B8D";
+    pub(in crate::session) const APP: &str = "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E";
     const D: u64 = 15_000;
 
     #[derive(Debug)]
@@ -461,14 +462,19 @@ mod tests {
     /// at token 3, storing `stored`, marked or not. The hub's authority runs
     /// on a manual clock and holds every support, so the tests move time
     /// only through the clock and never sleep.
-    struct Fixture {
-        state: AppState,
-        node_id: String,
-        data_dir: std::path::PathBuf,
-        clock: Arc<ManualClock>,
+    pub(in crate::session) struct Fixture {
+        pub(in crate::session) state: AppState,
+        pub(in crate::session) node_id: String,
+        pub(in crate::session) data_dir: std::path::PathBuf,
+        pub(in crate::session) clock: Arc<ManualClock>,
     }
 
-    async fn fixture(policy: &str, mode: &str, stored: Option<i64>, marked: bool) -> Fixture {
+    pub(in crate::session) async fn fixture(
+        policy: &str,
+        mode: &str,
+        stored: Option<i64>,
+        marked: bool,
+    ) -> Fixture {
         let (state, node_id, data_dir) = hub_with_node().await;
         let pool = state.store.pool();
         sqlx::query("UPDATE nodes SET subnet = '10.42.1.0/24' WHERE id = ?")
@@ -532,7 +538,10 @@ mod tests {
         /// A session of the node whose `hello` lists the lease `state` in
         /// `mode` at `token`, or not at all, and the frames the session
         /// start queued on the outbox.
-        async fn session(&self, listed: Option<(&str, LeaseMode, u64)>) -> (Session, Vec<Value>) {
+        pub(in crate::session) async fn session(
+            &self,
+            listed: Option<(&str, LeaseMode, u64)>,
+        ) -> (Session, Vec<Value>) {
             let hub = &self.state.hub;
             let (generation, _rx, _closed, _changed) = hub.attach(&self.node_id);
             let mut session = Session::new(hub.clone(), self.node_id.clone(), generation);
@@ -544,13 +553,13 @@ mod tests {
             (session, frames(outbox))
         }
 
-        async fn row(&self) -> Lease {
+        pub(in crate::session) async fn row(&self) -> Lease {
             let mut conn = self.state.store.pool().acquire().await.unwrap();
             leases::by_id(&mut conn, LEASE).await.unwrap().unwrap()
         }
 
         /// How many change-log entries the lease has.
-        async fn writes(&self) -> i64 {
+        pub(in crate::session) async fn writes(&self) -> i64 {
             sqlx::query_scalar(
                 "SELECT COUNT(*) FROM change_log WHERE entity_type = 'lease' AND entity_id = ?",
             )
@@ -562,7 +571,7 @@ mod tests {
 
         /// What `failoverApp` finds for a source that is not connected
         /// ([`crate::failover::held_while_away`]).
-        async fn held_while_away(&self) -> Option<&'static str> {
+        pub(in crate::session) async fn held_while_away(&self) -> Option<&'static str> {
             let lease = self.row().await;
             let mut conn = self.state.store.pool().acquire().await.unwrap();
             crate::failover::held_while_away(&mut conn, self.state.hub.authority(), &lease)
@@ -574,12 +583,15 @@ mod tests {
             self.state.hub.authority().passed(LEASE)
         }
 
-        fn done(self) {
+        pub(in crate::session) fn done(self) {
             std::fs::remove_dir_all(&self.data_dir).unwrap();
         }
     }
 
-    fn hello(node_id: &str, listed: Option<(&str, LeaseMode, u64)>) -> wire::Hello {
+    pub(in crate::session) fn hello(
+        node_id: &str,
+        listed: Option<(&str, LeaseMode, u64)>,
+    ) -> wire::Hello {
         wire::Hello {
             node_id: node_id.to_string(),
             agent_version: "agent".to_string(),
@@ -618,14 +630,14 @@ mod tests {
         }
     }
 
-    fn frames(outbox: Vec<String>) -> Vec<Value> {
+    pub(in crate::session) fn frames(outbox: Vec<String>) -> Vec<Value> {
         outbox
             .iter()
             .map(|text| serde_json::from_str(text).unwrap())
             .collect()
     }
 
-    fn of_type<'a>(frames: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    pub(in crate::session) fn of_type<'a>(frames: &'a [Value], kind: &str) -> Vec<&'a Value> {
         frames
             .iter()
             .filter(|frame| frame["type"] == kind)
@@ -670,7 +682,7 @@ mod tests {
     /// nothing in memory survives, and the start seeds the gates from the
     /// rows. Its authority then runs on a manual clock, seeded again from
     /// its start.
-    async fn restart(fixture: &Fixture) -> (AppState, Arc<ManualClock>) {
+    pub(in crate::session) async fn restart(fixture: &Fixture) -> (AppState, Arc<ManualClock>) {
         let store = crate::store::Store::open(&fixture.data_dir.join("quoro.db"))
             .await
             .unwrap();
@@ -1405,7 +1417,7 @@ mod tests {
         pings[0]["id"].as_str().unwrap().to_string()
     }
 
-    fn actor() -> Actor {
+    pub(in crate::session) fn actor() -> Actor {
         Actor {
             kind: ActorType::System,
             id: "test".to_string(),
@@ -1415,7 +1427,7 @@ mod tests {
     /// Runs `update` (bound to the lease's id) on the row and appends its
     /// change-log entry, in one single-writer transaction, as any write of
     /// the row does.
-    async fn write_row(f: &Fixture, update: &str) {
+    pub(in crate::session) async fn write_row(f: &Fixture, update: &str) {
         let mut w = f.state.store.begin_write().await.unwrap();
         sqlx::query(update)
             .bind(LEASE)

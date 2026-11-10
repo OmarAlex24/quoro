@@ -35,12 +35,12 @@
 //!   restart a node counts again only once it acknowledges on a new session.
 //!
 //! The settle clears the mark once the holder renews while the policy is
-//! `warm` ([`super::conversion`]). Out of scope (issue #555, ADR 0261): the
-//! other writes that clear it (the holder's `local` report at `hello`, the
-//! `pong` after a same-token `local` grant), R and the conversion grant, and
-//! the resend of the same-token `local` grant. Until they land, a row marked
-//! here that is not settled stays marked after its grant is taken, and moves
-//! only as a `local` lease does, which is safe. `failoverApp` ([`crate::failover`]) holds its
+//! `warm` ([`super::conversion`]), and so does the holder's `local` report
+//! at its next session start ([`super::local_report`]). Out of scope (issue
+//! #555, ADR 0261): the `pong` after a same-token `local` grant, R and the
+//! conversion grant, and the resend of the same-token `local` grant. Until
+//! the holder reports or renews, a row marked here stays marked after its
+//! grant is taken, and moves only as a `local` lease does, which is safe. `failoverApp` ([`crate::failover`]) holds its
 //! waiting grant with [`NodeHub::hold_grant`] and answers `in_progress` while
 //! [`NodeHub::grant_pending`] (ADR 0292).
 

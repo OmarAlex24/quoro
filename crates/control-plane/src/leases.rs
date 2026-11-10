@@ -48,8 +48,9 @@ pub(crate) struct Lease {
     /// "The mark"): the row may disagree with its holder's mode, so the lease
     /// moves only as a `local` lease does. No write with a new token clears
     /// it; only the writes that record what the holder holds do: the settle
-    /// ([`settle`]) and, not built yet, the holder's `local` report and the
-    /// `pong` after a same-token `local` grant (issue #555).
+    /// ([`settle`]), the holder's `local` report ([`write_local_report`])
+    /// and, not built yet, the `pong` after a same-token `local` grant
+    /// (issue #555).
     pub unsettled: bool,
 }
 
@@ -84,9 +85,15 @@ impl Lease {
     }
 
     /// The `lease_grant` body the holder receives (section 5.12). A `local`
-    /// lease carries no `duration_ms`.
+    /// lease carries no `duration_ms`, whatever the row stores: a `local`
+    /// row may keep the duration of an earlier `expiring` grant (section
+    /// 8.4: the holder's `local` report and R leave `leases.duration_ms` as
+    /// it was), and the node refuses a `local` grant that carries one with
+    /// `bad_message` (section 5.12, "Present for `expiring`, absent for
+    /// `local`").
     #[must_use]
     pub(crate) fn grant(&self) -> LeaseGrant {
+        let expiring = self.mode == "expiring";
         LeaseGrant {
             lease_id: LeaseId(self.id.clone()),
             resource_type: if self.resource_type == "primary" {
@@ -95,7 +102,7 @@ impl Lease {
                 ResourceType::App
             },
             resource_id: self.resource_id.clone(),
-            mode: if self.mode == "expiring" {
+            mode: if expiring {
                 LeaseMode::Expiring
             } else {
                 LeaseMode::Local
@@ -103,6 +110,7 @@ impl Lease {
             fencing_token: u64::try_from(self.fencing_token.max(1)).unwrap_or(1),
             duration_ms: self
                 .duration_ms
+                .filter(|_| expiring)
                 .and_then(|ms| u64::try_from(ms.max(1)).ok()),
             granted_at: self.granted_at.clone(),
         }
@@ -911,9 +919,9 @@ pub(crate) fn grant_must_wait(facts: GrantFacts) -> bool {
 ///
 /// A row marked here keeps the mark after its grant is taken until a write
 /// that records what the holder holds clears it: the settle at the holder's
-/// first renewal while the policy is `warm` ([`settle`]), or, not built yet,
-/// the holder's `local` report (issue #555). Until then it moves only as a
-/// `local` lease does, which is safe.
+/// first renewal while the policy is `warm` ([`settle`]), or the holder's
+/// `local` report at its next session start ([`write_local_report`]). Until
+/// then it moves only as a `local` lease does, which is safe.
 ///
 /// [`Authority::gate_remaining`]: crate::authority::Authority::gate_remaining
 ///
@@ -1118,6 +1126,37 @@ pub(crate) async fn settle(
     lease.mode = "expiring".to_string();
     lease.fencing_token = token;
     lease.duration_ms = Some(duration_ms);
+    lease.unsettled = false;
+    changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+    Ok(lease)
+}
+
+/// The write that records the holder's `local` report (section 8.4, "The
+/// holder's next `hello`", "Writing the row `local`" and "The mark"; ADR
+/// 0280, ADR 0285): the row takes `mode` `local` and the holder's `token`,
+/// and loses the unsettled mark. `duration_ms` stays as it was: lowering it
+/// waits for the gates of longer grants ([`lower_duration`], ADR 0203), as
+/// R leaves it ("Ending the renewals" step 1). The caller has checked, in
+/// the same single-writer transaction, that the holder may be recorded so.
+/// The same write records the `pong` after a same-token `local` grant
+/// ("The mark"). Returns the row as written.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn write_local_report(
+    conn: &mut SqliteConnection,
+    mut lease: Lease,
+    token: i64,
+    actor: &Actor,
+) -> Result<Lease, ApiError> {
+    sqlx::query("UPDATE leases SET mode = 'local', fencing_token = ?, unsettled = 0 WHERE id = ?")
+        .bind(token)
+        .bind(&lease.id)
+        .execute(&mut *conn)
+        .await?;
+    lease.mode = "local".to_string();
+    lease.fencing_token = token;
     lease.unsettled = false;
     changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
     Ok(lease)
