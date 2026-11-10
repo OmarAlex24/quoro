@@ -2704,25 +2704,59 @@
     color: var(--ink-2);
   }
 
+  /*
+   * Label and value tables (the sheet's Settings, a webhook, a backup
+   * repository, an audit entry): a sunk surface, 1 px rules between rows and
+   * a highlight under the pointer. Code values set themselves in Martian
+   * Mono (`.type-code`); labels never. Labels stay --ink-2: --ink-3 on the
+   * sunk surface is under 4.5:1 in both themes.
+   */
   .set-rows {
     display: grid;
+    background-color: var(--sunk);
+  }
+
+  .box.set-rows {
+    overflow: hidden;
   }
 
   .set-row {
     display: grid;
-    grid-template-columns: 140px minmax(0, 1fr);
+    grid-template-columns: 132px minmax(0, 1fr);
     gap: 12px;
-    padding: 9px 14px;
+    padding: 8px 14px;
     border-top: 1px solid var(--line);
     font-size: 13px;
+    transition: background-color var(--motion-feedback) var(--ease);
   }
 
   .set-row:first-child {
     border-top: 0;
   }
 
+  .set-row:hover {
+    background-color: color-mix(in oklab, var(--raised) 55%, transparent);
+  }
+
   .set-row dt {
     color: var(--ink-2);
+  }
+
+  /*
+   * Rows of a list on a card (settings lists, variables, VMs): the same rules
+   * and a highlight under the pointer, here the sunk colour, since the
+   * raised one is the card's own white in light.
+   */
+  .srow,
+  .keyrow,
+  .vmt tbody tr {
+    transition: background-color var(--motion-feedback) var(--ease);
+  }
+
+  .srow:hover,
+  .keyrow:hover,
+  .vmt tbody tr:hover {
+    background-color: color-mix(in oklab, var(--sunk) 75%, transparent);
   }
 
   .set-row dd {
