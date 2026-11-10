@@ -8,7 +8,10 @@
 //! generic netlink, and the interface's traffic is filtered by the
 //! `inet quoro_mesh` table so only the `allow` entries get through: to a
 //! guest, or, for a warm volume's replication stream, to the host's own mesh
-//! address (section 6.13).
+//! address (section 6.13). The table also keeps new connections out of the
+//! mesh unless a root process on this machine opens them, and forwards none:
+//! the mesh carries no traffic between guests, and a guest opens no
+//! connection on it (section 6.9).
 //!
 //! [`MeshManager`] keeps the interface equal to the newest verified snapshot:
 //! every changed snapshot is evaluated, and a failed apply or an unchanged one
@@ -155,9 +158,17 @@ pub fn desired_routes(mesh: &SpecMesh) -> Vec<String> {
 /// [`MESH_MARK`]. The forward chain then admits only marked packets from the
 /// mesh interface; the input chain admits replies to what this machine dialed
 /// and marked packets, such as the warm replication stream to the target's
-/// own mesh address (section 6.13). Both drop everything else. Any entry whose
-/// `source` or `address` is not an IPv4 address is skipped with a warning:
-/// unparsed text is never written into nftables syntax.
+/// own mesh address (section 6.13). Both drop everything else. Before its
+/// `iifname` rules, the forward chain drops every new connection forwarded out
+/// through the mesh interface: a guest opens no connection on the mesh
+/// (section 6.9). The output chain accepts root's new connections out through
+/// the interface and drops every other new one, a packet with no socket
+/// included: every connection Quoro opens on the mesh comes from root, the
+/// node agent or `quoro cluster promote` (section 7.3). Replies, the rest of
+/// established connections and the kernel's own ICMP errors are not `new`, so
+/// both rules let them through.
+/// Any entry whose `source` or `address` is not an IPv4 address is skipped
+/// with a warning: unparsed text is never written into nftables syntax.
 #[must_use]
 pub fn nft_ruleset(mesh: Option<&SpecMesh>) -> String {
     let mut rules = String::with_capacity(1024);
@@ -199,11 +210,26 @@ pub fn nft_ruleset(mesh: Option<&SpecMesh>) -> String {
         rules,
         "        type filter hook forward priority filter - 2; policy accept;"
     );
+    // A guest opens no connection on the mesh (section 6.9): nothing
+    // forwarded opens one through it.
+    let _ = writeln!(rules, "        oifname \"{INTERFACE}\" ct state new drop");
     let _ = writeln!(
         rules,
         "        iifname \"{INTERFACE}\" meta mark {MESH_MARK:#010x} accept"
     );
     let _ = writeln!(rules, "        iifname \"{INTERFACE}\" drop");
+    let _ = writeln!(rules, "    }}");
+    // Only root opens connections on the mesh (section 7.3).
+    let _ = writeln!(rules, "    chain output {{");
+    let _ = writeln!(
+        rules,
+        "        type filter hook output priority filter - 2; policy accept;"
+    );
+    let _ = writeln!(
+        rules,
+        "        oifname \"{INTERFACE}\" ct state new meta skuid 0 accept"
+    );
+    let _ = writeln!(rules, "        oifname \"{INTERFACE}\" ct state new drop");
     let _ = writeln!(rules, "    }}");
     let _ = writeln!(rules, "    chain input {{");
     let _ = writeln!(
@@ -1393,8 +1419,14 @@ table inet quoro_mesh {
     }
     chain forward {
         type filter hook forward priority filter - 2; policy accept;
+        oifname \"quoro-wg0\" ct state new drop
         iifname \"quoro-wg0\" meta mark 0x5155008c accept
         iifname \"quoro-wg0\" drop
+    }
+    chain output {
+        type filter hook output priority filter - 2; policy accept;
+        oifname \"quoro-wg0\" ct state new meta skuid 0 accept
+        oifname \"quoro-wg0\" ct state new drop
     }
     chain input {
         type filter hook input priority filter - 2; policy accept;
@@ -1430,6 +1462,48 @@ table inet quoro_mesh {
             .find("iifname \"quoro-wg0\" drop")
             .expect("the input chain drops the rest");
         assert!(accept < drop, "the accept comes before the drop");
+    }
+
+    /// A guest opens no connection on the mesh (section 6.9), so nothing
+    /// forwarded opens one through it, and only root opens connections on
+    /// it.
+    #[test]
+    fn new_connections_leave_the_mesh_only_from_root_processes() {
+        let rules = nft_ruleset(Some(&mesh()));
+        let root_accept = "oifname \"quoro-wg0\" ct state new meta skuid 0 accept";
+        let new_drop = "oifname \"quoro-wg0\" ct state new drop";
+
+        let forward_start = rules.find("chain forward {").expect("a forward chain");
+        let forward = &rules[forward_start..];
+        let forward = &forward[..forward.find("    }").expect("the forward chain ends")];
+        let first_rule = forward
+            .lines()
+            .nth(2)
+            .expect("the forward chain has rules")
+            .trim();
+        assert_eq!(first_rule, new_drop, "the oifname rule comes first");
+        let oifname = forward.find(new_drop).expect("the oifname rule");
+        let iifname = forward.find("iifname").expect("the iifname rules");
+        assert!(oifname < iifname, "the oifname rule precedes every iifname");
+
+        let output_start = rules.find("chain output {").expect("an output chain");
+        let input_start = rules.find("chain input {").expect("an input chain");
+        assert!(
+            forward_start < output_start && output_start < input_start,
+            "the output chain sits between the forward and input chains"
+        );
+        let output = &rules[output_start..input_start];
+        assert!(output.contains("type filter hook output priority filter - 2; policy accept;"));
+        let accept = output.find(root_accept).expect("root's new connections");
+        let drop = output.find(new_drop).expect("every other new connection");
+        assert!(accept < drop, "the accept comes before the drop");
+
+        let oifname_rules: Vec<&str> = rules.lines().filter(|l| l.contains("oifname")).collect();
+        assert_eq!(oifname_rules.len(), 3, "{oifname_rules:?}");
+        assert!(
+            oifname_rules.iter().all(|l| l.contains("ct state new")),
+            "every oifname rule matches only new connections"
+        );
     }
 
     #[test]
