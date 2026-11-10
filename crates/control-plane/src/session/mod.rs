@@ -1586,8 +1586,10 @@ impl NodeHub {
     /// `node_id`, from this or an earlier session of it, 0 when it holds
     /// none or answered `log_diverged` since. A `hello` whose `log_seq` is
     /// below it, or below `nodes.log_seq`, draws `log_diverged` (section
-    /// 7.1, "On `hello`", ADR 0261).
-    fn newest_log_ack(&self, node_id: &str) -> u64 {
+    /// 7.1, "On `hello`", ADR 0261). Once the session ended, the API
+    /// reports it as `Node.log_seq` when the row is behind it
+    /// ([`crate::api::nodes::attach_log_position`]).
+    pub(crate) fn newest_log_ack(&self, node_id: &str) -> u64 {
         self.0
             .log_acks
             .lock()
@@ -1600,16 +1602,11 @@ impl NodeHub {
     /// The newest change-log `seq` `node_id` acknowledged on its live
     /// session, or the position that session's follow started from until it
     /// acknowledges one; `None` when the node has no live session that
-    /// follows. This is `Node.log_seq` while the node is connected, and
-    /// `Node.log_lag` is the primary's newest `seq` minus it (section 7.1,
-    /// ADR 0227); `nodes.log_seq` holds it once the session ended.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Node.log_seq and Node.log_lag read it in the API's next change"
-        )
-    )]
+    /// follows. [`crate::api::nodes::attach_log_position`] reports it as
+    /// `Node.log_seq` while the node follows on a live session, with
+    /// `Node.log_lag`, the primary's newest `seq` minus it (section 7.1,
+    /// "Lag", ADR 0227, ADR 0301); once the session ended, `nodes.log_seq`
+    /// holds it and the API reads the row.
     pub(crate) fn log_seq(&self, node_id: &str) -> Option<u64> {
         self.0
             .sessions

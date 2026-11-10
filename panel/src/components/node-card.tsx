@@ -9,7 +9,7 @@ import { drawMeter } from '../lib/dither-draw';
 import { capacityAxis, cpuAxis, memoryFigures, percentTick, plainTick, streamReadout } from '../lib/metric-area';
 import { formatBytes, formatPercent } from '../lib/metrics';
 import { liveWords, loadWords, meterTone, nodeMeters, nodeTags, type NodeLoad, type NodeMeter } from '../lib/node-capacity';
-import { nodeReadout } from '../lib/nodes';
+import { logLagLine, nodeReadout } from '../lib/nodes';
 import { useNodeMetricsStream, type MetricsStreamStatus } from '../lib/use-metrics-stream';
 import { DitherArea } from './dither-area';
 import { DitherCanvas } from './dither-canvas';
@@ -53,6 +53,7 @@ export function NodeCard({ node, load }: { node: Node; load: NodeLoad }) {
   const readout = nodeReadout(node.status);
   const connected = node.status === 'connected';
   const runsVms = node.roles.includes('node');
+  const logLine = runsVms ? logLagLine(node.log_lag) : null;
   const { samples, status, problem } = useNodeMetricsStream(node.id, connected);
   const [charts, setCharts] = useState(false);
   const live = liveWords(samples[samples.length - 1]);
@@ -77,6 +78,7 @@ export function NodeCard({ node, load }: { node: Node; load: NodeLoad }) {
         ) : (
           <p className="node-note">Runs no VMs: this machine is {node.roles.join(' and ')} only.</p>
         )}
+        {logLine ? <p className="node-note">{logLine}</p> : null}
 
         <div className="node-live">
           {connected ? (

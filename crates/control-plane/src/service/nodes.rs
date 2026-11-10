@@ -1,7 +1,9 @@
 //! Node reads (`GET /api/v1/nodes`, `GET /api/v1/nodes/{node_id}`; MCP tools `list_nodes`, `get_node`).
 
 use crate::AppState;
-use crate::api::nodes::{NODE_COLUMNS, Node, NodeList, PageParams, node_from_row, tunnel_of};
+use crate::api::nodes::{
+    NODE_COLUMNS, Node, NodeList, PageParams, attach_log_position, node_from_row, tunnel_of,
+};
 use crate::api::page::finish;
 use crate::error::{ApiError, Target};
 use crate::request::{CallCtx, Resource};
@@ -50,6 +52,7 @@ pub async fn list_nodes(
         for node in &mut nodes {
             node.tunnel = tunnel_of(state.store.pool(), &node.id).await?;
         }
+        attach_log_position(state.store.pool(), &state.hub, &mut nodes).await?;
         let (items, next_cursor) = finish(nodes, limit, |node| node.id.clone());
         let items = access
             .filter(state, items, |node| Resource {
@@ -94,6 +97,12 @@ pub async fn get_node(state: &AppState, ctx: &CallCtx, node_id: &str) -> Result<
         .ok_or_else(|| ApiError::not_found("node"))?;
         let mut node = node_from_row(&row)?;
         node.tunnel = tunnel_of(state.store.pool(), node_id).await?;
+        attach_log_position(
+            state.store.pool(),
+            &state.hub,
+            std::slice::from_mut(&mut node),
+        )
+        .await?;
         Ok(node)
     }
     .await;
