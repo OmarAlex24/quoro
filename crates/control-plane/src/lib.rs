@@ -26,6 +26,8 @@ pub mod driver;
 pub(crate) mod edge_health;
 pub mod error;
 pub mod events;
+/// Moving a `warm` app's lease to its warm node (`failoverApp`, ADR 0175).
+pub(crate) mod failover;
 pub(crate) mod fences;
 pub mod idempotency;
 pub mod interactive;
@@ -173,6 +175,9 @@ pub struct AppState {
     /// and the loop that keeps it fresh (ADR 0150). The loop only runs once
     /// the binary calls [`vulns::Vulns::spawn`].
     pub vulns: vulns::Vulns,
+    /// The apps whose failover is running, in memory only (`failoverApp`
+    /// `in_progress`).
+    pub(crate) failovers: failover::Running,
 }
 
 impl AppState {
@@ -289,6 +294,7 @@ impl AppState {
             interactive: interactive::Interactive::default(),
             backups,
             vulns,
+            failovers: failover::Running::default(),
         };
         // Every session the previous process left open ends with
         // `primary_restarted` before the listener opens.
