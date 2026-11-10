@@ -2071,10 +2071,14 @@ async fn a_pending_acknowledgement_releases_only_the_grant_it_covered() {
 }
 
 /// Section 8.3, ADR 0183: a holder declared lost releases a `local` lease
-/// revoked by then. The test sets `nodes.lost_at` itself, to place the
-/// declaration before and after the revoke; `declaring_the_old_node_lost_lets
-/// _the_restore_finish` uses the API. A declaration older than the revoke says nothing
-/// about it. An `expiring` lease also waits for its gate (section 8.4): see
+/// revoked by then, while it has not reported since. The test sets
+/// `nodes.lost_at` and `last_seen_at` itself, to place the declaration
+/// before and after the revoke, and the node's last report after and at the
+/// declaration; `declaring_the_old_node_lost_lets_the_restore_finish` uses
+/// the API. A declaration older than the revoke says nothing about it. One
+/// the node reported after may have met a failed fence the primary lost, so
+/// it releases nothing either (section 8.5). An `expiring` lease also waits
+/// for its gate (section 8.4): see
 /// `a_lost_holders_expiring_lease_is_released_by_its_gate`.
 #[tokio::test]
 async fn a_holder_declared_lost_releases_the_lease() {
@@ -2091,9 +2095,23 @@ async fn a_holder_declared_lost_releases_the_lease() {
         .unwrap();
     ready_waits(&mut setup, &moving).await;
 
+    // Reported since the declaration.
     sqlx::query(
-        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
+        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?), \
+         last_seen_at = '2999-01-01T00:00:00.000Z' WHERE id = ?",
     )
+    .bind(&moving.lease_id)
+    .bind(&setup.state.node.node_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    ready_waits(&mut setup, &moving).await;
+
+    sqlx::query(
+        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?), \
+         last_seen_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
+    )
+    .bind(&moving.lease_id)
     .bind(&moving.lease_id)
     .bind(&setup.state.node.node_id)
     .execute(&pool)
@@ -2225,8 +2243,10 @@ async fn a_lost_holders_expiring_lease_is_released_by_its_gate() {
     drop_old_session(&mut setup).await;
     let passes = expiring_with_gate(&setup, &moving).await;
     sqlx::query(
-        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
+        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?), \
+         last_seen_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
     )
+    .bind(&moving.lease_id)
     .bind(&moving.lease_id)
     .bind(&setup.state.node.node_id)
     .execute(setup.state.server.state.store.pool())

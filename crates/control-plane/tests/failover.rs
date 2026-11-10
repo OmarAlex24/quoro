@@ -886,6 +886,85 @@ async fn a_stale_lost_at_does_not_free_a_lease_taken_after_the_declaration() {
     .await;
 }
 
+/// Sections 8.3 and 8.5: "declaring a node lost never covers a failed fence
+/// the operator has not seen". The source is declared lost and returns. It
+/// answers its `declared_lost` revoke `fence_failed`, the primary cannot
+/// record that failure, and the write that clears `lost_at` fails, so the
+/// session ends with `lost_at` still set and the failure held only in
+/// memory. Until the restart the failover answers `fence_failed`. After the
+/// primary restarts, which loses that failure, the declaration no longer
+/// releases the lease: the source said `hello` after it, so the failover
+/// answers `lease_held` and nothing moves.
+#[tokio::test]
+async fn a_declaration_frees_nothing_once_the_source_returned_and_its_failure_was_lost() {
+    let mut s = Setup::new().await;
+    s.report_copy().await;
+    set_support(&s.server, true);
+    s.disconnect_source().await;
+    let node = declare_source_lost(&s).await;
+    let declared = node["lost_at"].as_str().unwrap().to_string();
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 5, true));
+
+    for fault in [
+        Fault::FailureRecord {
+            node_id: s.source.node_id.clone(),
+        },
+        Fault::ClearLostAt {
+            node_id: s.source.node_id.clone(),
+        },
+    ] {
+        s.server.state.hub.inject_fault(fault);
+    }
+    let mut on_source = connect(&s.server, &s.source.credential).await;
+    send(&mut on_source, hello(&s.source.node_id, 1), None).await;
+    let revoke = recv_type(&mut on_source, "lease_revoke").await;
+    assert_eq!(revoke["body"]["reason"], "declared_lost", "{revoke}");
+    send(
+        &mut on_source,
+        fence_failed_result(),
+        Some(revoke["id"].as_str().unwrap()),
+    )
+    .await;
+    recv_type(&mut on_source, "error").await;
+    drop(on_source);
+    disconnected(&s.server, &s.source.node_id).await;
+    let (lost_at, last_seen_at): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT lost_at, last_seen_at FROM nodes WHERE id = ?")
+            .bind(&s.source.node_id)
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(lost_at.as_deref(), Some(declared.as_str()), "not cleared");
+    assert!(
+        last_seen_at.as_deref() > Some(declared.as_str()),
+        "seen since the declaration: {last_seen_at:?}"
+    );
+    refused(s.failover().await, 409, "conflict", Some("fence_failed")).await;
+
+    drop(s.on_warm.take());
+    disconnected(&s.server, &s.warm.node_id).await;
+    s.server =
+        common::restart_with_resolver(&s.server, Arc::new(quoro_control_plane::ReferenceAsDigest))
+            .await;
+    let mut on_warm = connect(&s.server, &s.warm.credential).await;
+    send(&mut on_warm, hello(&s.warm.node_id, 2), None).await;
+    recv_type(&mut on_warm, "desired_state").await;
+    s.on_warm = Some(on_warm);
+    s.report_copy().await;
+    set_support(&s.server, true);
+
+    let body = refused(s.failover().await, 409, "conflict", Some("lease_held")).await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("local"), "{detail}");
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 5, true));
+    none_of(
+        s.on_warm(),
+        "lease_grant",
+        "a lease whose failed fence was lost",
+    )
+    .await;
+}
+
 /// Sections 8.3 and 9 step 2, read with `Node.lost_at`: a source declared
 /// lost that returns listing none of its leases still gets the declared
 /// lease revoked with reason `declared_lost`, and its `lost_at` stays until

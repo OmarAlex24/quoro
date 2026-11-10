@@ -1007,7 +1007,8 @@ pub async fn declare_node_lost(
 /// and a revoked row is not held. `fence_failure` is left as it is (ADR 0202),
 /// and no release is recorded ([`crate::leases::Releases`]): a lease moves on
 /// `lost_at` through [`crate::leases::is_released`], which keeps an
-/// `expiring` lease behind its gate.
+/// `expiring` lease behind its gate, and only while the node has not
+/// reported since ([`crate::leases::declaration_releases`]).
 async fn declare_lost_tx(
     state: &AppState,
     ctx: &CallCtx,

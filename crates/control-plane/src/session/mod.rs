@@ -4032,7 +4032,10 @@ impl Session {
     /// that went on would let the node take new leases while the stale
     /// `lost_at` stays; [`leases::declaration_covers`] keeps such a lease
     /// from being freed by it, but nothing would clear it until the node
-    /// next reconnects.
+    /// next reconnects. A `lost_at` left set frees nothing the declaration
+    /// covered either once the node said `hello` after it
+    /// ([`leases::declaration_releases`]): only the node's answers, an
+    /// operator's acknowledgement or its removal do.
     async fn clear_lost_at(&mut self) -> bool {
         let Some(lost_at) = self.lost_at.take() else {
             return true;
@@ -4798,8 +4801,12 @@ async fn connect_node(
         wire::SnapshotMethod::Reflink => "reflink",
         wire::SnapshotMethod::PauseCopy => "pause_copy",
     });
-    let now = now_rfc3339();
     let mut w = hub.0.store.begin_write().await.map_err(|e| e.to_string())?;
+    // Taken under the writer gate, so it is never older than a `lost_at` a
+    // declaration committed before this write: once this `hello` is
+    // recorded, `last_seen_at` is past the declaration, which then releases
+    // nothing more ([`leases::declaration_releases`]).
+    let now = now_rfc3339();
     // A newer session's start write must not be overwritten (issue #324).
     if !hub.is_current(node_id, generation) {
         return Err("a newer session of the node took over before this hello was recorded".into());
