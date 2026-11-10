@@ -221,6 +221,7 @@ fn report(builds: Vec<BuildStatus>) -> NodeMessage {
         images: Vec::new(),
         warm: Vec::new(),
         volumes: Vec::new(),
+        quarantines: Vec::new(),
     })
 }
 

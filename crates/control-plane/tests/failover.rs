@@ -277,6 +277,7 @@ fn copy_report(app_id: &str) -> NodeMessage {
             error: None,
         }],
         volumes: Vec::new(),
+        quarantines: Vec::new(),
     })
 }
 

@@ -452,6 +452,8 @@ pub(crate) async fn delete_volume(
             "the app is running: stop it before deleting its volume",
         ));
     }
+    crate::quarantines::refuse_volume_with_copies(&mut w.tx, state.hub.listed_copies(), volume_id)
+        .await?;
     if volume.state == VolumeState::Deleting {
         return Err(ApiError::conflict("the volume is already deleting"));
     }

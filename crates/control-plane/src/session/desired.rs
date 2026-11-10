@@ -369,6 +369,8 @@ pub async fn build_spec(
     // Section 6.12: every voter gets the whole voter set and its version, a
     // machine with the `witness` role its `spec.witness`.
     let (votes, witness) = voters.current(store.pool()).await?.spec_for(node_id);
+    // Section 5.11: the copies on this node an operator deleted (ADR 0176).
+    let quarantine_deletes = crate::quarantines::deletes_on(store.pool(), node_id).await?;
 
     Ok(BuiltSpec {
         spec: Spec {
@@ -384,6 +386,7 @@ pub async fn build_spec(
             volumes,
             votes,
             witness,
+            quarantine_deletes,
         },
         held_back,
     })

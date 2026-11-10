@@ -386,6 +386,29 @@ pub struct StatusReport {
     /// M5b; absent when there is none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warm: Vec<WarmStatus>,
+    /// One entry per quarantined copy of a volume the node keeps (sections
+    /// 5.3 and 9, ADR 0176). Added in M5b; absent when there is none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantines: Vec<QuarantineStatus>,
+}
+
+/// One entry of `status_report.quarantines` (section 5.3, section 9).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantineStatus {
+    /// The quarantined copy (`qrn_`); the node generates the id.
+    pub quarantine_id: String,
+    /// The volume it is a copy of (`vol_`).
+    pub volume_id: String,
+    /// The volume's app (`app_`).
+    pub app_id: String,
+    /// RFC 3339: when the node took the copy.
+    pub created_at: String,
+    /// Bytes the copy uses on the node's disk.
+    pub size_bytes: u64,
+    /// Hex SHA-256 of the copy's content, 64 lowercase characters; absent
+    /// while the node is still computing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// One entry of `status_report.warm` (section 5.3, section 6.13).
@@ -1061,6 +1084,12 @@ pub struct Spec {
     /// (section 6.12). Added in M5b.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub witness: Option<SpecWitness>,
+    /// The `qrn_` ids of the quarantined copies on this node that an
+    /// operator deleted (section 5.11, ADR 0176). Added in M5b; absent when
+    /// there is none, so a node with no copy to delete gets the spec it got
+    /// before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantine_deletes: Vec<String>,
 }
 
 /// `spec.votes` (section 6.12): the voter set this machine counts in.
@@ -2101,6 +2130,58 @@ mod tests {
         let voter: SpecVoter =
             serde_json::from_value(json!({"node_id": "nod_1", "roles": ["witness"]})).unwrap();
         assert_eq!(voter.mesh_address, None);
+    }
+
+    /// Sections 5.3 and 5.11: `status_report.quarantines` and
+    /// `spec.quarantine_deletes` are optional, absent when empty, and a
+    /// quarantine entry carries `sha256` only once the node computed it.
+    #[test]
+    fn quarantines_and_quarantine_deletes_are_optional_and_round_trip() {
+        let old: Spec = serde_json::from_value(json!({"vms": [], "routes": []})).unwrap();
+        assert!(old.quarantine_deletes.is_empty());
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("quarantine_deletes").is_none(), "{value}");
+
+        let deletes = json!({
+            "vms": [], "routes": [],
+            "quarantine_deletes": ["qrn_01JC9Z0000000000000000000Q"]
+        });
+        let spec: Spec = serde_json::from_value(deletes.clone()).unwrap();
+        assert_eq!(spec.quarantine_deletes, ["qrn_01JC9Z0000000000000000000Q"]);
+        assert_eq!(serde_json::to_value(&spec).unwrap(), deletes);
+
+        let report = json!({
+            "applied_rev": 3, "vms": [], "routes": [],
+            "capacity": { "cpus": 8, "memory_mb": 16384, "disk_gb": 200 },
+            "allocated": { "cpus": 0, "memory_mb": 0, "disk_gb": 0 },
+            "disk_free_gb": 90.0
+        });
+        let parsed: StatusReport = serde_json::from_value(report.clone()).unwrap();
+        assert!(parsed.quarantines.is_empty());
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), report);
+
+        let entry = json!({
+            "quarantine_id": "qrn_01JC9Z0000000000000000000Q",
+            "volume_id": "vol_01JC9Z0000000000000000000V",
+            "app_id": "app_01JC9Z0000000000000000000A",
+            "created_at": "2026-11-09T10:00:00Z",
+            "size_bytes": 4096
+        });
+        let pending: QuarantineStatus = serde_json::from_value(entry.clone()).unwrap();
+        assert_eq!(pending.sha256, None);
+        assert_eq!(serde_json::to_value(&pending).unwrap(), entry);
+        let sha256 = "ab".repeat(32);
+        let mut hashed = entry;
+        hashed["sha256"] = json!(sha256);
+        let mut with = report;
+        with["quarantines"] = json!([hashed]);
+        let parsed: StatusReport = serde_json::from_value(with.clone()).unwrap();
+        assert_eq!(parsed.quarantines.len(), 1);
+        assert_eq!(
+            parsed.quarantines[0].sha256.as_deref(),
+            Some(sha256.as_str())
+        );
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), with);
     }
 
     /// Section 5.18: `stale_term` and `not_primary` are new codes, `term` is

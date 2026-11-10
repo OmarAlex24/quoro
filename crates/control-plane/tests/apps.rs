@@ -1734,6 +1734,7 @@ mod session {
             images: Vec::new(),
             warm: vec![entry],
             volumes: Vec::new(),
+            quarantines: Vec::new(),
         });
         send(socket, report).await;
     }

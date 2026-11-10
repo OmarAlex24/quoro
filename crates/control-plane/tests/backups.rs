@@ -532,6 +532,7 @@ fn status_report(
         volumes,
         images: Vec::new(),
         warm: Vec::new(),
+        quarantines: Vec::new(),
     })
 }
 

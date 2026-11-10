@@ -757,6 +757,7 @@ Buffers:          100000 kB
                     backup_repository: None,
                     votes: None,
                     witness: None,
+                    quarantine_deletes: Vec::new(),
                 },
                 signature: String::new(),
             },

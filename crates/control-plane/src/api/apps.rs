@@ -2206,6 +2206,8 @@ pub(crate) async fn delete_app_tx(
         .await?
         .ok_or_else(|| ApiError::not_found("app"))?;
     let app = app_from_row(&row)?;
+    crate::quarantines::refuse_app_with_copies(&mut w.tx, state.hub.listed_copies(), app_id)
+        .await?;
     let actor = ctx.identity.actor();
     let target = app_target(app_id);
 

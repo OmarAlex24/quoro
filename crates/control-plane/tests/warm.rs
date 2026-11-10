@@ -170,6 +170,7 @@ fn report(warm: Vec<WarmStatus>) -> NodeMessage {
         images: Vec::new(),
         warm,
         volumes: Vec::new(),
+        quarantines: Vec::new(),
     })
 }
 

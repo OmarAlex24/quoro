@@ -234,6 +234,7 @@ fn status_report(applied_rev: u64, volumes: Vec<VolumeStatus>) -> NodeMessage {
         images: Vec::new(),
         volumes,
         warm: Vec::new(),
+        quarantines: Vec::new(),
     })
 }
 

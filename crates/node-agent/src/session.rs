@@ -2367,6 +2367,7 @@ impl Session {
                 .warm
                 .as_ref()
                 .map_or_else(Vec::new, |warm| warm.borrow().clone()),
+            quarantines: Vec::new(),
         };
         write_message(sink, NodeMessage::StatusReport(report), None).await?;
         self.reported_applied_rev = applied_rev;
@@ -3935,6 +3936,7 @@ mod tests {
                     backup_repository: None,
                     votes: None,
                     witness: None,
+                    quarantine_deletes: Vec::new(),
                 },
                 signature: String::new(),
             },
@@ -4289,6 +4291,7 @@ mod tests {
                     backup_repository: None,
                     votes: None,
                     witness: None,
+                    quarantine_deletes: Vec::new(),
                 },
                 signature: String::new(),
             },
