@@ -282,11 +282,14 @@ async fn newest_write(server: &Server, lease_id: &str) -> u64 {
 }
 
 /// Reads `machine`'s frames until its copy of the log holds `seq`, and
-/// returns them.
+/// returns them. Once it does, one more [`Machine::settle`] puts a `ping`
+/// behind the machine's last `log_ack` on the ordered session, so its
+/// `pong` proves the primary processed that acknowledgement (#793).
 async fn follow_to(machine: &mut Machine, seq: u64) -> Vec<Value> {
     let mut frames = Vec::new();
     for _ in 0..50 {
         if machine.log.0 >= seq {
+            frames.extend(machine.settle().await);
             return frames;
         }
         frames.extend(machine.settle().await);
