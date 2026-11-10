@@ -8,12 +8,15 @@
 //! in one process; they now also carry the serde attributes of their wire
 //! form. [`wire`] has the envelope and every other message body, [`sign`] the
 //! cluster signature and [`jcs`] the RFC 8785 canonical JSON both use.
+//! [`custody`] has the custody key and the HPKE seals of the cluster keys
+//! (section 7.2).
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+pub mod custody;
 pub mod inventory;
 pub mod jcs;
 pub mod metrics;

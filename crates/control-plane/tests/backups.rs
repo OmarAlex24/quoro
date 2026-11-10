@@ -392,6 +392,7 @@ fn hello(node_id: &str) -> NodeMessage {
         },
         dropped_events: 0,
         volume_snapshot: Some(wire::SnapshotMethod::Reflink),
+        custody_public_key: None,
     })
 }
 

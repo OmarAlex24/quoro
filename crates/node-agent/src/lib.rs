@@ -113,7 +113,24 @@ pub struct AgentConfig {
     pub snapshots_at_start: Option<std::collections::BTreeSet<String>>,
 }
 
+/// Whether `roles` include `node`. Only such a machine keeps a custody key
+/// and reports it (section 7.2); an edge-only or witness-only machine never
+/// does.
+#[must_use]
+pub fn has_node_role(roles: &[String]) -> bool {
+    roles.iter().any(|role| role == "node")
+}
+
 impl AgentConfig {
+    /// Whether this machine has the `node` role ([`has_node_role`]). The
+    /// role is chosen at enrollment and recorded there, so `roles` is the
+    /// same at `join` and at every start; a roles change adds or removes
+    /// only `witness` (section 6.12).
+    #[must_use]
+    pub fn has_node_role(&self) -> bool {
+        has_node_role(&self.roles)
+    }
+
     /// The ingress settings this node's directories imply.
     #[must_use]
     pub fn ingress_config(&self) -> IngressConfig {
@@ -271,6 +288,10 @@ impl std::error::Error for AgentError {
 /// re-enrolls on its own (section 2.5); a lost credential is recovered by
 /// removing and re-enrolling the node by a human.
 ///
+/// With the `node` role the machine keeps its custody key before it asks,
+/// generating it when the data directory has none, and sends its public half
+/// in the request (sections 2.3 and 7.2).
+///
 /// # Errors
 ///
 /// [`AgentError::AlreadyEnrolled`], [`AgentError::Io`],
@@ -290,8 +311,26 @@ pub async fn join(
         &quoro_proto::sign::signing_key_from_seed(&seed).verifying_key(),
     );
     identity::write_seed(&config.data_dir, &seed)?;
+    // The primary binds the first custody key it sees, so the key is on disk
+    // before its public half is sent.
+    let custody_public_key = if config.has_node_role() {
+        Some(
+            identity::load_or_create_custody_key(&config.data_dir)?
+                .public_key()
+                .to_base64(),
+        )
+    } else {
+        None
+    };
 
-    let enrollment = enroll::enroll(config, target, facts, &public_key).await?;
+    let enrollment = enroll::enroll(
+        config,
+        target,
+        facts,
+        &public_key,
+        custody_public_key.as_deref(),
+    )
+    .await?;
 
     let key_id = Identity::key_id_for(&enrollment.cluster_public_key)?;
     let fingerprint = format!(

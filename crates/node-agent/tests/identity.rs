@@ -78,3 +78,43 @@ fn identity_files_are_private_and_load_back() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Section 7.2: the custody key is written once, `0600`, as the 32 raw bytes
+/// of the seed file's format, and loads back as the same key; a key that
+/// exists is never replaced. A malformed file is refused with the file
+/// named and left exactly as it was.
+#[test]
+fn the_custody_key_is_created_once_and_never_replaced() {
+    let dir = temp_dir();
+    let path = dir.join(identity::CUSTODY_KEY_FILE);
+    assert!(!path.exists());
+
+    let first = identity::load_or_create_custody_key(&dir).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), 32);
+    assert_eq!(bytes.as_slice(), &first.to_bytes()[..]);
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "custody.key is root-only");
+
+    let again = identity::load_or_create_custody_key(&dir).unwrap();
+    assert_eq!(again.public_key(), first.public_key());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "the file is not rewritten"
+    );
+
+    std::fs::write(&path, [1u8; 33]).unwrap();
+    let error = identity::load_or_create_custody_key(&dir)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(identity::CUSTODY_KEY_FILE), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), vec![1u8; 33]);
+    let files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files, vec![identity::CUSTODY_KEY_FILE.to_owned()]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

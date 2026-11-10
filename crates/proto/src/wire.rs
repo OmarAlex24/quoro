@@ -281,6 +281,12 @@ pub struct Hello {
     /// `pause_copy`. Added in M5a; absent from older agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_snapshot: Option<SnapshotMethod>,
+    /// Standard base64 X25519 public key (32 bytes) of the machine's custody
+    /// key, from M5b on a machine with the `node` role (sections 5.1 and
+    /// 7.2, ADR 0180). Absent from an edge-only or witness-only machine and
+    /// from older agents. The private half never leaves the machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody_public_key: Option<String>,
 }
 
 /// How a node snapshots a volume (section 5.1, ADR 0146).
@@ -1678,6 +1684,36 @@ mod tests {
         assert_eq!(hello.stored_rev, 412);
         assert_eq!(hello.leases[0].mode, crate::LeaseMode::Local);
         assert_eq!(hello.kvm.nested, Some(true));
+        assert_eq!(hello.custody_public_key, None);
+    }
+
+    /// Sections 5.1 and 7.2: `custody_public_key` is optional. The example's
+    /// key is read, and a `hello` without one leaves the member out.
+    #[test]
+    fn hello_carries_an_optional_custody_public_key() {
+        let text = r#"{"v":1,"type":"hello","id":"msg_1","body":{
+            "node_id":"nod_1","agent_version":"0.1.0","engine_version":"fake",
+            "boot_id":"8f1c","stored_rev":0,"applied_rev":0,"log_seq":0,
+            "log_hash":"0000","leases":[],"capacity":{"cpus":1,"memory_mb":1,"disk_gb":1},
+            "allocated":{"cpus":0,"memory_mb":0,"disk_gb":0},
+            "kvm":{"available":true,"kernel":"6.11.2"},"dropped_events":0,
+            "custody_public_key":"hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo="}}"#;
+        let raw = RawFrame::parse(text).unwrap();
+        let NodeMessage::Hello(mut hello) = NodeMessage::from_raw(&raw).unwrap() else {
+            panic!("not a hello");
+        };
+        let key = hello.custody_public_key.clone().unwrap();
+        assert_eq!(
+            crate::custody::CustodyPublicKey::from_base64(&key)
+                .unwrap()
+                .to_base64(),
+            key
+        );
+        let with = serde_json::to_value(&hello).unwrap();
+        assert_eq!(with["custody_public_key"], key.as_str());
+        hello.custody_public_key = None;
+        let without = serde_json::to_value(&hello).unwrap();
+        assert!(without.get("custody_public_key").is_none(), "{without}");
     }
 
     #[test]

@@ -349,6 +349,7 @@ impl Node {
             dropped_events: 0,
             mesh_public_key: None,
             volume_snapshot: None,
+            custody_public_key: None,
         });
         socket
             .send(Message::Text(

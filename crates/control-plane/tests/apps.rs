@@ -1662,6 +1662,7 @@ mod session {
             },
             dropped_events: 0,
             volume_snapshot: Some(wire::SnapshotMethod::Reflink),
+            custody_public_key: None,
         });
         send(&mut socket, hello).await;
         loop {

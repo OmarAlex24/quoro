@@ -117,6 +117,7 @@ fn hello(node_id: &str) -> NodeMessage {
         dropped_events: 0,
         mesh_public_key: None,
         volume_snapshot: None,
+        custody_public_key: None,
     })
 }
 
@@ -753,6 +754,43 @@ async fn a_hello_mesh_key_is_stored_with_a_mesh_address() {
             .unwrap();
     assert_eq!(stored.as_deref(), Some(key));
     assert_eq!(address.as_deref(), Some("10.43.0.1"));
+}
+
+/// Sections 2.3, 5.1 and 7.2: from M5b the enroll request and every `hello`
+/// of a machine with the `node` role carry `custody_public_key`. A primary
+/// that does not bind the key yet accepts both messages, and the session
+/// starts as it did without the member (section 3).
+#[tokio::test]
+async fn an_enroll_and_a_hello_with_a_custody_key_are_accepted() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let key = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=";
+    let token = create_token(&server, &owner).await;
+    let mut body = enroll_body(token["token"].as_str().unwrap(), "node-custody");
+    body["custody_public_key"] = json!(key);
+    let res = server
+        .client()
+        .post(server.url("/api/v1/nodes/enroll"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let enrolled: Value = res.json().await.unwrap();
+    assert_eq!(status, 201, "enroll: {enrolled}");
+    let node_id = enrolled["node_id"].as_str().unwrap();
+
+    let mut socket = connect(&server, enrolled["credential"].as_str().unwrap()).await;
+    let NodeMessage::Hello(mut body) = hello(node_id) else {
+        unreachable!("hello() builds a hello");
+    };
+    body.custody_public_key = Some(key.to_string());
+    send(&mut socket, NodeMessage::Hello(body)).await;
+    let first = recv_frame(&mut socket).await;
+    assert_eq!(first["type"], "welcome", "{first}");
+    let _snapshot = recv_type(&mut socket, "desired_state").await;
+    let node = node_json(&server, &owner, node_id).await;
+    assert_eq!(node["status"], "connected", "{node}");
 }
 
 /// Enrolls a machine with an explicit role set. A machine without the `node`

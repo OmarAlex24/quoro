@@ -18,12 +18,13 @@ use quoro_engine::{Engine as _, FakeEngine, VmState};
 use quoro_ingress::cloudflared::CloudflaredConfig;
 use quoro_ingress::proxy::BackendObserver as _;
 use quoro_node_agent::edge::EdgeManager;
-use quoro_node_agent::identity::LOG_MARK_FILE;
+use quoro_node_agent::identity::{CUSTODY_KEY_FILE, LOG_MARK_FILE};
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::session::{Session, SessionEnd, SessionSetup};
 use quoro_node_agent::store::{NodeStore, Refollowing, VOTE};
 use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, ManualHostClock, start_local_leases};
+use quoro_proto::custody::CustodyKey;
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
     Command, ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck,
@@ -3131,4 +3132,146 @@ async fn a_support_request_for_another_primary_than_the_session_s_is_refused() {
     let grant = reply_to(&mut ws, "msg_support_own").await;
     assert_eq!(grant["type"], "support_grant", "{grant}");
     end_session(ws, serving).await;
+}
+
+/// The `node` role, as a machine that enrolled with it runs.
+fn node_roles() -> Vec<String> {
+    vec!["node".to_owned()]
+}
+
+/// The public half of the custody key `custody.key` holds, read straight
+/// from the disk.
+fn custody_key_on_disk(dir: &TempDir) -> String {
+    let bytes = std::fs::read(dir.path().join(CUSTODY_KEY_FILE)).expect("custody.key exists");
+    CustodyKey::from_bytes(&bytes)
+        .expect("custody.key is 32 bytes")
+        .public_key()
+        .to_base64()
+}
+
+/// Section 7.2: a machine with the `node` role generates its custody key
+/// before its first `hello`, keeps it `0600` next to its credential, and
+/// reports its public half as standard base64 of 32 bytes. After an agent
+/// restart, a new session over the same data directory reports the same
+/// key and leaves the file as it was.
+#[tokio::test]
+async fn a_node_s_hello_carries_its_custody_key_and_a_restart_keeps_it() {
+    use base64::Engine as _;
+
+    let dir = TempDir::new();
+    let path = dir.path().join(CUSTODY_KEY_FILE);
+    assert!(!path.exists());
+    let (setup, _observed) = follow_node(&dir).await;
+    let (ws, hello, serving) = open_session(Session::new(setup).with_roles(&node_roles())).await;
+    let key = hello["body"]["custody_public_key"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a node's hello carries a custody key: {hello}"))
+        .to_owned();
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&key)
+        .expect("standard base64");
+    assert_eq!(raw.len(), 32);
+    assert_eq!(
+        custody_key_on_disk(&dir),
+        key,
+        "the key sent is the one kept"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "custody.key is root-only");
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    drop(end_session(ws, serving).await);
+
+    // The agent restarts: a new store handle and a new session, with a new
+    // boot id, over the same data directory.
+    let (setup, _observed_again) = follow_node(&dir).await;
+    let (ws, hello_again, serving) =
+        open_session(Session::new(setup).with_roles(&node_roles())).await;
+    assert_ne!(hello_again["body"]["boot_id"], hello["body"]["boot_id"]);
+    assert_eq!(hello_again["body"]["custody_public_key"], key.as_str());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "custody.key is not rewritten"
+    );
+    end_session(ws, serving).await;
+}
+
+/// Section 7.2: an edge-only or witness-only machine keeps no custody key.
+/// Its `hello` has no `custody_public_key` and no `custody.key` is written,
+/// while an edge that also has the `node` role keeps one.
+#[tokio::test]
+async fn only_a_machine_with_the_node_role_keeps_and_reports_a_custody_key() {
+    for (roles, keeps) in [
+        (vec!["edge"], false),
+        (vec!["witness"], false),
+        (vec!["edge", "witness"], false),
+        (vec!["edge", "node"], true),
+    ] {
+        let roles: Vec<String> = roles.into_iter().map(str::to_owned).collect();
+        let dir = TempDir::new();
+        let (setup, _observed) = follow_node(&dir).await;
+        let (ws, hello, serving) = open_session(Session::new(setup).with_roles(&roles)).await;
+        assert_eq!(
+            hello["body"].get("custody_public_key").is_some(),
+            keeps,
+            "{roles:?}: {hello}"
+        );
+        assert_eq!(
+            dir.path().join(CUSTODY_KEY_FILE).exists(),
+            keeps,
+            "{roles:?}"
+        );
+        end_session(ws, serving).await;
+    }
+}
+
+/// Section 7.2, ADR 0231: the primary binds the first custody key it sees,
+/// so a `custody.key` that cannot be read or is not 32 bytes is never
+/// replaced or overwritten: it is kept byte for byte. The custody key guards
+/// no lease, so the node still connects: `hello` goes out without
+/// `custody_public_key` and the session runs, on this session and the next.
+#[tokio::test]
+async fn a_malformed_custody_key_is_kept_and_hello_goes_out_without_it() {
+    for contents in [
+        Some(vec![0x42; 31]),
+        Some(vec![0x42; 33]),
+        Some(Vec::new()),
+        None,
+    ] {
+        let dir = TempDir::new();
+        let (setup, _observed) = follow_node(&dir).await;
+        let path = dir.path().join(CUSTODY_KEY_FILE);
+        match &contents {
+            Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+            // A directory where the file goes cannot be read as one.
+            None => std::fs::create_dir(&path).unwrap(),
+        }
+        let mut session = Session::new(setup).with_roles(&node_roles());
+        for _ in 0..2 {
+            let (mut ws, hello, serving) = open_session(session).await;
+            assert_eq!(hello["body"]["node_id"], "nod_test", "{hello}");
+            assert!(
+                hello["body"].get("custody_public_key").is_none(),
+                "no custody key ({contents:?}): {hello}"
+            );
+            match &contents {
+                Some(bytes) => assert_eq!(&std::fs::read(&path).unwrap(), bytes),
+                None => assert!(path.is_dir()),
+            }
+            // The session goes on past `hello`.
+            welcome(&mut ws, &hello).await;
+            session = end_session(ws, serving).await;
+        }
+        drop(session);
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("custody"))
+            .collect();
+        assert_eq!(names, vec![CUSTODY_KEY_FILE.to_owned()], "no new key file");
+    }
 }

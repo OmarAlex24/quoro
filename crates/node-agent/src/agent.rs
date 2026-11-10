@@ -80,6 +80,21 @@ pub async fn run<E: Engine + 'static>(
     // The mesh key pair is generated on the first start and reused after that;
     // only its public key leaves the machine (section 6.9).
     let mesh_key = MeshKey::load_or_create(&config.data_dir)?;
+    // A machine with the `node` role keeps a custody key (section 7.2); one
+    // upgraded to M5b generates it at this start. A file that cannot be read
+    // is left as it is, never replaced (ADR 0231). The custody key guards no
+    // lease or fence, so the node still connects and its `hello` goes
+    // without the key; but its seals open only with that key, so promotion
+    // from this machine is refused until the key can be read.
+    if config.has_node_role()
+        && let Err(e) = crate::identity::load_or_create_custody_key(&config.data_dir)
+    {
+        warn!(
+            error = %e,
+            file = %config.data_dir.join(crate::identity::CUSTODY_KEY_FILE).display(),
+            "could not read or create the custody key; the file is left as it is, the node connects and sends hello without the key, and promotion from this machine will be refused until the key can be read"
+        );
+    }
 
     let current = load_verified_snapshot(&identity, &store).await;
 
@@ -280,6 +295,9 @@ pub async fn run<E: Engine + 'static>(
     .with_metrics(metrics)
     .with_edge(Arc::clone(&edge))
     .with_mesh_key(mesh_public_key)
+    // With the `node` role the session keeps the custody key, generating it
+    // before the first `hello` of a machine upgraded to M5b (section 7.2).
+    .with_roles(&config.roles)
     .with_interactive(interactive)
     .with_inventory(inventory);
     let outcome = session.run(stop_rx).await;

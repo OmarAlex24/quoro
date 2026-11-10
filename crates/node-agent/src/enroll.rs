@@ -27,6 +27,10 @@ struct EnrollRequest<'a> {
     roles: &'a [String],
     capacity: quoro_proto::wire::Capacity,
     kvm: quoro_proto::wire::Kvm,
+    /// From M5b, with the `node` role: the custody key's public half
+    /// (section 7.2). Left out on an edge-only or witness-only machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    custody_public_key: Option<&'a str>,
 }
 
 /// The enroll response (section 2.4).
@@ -55,6 +59,8 @@ pub struct Enrollment {
 }
 
 /// Posts the node's public key and details to the primary and parses the 201.
+/// `custody_public_key` is the custody key's public half on a machine with
+/// the `node` role, and `None` on any other (sections 2.3 and 7.2).
 ///
 /// # Errors
 ///
@@ -67,6 +73,7 @@ pub async fn enroll(
     target: &JoinTarget,
     facts: &NodeFacts,
     public_key: &str,
+    custody_public_key: Option<&str>,
 ) -> Result<Enrollment, AgentError> {
     let url = target.url.trim_end_matches('/');
     let stream = tls::connect(url, &target.fingerprint).await?;
@@ -89,6 +96,7 @@ pub async fn enroll(
         roles: &config.roles,
         capacity: facts.capacity,
         kvm: facts.kvm.clone(),
+        custody_public_key,
     };
     let body = serde_json::to_vec(&body)
         .map_err(|e| AgentError::Protocol(format!("could not encode the enroll request: {e}")))?;
