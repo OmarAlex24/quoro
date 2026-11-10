@@ -227,15 +227,19 @@ impl TunnelManager {
     pub async fn sync_now(&self, node_id: &str) {
         let lock = self.lock_for(node_id);
         let _guard = lock.lock().await;
-        if let Err(e) = self.reconcile(node_id).await {
+        if let Err(e) = self.reconcile(node_id).await
+            && !self.inner.store.is_demoted()
+        {
             tracing::warn!(node_id, error = %e, "cannot reconcile the node's tunnel");
         }
     }
 
-    /// Whether the primary is demoted, checked right before each Cloudflare
-    /// write: the demotion may land in the middle of a [`Self::sync_now`]
-    /// pass, and a demoted primary changes no tunnel and no DNS record
-    /// (`node-agent-protocol.md` section 7.4).
+    /// Whether the primary is demoted, checked before each step of a
+    /// [`Self::sync_now`] pass that writes to Cloudflare: the demotion may
+    /// land in the middle of one, and a demoted primary changes no tunnel and
+    /// no DNS record (`node-agent-protocol.md` section 7.4). Within a step,
+    /// the controller checks again before each of its calls
+    /// ([`TunnelController::stop_when`]).
     fn stops_for_demotion(&self) -> bool {
         self.inner.store.stops_for_demotion("a tunnel sync")
     }
@@ -705,14 +709,18 @@ impl TunnelManager {
             .sync_routes(tunnel_id, state.origin_port, &empty, &mut published)
             .await
         {
-            tracing::warn!(node_id, error = %e, "cannot remove the tunnel hostnames");
+            if !self.inner.store.is_demoted() {
+                tracing::warn!(node_id, error = %e, "cannot remove the tunnel hostnames");
+            }
             return false;
         }
         if self.stops_for_demotion() {
             return false;
         }
         if let Err(e) = controller.delete_tunnel(tunnel_id).await {
-            tracing::warn!(node_id, error = %e, "cannot delete the tunnel");
+            if !self.inner.store.is_demoted() {
+                tracing::warn!(node_id, error = %e, "cannot delete the tunnel");
+            }
             return false;
         }
         true
@@ -749,11 +757,15 @@ impl TunnelManager {
             &endpoints.doh_base,
         )
         .map_err(|e| ApiError::internal(&e))?;
-        Ok(TunnelController::new(
-            cf,
-            account_id.to_string(),
-            zone_id.to_string(),
-        ))
+        // A demoted primary changes no tunnel and no DNS record: the
+        // controller checks the flag before each of its Cloudflare writes, so
+        // a demotion in the middle of a sync stops the rest of it
+        // (`node-agent-protocol.md` section 7.4).
+        let store = self.inner.store.clone();
+        Ok(
+            TunnelController::new(cf, account_id.to_string(), zone_id.to_string())
+                .stop_when(move || store.is_demoted()),
+        )
     }
 
     /// Stores the tunnel id and the encrypted run token, with its change-log

@@ -93,6 +93,12 @@ pub(crate) async fn after_seal(
             BackupSourceKind::ControlPlane => repo::cluster_id(store).await?,
         };
         let seal_key = object_key(&target.root, &layout::seal(&source_id, &stale.id));
+        // A demoted primary deletes nothing (`node-agent-protocol.md` section
+        // 7.4): checked right before each delete, as the demotion may land
+        // between two of them.
+        if store.stops_for_demotion("backup pruning") {
+            return Ok(());
+        }
         if let Err(error) = bucket.delete(&seal_key).await {
             tracing::warn!(backup_id = %stale.id, error = %error, "cannot delete the seal; pruning stops");
             return Ok(());
@@ -101,6 +107,9 @@ pub(crate) async fn after_seal(
             .manifest_key
             .clone()
             .unwrap_or_else(|| layout::manifest(&source_id, &stale.id));
+        if store.stops_for_demotion("backup pruning") {
+            return Ok(());
+        }
         if let Err(error) = bucket
             .delete(&object_key(&target.root, &manifest_key))
             .await
@@ -301,6 +310,11 @@ pub async fn sweep(
         if !older_than(&object.last_modified, now, GC_GRACE) {
             continue;
         }
+        // A demoted primary deletes nothing more, and records nothing
+        // (`node-agent-protocol.md` section 7.4).
+        if store.stops_for_demotion("the backup sweep") {
+            return Ok(counts);
+        }
         match bucket.delete(&object.key).await {
             Ok(()) => counts.manifests_deleted += 1,
             Err(error) => {
@@ -325,6 +339,9 @@ pub async fn sweep(
         }
         if !older_than(&object.last_modified, now, GC_GRACE) {
             continue;
+        }
+        if store.stops_for_demotion("the backup sweep") {
+            return Ok(counts);
         }
         match bucket.delete(&object.key).await {
             Ok(()) => counts.chunks_deleted += 1,

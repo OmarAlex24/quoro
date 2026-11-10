@@ -587,13 +587,14 @@ async fn a_failed_meta_write_still_demotes_the_running_process() {
     assert_eq!(meta(&server, "demoted_by_term").await, None);
 
     // Once the write can go through, the next stale_term records it, past
-    // the refusal every other write gets, with the same term rule.
+    // the refusal every other write gets, with the term the first attempt
+    // chose: the retry task, five seconds away, would record the same one.
     sqlx::query("DROP TRIGGER refuse_demotion")
         .execute(server.state.store.pool())
         .await
         .unwrap();
     server.state.hub.stale_term(Some(7)).await;
-    assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("7"));
+    assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
     assert_eq!(
         server
             .state
@@ -602,12 +603,48 @@ async fn a_failed_meta_write_still_demotes_the_running_process() {
             .await
             .unwrap()
             .as_deref(),
-        Some("7")
+        Some("5")
     );
     assert!(server.state.store.begin_write().await.is_err());
-    // Recorded once: the first recorded term stays.
+    // Recorded once: the recorded term stays.
     server.state.hub.stale_term(Some(9)).await;
-    assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("7"));
+    assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
+}
+
+/// No later `stale_term` is to be expected after a demotion: every session
+/// ends and the guard answers `503`. A failed `meta` write is retried by a
+/// task on its own until it is recorded, with the first attempt's term.
+#[tokio::test]
+async fn a_failed_meta_write_is_retried_until_it_is_recorded() {
+    let server = start_with_patient_node_session().await;
+    let store = server.state.store.clone();
+    store.set_demotion_retry_for_test(Duration::from_millis(50));
+    sqlx::query(
+        "CREATE TRIGGER refuse_demotion BEFORE INSERT ON meta \
+         WHEN NEW.key = 'demoted_by_term' BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    server.state.hub.stale_term(Some(5)).await;
+    assert!(store.is_demoted());
+    // The retries keep failing while the write is refused.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(meta(&server, "demoted_by_term").await, None);
+
+    sqlx::query("DROP TRIGGER refuse_demotion")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while meta(&server, "demoted_by_term").await.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the retry records the demotion without another stale_term");
+    assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
+    assert!(store.begin_write().await.is_err());
 }
 
 /// A `meta.term` that is not a number cannot rule the term: the error's own

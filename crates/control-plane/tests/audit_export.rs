@@ -825,3 +825,51 @@ async fn the_probe_reruns_and_is_recorded() {
         2
     );
 }
+
+/// Every object version under the export's root, delete markers included.
+async fn versions(server: &Server, store: &MemoryStore) -> usize {
+    store.list_versions(&root(server)).await.unwrap().len()
+}
+
+/// A demoted primary writes no object (`node-agent-protocol.md` section
+/// 7.4): an export pass after the demotion writes no segment and no head.
+#[tokio::test]
+async fn an_export_after_the_demotion_writes_nothing() {
+    let store = MemoryStore::new();
+    let (server, _export) = setup(&store).await;
+    let total = local_last(&server).await;
+    append_records(&server, (1_001 - total) as usize).await;
+    let before = versions(&server, &store).await;
+
+    server.state.hub.stale_term(Some(5)).await;
+    let _ = exporter::step(&server.state, &store, now() + Duration::minutes(6)).await;
+
+    assert_eq!(versions(&server, &store).await, before);
+    assert!(
+        store
+            .get(&audit_export::segment_key(&root(&server), 1, 1_000))
+            .await
+            .is_err()
+    );
+}
+
+/// The probe of a demoted primary writes no object: a probe object stays
+/// locked for a day.
+#[tokio::test]
+async fn a_probe_after_the_demotion_writes_nothing() {
+    let store = MemoryStore::compliance();
+    let (server, _export) = setup(&store).await;
+    let row = audit_export::load(&server.state.store)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = versions(&server, &store).await;
+    assert!(before > 0, "the create's probe left its locked object");
+
+    server.state.hub.stale_term(Some(5)).await;
+    let refused = probe::run_with(&server.state, &row, &store, now() + Duration::days(2))
+        .await
+        .expect_err("the probe is refused");
+    assert_eq!(refused.code, Code::NotPrimary);
+    assert_eq!(versions(&server, &store).await, before);
+}

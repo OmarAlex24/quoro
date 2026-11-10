@@ -683,6 +683,53 @@ async fn the_controller_creates_the_tunnel_and_fetches_its_run_token() {
     std::fs::remove_dir_all(&setup.dir).ok();
 }
 
+/// A controller stopped in the middle of a sync makes no Cloudflare call
+/// after the check that stopped it: here it stops after the ingress PUT, so
+/// no CNAME is written and `published` holds nothing.
+#[tokio::test]
+async fn a_stopped_controller_makes_no_further_cloudflare_write() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let mock = MockCloudflare::spawn().await;
+    let armed = Arc::new(AtomicBool::new(false));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let controller =
+        TunnelController::new(cloudflare_for(&mock), "acc".to_string(), "zone".to_string())
+            .stop_when({
+                let armed = Arc::clone(&armed);
+                let checks = Arc::clone(&checks);
+                // Once armed, the first check passes and every later one stops.
+                move || armed.load(Ordering::SeqCst) && checks.fetch_add(1, Ordering::SeqCst) >= 1
+            });
+    let (tunnel, _token) = controller
+        .ensure_tunnel("lab")
+        .await
+        .expect("an unstopped controller creates the tunnel");
+
+    armed.store(true, Ordering::SeqCst);
+    let before = mock.request_count();
+    let wanted: BTreeSet<String> = ["a.example.com", "b.example.com"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let mut published = BTreeSet::new();
+    let stopped = controller
+        .sync_routes(&tunnel.id, 8080, &wanted, &mut published)
+        .await
+        .expect_err("the sync stops before its first CNAME");
+    assert!(stopped.to_string().contains("stopped"), "{stopped}");
+    assert_eq!(mock.request_count(), before + 1, "only the ingress PUT");
+    assert!(mock.last_configuration().is_some());
+    assert!(published.is_empty(), "{published:?}");
+    assert!(mock.records().is_empty(), "{:?}", mock.records());
+
+    // Stopped for good: neither a deletion nor a creation reaches Cloudflare.
+    controller
+        .delete_tunnel(&tunnel.id)
+        .await
+        .expect_err("the deletion is stopped");
+    assert_eq!(mock.request_count(), before + 1);
+}
+
 #[tokio::test]
 async fn the_controller_finds_an_existing_tunnel_instead_of_creating_it() {
     let setup = tunnel_setup("backends-tunnel-reuse").await;

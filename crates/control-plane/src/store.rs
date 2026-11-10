@@ -11,7 +11,7 @@ use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, watch};
 
@@ -54,13 +54,50 @@ pub struct Store {
     /// is held, and never cleared: from then on [`Store::begin_write`]
     /// refuses. Readable without the database.
     demoted: Arc<watch::Sender<bool>>,
-    /// Whether [`Store::demote`] recorded `meta.demoted_by_term`. Until it
-    /// does, every later demotion tries the write again.
-    demotion_recorded: Arc<AtomicBool>,
+    /// The `meta.demoted_by_term` record of the demotion, and its retry
+    /// until it is recorded ([`Store::demote`]).
+    demotion: Arc<DemotionRecord>,
     /// Test seam: the next demotion waits here, after its `meta` write and
     /// before it sets the flag, with the gate held
     /// ([`Store::hold_next_demotion`]).
     demotion_hold: Arc<std::sync::Mutex<Option<Arc<DemotionHold>>>>,
+}
+
+/// The first wait of the retry of an unrecorded demotion; it doubles after
+/// each failed attempt, up to [`DEMOTION_RETRY_MAX`].
+pub const DEMOTION_RETRY_FIRST: Duration = Duration::from_secs(5);
+
+/// The longest wait between two retries of an unrecorded demotion.
+pub const DEMOTION_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// How far the demotion got with `meta.demoted_by_term`. Read and written
+/// only with the writer gate held, but the retry task reads `recorded` to
+/// stop.
+struct DemotionRecord {
+    /// Whether `meta.demoted_by_term` is recorded.
+    recorded: AtomicBool,
+    /// The term the first attempt that could compute one chose. Every later
+    /// attempt, the retry task's and a later `stale_term`'s, records this one,
+    /// so the two never record different terms.
+    term: std::sync::Mutex<Option<u64>>,
+    /// Whether the retry task was started; one is enough.
+    retrying: AtomicBool,
+    /// The retry task's first wait, in milliseconds
+    /// ([`Store::set_demotion_retry_for_test`]).
+    first_retry_ms: AtomicU64,
+}
+
+impl Default for DemotionRecord {
+    fn default() -> Self {
+        Self {
+            recorded: AtomicBool::new(false),
+            term: std::sync::Mutex::new(None),
+            retrying: AtomicBool::new(false),
+            first_retry_ms: AtomicU64::new(
+                u64::try_from(DEMOTION_RETRY_FIRST.as_millis()).unwrap_or(u64::MAX),
+            ),
+        }
+    }
 }
 
 /// The error [`Store::begin_write`] returns once the primary is demoted.
@@ -267,7 +304,7 @@ impl Store {
             migrations: Arc::from(MIGRATIONS),
             head: Arc::new(watch::channel(head).0),
             demoted: Arc::new(watch::channel(false).0),
-            demotion_recorded: Arc::new(AtomicBool::new(false)),
+            demotion: Arc::new(DemotionRecord::default()),
             demotion_hold: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -415,7 +452,7 @@ impl Store {
     ///
     /// It takes the writer gate and, in one transaction, records
     /// `meta.demoted_by_term`: the error's `node_term` when it is usable,
-    /// else `meta.term + 1` ([`record_demotion`]). The contract gives no rule
+    /// else `meta.term + 1` ([`demotion_term`]). The contract gives no rule
     /// for a `stale_term` without a usable term; that case is logged at
     /// `error` and the primary is demoted all the same, as section 8.8 sets
     /// no condition. The flag is set after the commit and before the gate is
@@ -423,10 +460,14 @@ impl Store {
     /// write.
     ///
     /// A failed `meta` write still sets the flag: this process is demoted,
-    /// though a restart would not be. Every later `stale_term` then tries the
-    /// write again, under the gate and with the same rule, until one is
-    /// recorded. That write is the one write a demoted primary makes: it goes
-    /// straight to the pool, past the refusal of [`Store::begin_write`].
+    /// though a restart would not be. A task then retries the write under the
+    /// gate, after [`DEMOTION_RETRY_FIRST`] and doubling up to
+    /// [`DEMOTION_RETRY_MAX`], until it is recorded: no later `stale_term` is
+    /// to be expected, as every session ends and the guard answers `503`. A
+    /// later `stale_term` tries as well. Both record the term the first
+    /// attempt chose, and only if no term is recorded yet. That write is the
+    /// one write a demoted primary makes: it goes straight to the pool, past
+    /// the refusal of [`Store::begin_write`].
     ///
     /// Section 8.8 excepts a primary restored with `quoro restore
     /// --accept-loss` that has sent no `lease_grant` yet, which would start
@@ -435,19 +476,16 @@ impl Store {
     /// demotes here.
     pub async fn demote(&self, node_term: Option<u64>) -> Option<Demotion> {
         let gate = Arc::clone(&self.writer).lock_owned().await;
-        if self.is_demoted() && self.demotion_recorded.load(Ordering::SeqCst) {
+        if self.is_demoted() && self.demotion.recorded.load(Ordering::SeqCst) {
             return None;
         }
-        let demotion = match record_demotion(&self.pool, node_term).await {
-            Ok(term) => {
-                self.demotion_recorded.store(true, Ordering::SeqCst);
-                Demotion::Recorded(term)
-            }
+        let demotion = match self.record_demotion(node_term).await {
+            Ok(term) => Demotion::Recorded(term),
             Err(error) => {
                 tracing::error!(
                     %error,
                     ?node_term,
-                    "cannot record meta.demoted_by_term: this process is demoted, but a restart would not stay demoted until a later stale_term records it"
+                    "cannot record meta.demoted_by_term: this process is demoted, but a restart would not stay demoted until a retry records it"
                 );
                 Demotion::NotRecorded
             }
@@ -463,7 +501,96 @@ impl Store {
         }
         self.demoted.send_replace(true);
         drop(gate);
+        if demotion == Demotion::NotRecorded {
+            self.retry_demotion(node_term);
+        }
         Some(demotion)
+    }
+
+    /// Records `meta.demoted_by_term` with the writer gate held, and marks it
+    /// recorded. The term is the one an earlier attempt chose, or else the one
+    /// [`demotion_term`] gives for `node_term`, kept for later attempts. An
+    /// existing row is kept: a commit that reported an error but landed keeps
+    /// its term. Returns the term the row holds.
+    async fn record_demotion(&self, node_term: Option<u64>) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let chosen = *self
+            .demotion
+            .term
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let term = match chosen {
+            Some(term) => term,
+            None => {
+                let term = demotion_term(&mut tx, node_term).await?;
+                *self
+                    .demotion
+                    .term
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(term);
+                term
+            }
+        };
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES ('demoted_by_term', ?) \
+             ON CONFLICT(key) DO NOTHING",
+        )
+        .bind(term.to_string())
+        .execute(&mut *tx)
+        .await?;
+        let recorded: String =
+            sqlx::query_scalar("SELECT value FROM meta WHERE key = 'demoted_by_term'")
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        self.demotion.recorded.store(true, Ordering::SeqCst);
+        Ok(recorded.parse().unwrap_or(term))
+    }
+
+    /// Starts the task that retries an unrecorded demotion until it is
+    /// recorded ([`Store::demote`]); a second call starts nothing.
+    fn retry_demotion(&self, node_term: Option<u64>) {
+        if self.demotion.retrying.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let store = self.clone();
+        tokio::spawn(async move {
+            let mut wait =
+                Duration::from_millis(store.demotion.first_retry_ms.load(Ordering::SeqCst));
+            loop {
+                tokio::time::sleep(wait).await;
+                let gate = Arc::clone(&store.writer).lock_owned().await;
+                if store.demotion.recorded.load(Ordering::SeqCst) {
+                    return;
+                }
+                match store.record_demotion(node_term).await {
+                    Ok(term) => {
+                        tracing::info!(
+                            demoted_by_term = term,
+                            "meta.demoted_by_term is recorded: a restart stays demoted"
+                        );
+                        return;
+                    }
+                    Err(error) => tracing::error!(
+                        %error,
+                        retry_in = ?wait.saturating_mul(2).min(DEMOTION_RETRY_MAX),
+                        "cannot record meta.demoted_by_term yet; a restart would not stay demoted"
+                    ),
+                }
+                drop(gate);
+                wait = wait.saturating_mul(2).min(DEMOTION_RETRY_MAX);
+            }
+        });
+    }
+
+    /// Test seam: the first wait of the retry of an unrecorded demotion,
+    /// instead of [`DEMOTION_RETRY_FIRST`].
+    #[doc(hidden)]
+    pub fn set_demotion_retry_for_test(&self, first: Duration) {
+        self.demotion.first_retry_ms.store(
+            u64::try_from(first.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
     }
 
     /// Test seam: holds the next [`Store::demote`] after its `meta` write and
@@ -480,32 +607,31 @@ impl Store {
     }
 }
 
-/// Writes `meta.demoted_by_term` in one transaction and returns the term
-/// written ([`Store::demote`], which holds the writer gate).
-///
-/// The term is `node_term` when it is present and above `meta.term`, or
-/// present while `meta.term` cannot be read as a number. Otherwise it is
-/// `meta.term + 1` (a missing `meta.term` reads as 1), logged at `error`
-/// because the `stale_term` carried no usable term. With neither usable
-/// nothing is written.
-async fn record_demotion(pool: &SqlitePool, node_term: Option<u64>) -> Result<u64, sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+/// The term a demotion records, read through `tx`: `node_term` when it is
+/// present and above `meta.term`, or present while `meta.term` cannot be read
+/// as a number. Otherwise `meta.term + 1` (a missing `meta.term` reads as 1),
+/// logged at `error` because the `stale_term` carried no usable term. With
+/// neither usable there is no term, and nothing is recorded.
+async fn demotion_term(
+    tx: &mut Transaction<'_, Sqlite>,
+    node_term: Option<u64>,
+) -> Result<u64, sqlx::Error> {
     let stored: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'term'")
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
     let current = match &stored {
         None => Some(1),
         Some(value) => value.parse::<u64>().ok(),
     };
-    let term = match (node_term, current) {
-        (Some(term), Some(current)) if term > current => term,
+    match (node_term, current) {
+        (Some(term), Some(current)) if term > current => Ok(term),
         (Some(term), None) => {
             tracing::error!(
                 node_term = term,
                 meta_term = ?stored,
                 "meta.term is not a number; recording the stale_term's term"
             );
-            term
+            Ok(term)
         }
         (_, Some(current)) => {
             tracing::error!(
@@ -513,23 +639,12 @@ async fn record_demotion(pool: &SqlitePool, node_term: Option<u64>) -> Result<u6
                 meta_term = current,
                 "the stale_term carried no term above this primary's; recording meta.term + 1"
             );
-            current.saturating_add(1)
+            Ok(current.saturating_add(1))
         }
-        (None, None) => {
-            return Err(sqlx::Error::Protocol(format!(
-                "the stale_term carried no term and meta.term {stored:?} is not a number: no term to record"
-            )));
-        }
-    };
-    sqlx::query(
-        "INSERT INTO meta (key, value) VALUES ('demoted_by_term', ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(term.to_string())
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(term)
+        (None, None) => Err(sqlx::Error::Protocol(format!(
+            "the stale_term carried no term and meta.term {stored:?} is not a number: no term to record"
+        ))),
+    }
 }
 
 /// The change log's newest `seq` through `conn`, 0 when it is empty.

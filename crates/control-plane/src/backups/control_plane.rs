@@ -795,6 +795,10 @@ async fn upload_database(
         let (id, object, _zero) = writer.push(chunk);
         let size = object.len() as u64;
         let key = object_key(&target.root, &layout::chunk(&id));
+        // A primary demoted during the upload uploads no further chunk.
+        if store.is_demoted() {
+            return Err(crate::store::DEMOTED_REFUSAL.to_string());
+        }
         match bucket.put_new(&key, object).await {
             Ok(()) => uploaded = uploaded.saturating_add(size),
             Err(ObjectStoreError::AlreadyExists) => {}

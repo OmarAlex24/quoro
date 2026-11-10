@@ -2807,11 +2807,10 @@ async fn run_session(
         let follow_due = tokio::time::sleep_until(session.follow_retry.unwrap_or(deadline));
         let support_due = tokio::time::sleep_until(session.support_due.unwrap_or(deadline));
         tokio::select! {
-            // The demotion goes first: a frame or a timer ready in the same
-            // pass must not run before it.
-            biased;
+            // Wakes the loop on the demotion. Not biased: a branch that runs
+            // in the same pass may queue frames, and the top of the loop
+            // drops them, sends `not_primary` and ends the session.
             seen = async { demoted.wait_for(|demoted| *demoted).await.is_ok() }, if demoted_open => {
-                // The top of the loop sends `not_primary` and ends the session.
                 if !seen {
                     demoted_open = false;
                 }

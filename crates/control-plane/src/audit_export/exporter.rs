@@ -75,6 +75,11 @@ async fn cycle(
         }
     };
     step(state, &store, now).await?;
+    // A pass the demotion cut short goes no further (`node-agent-protocol.md`
+    // section 7.4); the probe checks the flag again before its put.
+    if state.store.is_demoted() {
+        return Ok(());
+    }
 
     let Some(row) = load(&state.store).await? else {
         return Ok(());

@@ -131,6 +131,15 @@ async fn run_with_call_inner<S: ObjectStore>(
     let lock = ComplianceLock {
         retain_until: format_rfc3339(now + time::Duration::days(1)),
     };
+    // A demoted primary writes no object, and a probe object stays locked for
+    // a day (`node-agent-protocol.md` section 7.4): checked right before the
+    // probe's put, as the demotion may land during an export pass.
+    if state.store.stops_for_demotion("the audit export probe") {
+        return Err(ApiError::new(
+            crate::error::Code::NotPrimary,
+            crate::store::DEMOTED_REFUSAL,
+        ));
+    }
     let probe = probe_lock(
         store,
         &probe_prefix,
