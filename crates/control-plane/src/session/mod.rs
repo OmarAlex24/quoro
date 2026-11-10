@@ -515,6 +515,8 @@ struct HubInner {
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
+    /// Test seam: failures to inject, each once ([`NodeHub::inject_fault`]).
+    faults: Mutex<Vec<Fault>>,
     /// Woken by every change notification, so the domains' serving status
     /// is recomputed after the desired states it follows (ADR 0167).
     serving_inputs: Notify,
@@ -522,6 +524,23 @@ struct HubInner {
     /// failover waiting on its revoke checks again (`openapi.yaml`
     /// `failoverApp`).
     revoke_answers: Notify,
+}
+
+/// Test seam: a failure the hub injects once, where a database read or
+/// write could fail, so the tests can reach the paths that handle it
+/// ([`NodeHub::inject_fault`]).
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// The next session start of `node_id` cannot read the row of
+    /// `lease_id`, which its `hello` lists.
+    StartRead { node_id: String, lease_id: String },
+    /// The next session start of `node_id` cannot commit its ADR 0285
+    /// raises.
+    Raise { node_id: String },
+    /// The next failed fence `node_id` reports by a revoke's answer cannot
+    /// be recorded.
+    FailureRecord { node_id: String },
 }
 
 /// A test seam that holds one node's next snapshot after it is built and
@@ -622,6 +641,7 @@ impl NodeHub {
             support,
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
+            faults: Mutex::new(Vec::new()),
             serving_inputs: Notify::new(),
             revoke_answers: Notify::new(),
         }))
@@ -644,6 +664,24 @@ impl NodeHub {
             .expect("snapshot hold lock")
             .insert(node_id.to_string(), Arc::clone(&hold));
         hold
+    }
+
+    /// Test seam: injects `fault` once, at the next place it names.
+    #[doc(hidden)]
+    pub fn inject_fault(&self, fault: Fault) {
+        self.0.faults.lock().expect("fault lock").push(fault);
+    }
+
+    /// Whether `fault` was injected, consuming it.
+    fn take_fault(&self, fault: &Fault) -> bool {
+        let mut faults = self.0.faults.lock().expect("fault lock");
+        match faults.iter().position(|injected| injected == fault) {
+            Some(index) => {
+                faults.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The gates of `expiring` leases and the voters' support (section 8.4,
@@ -827,6 +865,19 @@ impl NodeHub {
         }
     }
 
+    /// Whether any node reported a failed fence of `lease_id` that this
+    /// primary could not record ([`HubInner::unrecorded_failures`]): its VMs
+    /// may still run, so no grant of the lease goes out and none is minted
+    /// (section 8.5 step 1), as for a failure `fence_failure` lists.
+    pub(crate) fn unrecorded_failure(&self, lease_id: &str) -> bool {
+        self.0
+            .unrecorded_failures
+            .lock()
+            .expect("unrecorded failures lock")
+            .iter()
+            .any(|(_, failed)| failed == lease_id)
+    }
+
     /// Tells the live session of `node_id` to rebuild and resend its desired
     /// state (section 5.11). A node without a session is left alone: it gets
     /// the new snapshot when it dials.
@@ -973,6 +1024,7 @@ impl NodeHub {
             || crate::fences::pending_of(&mut w.tx, node_id)
                 .await?
                 .is_some_and(|pending| pending.lease_ids.iter().any(|id| id == lease_id))
+            || self.unrecorded_failure(lease_id)
         {
             tracing::info!(
                 node_id,
@@ -2821,6 +2873,9 @@ impl Session {
             };
 
             self.welcome_primary = Some(primary_node_id.clone());
+            // Everything the session start queues from here on goes out only
+            // if its pass over the leases is complete.
+            let start_frames = outbox.len();
             outbox.push(
                 ControlMessage::Welcome(wire::Welcome {
                     cluster_id: self.hub.0.cluster_id.clone(),
@@ -2853,6 +2908,27 @@ impl Session {
             if self.revoke_stale_leases(&hello.leases, outbox).await {
                 self.hub
                     .stale_leases_revoked(&self.node_id, self.generation);
+            } else {
+                // ADR 0299, section 8.4 "Acknowledgements": an incomplete pass
+                // (a failed read, or an ADR 0285 raise that did not commit)
+                // may have left a lease without its revoke or its raise. The
+                // node's `log_ack` counts at once only because it answers
+                // the revokes before it (section 4.2 rule 3), which fails
+                // for a revoke that never left. So the session ends before
+                // its welcome, and the revokes this pass queued are dropped,
+                // so that none goes out without its raise: the node dials
+                // again (section 4.4) and the next session runs the pass
+                // again. Nothing else the pass queues goes through the
+                // hub's channel: it registers no held grant on this session,
+                // and a held grant waits for the session's start anyway.
+                outbox.truncate(start_frames);
+                outbox.push(protocol_error(
+                    quoro_proto::ErrorCode::BadMessage,
+                    "the primary could not finish this session's start; dial again",
+                    false,
+                    Some(&raw.id),
+                ));
+                return true;
             }
             if self.has_pending_fence_ack().await {
                 self.start_wait = Some(hello.stored_rev);
@@ -3293,6 +3369,12 @@ impl Session {
                     // revoke at the token it reports comes first (section
                     // 4.2 rule 3, ADR 0258, ADR 0299), and without majority
                     // support neither goes out until support returns.
+                    if self.hub.unrecorded_failure(&row.id) {
+                        // No grant follows on this session, so no revoke
+                        // goes before it.
+                        eligible.push((row.clone(), None));
+                        continue;
+                    }
                     let same_mode = matches!(claimed.mode, quoro_proto::LeaseMode::Expiring)
                         == (row.mode == "expiring");
                     let other_mode_held =
@@ -3322,7 +3404,16 @@ impl Session {
                     continue;
                 }
             }
-            let row = match leases::by_id(&mut conn, &claimed.lease_id).await {
+            let fault = Fault::StartRead {
+                node_id: self.node_id.clone(),
+                lease_id: claimed.lease_id.clone(),
+            };
+            let read = if self.hub.take_fault(&fault) {
+                Err(ApiError::internal(&"a test seam failed the read"))
+            } else {
+                leases::by_id(&mut conn, &claimed.lease_id).await
+            };
+            let row = match read {
                 Ok(row) => row,
                 Err(e) => {
                     tracing::warn!(error = %e.code.as_str(), lease_id = %claimed.lease_id, "cannot read a lease");
@@ -3360,7 +3451,13 @@ impl Session {
                 kind: ActorType::Node,
                 id: self.node_id.clone(),
             };
+            let fault = Fault::Raise {
+                node_id: self.node_id.clone(),
+            };
             let raised: Result<Vec<leases::Lease>, ApiError> = async {
+                if self.hub.take_fault(&fault) {
+                    return Err(ApiError::internal(&"a test seam failed the raise"));
+                }
                 let mut w = self.hub.0.store.begin_write().await?;
                 let mut raised = Vec::new();
                 for (lease_id, reported) in &raises {
@@ -3399,6 +3496,11 @@ impl Session {
                 }
             }
         }
+        // An incomplete pass ends the session (ADR 0299): nothing is
+        // registered or removed on it, and its next session decides again.
+        if !complete {
+            return false;
+        }
         // Not listed: the held grant (ADR 0295).
         for row in step4.values() {
             if !reported.iter().any(|claimed| claimed.lease_id == row.id) {
@@ -3407,6 +3509,13 @@ impl Session {
         }
         for (row, revoke_first) in eligible {
             self.step4_eligible.insert(row.id.clone());
+            // Section 8.5 step 1: a failed fence this primary could not
+            // record holds the grant like a recorded one, so the row is a
+            // step-4 row that nothing goes out for on this session, and no
+            // regrant mints a token over it.
+            if self.hub.unrecorded_failure(&row.id) {
+                continue;
+            }
             self.hub.held_eligible(&row, self.generation, revoke_first);
         }
         for row in &held_by_node {
@@ -3724,7 +3833,13 @@ impl Session {
         }
         // The VMs may run again, whatever this holder released before.
         self.hub.0.releases.forget(lease_id, &self.node_id);
+        let fault = Fault::FailureRecord {
+            node_id: self.node_id.clone(),
+        };
         let recorded: Result<bool, ApiError> = async {
+            if self.hub.take_fault(&fault) {
+                return Err(ApiError::internal(&"a test seam failed the record"));
+            }
             let mut w = self.hub.0.store.begin_write().await?;
             let app_ids: Vec<String> = leases::by_id(&mut w.tx, lease_id)
                 .await?

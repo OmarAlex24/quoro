@@ -143,14 +143,19 @@ impl NodeHub {
     }
 
     /// Raises the node's countable acknowledgement to `seq` while
-    /// `generation` is its current session, and wakes the held grants when
-    /// it rose. Called with the `sessions` lock not held.
+    /// `generation` is its current session and its start pass ran to its
+    /// end, and wakes the held grants when it rose. Called with the
+    /// `sessions` lock not held.
     fn raise_countable(&self, node_id: &str, generation: u64, seq: u64) {
         let rose = {
             let sessions = self.0.sessions.lock().expect("session lock");
+            // A session whose start pass was incomplete ends before it
+            // follows the log; refusing its acknowledgements here too keeps
+            // a revoke that never left from being taken as answered (ADR
+            // 0299).
             if !sessions
                 .get(node_id)
-                .is_some_and(|handle| handle.generation == generation)
+                .is_some_and(|handle| handle.generation == generation && handle.stale_revoked)
             {
                 return;
             }
@@ -168,7 +173,8 @@ impl NodeHub {
     /// A `log_ack` of `seq` accepted on `generation`: it counts at once,
     /// because the node holds its `log_ack` back until it has answered the
     /// revokes before it (section 4.2 rule 3; section 8.4,
-    /// "Acknowledgements").
+    /// "Acknowledgements"). That holds only for revokes that went out, so it
+    /// counts only on a session whose start pass ran to its end.
     pub(super) fn count_log_ack(&self, node_id: &str, generation: u64, seq: u64) {
         self.raise_countable(node_id, generation, seq);
     }
@@ -473,8 +479,8 @@ impl NodeHub {
     /// - A row that is a step-4 row stays: the session start registers it
     ///   ([`NodeHub::held_eligible`]).
     /// - A row that names the entry, marked and unrevoked, whose lease a
-    ///   failed fence lists or the holder's `fence_ack_pending` holds (section
-    ///   8.5), keeps its entry, waiting for the holder's next session start,
+    ///   failed fence lists, one this primary could not record, or the
+    ///   holder's `fence_ack_pending` holds (section 8.5), keeps its entry, waiting for the holder's next session start,
     ///   as an attempt at send keeps it ([`NodeHub::attempt_held`]): the
     ///   fence may be acknowledged without the row moving.
     /// - Any other entry goes: the row moved, was revoked, lost its mark, or
@@ -502,12 +508,13 @@ impl NodeHub {
         };
         for (lease_id, held) in entries {
             let row = leases::by_id(conn, &lease_id).await?;
+            let unrecorded = self.unrecorded_failure(&lease_id);
             let fenced = match row
                 .as_ref()
                 .filter(|row| held.names(row) && row.unsettled && !row.is_revoked())
             {
-                Some(row) if leases::is_step4(conn, row).await? => continue,
-                Some(row) => leases::fenced(conn, row).await?,
+                Some(row) if !unrecorded && leases::is_step4(conn, row).await? => continue,
+                Some(row) => unrecorded || leases::fenced(conn, row).await?,
                 None => false,
             };
             // What the entry was when it changed, so a revoke it held back
@@ -752,6 +759,7 @@ impl NodeHub {
             }
             if !self.0.authority.supports(held.support_ms)
                 || self.0.authority.gate_remaining(lease_id).is_some()
+                || self.unrecorded_failure(lease_id)
             {
                 return Ok(Attempt::Wait);
             }
@@ -777,7 +785,9 @@ impl NodeHub {
         }
         // Section 8.5: a failed fence or an acknowledgement pending delivery
         // holds the grant; the acknowledgement's increment changes the token.
-        if leases::fenced(&mut w.tx, &row).await? {
+        // A failed fence this primary could not record holds it the same
+        // way (section 8.5 step 1).
+        if leases::fenced(&mut w.tx, &row).await? || self.unrecorded_failure(lease_id) {
             return Ok(Attempt::Wait);
         }
         // Step 4: the row's newest write gave the lease its token.

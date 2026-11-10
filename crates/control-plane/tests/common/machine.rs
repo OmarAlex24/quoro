@@ -139,6 +139,22 @@ pub fn echo(request: &Value, version: u64) -> wire::SupportGrant {
     }
 }
 
+/// Opens a node session's WebSocket with `node`'s credential.
+pub async fn dial(server: &Server, node: &Node) -> Socket {
+    let url = format!("ws://{}/api/v1/nodes/session", server.address());
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", node.credential).parse().unwrap(),
+    );
+    let stream = TcpStream::connect(server.address()).await.unwrap();
+    let (socket, response) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .expect("websocket upgrade");
+    assert_eq!(response.status(), 101);
+    socket
+}
+
 /// A fake machine on a live session.
 pub struct Machine {
     pub socket: Socket,
@@ -185,17 +201,7 @@ impl Machine {
         acks: bool,
         follows: bool,
     ) -> Self {
-        let url = format!("ws://{}/api/v1/nodes/session", server.address());
-        let mut request = url.into_client_request().unwrap();
-        request.headers_mut().insert(
-            "Authorization",
-            format!("Bearer {}", node.credential).parse().unwrap(),
-        );
-        let stream = TcpStream::connect(server.address()).await.unwrap();
-        let (socket, response) = tokio_tungstenite::client_async(request, stream)
-            .await
-            .expect("websocket upgrade");
-        assert_eq!(response.status(), 101);
+        let socket = dial(server, node).await;
         let mut machine = Self {
             socket,
             primary: String::new(),

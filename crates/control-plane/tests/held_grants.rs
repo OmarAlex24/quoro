@@ -18,20 +18,23 @@
 
 mod common;
 
-use common::log::{log_hash_at, log_head};
-use common::machine::{Machine, Node, echo, enroll, hello_body, manual_clock, ok_result};
+use common::log::{check_entries, log_hash_at, log_head};
+use common::machine::{Machine, Node, dial, echo, enroll, hello_body, manual_clock, ok_result};
 use common::{Server, TLS_FINGERPRINT, restart_with_resolver, start_with_patient_node_session};
+use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::api::enroll::{ensure_local_join, local_join_token};
 use quoro_control_plane::changelog::{self, Actor, Op};
+use quoro_control_plane::session::Fault;
 use quoro_proto::wire::{
-    self, Capacity as WireCapacity, Heartbeat, NodeMessage, StatusReport,
+    self, Capacity as WireCapacity, Heartbeat, LogAck, NodeMessage, StatusReport,
     VolumeState as WireVolumeState, VolumeStatus,
 };
-use quoro_proto::{LeaseMode, ResourceType};
+use quoro_proto::{CommandResult, CommandStatus, ErrorBody, ErrorCode, LeaseMode, ResourceType};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 const IMAGE: &str =
     "ghcr.io/example/web@sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -1294,5 +1297,296 @@ async fn the_primarys_host_counts_only_through_its_own_session() {
         let (mut on_host, _) = session(&server, &host, None, Vec::new(), true).await;
         follow_to(&mut on_host, seq).await;
         assert_eq!(pending(&server, &owner, &app_id).await, (true, Vec::new()));
+    }
+}
+
+/// Dials as `node`, sends `hello` and serves the session as a following
+/// node would, checking and acknowledging each `log_entries` from the
+/// `hello`'s position, until the primary closes it or it stays quiet past
+/// `within`. Returns every frame, and whether the primary closed it.
+async fn serve_until_closed(
+    server: &Server,
+    node: &Node,
+    hello: wire::Hello,
+    within: Duration,
+) -> (Vec<Value>, bool) {
+    let mut socket = dial(server, node).await;
+    let mut log = (hello.log_seq, hello.log_hash.clone());
+    let text = NodeMessage::Hello(hello)
+        .to_frame("msg_01JC9Z6Q5W8N3K4T7R2MHELL00", None)
+        .to_text();
+    socket.send(WsMessage::Text(text.into())).await.unwrap();
+    let mut frames = Vec::new();
+    let mut acks = 0u32;
+    loop {
+        let message = match tokio::time::timeout(within, socket.next()).await {
+            Err(_) => return (frames, false),
+            Ok(None | Some(Err(_))) => return (frames, true),
+            Ok(Some(Ok(message))) => message,
+        };
+        match message {
+            WsMessage::Text(text) => {
+                let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                if frame["type"] == "log_entries" {
+                    let (seq, hash) = check_entries(&frame["body"], &log.1);
+                    log = (seq, hash.clone());
+                    acks += 1;
+                    let ack = NodeMessage::LogAck(LogAck { seq, hash })
+                        .to_frame(&format!("msg_01JC9Z6Q5W8N3K4T7R2MACK{acks:03}"), None)
+                        .to_text();
+                    let _ = socket.send(WsMessage::Text(ack.into())).await;
+                }
+                frames.push(frame);
+            }
+            WsMessage::Close(_) => return (frames, true),
+            _ => {}
+        }
+    }
+}
+
+/// The `hello` of `node` at the primary's newest change-log entry, listing
+/// `leases`.
+async fn hello_at_head(server: &Server, node: &Node, leases: Vec<wire::HelloLease>) -> wire::Hello {
+    let head = log_head(server).await;
+    let mut hello = hello_body(&node.node_id);
+    hello.log_seq = head;
+    hello.log_hash = log_hash_at(server, head).await;
+    hello.leases = leases;
+    hello
+}
+
+/// B1 (ADR 0299, section 8.4 "Acknowledgements"). A, the holder, and C have
+/// acknowledged the marked row's write and support the primary, a majority
+/// of three voters. B, which the row does not name, lists the lease `held`
+/// `local` above the row's token, from writes this primary lacks, and an
+/// unknown lease; its session start cannot read the marked row. The pass is
+/// incomplete, so the session ends before the welcome: no revoke reaches B,
+/// B's position and acknowledgements never count, and A gets no grant. B's
+/// next session runs the pass to its end: the revoke at B's token reaches
+/// it, the row is raised above it and recorded revoked (ADR 0285), and A
+/// still gets no grant once every condition else holds.
+#[tokio::test]
+async fn a_failed_start_pass_ends_the_session_without_its_revokes() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let b = enroll(&server, &owner, "node-b", &["node"]).await;
+    let c = enroll(&server, &owner, "node-c", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = warm_volume(&server, &owner, &project_id, "web", &a).await;
+    let (mut on_c, _) = session(&server, &c, None, Vec::new(), true).await;
+    let seq = newest_write(&server, &lease_id).await;
+    follow_to(&mut on_a, seq).await;
+    follow_to(&mut on_c, seq).await;
+    let mut seen = support_keeping_frames(&mut on_a).await;
+    on_c.support().await;
+    assert!(server.state.hub.authority().supports(D));
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, vec![b.node_id.clone()])
+    );
+
+    let listing = vec![
+        listed(&lease_id, &app_id, LeaseMode::Local, 2, "held"),
+        unknown_lease(),
+    ];
+    server.state.hub.inject_fault(Fault::StartRead {
+        node_id: b.node_id.clone(),
+        lease_id: lease_id.clone(),
+    });
+    let hello = hello_at_head(&server, &b, listing.clone()).await;
+    let (frames, closed) = serve_until_closed(&server, &b, hello, Duration::from_secs(3)).await;
+    assert!(closed, "the session ends: {frames:?}");
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame["type"] == "lease_revoke" || frame["type"] == "welcome"),
+        "{frames:?}"
+    );
+    assert_eq!(frames[0]["type"], "error", "{frames:?}");
+    assert_eq!(server.state.hub.countable_ack(&b.node_id), 0);
+    wait_disconnected(&server, &b).await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "expiring".to_string(), Some(15_000), 1, false),
+        "neither raised nor revoked"
+    );
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, vec![b.node_id.clone()])
+    );
+
+    // The next session runs the pass to its end.
+    let hello = hello_at_head(&server, &b, listing).await;
+    let mut on_b = Machine::connect_with(&server, &b, hello, true, true).await;
+    let mut frames = on_b.start.clone();
+    frames.extend(on_b.settle().await);
+    let revokes = revokes_of(&frames, &lease_id);
+    assert_eq!(revokes.len(), 1, "{frames:?}");
+    assert_eq!(revokes[0]["body"]["fencing_token"], 2);
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (3, "expiring".to_string(), Some(15_000), 1, true),
+        "raised above B's token, revoked, the mark kept"
+    );
+    for frame in &frames {
+        if frame["type"] == "lease_revoke" {
+            on_b.send(ok_result(None), frame["id"].as_str()).await;
+        }
+    }
+    on_b.settle().await;
+    let head = log_head(&server).await;
+    follow_to(&mut on_a, head).await;
+    follow_to(&mut on_b, head).await;
+    follow_to(&mut on_c, head).await;
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    assert_eq!(pending(&server, &owner, &app_id).await, (false, Vec::new()));
+}
+
+/// B2 ("The mark", ADR 0285). B, which the marked row does not name, lists
+/// the lease `held` at the row's token, and its session start cannot
+/// commit the raise. The pass is incomplete, so the session ends and the
+/// revoke never reaches B, which therefore lists the lease `held` again on
+/// its next session: the raise commits there, the revoke follows, and step
+/// 4 never sends A a grant, on its live session or its next one.
+#[tokio::test]
+async fn a_failed_raise_is_tried_again_before_its_revoke_goes_out() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let b = enroll(&server, &owner, "node-b", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = warm_volume(&server, &owner, &project_id, "web", &a).await;
+    let listing = vec![listed(&lease_id, &app_id, LeaseMode::Local, 1, "held")];
+
+    server.state.hub.inject_fault(Fault::Raise {
+        node_id: b.node_id.clone(),
+    });
+    let mut hello = hello_body(&b.node_id);
+    hello.leases = listing.clone();
+    let (frames, closed) = serve_until_closed(&server, &b, hello, Duration::from_secs(3)).await;
+    assert!(closed, "the session ends: {frames:?}");
+    assert!(revokes_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    wait_disconnected(&server, &b).await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "expiring".to_string(), Some(15_000), 1, false)
+    );
+
+    let (mut on_b, frames) = session(&server, &b, None, listing, true).await;
+    let revokes = revokes_of(&frames, &lease_id);
+    assert_eq!(revokes.len(), 1, "{frames:?}");
+    assert_eq!(revokes[0]["body"]["fencing_token"], 1);
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (2, "expiring".to_string(), Some(15_000), 1, true),
+        "raised, revoked, the mark kept"
+    );
+    on_b.send(ok_result(None), revokes[0]["id"].as_str()).await;
+    on_b.settle().await;
+
+    let head = log_head(&server).await;
+    let mut seen = follow_to(&mut on_a, head).await;
+    follow_to(&mut on_b, head).await;
+    seen.extend(support_keeping_frames(&mut on_a).await);
+    on_b.support().await;
+    assert!(server.state.hub.authority().supports(D));
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    let (mut on_a, frames) = session(&server, &a, Some(on_a.log.clone()), Vec::new(), true).await;
+    let mut seen = frames;
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    assert_eq!(pending(&server, &owner, &app_id).await, (false, Vec::new()));
+}
+
+/// B2, section 8.5 step 1. B, an old holder, lists the lease `expired`; it
+/// answers its revoke `fence_failed`, and the primary cannot record the
+/// failure, which it then keeps in memory only. With every other condition
+/// met, A gets no grant: not on its live session, not as a regrant when it
+/// lists the lease `expired` at the row's token (no token is minted), and
+/// not as step 4 when a later session lists nothing.
+#[tokio::test]
+async fn an_unrecorded_failed_fence_holds_the_grant() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let b = enroll(&server, &owner, "node-b", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = warm_volume(&server, &owner, &project_id, "web", &a).await;
+
+    server.state.hub.inject_fault(Fault::FailureRecord {
+        node_id: b.node_id.clone(),
+    });
+    let listing = vec![listed(&lease_id, &app_id, LeaseMode::Local, 1, "expired")];
+    let (mut on_b, frames) = session(&server, &b, None, listing, true).await;
+    let revokes = revokes_of(&frames, &lease_id);
+    assert_eq!(revokes.len(), 1, "{frames:?}");
+    on_b.send(
+        NodeMessage::CommandResult(CommandResult {
+            status: CommandStatus::Error,
+            detail: Some("the VM may still run".to_string()),
+            error: Some(ErrorBody {
+                code: ErrorCode::FenceFailed,
+                message: "the forced stop could not be confirmed".to_string(),
+            }),
+            lines: None,
+            metrics: None,
+        }),
+        revokes[0]["id"].as_str(),
+    )
+    .await;
+    on_b.settle().await;
+    let failure: Option<String> =
+        sqlx::query_scalar("SELECT fence_failure FROM nodes WHERE id = ?")
+            .bind(&b.node_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(failure, None, "not recorded");
+
+    let head = log_head(&server).await;
+    let mut seen = follow_to(&mut on_a, head).await;
+    follow_to(&mut on_b, head).await;
+    seen.extend(support_keeping_frames(&mut on_a).await);
+    on_b.support().await;
+    assert!(server.state.hub.authority().supports(D));
+    assert!(server.state.hub.countable_ack(&b.node_id) >= head);
+    seen.extend(after_a_tick(&mut on_a).await);
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    assert_eq!(pending(&server, &owner, &app_id).await, (true, Vec::new()));
+    let written = newest_write(&server, &lease_id).await;
+
+    for leases in [
+        vec![listed(
+            &lease_id,
+            &app_id,
+            LeaseMode::Expiring,
+            1,
+            "expired",
+        )],
+        Vec::new(),
+    ] {
+        let (mut on_a_again, frames) =
+            session(&server, &a, Some(on_a.log.clone()), leases, true).await;
+        let mut seen = frames;
+        seen.extend(after_a_tick(&mut on_a_again).await);
+        assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+        assert_eq!(row(&server, &lease_id).await.0, 1, "no token minted");
+        assert_eq!(newest_write(&server, &lease_id).await, written);
+        on_a = on_a_again;
     }
 }
