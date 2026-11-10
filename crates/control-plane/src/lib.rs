@@ -22,6 +22,9 @@ pub mod crypto;
 /// Key custody: binding each node's custody key and sealing the cluster keys
 /// to it (ADR 0180, ADR 0231).
 pub mod custody;
+/// The `503` `not_primary` responder of a demoted primary (section 7.4, ADR
+/// 0230).
+pub mod demotion;
 pub mod deploy;
 pub mod dispatcher;
 pub mod driver;
@@ -389,7 +392,8 @@ impl AppState {
 
 /// The API router with the request-id layer and the request body limit
 /// (README "Request body limit", ADR 0306). The panel's static assets are
-/// mounted by the binary beside it.
+/// mounted by the binary beside it, and the binary wraps the whole service in
+/// [`demotion::guard`].
 ///
 /// The limit runs after routing, on every route of [`api::routes`], so it
 /// knows the operation it refuses; the `DefaultBodyLimit` keeps the

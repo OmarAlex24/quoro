@@ -39,8 +39,15 @@ pub fn spawn(state: AppState) {
         let mut ticker = tokio::time::interval(EXPORT_INTERVAL);
         loop {
             ticker.tick().await;
+            // A demoted primary exports nothing more (`node-agent-protocol.md`
+            // section 7.4): its chain stays in its database.
+            if state.store.stops_for_demotion("the audit export") {
+                break;
+            }
             let now = OffsetDateTime::now_utc();
-            if let Err(error) = cycle(&state, now, &mut last_verify).await {
+            if let Err(error) = cycle(&state, now, &mut last_verify).await
+                && !state.store.is_demoted()
+            {
                 tracing::warn!(error = ?error, "audit export pass failed");
             }
         }

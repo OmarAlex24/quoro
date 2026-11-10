@@ -15,8 +15,8 @@
 //! - **Answers.** A `support_grant` goes to the tracker
 //!   ([`crate::support::SupportTracker`]), which counts it or ignores it. An
 //!   `error` that answers a request is logged and counts nothing. A
-//!   `stale_term`, whatever it answers, stops all support (section 8.8,
-//!   "Terms").
+//!   `stale_term`, whatever it answers, stops all support and demotes the
+//!   primary (sections 7.4 and 8.8, "Terms").
 
 use super::{NodeHub, Session, cluster_term, new_msg_id};
 use crate::authority::DEFAULT_DURATION_MS;
@@ -301,16 +301,14 @@ impl Session {
     }
 
     /// The node answered `stale_term`: a higher term exists. The primary
-    /// stops granting and renewing `expiring` leases at once and holds no
-    /// support until it restarts (section 8.8, "Terms"). Demotion, which ends
-    /// the sessions with `not_primary` (section 7.4, ADR 0182), belongs to
-    /// the promotion work and is not built here.
-    pub(super) fn on_stale_term(&self, node_term: Option<u64>) {
+    /// stops granting and renewing `expiring` leases at once, then demotes
+    /// itself ([`NodeHub::stale_term`], section 7.4, ADR 0230).
+    pub(super) async fn on_stale_term(&self, node_term: Option<u64>) {
         tracing::error!(
             node_id = %self.node_id,
             ?node_term,
-            "a node answered stale_term: a higher term exists; this primary grants and renews no expiring lease until it restarts"
+            "a node answered stale_term: a higher term exists; this primary grants and renews no expiring lease and demotes itself"
         );
-        self.hub.0.support.stale_term();
+        self.hub.stale_term(node_term).await;
     }
 }

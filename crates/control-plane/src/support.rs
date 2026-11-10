@@ -357,12 +357,12 @@ impl SupportTracker {
 
     /// A node answered `stale_term`: a higher term exists, so this primary
     /// stops granting and renewing `expiring` leases at once (section 8.8,
-    /// "Terms"), and holds no support until the process restarts.
+    /// "Terms"), and holds no support again.
     ///
-    /// Section 8.8 also has it demote itself, ending its sessions with
-    /// `not_primary` and answering every later request with `503`
-    /// `not_primary` (section 7.4, ADR 0182). That belongs to the promotion
-    /// work and is not built here.
+    /// This runs first; the demotion follows it ([`crate::store::Store::demote`]),
+    /// which ends the sessions with `not_primary`, answers every later
+    /// request with `503` `not_primary` and keeps a restart demoted
+    /// (section 7.4, ADR 0182, ADR 0230).
     pub(crate) fn stale_term(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         let mut state = self.state();

@@ -357,3 +357,110 @@ async fn an_advertised_address_that_never_answers_costs_a_short_timeout() {
     primary.abort();
     silent_task.abort();
 }
+
+/// Serves TLS and answers every session upgrade with `503` and the
+/// `not_primary` problem, as a demoted primary does (section 7.4), counting
+/// the upgrades it refused. The handshake's callback returns tungstenite's
+/// own error response, whatever its size.
+#[allow(clippy::result_large_err)]
+async fn serve_not_primary(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    refused: Arc<AtomicUsize>,
+) {
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    loop {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let acceptor = acceptor.clone();
+        let refused = Arc::clone(&refused);
+        tokio::spawn(async move {
+            let Ok(stream) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let _ = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |_request: &Request, _response: Response| -> Result<Response, ErrorResponse> {
+                    refused.fetch_add(1, Ordering::SeqCst);
+                    let mut answer = ErrorResponse::new(Some(
+                        r#"{"type":"about:blank","title":"Not primary","status":503,"code":"not_primary"}"#
+                            .to_owned(),
+                    ));
+                    *answer.status_mut() =
+                        tokio_tungstenite::tungstenite::http::StatusCode::SERVICE_UNAVAILABLE;
+                    answer.headers_mut().insert(
+                        "content-type",
+                        tokio_tungstenite::tungstenite::http::HeaderValue::from_static(
+                            "application/problem+json",
+                        ),
+                    );
+                    Err(answer)
+                },
+            )
+            .await;
+        });
+    }
+}
+
+/// A demoted primary answers the session upgrade with `503` `not_primary`
+/// (section 7.4). That is not fatal: the node tries its next address in the
+/// same attempt, reaches the primary of the newer term there, and keeps it
+/// (sections 4.4 and 5.10).
+#[tokio::test]
+async fn an_upgrade_answered_with_503_moves_on_to_the_next_address() {
+    let dir = TempDir::new();
+    let cluster = sign::signing_key_from_seed(&[8; 32]);
+    let (cert, key) = self_signed();
+    let pin = format!("sha256:{}", tls::cert_fingerprint(cert.as_ref()));
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+
+    let demoted_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let demoted = format!(
+        "https://127.0.0.1:{}",
+        demoted_listener.local_addr().unwrap().port()
+    );
+    let refused = Arc::new(AtomicUsize::new(0));
+    let old_primary = tokio::spawn(serve_not_primary(
+        demoted_listener,
+        acceptor.clone(),
+        Arc::clone(&refused),
+    ));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let promoted = format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let welcomed = Arc::new(AtomicUsize::new(0));
+    let new_primary = tokio::spawn(serve_welcome(listener, acceptor, Arc::clone(&welcomed)));
+
+    let identity = write_identity(
+        dir.path(),
+        &cluster,
+        &demoted,
+        &pin,
+        std::slice::from_ref(&promoted),
+    );
+    let (stop, running) = session(&dir, identity.clone()).await;
+
+    within(Duration::from_secs(10), || {
+        welcomed.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    assert!(
+        refused.load(Ordering::SeqCst) >= 1,
+        "the demoted primary was dialed first"
+    );
+    within(Duration::from_secs(5), || {
+        identity.get().primary_url == promoted
+    })
+    .await;
+    assert_eq!(identity.get().primary_urls, vec![demoted]);
+    assert!(!running.is_finished(), "a 503 is not fatal");
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), running).await;
+    old_primary.abort();
+    new_primary.abort();
+}

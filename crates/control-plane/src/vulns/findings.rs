@@ -955,6 +955,11 @@ fn remember_subject_fingerprint(key: &str, fingerprint: SubjectFingerprint) {
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
         loop {
+            // A demoted primary writes nothing more (`node-agent-protocol.md`
+            // section 7.4).
+            if state.store.stops_for_demotion("the vulnerability matcher") {
+                break;
+            }
             run_once(&state).await;
             tokio::select! {
                 () = wake().notified() => {}

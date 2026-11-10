@@ -367,12 +367,12 @@ async fn support_runs_out_at_p_send_plus_s_minus_m_s() {
     assert!(!supports(&server, D), "at p_send + S - M_S");
 }
 
-/// Section 8.8, "Terms" and "Restarts": after a `stale_term` from any node
-/// the primary holds no support, whatever its voters answer, until it
-/// restarts. A restarted primary holds none either until its voters answer
-/// its own requests.
+/// Section 8.8, "Terms": after a `stale_term` from any node the primary
+/// holds no support at once. It also demotes itself, so the session ends
+/// with `not_primary` and no later answer can come (section 7.4; the
+/// demotion itself is tested in `tests/demotion.rs`).
 #[tokio::test]
-async fn a_stale_term_stops_all_support_until_the_primary_restarts() {
+async fn a_stale_term_stops_all_support_at_once() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     manual_clock(&server);
@@ -391,10 +391,22 @@ async fn a_stale_term_stops_all_support_until_the_primary_restarts() {
         None,
     )
     .await;
-    on_a.settle().await;
+    let ended = on_a.until("error").await;
+    assert_eq!(ended["body"]["code"], "not_primary", "{ended}");
     assert!(!supports(&server, D), "stale_term stops all support");
+}
+
+/// Section 8.8, "Restarts": the primary keeps support in memory only, so a
+/// restarted primary holds none until its voters answer its own requests.
+#[tokio::test]
+async fn no_support_survives_a_restart() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let mut on_a = Machine::connect(&server, &a).await;
     on_a.support().await;
-    assert!(!supports(&server, D), "and no later answer counts");
+    assert!(supports(&server, D));
 
     drop(on_a);
     let deadline = Instant::now() + Duration::from_secs(10);

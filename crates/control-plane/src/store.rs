@@ -12,7 +12,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, OwnedMutexGuard, watch};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, watch};
 
 const BASE_SCHEMA: &str = include_str!("../../../docs/contracts/db-schema.sql");
 
@@ -48,6 +48,49 @@ pub struct Store {
     /// The newest change-log `seq`, raised after each commit
     /// ([`Store::change_log_head`]).
     head: Arc<watch::Sender<u64>>,
+    /// Whether this primary is demoted (`node-agent-protocol.md` section
+    /// 7.4, ADR 0230). Set once, by [`Store::demote`], while the writer gate
+    /// is held, and never cleared: from then on [`Store::begin_write`]
+    /// refuses. Readable without the database.
+    demoted: Arc<watch::Sender<bool>>,
+    /// Test seam: the next demotion waits here, after its `meta` write and
+    /// before it sets the flag, with the gate held
+    /// ([`Store::hold_next_demotion`]).
+    demotion_hold: Arc<std::sync::Mutex<Option<Arc<DemotionHold>>>>,
+}
+
+/// The error [`Store::begin_write`] returns once the primary is demoted.
+pub const DEMOTED_REFUSAL: &str =
+    "this primary is demoted: a higher term exists, and it writes nothing more";
+
+/// What [`Store::demote`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Demotion {
+    /// `meta.demoted_by_term` holds this term, so a restart stays demoted.
+    Recorded(u64),
+    /// The `meta` write failed: this process is demoted, a restart is not.
+    NotRecorded,
+}
+
+/// A test seam that holds the next demotion after its `meta` write and before
+/// it sets the demoted flag, with the writer gate still held.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct DemotionHold {
+    reached: Notify,
+    release: Notify,
+}
+
+impl DemotionHold {
+    /// Waits until the held demotion has written `meta`.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the held demotion go on to set the flag and release the gate.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 /// A write transaction holding the single-writer gate. Dropping it without
@@ -219,6 +262,8 @@ impl Store {
             writer: Arc::new(Mutex::new(())),
             migrations: Arc::from(MIGRATIONS),
             head: Arc::new(watch::channel(head).0),
+            demoted: Arc::new(watch::channel(false).0),
+            demotion_hold: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -289,11 +334,20 @@ impl Store {
     /// connection committed in between: SQLite answers `SQLITE_BUSY_SNAPSHOT`
     /// at once, without waiting.
     ///
+    /// Once the primary is demoted it refuses, after it acquired the gate,
+    /// and opens no transaction (section 7.4: a demoted primary writes
+    /// nothing more). A writer queued on the gate when the demotion took it
+    /// is refused too, because the flag is set before the gate is released.
+    ///
     /// # Errors
     ///
-    /// The database error from `BEGIN IMMEDIATE`.
+    /// [`DEMOTED_REFUSAL`] once the primary is demoted, or the database error
+    /// from `BEGIN IMMEDIATE`.
     pub async fn begin_write(&self) -> Result<WriteTx, sqlx::Error> {
         let gate = Arc::clone(&self.writer).lock_owned().await;
+        if self.is_demoted() {
+            return Err(sqlx::Error::Protocol(DEMOTED_REFUSAL.to_string()));
+        }
         let tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         Ok(WriteTx {
             tx,
@@ -301,6 +355,149 @@ impl Store {
             _gate: gate,
         })
     }
+
+    /// Whether this primary is demoted (`node-agent-protocol.md` section 7.4).
+    /// Reads memory only.
+    #[must_use]
+    pub fn is_demoted(&self) -> bool {
+        *self.demoted.borrow()
+    }
+
+    /// A watch of the demoted flag: it turns `true` once and stays so. Node
+    /// sessions wait on it to end with `not_primary`.
+    #[must_use]
+    pub fn demoted_watch(&self) -> watch::Receiver<bool> {
+        self.demoted.subscribe()
+    }
+
+    /// Whether a background loop must stop because the primary is demoted,
+    /// logging one line naming `what` when it must. A loop calls it once per
+    /// pass and stops on `true`, so it logs at most once.
+    #[must_use]
+    pub fn stops_for_demotion(&self, what: &str) -> bool {
+        if self.is_demoted() {
+            tracing::info!("{what} stops: this primary is demoted");
+            return true;
+        }
+        false
+    }
+
+    /// `meta.demoted_by_term`, read through the pool: `None` when the key is
+    /// absent or the database has no `meta` table yet. Nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// Any database error.
+    pub async fn demoted_by_term(&self) -> Result<Option<String>, sqlx::Error> {
+        let has_meta: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'")
+                .fetch_optional(&self.pool)
+                .await?;
+        if has_meta.is_none() {
+            return Ok(None);
+        }
+        sqlx::query_scalar("SELECT value FROM meta WHERE key = 'demoted_by_term'")
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Demotes this primary: a machine answered it with `stale_term`, so a
+    /// higher term exists (`node-agent-protocol.md` sections 7.4 and 8.8, ADR
+    /// 0230). Returns `None` when it was already demoted: the first demotion
+    /// wins, and its term stays.
+    ///
+    /// It takes the writer gate and, in one transaction, records
+    /// `meta.demoted_by_term`: the error's `node_term` when it is above
+    /// `meta.term`, else `meta.term + 1`. The contract gives no rule for a
+    /// `stale_term` without a usable term; that case is logged at `error`
+    /// and the primary is demoted all the same, as section 8.8 sets no
+    /// condition. The flag is set after the commit and before the gate is
+    /// released, so no writer queued on the gate commits after the `meta`
+    /// write. A failed `meta` write still sets the flag: this process is
+    /// demoted, though a restart would not be.
+    ///
+    /// Section 8.8 excepts a primary restored with `quoro restore
+    /// --accept-loss` that has sent no `lease_grant` yet, which would start
+    /// again above the error's term instead (`backup-format.md` section 8.2,
+    /// ADR 0261). That restore path does not exist yet, so every primary
+    /// demotes here.
+    pub async fn demote(&self, node_term: Option<u64>) -> Option<Demotion> {
+        let gate = Arc::clone(&self.writer).lock_owned().await;
+        if self.is_demoted() {
+            return None;
+        }
+        let demotion = match record_demotion(&self.pool, node_term).await {
+            Ok(term) => Demotion::Recorded(term),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    ?node_term,
+                    "cannot record meta.demoted_by_term: this process is demoted, but a restart would not stay demoted"
+                );
+                Demotion::NotRecorded
+            }
+        };
+        let hold = self
+            .demotion_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hold) = hold {
+            hold.reached.notify_one();
+            hold.release.notified().await;
+        }
+        self.demoted.send_replace(true);
+        drop(gate);
+        Some(demotion)
+    }
+
+    /// Test seam: holds the next [`Store::demote`] after its `meta` write and
+    /// before it sets the flag, with the writer gate held.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hold_next_demotion(&self) -> Arc<DemotionHold> {
+        let hold = Arc::new(DemotionHold::default());
+        *self
+            .demotion_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hold));
+        hold
+    }
+}
+
+/// Writes `meta.demoted_by_term` in one transaction and returns the term
+/// written ([`Store::demote`], which holds the writer gate).
+async fn record_demotion(pool: &SqlitePool, node_term: Option<u64>) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let stored: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'term'")
+        .fetch_optional(&mut *tx)
+        .await?;
+    let current = match stored {
+        None => 1,
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| sqlx::Error::Protocol(format!("bad meta.term {value:?}")))?,
+    };
+    let term = match node_term {
+        Some(term) if term > current => term,
+        _ => {
+            tracing::error!(
+                ?node_term,
+                meta_term = current,
+                "the stale_term carried no term above this primary's; recording meta.term + 1"
+            );
+            current.saturating_add(1)
+        }
+    };
+    sqlx::query(
+        "INSERT INTO meta (key, value) VALUES ('demoted_by_term', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(term.to_string())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(term)
 }
 
 /// The change log's newest `seq` through `conn`, 0 when it is empty.

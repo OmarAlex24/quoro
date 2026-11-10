@@ -104,7 +104,16 @@ fn decide(facts: Facts) -> (ServingStatus, Option<&'static str>) {
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = recompute(&state.store).await {
+            // A demoted primary writes nothing more (section 7.4).
+            if state
+                .store
+                .stops_for_demotion("the domain serving status recompute")
+            {
+                break;
+            }
+            if let Err(error) = recompute(&state.store).await
+                && !state.store.is_demoted()
+            {
                 tracing::warn!(error = ?error, "the domain serving status recompute failed");
             }
             tokio::select! {

@@ -550,3 +550,37 @@ async fn a_body_above_the_limit_is_refused_and_audited_as_post_mcp() {
             .unwrap();
     assert_eq!(refused.0, 1);
 }
+
+/// A primary that learned of a higher term answers `/mcp` with `503`
+/// `not_primary` before it authenticates anything, as every other request
+/// (`node-agent-protocol.md` section 7.4, ADR 0230).
+#[tokio::test]
+async fn a_demoted_primary_answers_mcp_with_not_primary_before_authentication() {
+    let Seeded {
+        server,
+        access_token,
+        ..
+    } = seeded().await;
+    server.state.hub.stale_term(Some(5)).await;
+    let list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+    for token in [Some(access_token.as_str()), None] {
+        let res = reqwest::Client::new()
+            .post(server.url("/mcp"))
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", PROTOCOL_VERSION)
+            .header(
+                "Authorization",
+                token.map_or_else(String::new, |token| format!("Bearer {token}")),
+            )
+            .json(&list)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 503);
+        let content_type = header(res.headers(), "content-type");
+        assert!(header(res.headers(), "quoro-request-id").is_some());
+        assert_eq!(content_type.as_deref(), Some("application/problem+json"));
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["code"], "not_primary", "{body}");
+    }
+}

@@ -737,6 +737,12 @@ async fn upload_database(
     keys: SourceKeys,
     now: OffsetDateTime,
 ) -> Result<Uploaded, String> {
+    // `VACUUM INTO` does not go through the writer gate, so a demoted
+    // primary, which uploads nothing more, is checked here
+    // (`node-agent-protocol.md` section 7.4).
+    if store.is_demoted() {
+        return Err(crate::store::DEMOTED_REFUSAL.to_string());
+    }
     let path = temp_path(data_dir, backup_id)?;
     let quote_free = path
         .to_str()

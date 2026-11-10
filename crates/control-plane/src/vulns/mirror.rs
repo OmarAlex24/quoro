@@ -140,6 +140,14 @@ impl Vulns {
         let this = self.clone();
         tokio::spawn(async move {
             loop {
+                // A demoted primary downloads and writes nothing more
+                // (`node-agent-protocol.md` section 7.4).
+                if this
+                    .store
+                    .stops_for_demotion("the vulnerability data download")
+                {
+                    break;
+                }
                 this.run_once(OffsetDateTime::now_utc()).await;
                 tokio::select! {
                     () = this.wake.notified() => {}

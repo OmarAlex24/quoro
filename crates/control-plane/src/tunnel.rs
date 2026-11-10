@@ -254,6 +254,11 @@ impl TunnelManager {
         // and drains never postpone it.
         let mut next_pass = tokio::time::Instant::now() + RECONCILE_INTERVAL;
         loop {
+            // A demoted primary changes no tunnel and no DNS record
+            // (`node-agent-protocol.md` section 7.4).
+            if self.inner.store.stops_for_demotion("the tunnel manager") {
+                return;
+            }
             let drains = self.inner.hub.drains();
             let next_end = drains.next_end().map(|end| {
                 Duration::try_from(end - time::OffsetDateTime::now_utc()).unwrap_or(Duration::ZERO)
@@ -267,6 +272,9 @@ impl TunnelManager {
                     next_pass = tokio::time::Instant::now() + RECONCILE_INTERVAL;
                     self.inner.pending.lock().expect("tunnel pending lock").all = true;
                 }
+            }
+            if self.inner.store.stops_for_demotion("the tunnel manager") {
+                return;
             }
             // A drain whose window is over leaves its machine's snapshot and
             // its tunnel's ingress rules now (ADR 0194).

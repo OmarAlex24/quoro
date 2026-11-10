@@ -413,6 +413,17 @@ fn protocol_error(
     .to_text()
 }
 
+/// The fatal `error` `not_primary` a demoted primary ends every session with
+/// (sections 5.18 and 7.4, ADR 0230).
+fn not_primary_frame() -> String {
+    protocol_error(
+        quoro_proto::ErrorCode::NotPrimary,
+        "this primary learned of a higher term and is demoted; dial the other primary addresses",
+        true,
+        None,
+    )
+}
+
 fn decode_failure(error: &wire::DecodeError, outbox: &mut Vec<String>) -> bool {
     outbox.push(protocol_error(
         error.code(),
@@ -835,6 +846,10 @@ impl NodeHub {
                 let Some(inner) = hub.upgrade() else {
                     break;
                 };
+                // A demoted primary sends no desired state (section 7.4).
+                if inner.store.stops_for_demotion("the voter-set watch") {
+                    break;
+                }
                 let hub = NodeHub(inner);
                 match hub.voter_set().await {
                     Ok(set) => {
@@ -1777,6 +1792,28 @@ impl NodeHub {
         Ok(())
     }
 
+    /// A machine answered `stale_term`: a higher term exists (sections 7.4
+    /// and 8.8, ADR 0230). The primary stops granting and renewing
+    /// `expiring` leases at once, then demotes itself
+    /// ([`crate::store::Store::demote`]): it records the term in `meta`, and
+    /// from then on writes nothing. Every node session ends with a fatal
+    /// `not_primary` as soon as it sees the demoted flag, and the demotion
+    /// guard ([`crate::demotion`]) answers every later request with `503`.
+    /// A second `stale_term` changes nothing.
+    pub async fn stale_term(&self, node_term: Option<u64>) {
+        self.0.support.stale_term();
+        match self.0.store.demote(node_term).await {
+            Some(crate::store::Demotion::Recorded(term)) => tracing::error!(
+                demoted_by_term = term,
+                "this primary is demoted: it ends every node session with not_primary and answers every request with 503"
+            ),
+            Some(crate::store::Demotion::NotRecorded) => tracing::error!(
+                "this primary is demoted until it restarts: it ends every node session with not_primary and answers every request with 503"
+            ),
+            None => tracing::debug!(?node_term, "already demoted; the first term stays"),
+        }
+    }
+
     /// Ends every live session, for a clean shutdown.
     pub fn shutdown(&self) {
         let mut sessions = self.0.sessions.lock().expect("session lock");
@@ -2717,6 +2754,10 @@ async fn run_session(
     // Change-log follow sends new entries when this watch rises (section 7.1).
     let mut head = hub.0.store.change_log_head();
     let mut head_open = true;
+    // Section 7.4: once the primary is demoted, every session ends with
+    // `not_primary`, one that attached after the flag was set too.
+    let mut demoted = hub.0.store.demoted_watch();
+    let mut demoted_open = true;
     let mut session = Session::new(hub, node_id, generation);
     let mut superseded = false;
     let mut reason = "session_closed";
@@ -2772,6 +2813,14 @@ async fn run_session(
                 match queued {
                     Some(text) => outbox.push(text),
                     None => break,
+                }
+            }
+            seen = async { demoted.wait_for(|demoted| *demoted).await.is_ok() }, if demoted_open => {
+                if seen {
+                    outbox.push(not_primary_frame());
+                    close_after_error = true;
+                } else {
+                    demoted_open = false;
                 }
             }
             changed_result = closed.changed() => {
@@ -2868,6 +2917,8 @@ async fn end_session(
     // Nothing can answer this session's support requests any more; the
     // support the node already granted lasts its window (section 8.8).
     hub.0.support.session_ended(node_id, generation);
+    // A demoted primary writes nothing more (section 7.4).
+    let record_disconnect = record_disconnect && !hub.0.store.is_demoted();
     if record_disconnect && let Err(e) = disconnect_node(hub, node_id, reason, log_seq).await {
         tracing::warn!(%e, node_id = %node_id, "cannot record the disconnect");
     }
@@ -3234,9 +3285,12 @@ impl Session {
                     "node reported an error"
                 );
                 // Section 8.8, "Terms": a `stale_term`, whatever it answers,
-                // means a higher term exists.
+                // means a higher term exists. The primary demotes itself and
+                // ends this session like every other one (section 7.4).
                 if error.code == quoro_proto::ErrorCode::StaleTerm {
-                    self.on_stale_term(error.term);
+                    self.on_stale_term(error.term).await;
+                    outbox.push(not_primary_frame());
+                    return true;
                 }
                 if let Some(re) = raw.re.as_deref()
                     && self
