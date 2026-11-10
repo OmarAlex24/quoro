@@ -314,6 +314,27 @@ async fn wait_for_no_pending_ack(server: &Server, socket: &mut Socket, node_id: 
     }
 }
 
+/// The change log's newest `seq`, 0 for an empty log.
+async fn log_head(server: &Server) -> i64 {
+    let head: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    head.unwrap_or(0)
+}
+
+/// Asserts that `node`'s `log_lag` is the newest `seq` when the response was
+/// built minus its `log_seq`: above `before`, read before the call that wrote,
+/// and at most `after` (node-agent-protocol.md section 7.1, ADR 0301).
+fn assert_log_lag(node: &Value, before: i64, after: i64) {
+    let reported =
+        node["log_seq"].as_i64().expect("log_seq") + node["log_lag"].as_i64().expect("log_lag");
+    assert!(
+        before < reported && reported <= after,
+        "{before} < {reported} <= {after}: {node}"
+    );
+}
+
 async fn lease_row(server: &Server, lease_id: &str) -> (i64, Option<String>, String) {
     sqlx::query_as("SELECT fencing_token, revoked_at, holder_node_id FROM leases WHERE id = ?")
         .bind(lease_id)
@@ -584,6 +605,7 @@ async fn a_failed_fence_is_listed_and_a_human_acknowledgement_reaches_the_node()
 
     // Steps 2 and 3: the acknowledgement bumps the token, records the lease
     // revoked, clears `fence_failure` and queues the `fence_ack`.
+    let before = log_head(&server).await;
     let res = ack(
         &owner,
         &server,
@@ -597,7 +619,7 @@ async fn a_failed_fence_is_listed_and_a_human_acknowledgement_reaches_the_node()
     assert_eq!(body["id"], node_id);
     // The returned node carries its change-log lag, as every node read does
     // (node-agent-protocol.md section 7.1, ADR 0301).
-    assert!(body["log_lag"].is_u64(), "{body}");
+    assert_log_lag(&body, before, log_head(&server).await);
     let (token, revoked_at, holder) = lease_row(&server, &lease_id).await;
     assert_eq!(token, 2);
     assert!(revoked_at.is_some());

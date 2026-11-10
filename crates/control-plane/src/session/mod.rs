@@ -1586,8 +1586,10 @@ impl NodeHub {
     /// `node_id`, from this or an earlier session of it, 0 when it holds
     /// none or answered `log_diverged` since. A `hello` whose `log_seq` is
     /// below it, or below `nodes.log_seq`, draws `log_diverged` (section
-    /// 7.1, "On `hello`", ADR 0261).
-    fn newest_log_ack(&self, node_id: &str) -> u64 {
+    /// 7.1, "On `hello`", ADR 0261). Once the session ended, the API
+    /// reports it as `Node.log_seq` when the row is behind it
+    /// ([`crate::api::nodes::attach_log_position`]).
+    pub(crate) fn newest_log_ack(&self, node_id: &str) -> u64 {
         self.0
             .log_acks
             .lock()

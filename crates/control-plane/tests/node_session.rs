@@ -2450,17 +2450,19 @@ async fn a_disconnected_node_reads_the_log_seq_its_session_end_wrote() {
         (acked, Some(head - acked))
     );
 
-    // Once the session ended the API reads the row, not the primary's
-    // memory, which still holds `acked`.
+    // A row behind the acknowledgement the primary still holds in memory,
+    // as between a session's detach and its end write, or after a failed end
+    // write, reads that acknowledgement, not the row.
     set_stored_log_seq(&server, &node.node_id, acked - 1).await;
     assert_eq!(log_head(&server).await, head);
     assert_eq!(
         log_position(&server, &owner, &node.node_id).await,
-        (acked - 1, Some(head - acked + 1))
+        (acked, Some(head - acked))
     );
 
-    // A row above the primary's newest seq, as a session's start writes from
-    // a `hello` before its check, reads as no lag, never below 0.
+    // A row above both, as a session's start writes from a `hello` before
+    // its check, reads the row; above the primary's newest seq it reads as
+    // no lag, never below 0.
     set_stored_log_seq(&server, &node.node_id, head + 5).await;
     assert_eq!(
         log_position(&server, &owner, &node.node_id).await,

@@ -364,9 +364,14 @@ pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
 /// Fills `log_seq` and `log_lag` of nodes built by [`node_from_row`]
 /// (`node-agent-protocol.md` section 7.1, "Lag", ADR 0227, ADR 0301):
 ///
-/// - `log_seq` is the newest acknowledgement the primary holds in memory for
-///   a node that follows on a live session ([`NodeHub::log_seq`]), and
-///   otherwise stays the row's `nodes.log_seq`, which a session's end wrote.
+/// - `log_seq` is the newest acknowledgement the primary holds in memory: for
+///   a node that follows on a live session, that session's
+///   ([`NodeHub::log_seq`]); otherwise the higher of the row's
+///   `nodes.log_seq` and the newest acknowledgement held from an earlier
+///   session ([`NodeHub::newest_log_ack`]). The row alone would lag between a
+///   session's detach and its end write, or after a failed end write; and
+///   after a restart of the primary, which holds none, the row is the
+///   position.
 /// - `log_lag` is the change log's newest `seq` minus `log_seq`, never below
 ///   0, for a machine with the `node` role, and null for any other machine.
 ///   It is never absent.
@@ -386,9 +391,12 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     for node in nodes.iter_mut() {
-        if let Some(seq) = hub.log_seq(&node.id) {
-            node.log_seq = i64::try_from(seq).unwrap_or(i64::MAX);
-        }
+        let seq = hub.log_seq(&node.id).unwrap_or_else(|| {
+            u64::try_from(node.log_seq)
+                .unwrap_or(0)
+                .max(hub.newest_log_ack(&node.id))
+        });
+        node.log_seq = i64::try_from(seq).unwrap_or(i64::MAX);
     }
     let head: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
         .fetch_one(executor)

@@ -422,6 +422,27 @@ struct Enrolled {
     credential: String,
 }
 
+/// The change log's newest `seq`, 0 for an empty log.
+async fn log_head(server: &Server) -> i64 {
+    let head: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    head.unwrap_or(0)
+}
+
+/// Asserts that `node`'s `log_lag` is the newest `seq` when the response was
+/// built minus its `log_seq`: above `before`, read before the call that wrote,
+/// and at most `after` (node-agent-protocol.md section 7.1, ADR 0301).
+fn assert_log_lag(node: &Value, before: i64, after: i64) {
+    let reported =
+        node["log_seq"].as_i64().expect("log_seq") + node["log_lag"].as_i64().expect("log_lag");
+    assert!(
+        before < reported && reported <= after,
+        "{before} < {reported} <= {after}: {node}"
+    );
+}
+
 async fn create_token(server: &Server, owner: &reqwest::Client) -> String {
     let res = owner
         .post(server.url("/api/v1/nodes/join-tokens"))
@@ -730,6 +751,7 @@ async fn tunnel_mapping_reaches_the_node_and_never_leaks_the_token() {
 
     // PUT maps the node; the manager creates the tunnel and resends the
     // snapshot with the run token.
+    let before = log_head(&server).await;
     let res = owner
         .put(server.url(&format!("/api/v1/nodes/{}/tunnel", node.node_id)))
         .json(&json!({ "provider_id": provider_id, "origin_port": 8080 }))
@@ -744,7 +766,7 @@ async fn tunnel_mapping_reaches_the_node_and_never_leaks_the_token() {
     assert_eq!(body["tunnel"]["origin_port"], 8080);
     // The returned node carries its change-log lag, as every node read does
     // (node-agent-protocol.md section 7.1, ADR 0301).
-    assert!(body["log_lag"].is_u64(), "{body}");
+    assert_log_lag(&body, before, log_head(&server).await);
 
     let tunnel_id = wait_for(|| mock.tunnels().first().map(|tunnel| tunnel.id.clone())).await;
     let token = format!("tunnel-token-{tunnel_id}");
