@@ -4077,7 +4077,7 @@ impl Session {
         renew: &quoro_proto::LeaseRenew,
         outbox: &mut Vec<String>,
     ) {
-        use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind};
+        use crate::authority::{DEFAULT_DURATION_MS, Grant};
         use conversion::Plan;
         let lease_id = renew.lease_id.0.as_str();
         let mut w = match self.hub.0.store.begin_write().await {
@@ -4186,7 +4186,10 @@ impl Session {
             );
             return;
         };
-        let (duration_ms, lease) = if kind == GrantKind::Renewal {
+        // An ordinary answer, settling or not, carries `D` and raises the
+        // stored duration to it; the others carry the stored duration when
+        // it is shorter and write nothing.
+        let (duration_ms, lease) = if let Plan::Ordinary { .. } = plan {
             let duration_ms = DEFAULT_DURATION_MS;
             let stored = i64::try_from(duration_ms).unwrap_or(i64::MAX);
             if let Err(e) = leases::raise_duration(&mut w, lease_id, stored, &actor).await {

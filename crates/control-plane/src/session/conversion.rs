@@ -215,7 +215,11 @@ pub(super) fn answer_ms(row: &Lease) -> Option<u64> {
 /// carried, the conversion's included (section 8.4, "What the authority must
 /// enforce"); so does an answer from R, which "as for an `expiring` lease"
 /// gives no other count, and whose stored duration bounds the holder's
-/// earlier grants (ADR 0268).
+/// earlier grants (ADR 0268). An ordinary answer that settles a marked row
+/// counts the stored duration as well ("Settling a lease": "The answer that
+/// settles the lease counts for its gate at the longer of its own duration
+/// and the stored `duration_ms`"); it still carries `D` and raises the
+/// stored duration to it, as any ordinary answer does.
 pub(super) fn counted(plan: Plan, row: &Lease) -> Option<GrantKind> {
     let stored = row.duration_ms.and_then(|ms| u64::try_from(ms).ok());
     match plan {
@@ -230,7 +234,14 @@ pub(super) fn counted(plan: Plan, row: &Lease) -> Option<GrantKind> {
         Plan::Settle | Plan::FromR => {
             stored.map(|counted_ms| GrantKind::CountedRenewal { counted_ms })
         }
-        Plan::Ordinary { .. } => Some(GrantKind::Renewal),
+        Plan::Ordinary { settle: true } => {
+            Some(
+                stored.map_or(GrantKind::Renewal, |counted_ms| GrantKind::CountedRenewal {
+                    counted_ms,
+                }),
+            )
+        }
+        Plan::Ordinary { settle: false } => Some(GrantKind::Renewal),
         Plan::Unanswered(_) => None,
     }
 }
@@ -1307,6 +1318,41 @@ pub(super) mod tests {
             ("expiring", Some(30_000), false)
         );
         assert_eq!(f.writes().await, writes + 3);
+        f.done();
+    }
+
+    /// "Settling a lease": the answer that settles a marked `expiring` row
+    /// counts for its gate at the longer of its own duration and the stored
+    /// one. The row stores 30 s and the answer carries `D` = 15 s, so the
+    /// gate is 30 s + 2 x 3 s, where an ordinary answer counts 15 s + 3 s.
+    /// The stored duration stays, and an unmarked row's answer still counts
+    /// its own duration.
+    #[tokio::test]
+    async fn a_settling_answer_counts_its_gate_at_the_stored_duration() {
+        let f = fixture("warm", "expiring", Some(30_000), true).await;
+        let (mut session, _) = f.session(None).await;
+        let answer = renew(&mut session, "msg_r1", 3).await;
+        assert_answer(&answer, "msg_r1", 3, D);
+        assert_eq!(of_type(&answer, "ping").len(), 1, "a settling answer");
+        assert_eq!(
+            f.state.hub.authority().gate_remaining(LEASE),
+            Some(Duration::from_secs(36)),
+            "counted at the stored duration"
+        );
+        assert_eq!(f.row().await.duration_ms, Some(30_000));
+        f.done();
+
+        let f = fixture("warm", "expiring", Some(30_000), false).await;
+        let (mut session, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
+        assert_eq!(f.state.hub.authority().gate_remaining(LEASE), None);
+        let answer = renew(&mut session, "msg_r1", 3).await;
+        assert_answer(&answer, "msg_r1", 3, D);
+        assert!(of_type(&answer, "ping").is_empty(), "not a settle");
+        assert_eq!(
+            f.state.hub.authority().gate_remaining(LEASE),
+            Some(Duration::from_secs(18)),
+            "an ordinary answer counts its own duration"
+        );
         f.done();
     }
 
