@@ -324,6 +324,16 @@ impl UnrecordedFailures {
             .contains(&(node_id.to_string(), lease_id.to_string()))
     }
 
+    /// Whether `node_id` reported a failed fence, of any lease, that is not
+    /// recorded.
+    pub(crate) fn any_of_node(&self, node_id: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(failed_on, _)| failed_on == node_id)
+    }
+
     /// Every lease some node reported a failed fence of that is not
     /// recorded.
     fn leases(&self) -> HashSet<String> {
@@ -372,6 +382,26 @@ pub(crate) async fn failed_leases(
     let mut failed = unrecorded.leases();
     failed.extend(listed_leases(conn).await?);
     Ok(failed)
+}
+
+/// Whether `node_id` has a failed fence that no operator acknowledged,
+/// recorded in its `fence_failure` or reported while this primary could not
+/// record it ([`UnrecordedFailures`]): its VMs may still run (section 8.5
+/// step 1, `openapi.yaml` `failoverApp`'s `fence_failed`). The in-memory set
+/// is read before the database, for the reason [`failed_leases`] gives.
+///
+/// # Errors
+///
+/// A database error, or a stored value that does not parse.
+pub(crate) async fn node_has_failed_fence(
+    conn: &mut SqliteConnection,
+    unrecorded: &UnrecordedFailures,
+    node_id: &str,
+) -> Result<bool, ApiError> {
+    if unrecorded.any_of_node(node_id) {
+        return Ok(true);
+    }
+    Ok(failure_of(conn, node_id).await?.is_some())
 }
 
 /// Clears what `delivered` carried from the node's `fence_ack_pending` once

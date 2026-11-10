@@ -12,6 +12,7 @@ use base64::Engine as _;
 use common::{Server, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::authority::VoterSupport;
+use quoro_control_plane::session::Fault;
 use quoro_proto::wire::{
     self, Capacity as WireCapacity, Kvm as WireKvm, NodeMessage, StatusReport, WarmRole, WarmStatus,
 };
@@ -1201,6 +1202,57 @@ async fn a_revoke_answered_fence_failed_moves_nothing() {
     );
     s.unmoved(true, "fence_failed").await;
     none_of(s.on_warm(), "lease_grant", "fence_failed").await;
+}
+
+/// `openapi.yaml` `failoverApp`: `fence_failed` when "the warm node has a
+/// failed fence that no operator acknowledged", recorded or not (section
+/// 8.5 step 1). The warm node answers the revoke of a lease no row knows
+/// `fence_failed`, and the primary cannot record it. The call refuses with
+/// `fence_failed` naming the warm node, before `no_support`, and nothing
+/// moves.
+#[tokio::test]
+async fn an_unrecorded_failed_fence_on_the_warm_node_refuses() {
+    let mut s = Setup::new().await;
+    s.expiring().await;
+    drop(s.on_warm.take());
+    disconnected(&s.server, &s.warm.node_id).await;
+
+    s.server.state.hub.inject_fault(Fault::FailureRecord {
+        node_id: s.warm.node_id.clone(),
+    });
+    let NodeMessage::Hello(mut body) = hello(&s.warm.node_id, 2) else {
+        unreachable!("hello builds a hello");
+    };
+    body.leases = vec![wire::HelloLease {
+        lease_id: "lse_0000000000000000000000000Z".to_string(),
+        resource_type: quoro_proto::ResourceType::App,
+        resource_id: "app_0000000000000000000000000Z".to_string(),
+        mode: quoro_proto::LeaseMode::Local,
+        fencing_token: 1,
+        state: "held".to_string(),
+    }];
+    let mut on_warm = connect(&s.server, &s.warm.credential).await;
+    send(&mut on_warm, NodeMessage::Hello(body), None).await;
+    let revoke = recv_type(&mut on_warm, "lease_revoke").await;
+    let revoke_id = revoke["id"].as_str().unwrap().to_string();
+    send(&mut on_warm, fence_failed_result(), Some(&revoke_id)).await;
+    frames_until_settled(&mut on_warm).await;
+    s.on_warm = Some(on_warm);
+    let failure: Option<String> =
+        sqlx::query_scalar("SELECT fence_failure FROM nodes WHERE id = ?")
+            .bind(&s.warm.node_id)
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(failure, None, "the failed fence was not recorded");
+    s.report_copy().await;
+
+    let body = refused(s.failover().await, 409, "conflict", Some("fence_failed")).await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("warm node"), "{detail}");
+    s.unmoved(false, "unrecorded failed fence on the warm node")
+        .await;
+    none_of(s.on_source(), "lease_revoke", "fence_failed").await;
 }
 
 /// Section 8.5, issue #392: a revoke answered `fence_failed` that the

@@ -307,9 +307,8 @@ async fn refuse(state: &AppState, app: &App, node_id: &str) -> Result<Plan, ApiE
             "the app's lease has a failed fence that no operator acknowledged",
         ));
     }
-    if crate::fences::failure_of(&mut conn, node_id)
+    if crate::fences::node_has_failed_fence(&mut conn, state.hub.unrecorded_failures(), node_id)
         .await?
-        .is_some()
     {
         return Err(conflict(
             Reason::FenceFailed,
@@ -729,9 +728,8 @@ async fn change(
                 "the warm node is not connected",
             ));
         }
-        if crate::fences::failure_of(&mut w.tx, &plan.warm)
+        if crate::fences::node_has_failed_fence(&mut w.tx, hub.unrecorded_failures(), &plan.warm)
             .await?
-            .is_some()
         {
             return Err(conflict(
                 Reason::FenceFailed,

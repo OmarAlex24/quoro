@@ -505,9 +505,12 @@ struct HubInner {
     /// failover, `createVolume`), a first grant's resend, a renewal's answer,
     /// the session start's grants or step 4 and the held grants, as for a
     /// failure `fence_failure` lists (section 8.5 step 1, issue #392).
+    /// [`fences::node_has_failed_fence`] reads the warm node's, so a
+    /// failover to it answers `fence_failed`.
     ///
     /// [`fences::UnrecordedFailures`]: crate::fences::UnrecordedFailures
     /// [`fences::has_failed_fence`]: crate::fences::has_failed_fence
+    /// [`fences::node_has_failed_fence`]: crate::fences::node_has_failed_fence
     unrecorded_failures: crate::fences::UnrecordedFailures,
     /// The gates of `expiring` leases and the voters' support (section 8.4,
     /// "What the authority must enforce"; section 8.8).
