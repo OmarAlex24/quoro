@@ -793,8 +793,8 @@ components:
           pattern: '^[0-9a-f]{64}$'
           description: |
             Id of the current cluster signing key: the lowercase hex SHA-256 of
-            its public key (node-agent-protocol.md section 5.21). Absent until
-            the promotion and custody work ships.
+            its public key (node-agent-protocol.md section 5.21). Present from
+            M5b.
         signing_key_rotation:
           description: |
             The signing-key rotation that is running, or null when none is
@@ -1059,8 +1059,7 @@ components:
             key in use is, `pending` while a seal is missing, `none` before the
             machine reports a custody key, `key_changed` after the machine
             reported a different key, which the primary refused. Null for a
-            machine without the `node` role. Absent until the promotion and
-            custody work ships.
+            machine without the `node` role. Present from M5b.
           oneOf:
             - type: string
               enum:
@@ -1352,6 +1351,13 @@ components:
           $ref: '#/components/schemas/NodeCapacity'
         kvm:
           $ref: '#/components/schemas/KvmInfo'
+        custody_public_key:
+          type: string
+          description: |
+            From M5b, on a machine with the `node` role: base64 X25519 public
+            key of the machine's custody key (node-agent-protocol.md sections
+            2.3 and 7.2, ADR 0231). The primary binds the machine to the first
+            custody key it reports, here or in `hello`.
     EnrollNodeResponse:
       type: object
       title: EnrollNodeResponse
