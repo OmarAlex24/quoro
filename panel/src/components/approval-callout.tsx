@@ -1,15 +1,15 @@
 import { Link } from '@tanstack/react-router';
 import type { Approval } from '../api/generated/model';
-import { approvalAsk, approvalExpiry } from '../lib/access';
+import { approvalAsk } from '../lib/access';
 import { Avatar } from './avatar';
 import { AgentName } from './identity-name';
 import { Button } from './ui/button';
 
 /**
- * A request that waits on a person, at the top of the page it concerns:
- * which agent, what it wants, how long it has, and the way to decide.
- * Only `listApprovals` fields; the target's name comes from the lists the
- * page already holds.
+ * A request that waits on a person, inside the project tile it acts in:
+ * which agent and what it wants, and the way to it. Its expiry and both
+ * decisions are in the board's "Needs you". Only `listApprovals` fields; the
+ * target's name comes from the lists the page already holds.
  */
 export function ApprovalCallout({
   approval,
@@ -23,13 +23,15 @@ export function ApprovalCallout({
     <div className="callout">
       <Avatar kind="agent" seed={approval.agent_id} />
       <p className="min-w-0 flex-1">
-        <b className="font-[620]">
+        <b>
           <AgentName id={approval.agent_id} link={false} />
         </b>{' '}
-        {ask.wants} <b className="font-[620]">{ask.target}</b>. {approvalExpiry(approval.expires_at)}
+        {ask.wants} <b>{ask.target}</b>
       </p>
       <Button size="sm" asChild>
-        <Link to="/approvals">Review</Link>
+        <Link to="/approvals" search={{ approval: approval.id }}>
+          Review
+        </Link>
       </Button>
     </div>
   );

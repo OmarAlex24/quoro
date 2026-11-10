@@ -110,7 +110,6 @@ export function ApprovalDecision({
   const noteId = `decision-note-${approval.id}`;
   const destructive = isDestructiveScope(approval.scope);
   const approveLabel = approveWords(approval.scope);
-  const trimmed = note.trim();
 
   return (
     <div className={cn('grid gap-3', className)}>
@@ -152,65 +151,158 @@ export function ApprovalDecision({
         {aside ? <span className="ml-auto">{aside}</span> : null}
       </div>
 
-      <Dialog
-        open={confirm !== null}
-        onOpenChange={(open) => {
-          if (!open) setConfirm(null);
+      <DecisionConfirm
+        approval={approval}
+        confirm={confirm}
+        onCancel={() => setConfirm(null)}
+        pending={decide.isPending}
+        problem={problem}
+        noteId={noteId}
+        note={note}
+        onNote={setNote}
+        noteInDialog={!withNote}
+        onSend={(kind) => decide.mutate({ kind, note })}
+      />
+    </div>
+  );
+}
+
+/**
+ * The confirm step of a decision: what happens, the scope and target, the
+ * note (asked here when the caller has no note field of its own), Cancel and
+ * the button that sends it.
+ */
+function DecisionConfirm({
+  approval,
+  confirm,
+  onCancel,
+  pending,
+  problem,
+  noteId,
+  note,
+  onNote,
+  noteInDialog,
+  onSend,
+}: {
+  approval: Approval;
+  confirm: Decision | null;
+  onCancel: () => void;
+  pending: boolean;
+  problem: ProblemView | null;
+  noteId: string;
+  note: string;
+  onNote: (note: string) => void;
+  noteInDialog: boolean;
+  onSend: (kind: Decision) => void;
+}) {
+  const destructive = isDestructiveScope(approval.scope);
+  const trimmed = note.trim();
+  return (
+    <Dialog
+      open={confirm !== null}
+      onOpenChange={(open) => {
+        if (!open) onCancel();
+      }}
+    >
+      {confirm ? (
+        <DialogContent
+          title={confirm === 'approve' ? 'Approve this request?' : 'Deny this request?'}
+          description={approvalConfirm(confirm, approval)}
+        >
+          <div className="flex flex-col gap-3">
+            {problem ? <ProblemBanner view={problem} /> : null}
+            <p className="type-data text-[13px] leading-snug text-ink">
+              <span className="type-code">{approval.scope}</span> on {approval.target.type}{' '}
+              <span className="type-code" title={approval.target.id}>{shortId(approval.target.id)}</span>
+            </p>
+            {!noteInDialog ? (
+              trimmed !== '' ? (
+                <p className="border-l-2 border-line pl-3 text-[13px] leading-snug text-ink">
+                  Your note: {trimmed}
+                </p>
+              ) : null
+            ) : (
+              <Field label="Note (optional)" htmlFor={noteId} hint="Recorded with the decision in the audit log.">
+                <Textarea
+                  id={noteId}
+                  value={note}
+                  maxLength={2000}
+                  placeholder="Why you decided this way"
+                  onChange={(event) => onNote(event.target.value)}
+                />
+              </Field>
+            )}
+            <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+              <Button variant="default" disabled={pending} onClick={onCancel}>
+                Cancel
+              </Button>
+              <Button
+                busy={pending}
+                variant={confirm === 'approve' && destructive ? 'danger-solid' : 'primary'}
+                disabled={pending}
+                onClick={() => onSend(confirm)}
+              >
+                {pending ? 'Sending…' : confirm === 'approve' ? 'Approve and issue grant' : 'Deny request'}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      ) : null}
+    </Dialog>
+  );
+}
+
+/**
+ * Deny on its own, for a request shown away from the inbox: the same confirm
+ * step as the inbox's Deny, with its note, its 409 and 404 handling and its
+ * refreshes. Approving stays in the inbox, where the whole request is read.
+ * Render it only for someone who may decide (`canDecideApprovals`).
+ */
+export function DenyButton({
+  approval,
+  onDecided,
+  onConflict,
+  className,
+}: DecisionCallbacks & { approval: Approval; className?: string }) {
+  const [note, setNote] = useState('');
+  const [confirm, setConfirm] = useState<Decision | null>(null);
+  const { decide, problem, setProblem } = useApprovalDecision(approval, {
+    onDecided: (kind, decided) => {
+      setConfirm(null);
+      setNote('');
+      onDecided(kind, decided);
+    },
+    onConflict: (view) => {
+      setConfirm(null);
+      onConflict(view);
+    },
+  });
+  return (
+    <>
+      <Button
+        variant="default"
+        size="sm"
+        className={className}
+        disabled={decide.isPending}
+        onClick={() => {
+          setProblem(null);
+          setConfirm('deny');
         }}
       >
-        {confirm ? (
-          <DialogContent
-            title={confirm === 'approve' ? 'Approve this request?' : 'Deny this request?'}
-            description={approvalConfirm(confirm, approval)}
-          >
-            <div className="flex flex-col gap-3">
-              {problem ? <ProblemBanner view={problem} /> : null}
-              <p className="type-data text-[13px] leading-snug text-ink">
-                <span className="type-code">{approval.scope}</span> on {approval.target.type}{' '}
-                <span className="type-code" title={approval.target.id}>{shortId(approval.target.id)}</span>
-              </p>
-              {withNote ? (
-                trimmed !== '' ? (
-                  <p className="border-l-2 border-line pl-3 text-[13px] leading-snug text-ink">
-                    Your note: {trimmed}
-                  </p>
-                ) : null
-              ) : (
-                <Field label="Note (optional)" htmlFor={noteId} hint="Recorded with the decision in the audit log.">
-                  <Textarea
-                    id={noteId}
-                    value={note}
-                    maxLength={2000}
-                    placeholder="Why you decided this way"
-                    onChange={(event) => setNote(event.target.value)}
-                  />
-                </Field>
-              )}
-              <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
-                <Button
-                  variant="default"
-                  disabled={decide.isPending}
-                  onClick={() => setConfirm(null)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  busy={decide.isPending}
-                  variant={confirm === 'approve' && destructive ? 'danger-solid' : 'primary'}
-                  disabled={decide.isPending}
-                  onClick={() => decide.mutate({ kind: confirm, note })}
-                >
-                  {decide.isPending
-                    ? 'Sending…'
-                    : confirm === 'approve'
-                      ? 'Approve and issue grant'
-                      : 'Deny request'}
-                </Button>
-              </div>
-            </div>
-          </DialogContent>
-        ) : null}
-      </Dialog>
-    </div>
+        Deny
+      </Button>
+      <DecisionConfirm
+        approval={approval}
+        confirm={confirm}
+        onCancel={() => setConfirm(null)}
+        pending={decide.isPending}
+        problem={problem}
+        noteId={`deny-note-${approval.id}`}
+        note={note}
+        onNote={setNote}
+        noteInDialog
+        onSend={(kind) => decide.mutate({ kind, note })}
+      />
+    </>
   );
 }
