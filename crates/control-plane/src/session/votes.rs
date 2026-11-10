@@ -106,6 +106,33 @@ impl NodeHub {
         }
     }
 
+    /// The check after the write of a voter-set change that passed
+    /// [`NodeHub::voter_change_gate`], on the same transaction `conn`: the
+    /// voter-set version must now be `seq`, the change's own change-log
+    /// entry ([`crate::voters::VoterLog::landed`]). Otherwise the caller
+    /// returns the error and the transaction rolls back unwritten.
+    ///
+    /// The answer is `internal`, not `conflict`. With the gate refusing while
+    /// the rows and the log disagree, the version fails to move only when the
+    /// change's own entry leaves out the `roles` or `status` it wrote: a bug
+    /// in the write, which no retry and no acknowledgement fixes, so the
+    /// caller is not told to try again.
+    ///
+    /// # Errors
+    ///
+    /// `internal` when the version is not `seq` or cannot be read.
+    pub(crate) async fn voter_change_landed(
+        &self,
+        conn: &mut SqliteConnection,
+        seq: i64,
+    ) -> Result<(), ApiError> {
+        self.0
+            .voters
+            .landed(conn, seq)
+            .await
+            .map_err(|e| ApiError::internal(&e))
+    }
+
     /// Test seam: records that every current voter acknowledged the current
     /// voter-set version, as if each had a session that did, so a test that
     /// enrolls voters back to back without sessions passes rule 2 of section

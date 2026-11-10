@@ -557,6 +557,30 @@ impl VoterLog {
         })
     }
 
+    /// Checks, on the change's own write transaction `conn`, that a
+    /// voter-set change landed: the voter-set version is now `seq`, the
+    /// change-log entry of the change, as [`crate::changelog::append`]
+    /// returned it. Rule 2's gate let the change through
+    /// because the rows and the log agreed; an entry that moves the version
+    /// keeps them agreeing, one that does not (a payload that leaves out the
+    /// `roles` or `status` it changed) would let the next change pass on the
+    /// same acknowledgements (section 8.10 rules 1 and 2).
+    ///
+    /// # Errors
+    ///
+    /// The version the change left, or a database error.
+    pub async fn landed(&self, conn: &mut SqliteConnection, seq: i64) -> Result<(), String> {
+        let set = self.read_on(conn).await?;
+        if u64::try_from(seq).ok() == Some(set.version) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the voter-set change at change-log seq {seq} left the voter-set version at {}",
+                set.version
+            ))
+        }
+    }
+
     /// The newest set [`VoterLog::current`] read, `None` before the first.
     #[must_use]
     pub fn latest(&self) -> Option<Arc<VoterSet>> {
@@ -919,6 +943,63 @@ mod tests {
                         },
                     );
                 }
+            }
+        }
+
+        /// Review finding F1 of #687: a voter-set change has landed only once
+        /// its own change-log entry is the voter-set version. An entry whose
+        /// payload leaves out the roles that make its machine a voter moves
+        /// nothing, and the check says so on the change's own transaction;
+        /// one with the whole row passes it.
+        #[tokio::test]
+        async fn a_voter_change_lands_only_when_its_entry_moves_the_version() {
+            let cluster = Cluster::new().await;
+            cluster.enroll().await;
+            let before = cluster.read().await.version;
+
+            for (payload_roles, lands) in [(false, false), (true, true)] {
+                let id = new_id(Prefix::Node);
+                let mut w = cluster.store.begin_write().await.unwrap();
+                sqlx::query(
+                    "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, \
+                     behind_nat, labels, capacity, allocated, kvm, engine_version, agent_version, \
+                     desired_rev, applied_rev, log_seq, last_seen_at, created_at) \
+                     VALUES (?, ?, '[\"witness\"]', NULL, 'pending', '', NULL, 1, '{}', '{}', \
+                     '{}', '{}', NULL, NULL, 0, 0, 0, NULL, ?)",
+                )
+                .bind(&id)
+                .bind(&id)
+                .bind(now_rfc3339())
+                .execute(&mut *w.tx)
+                .await
+                .unwrap();
+                let payload = if payload_roles {
+                    node(&["witness"], "pending")
+                } else {
+                    json!({ "id": id, "status": "pending", "name": "n" })
+                };
+                let seq = changelog::append(
+                    &mut w.tx,
+                    &Actor::system("test"),
+                    "node",
+                    &id,
+                    Op::Create,
+                    payload,
+                )
+                .await
+                .unwrap();
+                let landed = cluster.voters.landed(&mut w.tx, seq).await;
+                assert_eq!(
+                    landed.is_ok(),
+                    lands,
+                    "roles in the payload: {payload_roles}: {landed:?}"
+                );
+                if !lands {
+                    let error = landed.unwrap_err();
+                    assert!(error.contains(&before.to_string()), "{error}");
+                }
+                // Rolled back like the API call it stands for.
+                drop(w);
             }
         }
 

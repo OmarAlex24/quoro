@@ -584,7 +584,8 @@ async fn enroll(
         .roles
         .iter()
         .any(|role| matches!(role, NodeRole::Node | NodeRole::Witness));
-    if votes_before != votes_after {
+    let changes_vote = votes_before != votes_after;
+    if changes_vote {
         state.hub.voter_change_gate(&mut w.tx).await?;
     }
 
@@ -721,7 +722,7 @@ async fn enroll(
     let payload = crate::driver::node_payload(&mut w.tx, &node_id)
         .await
         .map_err(|e| ApiError::internal(&format!("{e:?}")))?;
-    changelog::append(&mut w.tx, &actor, "node", &node_id, op, payload).await?;
+    let seq = changelog::append(&mut w.tx, &actor, "node", &node_id, op, payload).await?;
 
     // A machine with the `witness` role gets its mesh address when it
     // enrolls (section 6.12); any other gets it at its first `hello`.
@@ -729,6 +730,12 @@ async fn enroll(
         crate::session::mesh::assign_address(&mut w.tx, &actor, &node_id)
             .await
             .map_err(|e| ApiError::internal(&e))?;
+    }
+    if changes_vote {
+        // The enrollment moved the voter-set version to its own entry, or
+        // nothing is written and the token stays unused (section 8.10 rules
+        // 1 and 2).
+        state.hub.voter_change_landed(&mut w.tx, seq).await?;
     }
 
     let name: String = sqlx::query_scalar("SELECT name FROM nodes WHERE id = ?")

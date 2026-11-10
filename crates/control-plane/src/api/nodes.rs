@@ -1472,7 +1472,8 @@ async fn roles_tx(
     // changes the voter set (sections 6.12 and 8.10).
     let votes_before = crate::voters::is_voter_roles(&roles);
     let votes_after = crate::voters::is_voter_roles(&new_roles);
-    if votes_before != votes_after {
+    let changes_vote = votes_before != votes_after;
+    if changes_vote {
         let (_, voters) = state.hub.voter_change_gate(&mut w.tx).await?;
         if votes_before && !force && voters.saturating_sub(1) < 3 {
             let expiring: bool =
@@ -1504,6 +1505,11 @@ async fn roles_tx(
         .await?;
     let payload = crate::driver::node_payload(&mut w.tx, node_id).await?;
     let seq = changelog::append(&mut w.tx, &actor, "node", node_id, Op::Update, payload).await?;
+    if changes_vote {
+        // The change moved the voter-set version to its own entry, or
+        // nothing is written (section 8.10 rules 1 and 2).
+        state.hub.voter_change_landed(&mut w.tx, seq).await?;
+    }
     ctx.append_ok(
         &mut w.tx,
         Some(Scope::NodeRoles),
