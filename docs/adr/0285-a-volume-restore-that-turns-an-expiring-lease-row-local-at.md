@@ -1,12 +1,12 @@
 # ADR 0285: A volume restore that turns an expiring lease row local at a new token sets the unsettled mark as R does, so its grant waits for replication and majority support
 
-- **Status:** Accepted; refined by [ADR 0288](0288-a-new-token-local-grant-of-a-warm-app-s-lease-sets-the.md), [ADR 0292](0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md)
+- **Status:** Accepted; refined by [ADR 0288](0288-a-new-token-local-grant-of-a-warm-app-s-lease-sets-the.md), [ADR 0292](0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md), [ADR 0321](0321-four-lease-and-voter-readings-every-waiting-grant-is-marked.md)
 - **Date:** 2026-11-09
 - **Ledger id:** D-0285
 - **Tags:** m5b, leases, contracts, review
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md), [ADR 0288](0288-a-new-token-local-grant-of-a-warm-app-s-lease-sets-the.md), [ADR 0292](0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md)
+- **Related:** [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md), [ADR 0288](0288-a-new-token-local-grant-of-a-warm-app-s-lease-sets-the.md), [ADR 0292](0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md), [ADR 0321](0321-four-lease-and-voter-readings-every-waiting-grant-is-marked.md)
 
 ## Context
 
@@ -104,6 +104,7 @@ _Some wording was changed for the public repository._
 - Refines [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md): which writes set the mark and what a raise records: any write that turns a row reading expiring into local, at any token, sets the mark, a volume restore's included; the raise of a marked row's token also sets revoked_at; and the side paths listed here are fixed or stated as limits. The rest of [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md) stands.
 - [ADR 0288](0288-a-new-token-local-grant-of-a-warm-app-s-lease-sets-the.md) refines which writes set the mark: a new-token local grant of a warm app's lease sets it whatever the row reads, which covers the conversion window of ADR 0244. The rest of this decision stands.
 - [ADR 0292](0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md) refines how failoverApp answers while a marked lease's grant waits: 202 at once, with the wait shown in Lease.grant_pending and Lease.grant_waiting_on. The rest of this decision stands.
+- [ADR 0321](0321-four-lease-and-voter-readings-every-waiting-grant-is-marked.md) refines what happens at the token cap: the row stays revoked, and a fence acknowledgement that would raise it answers `409` and writes nothing. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

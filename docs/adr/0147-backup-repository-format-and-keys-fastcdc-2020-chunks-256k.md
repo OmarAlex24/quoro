@@ -1,12 +1,12 @@
 # ADR 0147: Backup repository format and keys: FastCDC 2020 chunks (256K/1M/4M), keyed BLAKE3 ids, zstd + XChaCha20-Poly1305, signed manifests; a repo key wrapped by the cluster DEK and by an owner recovery key shown once; the volume's node uploads directly with a credential sent in signed desired state
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0322](0322-how-a-promoted-primary-gets-the-backup-repository-key-back.md)
 - **Date:** 2026-11-04
 - **Ledger id:** D-0147
 - **Tags:** m5a, contracts, sync, security
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0322](0322-how-a-promoted-primary-gets-the-backup-repository-key-back.md)
 
 ## Context
 
@@ -20,6 +20,7 @@ Contract B: backups resource (POST /apps/{app_id}/backups, GET list/one, POST /b
 
 ## Consequences
 
+- [ADR 0322](0322-how-a-promoted-primary-gets-the-backup-repository-key-back.md) refines where the repository key lives after a promotion: never in the change log, and restored on a promoted primary from the recovery key. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

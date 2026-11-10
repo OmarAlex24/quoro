@@ -1,12 +1,12 @@
 # ADR 0249: Panel redesign: a projects grid, a project canvas and a side sheet, drawn with a two-tone dither visual system
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0318](0318-panel-motion-allow-short-state-change-motion-across-the.md)
 - **Date:** 2026-11-07
 - **Ledger id:** D-0249
 - **Tags:** panel, ux, process
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0318](0318-panel-motion-allow-short-state-change-motion-across-the.md)
 
 ## Context
 
@@ -28,6 +28,7 @@ _Some wording was changed for the public repository._ _Some operational details 
 
 ## Consequences
 
+- [ADR 0318](0318-panel-motion-allow-short-state-change-motion-across-the.md) refines the motion rule: motion is allowed where it shows a change of state, within stated limits. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

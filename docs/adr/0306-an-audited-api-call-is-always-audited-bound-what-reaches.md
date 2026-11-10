@@ -1,12 +1,12 @@
 # ADR 0306: An audited API call is always audited: bound what reaches the audit change-log entry
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0315](0315-parse-json-floats-exactly-serde-json-float-roundtrip-so.md)
 - **Date:** 2026-11-10
 - **Ledger id:** D-0306
 - **Tags:** contracts, audit, m5b
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0031](0031-audit-log-append-only-hash-chained-optionally-copied-to-s3.md), [ADR 0302](0302-change-log-append-refuses-an-entry-a-follower-could-not.md)
+- **Related:** [ADR 0031](0031-audit-log-append-only-hash-chained-optionally-copied-to-s3.md), [ADR 0302](0302-change-log-append-refuses-an-entry-a-follower-could-not.md), [ADR 0315](0315-parse-json-floats-exactly-serde-json-float-roundtrip-so.md)
 
 ## Context
 
@@ -24,6 +24,7 @@ _Some wording was changed for the public repository._
 
 - Refines [ADR 0031](0031-audit-log-append-only-hash-chained-optionally-copied-to-s3.md): what an audit record keeps of its params when they would make its change-log entry one a node could not receive alone and verify: their digest and size instead; and the API's request body limit, whose 413 is audited. The rest of [ADR 0031](0031-audit-log-append-only-hash-chained-optionally-copied-to-s3.md) stands.
 - Refines [ADR 0302](0302-change-log-append-refuses-an-entry-a-follower-could-not.md): what the primary writes when an audit record's params would make its entry one it may not write: the record keeps their digest and size instead, so the audit write does not fail. The rest of [ADR 0302](0302-change-log-append-refuses-an-entry-a-follower-could-not.md) stands.
+- [ADR 0315](0315-parse-json-floats-exactly-serde-json-float-roundtrip-so.md) refines which floats keep parameters as a digest: once floats are parsed exactly, no float reads back on a node as another number. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

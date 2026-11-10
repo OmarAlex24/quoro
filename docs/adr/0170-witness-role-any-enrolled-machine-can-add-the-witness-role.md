@@ -1,12 +1,12 @@
 # ADR 0170: Witness role: any enrolled machine can add the witness role without re-enrolling; voters are machines with role node or witness; Cluster reports the votes and offers a witness below three
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0321](0321-four-lease-and-voter-readings-every-waiting-grant-is-marked.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0170
 - **Tags:** m5b, witness, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0321](0321-four-lease-and-voter-readings-every-waiting-grant-is-marked.md)
 
 ## Context
 
@@ -22,6 +22,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0321](0321-four-lease-and-voter-readings-every-waiting-grant-is-marked.md) refines which `expiring` leases the vote-removal guard counts: a row that is not revoked, or revoked with its gate not yet passed. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
