@@ -19,6 +19,7 @@ import { CopyButton } from './copy-button';
 import { AgentName, UserName } from './identity-name';
 import { ToneLamp } from './tone-lamp';
 import { ProblemBanner } from './ui/problem-banner';
+import { SkeletonLines } from './skeleton';
 
 /** A record field the format omits when it has no value. */
 const hasText = (value: string | null | undefined): value is string =>
@@ -30,9 +31,9 @@ function NotRecorded() {
 
 function DetailRow({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="grid gap-0.5 border-b border-line/60 py-2 last:border-b-0 sm:grid-cols-[9.5rem_minmax(0,1fr)] sm:gap-3">
-      <dt className="text-[12px] leading-snug text-ink-2">{label}</dt>
-      <dd className="min-w-0 text-[13px] leading-snug text-ink [overflow-wrap:anywhere]">{children}</dd>
+    <div className="set-row leading-snug">
+      <dt>{label}</dt>
+      <dd>{children}</dd>
     </div>
   );
 }
@@ -272,12 +273,12 @@ export function AuditRecordBody({ seq }: { seq: number }) {
     }
   };
 
-  if (recordQuery.isPending) return <p className="text-[13px] text-ink-2">Reading entry {seq}…</p>;
+  if (recordQuery.isPending) return <SkeletonLines label={`Loading entry ${seq}`} lines={6} heading={false} />;
   if (missing) return <p className="text-[13px] text-ink">No entry with that sequence number.</p>;
   if (recordQuery.error) return <ProblemBanner view={problemView(recordQuery.error, 'read this entry')} />;
   if (!record) return null;
   return (
-    <dl>
+    <dl className="box set-rows">
       {AUDIT_DETAIL_FIELDS.map((field) => (
         <DetailRow key={field.key} label={field.label}>
           {renderValue(field.key, record)}

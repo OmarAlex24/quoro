@@ -75,6 +75,7 @@ export function NodesPage() {
     <TabbedPage
       label="Nodes"
       title="Nodes"
+      current={tab ?? 'nodes'}
       tabs={
         <>
           {tabLink(undefined, 'Nodes')}
@@ -105,6 +106,7 @@ export function AgentsPage() {
   return (
     <TabbedPage
       label="Agents"
+      current={grants ? 'grants' : 'agents'}
       tabs={
         <>
           <Link

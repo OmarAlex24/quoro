@@ -2,6 +2,7 @@ import { MoreHorizontal, type LucideIcon } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { cn } from '../lib/utils';
 import { MenuPanel, useMenu } from './shell/menu';
+import { SkeletonRows } from './skeleton';
 
 /*
  * The one pattern every Settings page shares: a heading with its one action,
@@ -44,32 +45,9 @@ export function SettingsNote({ children }: { children: ReactNode }) {
   return <p className="set-note">{children}</p>;
 }
 
-/** Nothing in the list yet: one phrase, a line under it and at most one action. */
-export function SettingsEmpty({
-  title,
-  children,
-  action,
-}: {
-  title: string;
-  children?: ReactNode;
-  action?: ReactNode;
-}) {
-  return (
-    <div className="set-empty">
-      <p className="set-empty-t">{title}</p>
-      {children ? <p className="set-empty-x">{children}</p> : null}
-      {action ? <div className="mt-3">{action}</div> : null}
-    </div>
-  );
-}
-
-/** A box while its list loads: the height of two rows, so the page does not jump. */
+/** A box while its list loads: two rows of the dither skeleton, so the page does not jump. */
 export function SettingsLoading({ label }: { label: string }) {
-  return (
-    <div className="box set-loading" role="status">
-      <span className="sr-only">{label}</span>
-    </div>
-  );
+  return <SkeletonRows label={label} rows={2} />;
 }
 
 /** The ⋯ menu at the end of a row. */

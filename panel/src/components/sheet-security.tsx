@@ -23,6 +23,8 @@ import { Button } from './ui/button';
 import { ProblemBanner } from './ui/problem-banner';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Tag } from './ui/tag';
+import { EmptyState } from './empty-state';
+import { SkeletonRows } from './skeleton';
 
 /**
  * The Security tab: the open findings of the image the app runs, grouped by
@@ -59,7 +61,7 @@ export function SecurityTab({ app, canWrite, onRebuilt }: { app: AppDetail; canW
   if (reportQuery.error) {
     return <ProblemBanner view={problemView(reportQuery.error, 'read the vulnerability report')} />;
   }
-  if (!report) return <div className="box h-[160px] opacity-60" aria-hidden="true" />;
+  if (!report) return <SkeletonRows label="Loading the vulnerability report" rows={3} />;
 
   const items = [...report.items, ...(more?.items ?? [])];
   const cursor = more === null ? (report.next_cursor ?? null) : more.cursor;
@@ -128,13 +130,15 @@ export function SecurityTab({ app, canWrite, onRebuilt }: { app: AppDetail; canW
       ) : null}
 
       {checked && items.length === 0 ? (
-        <p className="box px-4 py-4 text-[13px] text-ink-2">
-          {filtered
-            ? 'No findings match these filters.'
-            : includeResolved
-              ? 'No findings, open or resolved, for this image.'
-              : 'No known vulnerabilities in this image.'}
-        </p>
+        <EmptyState
+          title={
+            filtered
+              ? 'No findings match these filters'
+              : includeResolved
+                ? 'No findings, open or resolved, for this image'
+                : 'No known vulnerabilities in this image'
+          }
+        />
       ) : null}
 
       {groups.map((group) => (

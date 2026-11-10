@@ -35,7 +35,6 @@ import { useSession } from '../session';
 import {
   RowMenu,
   RowMenuItem,
-  SettingsEmpty,
   SettingsHead,
   SettingsLoading,
   SettingsPage,
@@ -48,6 +47,7 @@ import { Field } from '../components/ui/field';
 import { Input } from '../components/ui/input';
 import { NoticeLine, ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
+import { EmptyState } from '../components/empty-state';
 
 const KIND_ICON: Record<ProviderKind, LucideIcon> = {
   dns: Globe,
@@ -279,9 +279,9 @@ export function ProvidersScreen() {
     return (
       <SettingsPage label="Providers">
         {head}
-        <SettingsEmpty title="Owners and operators manage providers.">
+        <EmptyState title="Owners and operators manage providers" glyph={false}>
           Your role cannot read them: a provider holds the credentials of an outside account.
-        </SettingsEmpty>
+        </EmptyState>
       </SettingsPage>
     );
   }
@@ -305,9 +305,9 @@ export function ProvidersScreen() {
       {providers.isPending ? (
         <SettingsLoading label="Loading providers" />
       ) : items.length === 0 ? (
-        <SettingsEmpty title="No providers yet." action={add}>
-          Add one to give the cluster a DNS zone, a tunnel or a bucket.
-        </SettingsEmpty>
+        <EmptyState title="No providers yet" action={add}>
+          A provider lends the cluster a DNS zone, a tunnel or a bucket from an outside account.
+        </EmptyState>
       ) : (
         PROVIDER_KINDS.filter((kind) => items.some((item) => item.kind === kind)).map((kind) => (
           <section key={kind} className="grid gap-2.5" aria-labelledby={`providers-${kind}`}>

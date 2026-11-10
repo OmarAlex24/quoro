@@ -8,6 +8,7 @@ import { SessionRoom } from '../components/session-room';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
+import { PageSkeleton, SkeletonCards } from '../components/skeleton';
 
 const backToApp = (appId: string) => (
   <Link
@@ -34,7 +35,7 @@ export function TerminalScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-2">Loading…</p>
+        <PageSkeleton />
       </main>
     );
   }
@@ -44,7 +45,7 @@ export function TerminalScreen() {
   if (appQuery.isPending) {
     return (
       <main className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6">
-        <div className="h-[180px] rounded-[10px] border border-line bg-surface/60" />
+        <SkeletonCards label="Loading the app" height={180} />
       </main>
     );
   }

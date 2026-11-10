@@ -17,6 +17,8 @@ import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { CopyButton } from './copy-button';
 import { SecretOnce } from './secret-once';
 import { ToneLamp } from './tone-lamp';
+import { EmptyState } from './empty-state';
+import { SkeletonRows } from './skeleton';
 
 const revokeProblem = (error: unknown): ProblemView =>
   isApiProblem(error) && error.status === 404
@@ -192,11 +194,11 @@ export function AgentKeys({
       {listError ? (
         <ProblemBanner view={listError} className="mt-2" />
       ) : keys.isPending ? (
-        <p className="mt-3 text-[13px] text-ink-2">Loading keys…</p>
+        <SkeletonRows label="Loading keys" rows={2} glyph={false} className="mt-3" />
       ) : items.length === 0 ? (
-        <p className="mt-3 border-y border-line py-3 text-[13px] text-ink-2">
-          No keys yet
-        </p>
+        <EmptyState title="No keys yet" className="mt-3">
+          The agent signs in with a key to get its tokens.{canWrite ? ' Create one to let it act.' : ''}
+        </EmptyState>
       ) : (
         <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">
           {items.map((agentKey) => (

@@ -15,6 +15,8 @@ import { useAppMetricsStream, type AppInstanceSeries, type MetricsStreamStatus }
 import type { ProblemView } from '../lib/problem';
 import { DitherArea } from './dither-area';
 import { LampDot } from './lamp';
+import { EmptyState } from './empty-state';
+import { SkeletonCards } from './skeleton';
 
 const MIB = 1024 * 1024;
 
@@ -62,12 +64,12 @@ export function MetricsTab({ app, nodeNames }: { app: AppDetail; nodeNames: Reco
       </div>
       <StreamNotice status={status} problem={problem} />
 
-      {current === undefined ? (
-        <p className="box px-4 py-4 text-[13px] leading-snug text-ink-2">
-          {status === 'connecting'
-            ? 'Reading the app’s instances…'
-            : 'No instance is reporting metrics. They appear when the app has a running instance.'}
-        </p>
+      {current === undefined && status === 'connecting' ? (
+        <SkeletonCards label="Loading the app’s instances" count={2} height={150} />
+      ) : current === undefined ? (
+        <EmptyState title="No instance is reporting metrics">
+          CPU and memory of each instance appear here when the app has a running instance.
+        </EmptyState>
       ) : (
         <InstanceCharts
           key={current.vm_id}

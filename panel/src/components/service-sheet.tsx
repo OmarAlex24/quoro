@@ -29,6 +29,7 @@ import { appAddress, appKind, keepInView } from '../lib/services';
 import { securityParams, securityTabCount } from '../lib/vulnerabilities';
 import { appReadInterval, RUN_PAGE, useAppRuns } from '../lib/use-app-runs';
 import { useRecentBuilds } from '../lib/use-builds';
+import { usePaneEnter, useTabInk } from '../lib/use-tab-motion';
 import { useSession } from '../session';
 import { AppEnvDialog } from './app-env-dialog';
 import { GlyphTile } from './glyph-tile';
@@ -43,6 +44,8 @@ import { StorageTab } from './sheet-storage';
 import { Button } from './ui/button';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { Tag } from './ui/tag';
+import { EmptyState } from './empty-state';
+import { SkeletonCards, SkeletonRows } from './skeleton';
 
 const TAB_WORDS: Record<ProjectTab, string> = {
   deployments: 'Deployments',
@@ -154,7 +157,7 @@ export function ServiceSheet({
             </div>
             <div className="sh-body">
               {appQuery.isPending ? (
-                <div className="box h-[220px] opacity-60" aria-hidden="true" />
+                <SkeletonCards label="Loading the app" height={220} lines={4} />
               ) : (
                 <ProblemBanner view={problemView(appQuery.error, 'see this app')} />
               )}
@@ -242,6 +245,7 @@ function SheetBody({
     query: { refetchInterval: 30_000 },
   });
   const openFindings = securityTabCount(vulnerabilities.data);
+  const bodyRef = usePaneEnter<HTMLDivElement>(tab);
 
   return (
     <>
@@ -297,7 +301,7 @@ function SheetBody({
         ))}
       </SheetTabs>
 
-      <div className="sh-body">
+      <div ref={bodyRef} className="sh-body">
         {notice ? <NoticeLine>{notice}</NoticeLine> : null}
         {problem ? <ProblemBanner view={problem} /> : null}
 
@@ -344,7 +348,7 @@ function SheetBody({
  * view whenever it changes.
  */
 export function SheetTabs({ label, tab, children }: { label: string; tab: string; children: ReactNode }) {
-  const ref = useRef<HTMLElement>(null);
+  const { navRef: ref, inkRef } = useTabInk(tab);
   const [edges, setEdges] = useState<'none' | 'start' | 'end' | 'both'>('none');
 
   useLayoutEffect(() => {
@@ -395,6 +399,7 @@ export function SheetTabs({ label, tab, children }: { label: string; tab: string
   return (
     <nav ref={ref} className="tabs sh-tabs" aria-label={label} data-fade={edges}>
       {children}
+      <span ref={inkRef} className="tab-ink" aria-hidden="true" />
     </nav>
   );
 }
@@ -500,11 +505,9 @@ function VariablesTab({
       {envQuery.error ? (
         <ProblemBanner view={problemView(envQuery.error, 'see variables')} />
       ) : envQuery.isPending ? (
-        <div className="box h-[120px] opacity-60" aria-hidden="true" />
+        <SkeletonRows label="Loading variables" rows={2} glyph={false} />
       ) : env.length === 0 ? (
-        <p className="box px-4 py-4 text-[13px] text-ink-2">
-          No variables yet. Add one to pass configuration to the app.
-        </p>
+        <EmptyState title="No variables yet">Add one to pass configuration to the app.</EmptyState>
       ) : (
         <ul className="box" aria-label="Variables">
           {env.map((item) => (

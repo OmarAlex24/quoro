@@ -13,7 +13,6 @@ import {
 } from '../components/user-dialog';
 import { UserRow } from '../components/user-row';
 import {
-  SettingsEmpty,
   SettingsHead,
   SettingsLoading,
   SettingsNote,
@@ -23,6 +22,7 @@ import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { Plus } from 'lucide-react';
 import { LoginScreen } from './login-screen';
+import { EmptyState } from '../components/empty-state';
 
 const PAGE_SIZE = 50;
 
@@ -61,10 +61,10 @@ export function UsersScreen() {
     return (
       <SettingsPage label="Members">
         <SettingsHead title="Members" />
-        <SettingsEmpty title="Members is not available to an agent session.">
+        <EmptyState title="Members is not available to an agent session" glyph={false}>
           Human identities and their roles are read and changed by a signed-in person. Ask your
           owner to sign in to this screen.
-        </SettingsEmpty>
+        </EmptyState>
       </SettingsPage>
     );
   }
@@ -100,9 +100,9 @@ export function UsersScreen() {
       {usersQuery.isPending ? (
         <SettingsLoading label="Loading members" />
       ) : users.length === 0 ? (
-        <SettingsEmpty title="No members yet." action={invite}>
-          Invite the first person who should sign in.
-        </SettingsEmpty>
+        <EmptyState title="No members yet" action={invite}>
+          A member signs in with their own password and acts with the role you give them.
+        </EmptyState>
       ) : (
         <ul className="box">
           {users.map((row) => (

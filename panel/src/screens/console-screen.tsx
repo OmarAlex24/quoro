@@ -9,6 +9,7 @@ import { SessionRoom } from '../components/session-room';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
+import { PageSkeleton, SkeletonCards } from '../components/skeleton';
 
 const BACK_CLASS =
   'text-[13px] text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';
@@ -34,7 +35,7 @@ export function ConsoleScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-2">Loading…</p>
+        <PageSkeleton />
       </main>
     );
   }
@@ -44,7 +45,7 @@ export function ConsoleScreen() {
   if (vmQuery.isPending) {
     return (
       <main className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6">
-        <div className="h-[180px] rounded-[10px] border border-line bg-surface/60" />
+        <SkeletonCards label="Loading the VM" height={180} />
       </main>
     );
   }

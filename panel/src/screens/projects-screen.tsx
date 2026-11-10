@@ -26,6 +26,7 @@ import { usePendingApprovals } from '../components/shell/shell-data';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { DeployScreen } from './deploy-screen';
+import { SkeletonCards } from '../components/skeleton';
 
 const projectsRoute = getRouteApi('/shell/projects');
 
@@ -128,9 +129,7 @@ function ProjectsGrid() {
       ) : null}
 
       {pending ? (
-        <div className="pgrid mt-5" aria-hidden="true">
-          <div className="card ptile ptile-ghost" />
-        </div>
+        <SkeletonCards label="Loading projects" height={222} lines={4} className="pgrid mt-5" />
       ) : tiles.length === 0 ? (
         listError ? null : (
           <EmptyState

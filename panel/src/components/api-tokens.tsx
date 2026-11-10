@@ -30,9 +30,10 @@ import { Input } from './ui/input';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { CopyButton } from './copy-button';
 import { SecretOnce } from './secret-once';
-import { RowMenu, RowMenuItem, SettingsEmpty, SettingsHead, SettingsLoading } from './settings-parts';
+import { RowMenu, RowMenuItem, SettingsHead, SettingsLoading } from './settings-parts';
 import { ToneLamp } from './tone-lamp';
 import { Tag } from './ui/tag';
+import { EmptyState } from './empty-state';
 
 const revokeProblem = (error: unknown): ProblemView =>
   isApiProblem(error) && error.status === 404
@@ -264,7 +265,9 @@ export function ApiTokens() {
       ) : tokens.isPending ? (
         <SettingsLoading label="Loading tokens" />
       ) : items.length === 0 ? (
-        <SettingsEmpty title="No tokens yet.">Create one to use the CLI or the API.</SettingsEmpty>
+        <EmptyState title="No tokens yet">
+          A token lets the CLI or a script call the API as you. Create one above.
+        </EmptyState>
       ) : (
         <ul className="box">
           {items.map((token) => (

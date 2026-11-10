@@ -46,6 +46,8 @@ import { Field } from './ui/field';
 import { Input } from './ui/input';
 import { ProblemBanner } from './ui/problem-banner';
 import { Tag } from './ui/tag';
+import { EmptyState } from './empty-state';
+import { SkeletonCards, SkeletonLines } from './skeleton';
 
 /** History rows read their progress lines; older ones keep to the list. */
 const HISTORY_ROWS = 10;
@@ -233,13 +235,13 @@ function RunsView({
       {listError ? <ProblemBanner view={problemView(listError, 'see deployments')} /> : null}
 
       {loading ? (
-        <div className="box h-[240px] opacity-60" aria-hidden="true" />
+        <SkeletonCards label="Loading deployments" height={240} lines={4} />
       ) : !top || !topTimeline ? (
-        <p className="box px-4 py-4 text-[13px] text-ink-2">
+        <EmptyState title="No deployment yet">
           {source !== null
-            ? 'No deployment yet. A successful build starts one.'
-            : 'No deployment yet. Redeploy to roll out the current image.'}
-        </p>
+            ? 'A deployment boots the built image on a node. A successful build starts one.'
+            : 'A deployment boots the image on a node. Redeploy to roll out the current image.'}
+        </EmptyState>
       ) : (
         <RunBox
           key={top.key}
@@ -413,7 +415,7 @@ function ProgressLines({
       {message ? (
         <p className="mt-2 text-[12.5px] text-fault">{message}</p>
       ) : !entries ? (
-        <p className="mt-2 text-[12.5px] text-ink-2">Reading progress lines…</p>
+        <SkeletonLines label="Loading progress lines" lines={3} heading={false} className="mt-2" />
       ) : entries.length === 0 ? (
         <p className="mt-2 text-[12.5px] text-ink-2">No progress lines have been written yet.</p>
       ) : (
@@ -742,7 +744,7 @@ function HostedBuild({
         All deployments
       </Link>
       {buildQuery.isPending && !build ? (
-        <div className="box h-[180px] opacity-60" aria-hidden="true" />
+        <SkeletonCards label="Loading the build" height={180} />
       ) : !build ? (
         <ProblemBanner view={problemView(buildQuery.error, 'see this build')} />
       ) : (

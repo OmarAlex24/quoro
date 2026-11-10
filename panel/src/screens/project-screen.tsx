@@ -21,6 +21,8 @@ import { ProjectShell } from '../components/shell/project-shell';
 import { SessionGate } from '../components/shell/side-shell';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
+import { EmptyState } from '../components/empty-state';
+import { SkeletonRows } from '../components/skeleton';
 
 const projectRoute = getRouteApi('/projects/$projectId');
 
@@ -204,11 +206,11 @@ function PerApp({
       <p className="mt-2 text-[14px] text-ink-2">{lede}</p>
       {listError ? <ProblemBanner view={listError} className="mt-4" /> : null}
       {appsQuery.isPending ? (
-        <div className="mt-5 h-[104px] rounded-[10px] border border-line bg-surface/60" />
+        <SkeletonRows label="Loading apps" rows={2} className="mt-5" />
       ) : apps.length === 0 && !listError ? (
-        <p className="mt-5 rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-6 text-[14px] text-ink-2">
-          No apps in this project yet.
-        </p>
+        <EmptyState title="No apps in this project yet" className="mt-5">
+          Deploy from a Git repository or an image to run an app here.
+        </EmptyState>
       ) : (
         apps.map((app) => (
           <section key={app.id} className="mt-6" aria-label={app.name}>

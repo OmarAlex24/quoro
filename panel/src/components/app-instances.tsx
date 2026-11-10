@@ -1,5 +1,6 @@
 import type { Node, Vm } from '../api/generated/model';
 import { Lamp } from './lamp';
+import { EmptyState } from './empty-state';
 
 /**
  * The status column of one instance. The API reports an instance `unknown`
@@ -32,11 +33,11 @@ export function AppInstances({
     <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
       <h2 className="type-display-light text-[15px] leading-none text-ink">Instances</h2>
       {instances.length === 0 ? (
-        <p className="mt-3 text-[13px] text-ink-2">
+        <EmptyState title="No instance is running" className="mt-3">
           {hasSource
-            ? 'No instance is running. A successful build deploys the app and boots one.'
-            : 'No instance is running. Deploy the app to boot one.'}
-        </p>
+            ? 'An instance is a microVM that runs the app. A successful build deploys the app and boots one.'
+            : 'An instance is a microVM that runs the app. Deploy the app to boot one.'}
+        </EmptyState>
       ) : (
         <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">
           {instances.map((instance) => (

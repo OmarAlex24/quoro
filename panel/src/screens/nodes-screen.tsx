@@ -8,6 +8,8 @@ import { HaVotes } from '../components/ha-votes';
 import { N1Strip } from '../components/n1-strip';
 import { NodeCard } from '../components/node-card';
 import { ProblemBanner } from '../components/ui/problem-banner';
+import { EmptyState } from '../components/empty-state';
+import { SkeletonCards } from '../components/skeleton';
 
 /**
  * `/nodes`: the voters and whether HA is ready, the N+1 strip, then one card per machine with what its VMs
@@ -30,13 +32,9 @@ export function NodesScreen() {
       {listError ? <ProblemBanner view={listError} className="mb-4" /> : null}
 
       {nodesQuery.isPending ? (
-        <div className="nodes" aria-hidden="true">
-          <div className="node h-[236px] opacity-60" />
-        </div>
+        <SkeletonCards label="Loading nodes" height={236} className="nodes" />
       ) : nodes.length === 0 && !listError ? (
-        <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
-          <p className="text-[15px] text-ink">No node is enrolled in the cluster yet.</p>
-        </div>
+        <EmptyState title="No node is enrolled in the cluster yet" />
       ) : (
         <>
           <HaVotes nodes={nodes} />

@@ -24,7 +24,6 @@ import {
 import { UserName } from '../components/identity-name';
 import { SecretOnce } from '../components/secret-once';
 import {
-  SettingsEmpty,
   SettingsHead,
   SettingsLoading,
   SettingsNote,
@@ -35,6 +34,7 @@ import { Button } from '../components/ui/button';
 import { Dialog, DialogContent } from '../components/ui/dialog';
 import { NoticeLine, ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
+import { EmptyState } from '../components/empty-state';
 
 const RECOVERY_NOTE =
   'Copy it now and keep it away from this cluster, in a password manager or on paper. Quoro shows it only once. With it, the backups can be opened even if every node is lost; the old key no longer opens them.';
@@ -243,11 +243,11 @@ export function BackupsScreen() {
       {repositories.isPending ? (
         <SettingsLoading label="Loading backup repositories" />
       ) : items.length === 0 ? (
-        <SettingsEmpty title="No backup repository yet." action={create}>
+        <EmptyState title="No backup repository yet" action={create}>
           {owner
             ? 'Create one in the bucket of an object storage provider. Until then, nothing is backed up.'
             : 'An owner creates one in the bucket of an object storage provider. Until then, nothing is backed up.'}
-        </SettingsEmpty>
+        </EmptyState>
       ) : (
         items.map((repository) => (
           <RepositoryBox
@@ -278,10 +278,9 @@ export function BackupsScreen() {
           {controlPlane.isPending ? (
             <SettingsLoading label="Loading control-plane backups" />
           ) : cpBackups.length === 0 ? (
-            <div className="set-empty">
-              <p className="set-empty-t">None yet.</p>
-              <p className="set-empty-x">The first one runs on the schedule above.</p>
-            </div>
+            <EmptyState title="No control-plane backup yet">
+              A backup keeps the cluster&rsquo;s own state in the repository. The first one runs on the schedule above.
+            </EmptyState>
           ) : (
             <ul className="box">
               {cpBackups.slice(0, CONTROL_PLANE_SHOWN).map((backup) => (

@@ -15,6 +15,7 @@ import { problemView, type ProblemView } from '../lib/problem';
 import { PROJECT_LIST_PARAMS } from '../lib/projects';
 import { VM_TABS, type VmTab } from '../lib/routes';
 import { memoryWords, vmSize } from '../lib/services';
+import { usePaneEnter } from '../lib/use-tab-motion';
 import { useSession } from '../session';
 import { GlyphTile } from './glyph-tile';
 import { ImageRef } from './image-ref';
@@ -24,6 +25,7 @@ import { Group, Rows } from './sheet-settings';
 import { Button } from './ui/button';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { DeleteVmDialog, useVmAction, VmActionsMenu, vmActionNotice } from './vm-actions';
+import { SkeletonCards } from './skeleton';
 
 const TAB_WORDS: Record<VmTab, string> = {
   overview: 'Overview',
@@ -94,7 +96,7 @@ export function VmSheet({
             </div>
             <div className="sh-body">
               {vmQuery.isPending ? (
-                <div className="box h-[220px] opacity-60" aria-hidden="true" />
+                <SkeletonCards label="Loading the VM" height={220} lines={4} />
               ) : (
                 <ProblemBanner view={problemView(vmQuery.error, 'see this VM')} />
               )}
@@ -112,6 +114,7 @@ function VmSheetBody({ vm, projectId, tab }: { vm: Vm; projectId: string; tab: V
   const [problem, setProblem] = useState<ProblemView | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
+  const bodyRef = usePaneEnter<HTMLDivElement>(tab);
 
   const nodesQuery = useListNodes(undefined, { query: { staleTime: 10_000 } });
   const projectsQuery = useListProjects(PROJECT_LIST_PARAMS);
@@ -195,7 +198,7 @@ function VmSheetBody({ vm, projectId, tab }: { vm: Vm; projectId: string; tab: V
         ))}
       </SheetTabs>
 
-      <div className="sh-body">
+      <div ref={bodyRef} className="sh-body">
         {notice ? <NoticeLine>{notice}</NoticeLine> : null}
         {problem ? <ProblemBanner view={problem} /> : null}
 

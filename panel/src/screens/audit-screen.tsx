@@ -26,6 +26,8 @@ import { useNow } from '../lib/use-now';
 import { useKeptNames, useRecordContext } from '../lib/use-record-context';
 import { useSession } from '../session';
 import { LoginScreen } from './login-screen';
+import { EmptyState } from '../components/empty-state';
+import { PageSkeleton, SkeletonRows } from '../components/skeleton';
 
 const activityRoute = getRouteApi('/shell/activity');
 
@@ -112,7 +114,7 @@ export function AuditScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-2">Loading…</p>
+        <PageSkeleton />
       </main>
     );
   }
@@ -198,24 +200,23 @@ export function AuditScreen() {
 
       <section aria-label="Activity" className="mt-2 min-w-0">
         {auditQuery.isPending ? (
-          <div className="mt-3 flex flex-col gap-2">
-            {[0, 1, 2, 3].map((index) => (
-              <div key={index} className="h-[46px] rounded-[10px] border border-line bg-surface/60" />
-            ))}
-          </div>
+          <SkeletonRows label="Loading activity" rows={4} className="mt-3" />
         ) : entries.length === 0 ? (
-          <div className="mt-3 rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
-            <p className="text-[15px] text-ink">
-              {hasFilters
-                ? 'Nothing recorded matches these filters.'
-                : 'Nothing has been recorded yet. Every call by people and agents will appear here.'}
-            </p>
-            {hasFilters ? (
-              <Button variant="default" className="mt-4" onClick={() => void navigate({ to: '/activity', search: {} })}>
-                Clear filters
-              </Button>
-            ) : null}
-          </div>
+          <EmptyState
+            title={hasFilters ? 'Nothing recorded matches these filters' : 'Nothing recorded yet'}
+            className="mt-3"
+            action={
+              hasFilters ? (
+                <Button variant="default" onClick={() => void navigate({ to: '/activity', search: {} })}>
+                  Clear filters
+                </Button>
+              ) : undefined
+            }
+          >
+            {hasFilters
+              ? 'Clear the filters to see every entry again.'
+              : 'Every call by people and agents will appear here, in the order it happened.'}
+          </EmptyState>
         ) : (
           days.map((day) => (
             <div key={`${day.label}-${day.records[0]?.seq}`}>

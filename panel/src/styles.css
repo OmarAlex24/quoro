@@ -850,6 +850,97 @@
   }
 
   /*
+   * A skeleton: bars in the shape of the coming content, with a dither band
+   * sweeping across them while data loads, instead of the word "Loading".
+   * Bars are the raised surface on the page; on a card (white in light) they
+   * mix in the rule colour so they still show.
+   */
+  .skel-field {
+    display: grid;
+    gap: 10px;
+    --skel-bar: var(--raised);
+  }
+
+  .box .skel-field,
+  .skel-field .box,
+  .skel-field.box {
+    --skel-bar: color-mix(in oklab, var(--line) 45%, var(--raised));
+  }
+
+  .skel {
+    position: relative;
+    display: block;
+    height: 12px;
+    overflow: hidden;
+    border-radius: 5px;
+    background-color: var(--skel-bar, var(--raised));
+  }
+
+  .skel::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image: conic-gradient(from 270deg at 2px 2px, var(--line-2) 25%, transparent 0);
+    background-size: 4px 4px;
+    /* A mask reads alpha only; any opaque token will do. */
+    -webkit-mask: linear-gradient(90deg, transparent, var(--ink) 45%, var(--ink) 55%, transparent) no-repeat;
+    mask: linear-gradient(90deg, transparent, var(--ink) 45%, var(--ink) 55%, transparent) no-repeat;
+    -webkit-mask-size: 60% 100%;
+    mask-size: 60% 100%;
+    -webkit-mask-position: -75% 0;
+    mask-position: -75% 0;
+    animation: sweep 1.4s linear infinite;
+  }
+
+  .skel-rows {
+    display: grid;
+    gap: 0;
+  }
+
+  .skel-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    border-top: 1px solid var(--line);
+  }
+
+  .skel-row:first-child {
+    border-top: 0;
+  }
+
+  .skel-row-t {
+    display: grid;
+    flex: 1;
+    gap: 7px;
+    min-width: 0;
+  }
+
+  .skel.skel-glyph {
+    flex: none;
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+  }
+
+  .skel-card {
+    display: grid;
+    align-content: start;
+    gap: 10px;
+    padding: 16px;
+    border-radius: 11px;
+  }
+
+  .skel-page {
+    gap: 12px;
+  }
+
+  .skel-page > div > .skel-rows,
+  .skel-page .skel-rows {
+    margin-top: 10px;
+  }
+
+  /*
    * The shell. Outside a project: a 236 px sidebar with the workspace, six
    * sections and the cluster at its foot. Inside one: a 52 px top bar with the
    * breadcrumb and a 56 px rail. Below 768 px the sidebar folds into a menu
@@ -1172,32 +1263,72 @@
     background-size: 22px 22px;
   }
 
+  /*
+   * A tab row: links (the tab is in the URL) over a 1 px rule, and one 2 px
+   * bar under the active tab's words. The bar slides to a new tab on the
+   * panel's curve only when the tab changes (`data-glide`, set by
+   * useTabInk); the rule is an inset shadow so the bar covers it even where
+   * the row scrolls sideways and clips what hangs below it.
+   */
   .tabs {
+    position: relative;
     display: flex;
-    flex-wrap: wrap;
-    gap: 0 20px;
-    border-bottom: 1px solid var(--line);
+    gap: 2px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    box-shadow: inset 0 -1px 0 var(--line);
+  }
+
+  .tabs::-webkit-scrollbar {
+    display: none;
   }
 
   .tabs a {
-    padding: 9px 0 10px;
+    flex: none;
+    height: 34px;
+    padding: 0 8px;
+    border-radius: 6px 6px 0 0;
     color: var(--ink-2);
     text-decoration: none;
     font-size: var(--type-body);
-    border-bottom: 2px solid transparent;
-    margin-bottom: -1px;
+    white-space: nowrap;
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    transition:
+      color var(--motion-feedback) var(--ease),
+      background-color var(--motion-feedback) var(--ease);
   }
 
   .tabs a:hover {
     color: var(--ink);
+    background-color: color-mix(in oklab, var(--raised) 60%, transparent);
   }
 
   .tabs a.on {
     color: var(--ink);
-    border-color: var(--ink);
+    font-weight: 560;
+  }
+
+  .tabs a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .tab-ink {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 0;
+    height: 2px;
+    background-color: var(--ink);
+    pointer-events: none;
+  }
+
+  .tab-ink[data-glide] {
+    transition:
+      transform var(--motion-change) var(--ease),
+      width var(--motion-change) var(--ease);
   }
 
   .subnav {
@@ -1391,11 +1522,6 @@
     overflow: hidden;
     color: var(--ink);
     text-decoration: none;
-  }
-
-  .ptile-ghost {
-    height: 222px;
-    opacity: 0.6;
   }
 
   .ptile-h {
@@ -1784,33 +1910,49 @@
     height: 15px;
   }
 
-  /* Nothing here yet. */
+  /*
+   * Nothing here yet: a dashed box with a dithered cube, what is missing,
+   * what adding it does and the action. The cube's canvas is wider than it is
+   * tall so the panel's cube (sized by height) fills the proposal's 64 px.
+   */
   .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    max-width: 360px;
-    margin-inline: auto;
+    display: grid;
+    justify-items: center;
+    gap: 8px;
+    padding: 26px 20px 24px;
+    border: 1px dashed var(--line-2);
+    border-radius: 10px;
     text-align: center;
   }
 
   .empty-cube {
     display: block;
-    width: 120px;
-    height: 78px;
+    width: 96px;
+    height: 64px;
+    margin-bottom: 4px;
   }
 
   .empty-title {
-    margin-top: 14px;
     font-size: 14.5px;
     font-weight: 620;
     color: var(--ink);
   }
 
   .empty-text {
-    margin-top: 6px;
+    max-width: 44ch;
     font-size: 13px;
+    line-height: 1.45;
     color: var(--ink-2);
+  }
+
+  .empty-action {
+    margin-top: 6px;
+  }
+
+  /* Over the dotted canvas the box takes the surface, as the proposal draws it. */
+  .canvas-empty .empty-state {
+    width: min(100%, 440px);
+    background-color: var(--surface);
   }
 
   /* The Add menu: a typed filter over what can be added. */
@@ -2023,15 +2165,9 @@
     color: var(--ink);
   }
 
+  /* The words line up with the body under it: 18 px here and 8 px in each tab. */
   .tabs.sh-tabs {
-    flex-wrap: nowrap;
-    padding: 0 26px;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .tabs.sh-tabs a {
-    flex: none;
+    padding: 0 18px;
   }
 
   .sh-body {
@@ -2568,25 +2704,80 @@
     color: var(--ink-2);
   }
 
+  /*
+   * Label and value tables (the sheet's Settings, a webhook, a backup
+   * repository, an audit entry): a sunk surface, 1 px rules between rows and
+   * a highlight under the pointer. Code values set themselves in Martian
+   * Mono (`.type-code`); labels never. Labels stay --ink-2: --ink-3 on the
+   * sunk surface is under 4.5:1 in both themes.
+   */
   .set-rows {
     display: grid;
+    background-color: var(--sunk);
+  }
+
+  .box.set-rows {
+    overflow: hidden;
   }
 
   .set-row {
     display: grid;
-    grid-template-columns: 140px minmax(0, 1fr);
+    grid-template-columns: 132px minmax(0, 1fr);
     gap: 12px;
-    padding: 9px 14px;
+    padding: 8px 14px;
     border-top: 1px solid var(--line);
     font-size: 13px;
+    transition: background-color var(--motion-feedback) var(--ease);
   }
 
   .set-row:first-child {
     border-top: 0;
   }
 
+  .set-row:hover {
+    background-color: color-mix(in oklab, var(--raised) 55%, transparent);
+  }
+
   .set-row dt {
     color: var(--ink-2);
+  }
+
+  /*
+   * Rows of a list on a card (settings lists, variables, VMs): the same rules
+   * and a highlight under the pointer, here the sunk colour, since the
+   * raised one is the card's own white in light.
+   */
+  .srow,
+  .keyrow,
+  .vmt tbody tr {
+    transition: background-color var(--motion-feedback) var(--ease);
+  }
+
+  .srow:hover,
+  .keyrow:hover,
+  .vmt tbody tr:hover {
+    background-color: color-mix(in oklab, var(--sunk) 75%, transparent);
+  }
+
+  /* The highlight keeps the box's rounded corners; the box itself does not clip, so row menus can open. */
+  .box > .srow:first-child,
+  .box > .keyrow:first-child {
+    border-top-left-radius: 9px;
+    border-top-right-radius: 9px;
+  }
+
+  .box > .srow:last-child,
+  .box > .keyrow:last-child {
+    border-bottom-left-radius: 9px;
+    border-bottom-right-radius: 9px;
+  }
+
+  .vmt tbody tr:last-child td:first-child {
+    border-bottom-left-radius: 9px;
+  }
+
+  .vmt tbody tr:last-child td:last-child {
+    border-bottom-right-radius: 9px;
   }
 
   .set-row dd {
@@ -3763,8 +3954,7 @@
     }
 
     .tabs.sh-tabs {
-      padding: 0 16px;
-      gap: 0 18px;
+      padding: 0 8px;
     }
 
     .sh-body {
@@ -4411,13 +4601,6 @@
 
   .split-list .list-h {
     padding-right: 16px;
-  }
-
-  .list-empty {
-    padding: 2px 16px 8px 0;
-    font-size: 13px;
-    line-height: 1.45;
-    color: var(--ink-2);
   }
 
   .split-detail {
@@ -5153,30 +5336,6 @@
     color: var(--ink-2);
   }
 
-  .set-empty {
-    padding: 22px 16px;
-    border: 1px dashed var(--line-2);
-    border-radius: 10px;
-    text-align: center;
-  }
-
-  .set-empty-t {
-    font-size: var(--type-body);
-    font-weight: 540;
-    color: var(--ink);
-  }
-
-  .set-empty-x {
-    margin-top: 4px;
-    font-size: var(--type-small);
-    color: var(--ink-2);
-  }
-
-  .set-loading {
-    height: 118px;
-    background-color: color-mix(in oklab, var(--surface) 60%, transparent);
-  }
-
   .set-form {
     display: grid;
     gap: 12px;
@@ -5451,13 +5610,15 @@
     .lamp-pulse,
     .sweep,
     .aura-breathe,
-    .btn[data-busy]::after {
+    .btn[data-busy]::after,
+    .skel::after {
       animation: none;
     }
 
     /* A still sweep sits in the middle instead of vanishing off one edge. */
     .sweep,
-    .btn[data-busy]::after {
+    .btn[data-busy]::after,
+    .skel::after {
       -webkit-mask-position: 50% 0;
       mask-position: 50% 0;
     }

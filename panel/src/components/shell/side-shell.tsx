@@ -8,14 +8,17 @@ import { QuoroMark } from '../avatar';
 import { AvatarMenu } from './avatar-menu';
 import { usePendingApprovalCount, useWorkspaceName } from './shell-data';
 import { PendingCount, Sidebar } from './sidebar';
+import { PageSkeleton } from '../skeleton';
 
 /** Shell pages need a person: sign-in shows full screen, without the shell. */
 export function SessionGate({ children }: { children: ReactNode }) {
   const { user, loading, unauthenticated } = useSession();
   if (loading) {
     return (
-      <div className="grid min-h-dvh place-items-center bg-ground">
-        <p className="text-[14px] text-ink-3">Loading…</p>
+      <div className="grid min-h-dvh place-items-center bg-ground px-4">
+        <div className="w-full max-w-[420px]">
+          <PageSkeleton />
+        </div>
       </div>
     );
   }

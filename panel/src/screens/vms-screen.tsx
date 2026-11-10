@@ -18,6 +18,8 @@ import { LampDot } from '../components/lamp';
 import { DeleteVmDialog, useVmAction, VmActionsMenu, vmActionNotice } from '../components/vm-actions';
 import { Button } from '../components/ui/button';
 import { NoticeLine, ProblemBanner } from '../components/ui/problem-banner';
+import { EmptyState } from '../components/empty-state';
+import { SkeletonRows } from '../components/skeleton';
 
 function CountLamp({ tone, value, label }: { tone: LampTone; value: number; label: string }) {
   return (
@@ -130,20 +132,22 @@ export function VmsScreen({ nodeId }: { nodeId?: string } = {}) {
 
       <div className="mt-4">
         {vmsQuery.isPending ? (
-          <div className="box h-[160px] opacity-60" aria-hidden="true" />
+          <SkeletonRows label="Loading virtual machines" rows={3} />
         ) : vms.length === 0 && !listError ? (
-          <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
-            <p className="text-[15px] text-ink">
-              {nodeId
-                ? `No VM is placed on ${filterNode?.name ?? 'this node'}.`
-                : `No VMs yet. Create one to boot a microVM on ${primary?.name ?? 'a node'}.`}
-            </p>
-            {canWrite && !nodeId ? (
-              <Button variant="primary" className="mt-4" onClick={() => setDialogOpen(true)}>
-                New VM
-              </Button>
-            ) : null}
-          </div>
+          <EmptyState
+            title={nodeId ? `No VM is placed on ${filterNode?.name ?? 'this node'}` : 'No VMs yet'}
+            action={
+              canWrite && !nodeId ? (
+                <Button variant="primary" onClick={() => setDialogOpen(true)}>
+                  New VM
+                </Button>
+              ) : undefined
+            }
+          >
+            {nodeId
+              ? 'The VMs and app instances placed on this node show here.'
+              : `Every microVM of the cluster shows here, app instances included. Create one to boot a VM on ${primary?.name ?? 'a node'}.`}
+          </EmptyState>
         ) : (
           <div className="box vmt-box">
             <table className="vmt">

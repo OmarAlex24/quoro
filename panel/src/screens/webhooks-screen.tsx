@@ -6,7 +6,6 @@ import { canManageWebhooks } from '../lib/capabilities';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useSession } from '../session';
 import {
-  SettingsEmpty,
   SettingsHead,
   SettingsLoading,
   SettingsNote,
@@ -22,6 +21,7 @@ import {
 import { WebhookDialog } from '../components/webhook-dialog';
 import { WebhookRow } from '../components/webhook-row';
 import { LoginScreen } from './login-screen';
+import { EmptyState } from '../components/empty-state';
 
 /** Settings › Webhooks: where events go, the latest delivery of each, and the agent each wakes. */
 export function WebhooksScreen() {
@@ -82,9 +82,11 @@ export function WebhooksScreen() {
       {webhooksQuery.isPending ? (
         <SettingsLoading label="Loading webhooks" />
       ) : webhooks.length === 0 ? (
-        <SettingsEmpty title="No webhooks yet." action={add}>
-          {writer ? 'Add one to send events to a receiver.' : 'An owner or operator can add one.'}
-        </SettingsEmpty>
+        <EmptyState title="No webhooks yet" action={add}>
+          {writer
+            ? 'A webhook sends the events you pick to a receiver you run, as they happen.'
+            : 'A webhook sends the events you pick to a receiver. An owner or operator can add one.'}
+        </EmptyState>
       ) : (
         <ul className="box">
           {webhooks.map((webhook) => (
