@@ -4,12 +4,13 @@ import { useListVms } from '../api/generated/vms/vms';
 import { nodeLoad } from '../lib/node-capacity';
 import { problemView } from '../lib/problem';
 import { SERVICE_LIST_PARAMS } from '../lib/projects';
+import { HaVotes } from '../components/ha-votes';
 import { N1Strip } from '../components/n1-strip';
 import { NodeCard } from '../components/node-card';
 import { ProblemBanner } from '../components/ui/problem-banner';
 
 /**
- * `/nodes`: the N+1 strip, then one card per machine with what its VMs
+ * `/nodes`: the voters and whether HA is ready, the N+1 strip, then one card per machine with what its VMs
  * reserve of its CPU, memory and disk, its own live reading, and what it runs.
  */
 export function NodesScreen() {
@@ -38,6 +39,7 @@ export function NodesScreen() {
         </div>
       ) : (
         <>
+          <HaVotes nodes={nodes} />
           <N1Strip nodes={nodes} apps={appsQuery.data?.items ?? []} />
           <div className="nodes">
             {nodes.map((node) => (
