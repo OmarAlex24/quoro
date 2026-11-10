@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { Link } from '@tanstack/react-router';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState, type RefObject } from 'react';
 import { useListAudit } from '../api/generated/audit/audit';
 import type { App, Approval, AuditRecord, Incident, Node } from '../api/generated/model';
 import { approvalAsk } from '../lib/access';
@@ -49,8 +49,10 @@ export function NeedsYou({
   targetName: (approval: Approval) => string | undefined;
   canDecide: boolean;
 }) {
-  const now = useNow(approvals.length > 0, 30_000);
+  const now = useNow(approvals.length > 0 || incidents.length > 0, 30_000);
   const [notice, setNotice] = useState<string | null>(null);
+  // After a Deny the request and its buttons leave, so focus goes to this section's heading.
+  const heading = useRef<HTMLHeadingElement>(null);
   const [first, ...more] = approvals;
   if (!first && incidents.length === 0 && notice === null) return null;
 
@@ -59,7 +61,9 @@ export function NeedsYou({
       {first ? <Aura tone="shift" breathe margin={10} /> : null}
       <div className="psec-h">
         <LampDot ring="shift" core="shift" size={11} />
-        <h2>Needs you</h2>
+        <h2 ref={heading} tabIndex={-1}>
+          Needs you
+        </h2>
         {approvals.length > 0 ? (
           <span className="pneed-n">
             {approvals.length}
@@ -82,6 +86,7 @@ export function NeedsYou({
           now={now}
           canDecide={canDecide}
           onNotice={setNotice}
+          heading={heading}
         />
       ) : null}
       {more.map((approval) => {
@@ -116,12 +121,14 @@ function WaitingRequest({
   now,
   canDecide,
   onNotice,
+  heading,
 }: {
   approval: Approval;
   targetName?: string;
   now: number;
   canDecide: boolean;
   onNotice: (notice: string | null) => void;
+  heading: RefObject<HTMLHeadingElement | null>;
 }) {
   const ask = approvalAsk(approval, targetName);
   const meter = approvalMeter(approval, now);
@@ -171,6 +178,7 @@ function WaitingRequest({
             approval={approval}
             onDecided={() => onNotice('Denied. The agent’s retry will be refused.')}
             onConflict={(view) => onNotice(view.message)}
+            focusAfter={() => heading.current}
           />
         ) : null}
       </div>
@@ -220,9 +228,9 @@ export function RailNodes({ nodes, apps }: { nodes: readonly Node[]; apps: reado
           <Link
             key={node.id}
             to="/nodes"
-            search={{ tab: 'vms', node: node.id }}
+            search={runsVms ? { tab: 'vms', node: node.id } : {}}
             className="pnd"
-            aria-label={`${node.name}, ${readout.words}${last ? `, ${Math.round(last.cpu_usage * 100)}% busy` : ''}. Its VMs`}
+            aria-label={`${node.name}, ${readout.words}${last ? `, ${Math.round(last.cpu_usage * 100)}% busy` : ''}${runsVms ? '. Its VMs' : ''}`}
           >
             <LampDot ring={readout.tone} core={readout.tone} pulse={readout.pulse} size={11} label={readout.words} />
             <div className="pnd-n">

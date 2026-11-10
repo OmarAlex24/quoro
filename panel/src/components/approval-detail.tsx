@@ -47,12 +47,15 @@ export function ApprovalDetail({
   canDecide,
   onDecided,
   onConflict,
+  focusAfter,
 }: {
   approval: Approval;
   ctx: RecordContext;
   canDecide: boolean;
   onDecided: (kind: Decision, decided: Approval) => void;
   onConflict: (view: ProblemView) => void;
+  /** Where focus goes once the decision is sent. */
+  focusAfter?: () => HTMLElement | null | undefined;
 }) {
   const pending = approval.status === 'pending';
   const now = useNow(pending, 15_000);
@@ -130,7 +133,7 @@ export function ApprovalDetail({
             share={meter.share}
           />
           {canDecide ? (
-            <ApprovalDecision approval={approval} onDecided={onDecided} onConflict={onConflict} />
+            <ApprovalDecision approval={approval} onDecided={onDecided} onConflict={onConflict} focusAfter={focusAfter} />
           ) : (
             <p className="box px-3.5 py-2.5 text-[13px] leading-snug text-ink-2">{DECIDER_ONLY_SENTENCE}</p>
           )}
