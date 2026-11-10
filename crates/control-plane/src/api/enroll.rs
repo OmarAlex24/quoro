@@ -103,6 +103,11 @@ pub struct EnrollNodeRequest {
     #[serde(default)]
     #[schema(nullable = false)]
     pub kvm: Option<KvmInfo>,
+    /// From M5b, on a machine with the `node` role: base64 X25519 public key
+    /// of its custody key (`node-agent-protocol.md` sections 2.3 and 7.2).
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub custody_public_key: Option<String>,
 }
 
 /// Enrollment result; `credential` is shown only in this response.
