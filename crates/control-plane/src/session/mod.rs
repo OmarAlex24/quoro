@@ -3266,6 +3266,18 @@ impl Session {
     /// token than the node's (sections 5.1 and 4.2 rule 3). Returns whether
     /// it ran to its end without a failed read or write: only then may the
     /// session's `hello` position count (section 8.4, "Acknowledgements").
+    ///
+    /// An incomplete pass ends the session before its `welcome`, so a step
+    /// here must not fail on every session because of what the node lists:
+    /// the node would then never be revoked. Each step that can make the
+    /// pass incomplete fails only on a database error or on a stored value
+    /// that does not decode: the reads of the leases restores wait for and
+    /// of their release, the check of the held grants, the step-4 rows, the
+    /// per-lease read, and the `fence_failure` and `fence_ack_pending`
+    /// columns they parse, which this primary writes from typed values. A
+    /// listed lease id is only ever bound as a parameter, and a listed token
+    /// is never written as it is: the ADR 0285 raise caps it at
+    /// [`leases::MAX_TOKEN`] and does not write a row it already covers.
     async fn revoke_stale_leases(
         &mut self,
         reported: &[wire::HelloLease],
