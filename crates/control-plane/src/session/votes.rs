@@ -31,7 +31,8 @@ pub const VOTERS_CHANGING: &str = "the previous voter-set change has not reached
 
 /// The `detail` of the refusal while the `nodes` rows and the change log
 /// disagree on the voters ([`NodeHub::voter_change_gate`]).
-pub const VOTERS_DISAGREE: &str = "the voter rows and the change log disagree on the voters; the change waits until they agree, which the disagreeing machine's next session brings about";
+pub const VOTERS_DISAGREE: &str =
+    "the voter rows and the change log disagree on the voters; the change waits until they agree";
 
 impl NodeHub {
     /// Records that `node_id` acknowledged, with `command_result` `ok`, a
