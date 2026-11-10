@@ -250,6 +250,8 @@ pub struct BackupRepository {
     /// When the recovery key was last replaced, or null if never.
     #[schema(format = "date-time")]
     pub recovery_key_rotated_at: Option<String>,
+    /// Whether this primary holds the repository key (ADR 0322).
+    pub repository_key_present: bool,
     /// Schedule of the control-plane database backups.
     pub control_plane_schedule: BackupSchedule,
     /// Owner who created the repository.
@@ -586,6 +588,7 @@ pub(crate) fn repository_to_api(repository: &crate::backups::repo::Repository) -
         prefix: repository.prefix.clone(),
         recovery_key_fingerprint: repository.recovery_key_fingerprint.clone(),
         recovery_key_rotated_at: repository.recovery_key_rotated_at.clone(),
+        repository_key_present: !repository.repo_key_enc.is_empty(),
         control_plane_schedule: repository.control_plane_schedule,
         created_by: repository.created_by.clone(),
         created_at: repository.created_at.clone(),
@@ -1336,6 +1339,7 @@ pub async fn update_backup_repository(
         (status = 401, response = crate::openapi::Unauthenticated),
         (status = 403, response = crate::openapi::Forbidden),
         (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
         (status = 429, response = crate::openapi::RateLimited),
         (status = 503, response = crate::openapi::NotPrimary),
     )

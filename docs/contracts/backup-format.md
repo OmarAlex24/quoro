@@ -77,6 +77,12 @@ The primary writes `config-<n>.json` when it creates the repository (`n = 1`) an
 - `wrapped_repo_key` is `repo_key` encrypted under `wrap_key` with a random nonce. The associated data is the ASCII bytes of `repository_id`.
 - `cluster_public_key` is the base64 public half of the cluster signing key, so the reader knows which key the seals must verify against. It is only a hint: an offline restore checks it against the signing key file the operator supplies (section 8.2).
 - **Rotation.** After it writes `config-<n+1>.json`, the primary deletes every `config-<m>.json` with `m ≤ n`, so the old recovery key no longer opens the repository. A reader uses the config object with the highest `n` that the given recovery key opens. A config object planted by someone else cannot hold the real `repo_key`, because writing one needs `repo_key` in the first place.
+- **Restoring the key on a primary (ADR 0322).** A primary that does not hold `repo_key`, as after a promotion (node-agent-protocol.md section 7.3), gets it back with `restoreBackupRepositoryKey`, which takes the recovery key. The primary:
+  1. checks that the recovery key's fingerprint equals `backup_repositories.recovery_key_fingerprint`, before it reads the bucket;
+  2. lists the config objects and unwraps `repo_key` from the newest one the recovery key opens, as `quoro restore` does (section 8.2);
+  3. stores `repo_key` wrapped under the cluster data-encryption key in `repo_key_enc`, on this primary only. The write appends no change-log entry, so no follower and no later primary receives the key.
+
+  The recovery key is held only for the call and is redacted from its audit record (`audit-log-format.md` section 4). A primary that already holds `repo_key` answers `conflict`.
 
 ## 5. Chunks
 

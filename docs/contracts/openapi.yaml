@@ -3876,6 +3876,7 @@ components:
         - provider_id
         - prefix
         - recovery_key_fingerprint
+        - repository_key_present
         - control_plane_schedule
         - created_by
         - created_at
@@ -3907,6 +3908,16 @@ components:
           type: [string, 'null']
           format: date-time
           description: When the recovery key was last replaced, or null if never.
+        repository_key_present:
+          type: boolean
+          description: |
+            Whether this primary holds the repository key. False on a primary
+            promoted since the repository was created, because the key never
+            enters the change log (node-agent-protocol.md sections 7.1 and
+            7.3, ADR 0322). While it is false, the primary takes no backup of
+            the repository, restores none and runs no garbage collection, and
+            `rotateBackupRecoveryKey` answers `conflict`. The owner restores
+            the key with `restoreBackupRepositoryKey`.
         control_plane_schedule:
           $ref: '#/components/schemas/BackupSchedule'
         created_by:
@@ -3974,6 +3985,20 @@ components:
           description: Key prefix inside the bucket. It must not hold a repository already.
         control_plane_schedule:
           $ref: '#/components/schemas/BackupSchedule'
+    RestoreBackupRepositoryKeyRequest:
+      type: object
+      title: RestoreBackupRepositoryKeyRequest
+      description: The recovery key that restores the repository key on this primary.
+      required:
+        - recovery_key
+      properties:
+        recovery_key:
+          type: string
+          writeOnly: true
+          pattern: '^qrk1(-[0-9A-HJKMNP-TV-Z]{4}){13}$'
+          description: |
+            The repository's current recovery key (`backup-format.md`
+            section 3). Write-only: never stored, returned or recorded.
     UpdateBackupRepositoryRequest:
       type: object
       title: UpdateBackupRepositoryRequest
@@ -11144,9 +11169,11 @@ paths:
         (`backup-format.md` section 3). The repository key, and so every
         backup, stays the same; the old recovery key no longer opens the
         repository. Use it when the owner lost the key while the primary still
-        holds the repository key, or suspects the key leaked. Human-only and
-        owner-only: an agent's access token is refused with `forbidden` and
-        `reason: human_only`.
+        holds the repository key, or suspects the key leaked. `conflict` (409)
+        while this primary does not hold the repository key
+        (`repository_key_present` false, ADR 0322): restore it first with
+        `restoreBackupRepositoryKey`. Human-only and owner-only: an agent's
+        access token is refused with `forbidden` and `reason: human_only`.
       x-quoro-scope: backup:manage
       parameters:
         - $ref: '#/components/parameters/BackupRepositoryId'
@@ -11166,6 +11193,66 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/backup-repositories/{repository_id}/repository-key:
+    post:
+      tags: [backups]
+      operationId: restoreBackupRepositoryKey
+      summary: Restore the repository key on this primary
+      description: |
+        Restores the repository key on a primary that does not hold it
+        (`repository_key_present` false), as after a promotion: the key never
+        enters the change log (node-agent-protocol.md sections 7.1 and 7.3,
+        ADR 0322). The caller gives the recovery key. The primary checks its
+        fingerprint against `recovery_key_fingerprint`, unwraps the repository
+        key from the newest config object the recovery key opens, and stores
+        it wrapped under the cluster data-encryption key on this primary only
+        (`backup-format.md` section 4). It appends no change-log entry, so no
+        follower and no later primary receives the key. The recovery key is
+        never stored, and the audit record carries it redacted. Backups,
+        restores and garbage collection of the repository resume. Re-keying a
+        repository is not served yet (ADR 0324): when the recovery key is lost
+        too, the repository takes no new backup. `conflict` (409) when this
+        primary already holds the key. `validation_failed` (422) when the recovery key's fingerprint
+        differs from `recovery_key_fingerprint`, no config object in the
+        bucket opens with it, or the bucket cannot be read. Human-only and
+        owner-only: an agent's access token is refused with `forbidden` and
+        `reason: human_only`. The call is audited (ADR 0031).
+      x-quoro-scope: backup:manage
+      parameters:
+        - $ref: '#/components/parameters/BackupRepositoryId'
+      requestBody:
+        required: true
+        description: The recovery key.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestoreBackupRepositoryKeyRequest'
+      responses:
+        '200':
+          description: The repository, with `repository_key_present` true.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRepository'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':
