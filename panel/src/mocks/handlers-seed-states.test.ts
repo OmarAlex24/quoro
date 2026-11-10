@@ -94,9 +94,10 @@ describe('blog in the seed', () => {
     ]);
     expect(blog.instances.every((vm) => vm.desired_status === 'running' && vm.restart_count === 1)).toBe(true);
     expect(blog.instances.find((vm) => vm.name === 'blog-1')?.last_exit_code).toBe(1);
-    expect(blog.edge_backends).toHaveLength(2);
-    expect(blog.edge_backends.some((backend) => backend.in_rotation)).toBe(false);
-    expect(blog.edge_backends.every((backend) => backend.reason === 'health_check' && backend.last_error)).toBe(true);
+    const backends = blog.edge_backends ?? [];
+    expect(backends).toHaveLength(2);
+    expect(backends.some((backend) => backend.in_rotation)).toBe(false);
+    expect(backends.every((backend) => backend.reason === 'health_check' && backend.last_error)).toBe(true);
   });
 });
 
