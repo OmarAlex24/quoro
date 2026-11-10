@@ -20,7 +20,8 @@
   --dot: #232a3a;
   --ink: #e8ebf3;
   --ink-2: #a3abbd;
-  --ink-3: #6e768b;
+  /* Tertiary words keep 4.5:1 on every surface, the raised one included. */
+  --ink-3: #80889c;
   --accent: #8196ff;
   --accent-solid: #4a63f0;
   --on-accent: #ffffff;
@@ -94,7 +95,7 @@
     --dot: #cdd3de;
     --ink: #11151e;
     --ink-2: #4b5467;
-    --ink-3: #737c90;
+    --ink-3: #60697d;
     --accent: #2643b5;
     --accent-solid: #2643b5;
     --on-accent: #ffffff;
@@ -137,7 +138,7 @@
   --dot: #cdd3de;
   --ink: #11151e;
   --ink-2: #4b5467;
-  --ink-3: #737c90;
+  --ink-3: #60697d;
   --accent: #2643b5;
   --accent-solid: #2643b5;
   --on-accent: #ffffff;
@@ -179,7 +180,7 @@
   --dot: #232a3a;
   --ink: #e8ebf3;
   --ink-2: #a3abbd;
-  --ink-3: #6e768b;
+  --ink-3: #80889c;
   --accent: #8196ff;
   --accent-solid: #4a63f0;
   --on-accent: #ffffff;
@@ -3747,8 +3748,8 @@
    * Label and value tables (the sheet's Settings, a webhook, a backup
    * repository, an audit entry): a sunk surface, 1 px rules between rows and
    * a highlight under the pointer. Code values set themselves in Martian
-   * Mono (`.type-code`); labels never. Labels stay --ink-2: --ink-3 on the
-   * sunk surface is under 4.5:1 in both themes.
+   * Mono (`.type-code`); labels never. Labels stay --ink-2, a step above the
+   * --ink-3 notes beside some values.
    */
   .set-rows {
     display: grid;
