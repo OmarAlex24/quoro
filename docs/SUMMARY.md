@@ -9,6 +9,7 @@
 # Guides
 
 - [Command-line client](guides/cli.md)
+- [M5b demo runbook](guides/m5b-demo-runbook.md)
 
 # Concepts
 
