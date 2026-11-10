@@ -129,8 +129,11 @@ impl HeldGrant {
         self.token == lease.fencing_token && self.holder == lease.holder_node_id
     }
 
+    /// Not sent yet, and waiting as a grant does: a same-token `local`
+    /// grant that waits for evidence that the holder holds the lease is no
+    /// grant pending ([`super::local_end`]); it may never go out.
     fn pending(&self) -> bool {
-        self.sent_on.is_none()
+        self.sent_on.is_none() && (self.kind == Kind::NewToken || self.eligible_on.is_some())
     }
 }
 
@@ -328,7 +331,9 @@ impl NodeHub {
     /// a second call never sends it twice. While the holder's session is
     /// live after its `hello`, the grant may go out on it: the node cannot
     /// hold a token written after its `hello`. Otherwise it waits for the
-    /// holder's next session start.
+    /// holder's next session start. A held same-token `local` grant that
+    /// names the row is replaced: this grant has a new token, and goes out
+    /// only through [`Self::try_send_held`], gated.
     pub(crate) fn hold_grant(&self, lease: &leases::Lease) {
         let live = {
             let sessions = self.0.sessions.lock().expect("session lock");
@@ -340,7 +345,7 @@ impl NodeHub {
         let replaced = {
             let mut registry = self.0.held.lock().expect("held grant lock");
             match registry.entries.get_mut(&lease.id) {
-                Some(held) if held.names(lease) => {
+                Some(held) if held.kind == Kind::NewToken && held.names(lease) => {
                     if held.eligible_on.is_none() {
                         held.eligible_on = live;
                     }
@@ -700,6 +705,29 @@ impl NodeHub {
                 .collect()
         };
         for (lease_id, held) in entries {
+            // An unsent same-token `local` grant goes once it has nothing
+            // left to end, the policy back on `warm` included, whether or
+            // not a session may take it ([`super::local_end`]).
+            if held.kind == Kind::LocalEnd && held.sent_on.is_none() {
+                match self.local_end_obsolete(&lease_id, &held).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let mut registry = self.0.held.lock().expect("held grant lock");
+                        if registry.entries.get(&lease_id) == Some(&held) {
+                            registry.entries.remove(&lease_id);
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            code = %e.code.as_str(),
+                            lease_id,
+                            "cannot read a held local grant's row; trying again"
+                        );
+                        continue;
+                    }
+                }
+            }
             let Some(generation) = held.eligible_on else {
                 continue;
             };
@@ -1097,6 +1125,28 @@ mod tests {
         other.holder_node_id = "nod_other".to_string();
         assert!(!hub.row_grant_pending(&other), "another holder");
         assert!(hub.grant_pending("lse_one"), "the entry stays");
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// A re-entry's `hold_grant` over a held `local` grant that ends the
+    /// renewals and names the same row holds a new-token grant: a grant
+    /// with a new token never goes out through the same-token grant's path,
+    /// which checks no gate.
+    #[tokio::test]
+    async fn a_hold_grant_over_a_local_end_entry_holds_a_new_token_grant() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let lease = marked("lse_one", &node_id);
+        let mut held = HeldGrant::of(&lease, None);
+        held.kind = super::Kind::LocalEnd;
+        hub.0
+            .held
+            .lock()
+            .unwrap()
+            .entries
+            .insert("lse_one".to_string(), held);
+        hub.hold_grant(&lease);
+        assert_eq!(entry(hub, "lse_one").kind, super::Kind::NewToken);
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 

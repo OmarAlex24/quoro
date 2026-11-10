@@ -2432,3 +2432,50 @@ async fn the_local_grant_waits_for_a_down_node_until_its_removal_is_replicated()
     assert_eq!(view["local_pending"], false, "{view}");
     assert_eq!(view["grant_pending"], false, "{view}");
 }
+
+/// #555, a `local` grant that waits for evidence. A holds the lease `local`
+/// at token 1, granted after its `hello`, and has not renewed it: no
+/// evidence on this session. `updateApp` takes the policy off `warm`; R
+/// marks the row, and its `local` grant waits for evidence, which is no
+/// grant pending: `grant_pending` false and `grant_waiting_on` empty. Back on
+/// `warm`, the entry is dropped and `failoverApp` does not answer
+/// `in_progress`.
+#[tokio::test]
+async fn a_local_grant_waiting_for_evidence_never_answers_a_failover_in_progress() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    set_policy(&server, &app_id, "warm").await;
+    let res = owner
+        .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+        .json(&json!({ "ha_policy": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let seq = newest_write(&server, &lease_id).await;
+    let mut seen = follow_to(&mut on_a, seq).await;
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), None, 1, false)
+    );
+
+    set_policy(&server, &app_id, "warm").await;
+    after_a_tick(&mut on_a).await;
+    let res = owner
+        .post(server.url(&format!("/api/v1/apps/{app_id}/failover")))
+        .json(&json!({ "node_id": a.node_id }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = res.json().await.unwrap();
+    assert_ne!(body["reason"], "in_progress", "{body}");
+    assert_eq!(pending(&server, &owner, &app_id).await, (false, Vec::new()));
+}

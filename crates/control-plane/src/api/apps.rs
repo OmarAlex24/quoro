@@ -1731,6 +1731,8 @@ pub async fn update_app(
         Ok((mut app, vm_ids, warm_wake, ended)) => {
             // Section 8.4, "Ending the renewals" step 2: the `local` grant that
             // ends the renewals goes out once R is replicated and supported.
+            // Only a row R wrote is held so: one R found already `local` and
+            // marked may be a row whose grant with a new token is held.
             if let Some(lease) = ended {
                 state.hub.hold_local_end(&lease);
             }
@@ -1789,7 +1791,7 @@ async fn update_app_tx(
     let mut app = app_from_row(&row)?;
     let was_warm = app.ha_policy == HaPolicy::Warm;
     let mut changed = Vec::new();
-    // The lease row R left `local` and marked, when the policy leaves `warm`.
+    // The lease row R wrote `local` and marked, when the policy leaves `warm`.
     let mut ended = None;
 
     // A new replica count is checked against the app as it is now, and against
@@ -1994,8 +1996,8 @@ async fn update_app_tx(
 }
 
 /// What [`update_app_tx`] committed: the app, the VMs to wake, the nodes
-/// whose warm settings changed, and the lease row R wrote or found `local`
-/// and marked when the policy left `warm`.
+/// whose warm settings changed, and the lease row R wrote when the policy
+/// left `warm`.
 type UpdatedApp = (
     App,
     Vec<String>,

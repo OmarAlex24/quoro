@@ -3469,11 +3469,12 @@ impl Session {
                         // Any refusal of a same-token `local` grant drops its
                         // barrier `ping`: the `pong` after it writes nothing
                         // and passes no barrier. A `bad_message` refusal of
-                        // one the `hello` listed `held` or `uncertain` at that
-                        // token, or of the one that ends the renewals, means
-                        // the lease expired while the grant was on its way
-                        // (section 8.5, "Regrant from `hello`"; section 8.4,
-                        // "The holder fenced first").
+                        // one sent on a session whose `hello` listed the lease
+                        // `held` or `uncertain` at that token, the one that
+                        // ends the renewals included, means the lease expired
+                        // while the grant was on its way (section 8.5,
+                        // "Regrant from `hello`"; section 8.4, "The holder
+                        // fenced first").
                         self.regrant(&lease_id, token, outbox).await;
                     }
                 }

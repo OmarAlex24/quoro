@@ -1175,8 +1175,11 @@ pub(crate) async fn write_local_report(
 /// one change-log entry. Any mode is written: "The row stays `local` with the
 /// mark that R set", and marking more only delays a move ("The mark"). A row
 /// that already reads `local` with the mark is left as it is. Returns the
-/// row as it stands after the call, `None` when the app has no unrevoked
-/// lease.
+/// row R wrote, `None` when it wrote nothing: the app has no unrevoked
+/// lease, or its row already reads `local` with the mark. Only a row R wrote
+/// gets the same-token `local` grant that ends the renewals: its newest
+/// write is then R's, which gave no new token, so a held grant with a new
+/// token never stands behind it ([`crate::session`]'s held grants).
 ///
 /// # Errors
 ///
@@ -1193,7 +1196,7 @@ pub(crate) async fn end_renewals(
         return Ok(None);
     }
     if lease.mode == "local" && lease.unsettled {
-        return Ok(Some(lease));
+        return Ok(None);
     }
     sqlx::query("UPDATE leases SET mode = 'local', unsettled = 1 WHERE id = ?")
         .bind(&lease.id)

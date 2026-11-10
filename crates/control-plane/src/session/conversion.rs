@@ -1514,19 +1514,20 @@ pub(super) mod tests {
     }
 
     /// R, as `updateApp` writes it when the policy leaves `warm`: the policy
-    /// and the row in one single-writer transaction.
-    pub(in crate::session) async fn end_renewals(f: &Fixture) {
+    /// and the row in one single-writer transaction. The row R wrote, `None`
+    /// when it wrote nothing.
+    pub(in crate::session) async fn end_renewals(f: &Fixture) -> Option<Lease> {
         let mut w = f.state.store.begin_write().await.unwrap();
         sqlx::query("UPDATE apps SET ha_policy = 'none' WHERE id = ?")
             .bind(APP)
             .execute(&mut *w.tx)
             .await
             .unwrap();
-        leases::end_renewals(&mut w.tx, APP, &actor())
+        let written = leases::end_renewals(&mut w.tx, APP, &actor())
             .await
-            .unwrap()
             .unwrap();
         w.commit().await.unwrap();
+        written
     }
 
     pub(in crate::session) async fn set_policy(f: &Fixture, policy: &str) {
@@ -1564,11 +1565,12 @@ pub(super) mod tests {
         let mut w = f.state.store.begin_write().await.unwrap();
         let again = leases::end_renewals(&mut w.tx, APP, &actor())
             .await
-            .unwrap()
             .unwrap();
         w.commit().await.unwrap();
-        assert_eq!((again.mode.as_str(), again.unsettled), ("local", true));
-        assert_eq!(f.writes().await, writes + 1, "already local and marked");
+        assert_eq!(again, None, "already local and marked: nothing written");
+        let row = f.row().await;
+        assert_eq!((row.mode.as_str(), row.unsettled), ("local", true));
+        assert_eq!(f.writes().await, writes + 1);
 
         let mut w = f.state.store.begin_write().await.unwrap();
         leases::revoke_app_lease(&mut w.tx, APP, &actor())
