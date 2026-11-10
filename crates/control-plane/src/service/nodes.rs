@@ -2,7 +2,8 @@
 
 use crate::AppState;
 use crate::api::nodes::{
-    NODE_COLUMNS, Node, NodeList, PageParams, attach_log_position, node_from_row, tunnel_of,
+    NODE_COLUMNS, Node, NodeList, PageParams, attach_custody, attach_log_position, node_from_row,
+    tunnel_of,
 };
 use crate::api::page::finish;
 use crate::error::{ApiError, Target};
@@ -53,6 +54,7 @@ pub async fn list_nodes(
             node.tunnel = tunnel_of(state.store.pool(), &node.id).await?;
         }
         attach_log_position(state.store.pool(), &state.hub, &mut nodes).await?;
+        attach_custody(state.store.pool(), &state.keyring(), &mut nodes).await?;
         let (items, next_cursor) = finish(nodes, limit, |node| node.id.clone());
         let items = access
             .filter(state, items, |node| Resource {
@@ -100,6 +102,12 @@ pub async fn get_node(state: &AppState, ctx: &CallCtx, node_id: &str) -> Result<
         attach_log_position(
             state.store.pool(),
             &state.hub,
+            std::slice::from_mut(&mut node),
+        )
+        .await?;
+        attach_custody(
+            state.store.pool(),
+            &state.keyring(),
             std::slice::from_mut(&mut node),
         )
         .await?;

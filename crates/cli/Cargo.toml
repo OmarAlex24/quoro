@@ -82,7 +82,7 @@ axum = { version = "0.8", default-features = false, features = [
 axum-server = { version = "0.7", default-features = false, features = [
     "tls-rustls-no-provider",
 ] }
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 # The tests insert a personal API token and read the audit log with SQL; the
 # crate itself never touches a database.
 sqlx = { version = "0.8", default-features = false, features = [

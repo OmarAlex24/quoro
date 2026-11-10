@@ -660,6 +660,16 @@ impl NodeHub {
         }))
     }
 
+    /// The keys this primary holds, for the custody seals (section 7.2).
+    pub(crate) fn keyring(&self) -> crate::custody::Keyring<'_> {
+        crate::custody::Keyring {
+            cluster_id: &self.0.cluster_id,
+            keys: &self.0.keys,
+            data_key: &self.0.data_key,
+            tls: &self.0.config.tls,
+        }
+    }
+
     /// Woken by every answered `lease_revoke` and every session that ends.
     pub(crate) fn revoke_answers(&self) -> &Notify {
         &self.0.revoke_answers
@@ -2920,6 +2930,8 @@ impl Session {
                 ));
                 return true;
             }
+            self.bind_custody_key(hello.custody_public_key.as_deref(), &raw.id, outbox)
+                .await;
             if self.has_pending_fence_ack().await {
                 self.start_wait = Some(hello.stored_rev);
                 self.advance_start(outbox).await;
@@ -3248,6 +3260,33 @@ impl Session {
                     ),
                 }
             });
+        }
+    }
+
+    /// Binds the custody key the `hello` reported, or refuses a changed one
+    /// with `custody_key_changed`, non-fatal, after any `lease_revoke`
+    /// (sections 4.2 and 7.2, ADR 0231). A failed write is logged and the
+    /// session goes on: a failure to bind never takes a node offline.
+    async fn bind_custody_key(&self, reported: Option<&str>, re: &str, outbox: &mut Vec<String>) {
+        match crate::custody::bind_from_hello(
+            &self.hub.0.store,
+            self.hub.keyring(),
+            &self.node_id,
+            reported,
+        )
+        .await
+        {
+            Ok(crate::custody::Binding::KeyChanged) => outbox.push(protocol_error(
+                quoro_proto::ErrorCode::CustodyKeyChanged,
+                "the custody_public_key differs from the key the primary bound to this machine; \
+                 no seal is made to it",
+                false,
+                Some(re),
+            )),
+            Ok(crate::custody::Binding::Bound | crate::custody::Binding::Unchanged) => {}
+            Err(e) => {
+                tracing::warn!(%e, node_id = %self.node_id, "cannot bind the custody key");
+            }
         }
     }
 
@@ -5342,6 +5381,7 @@ mod tests {
                 secure_cookies: false,
                 public_url: None,
                 tls_fingerprint: String::new(),
+                tls: crate::custody::test_tls(),
                 node_network: crate::NodeNetwork {
                     subnet: "10.42.1.0/24".to_string(),
                     gateway: "10.42.1.1".to_string(),

@@ -109,6 +109,10 @@ pub enum ErrorCode {
     /// From M5b: the sender was the primary and has learned of a higher term
     /// (fatal, section 7.4).
     NotPrimary,
+    /// From M5b: the `custody_public_key` of a `hello` differs from the key
+    /// the primary bound to the machine (non-fatal, section 7.2). The session
+    /// goes on; the primary makes no seal to the new key.
+    CustodyKeyChanged,
 }
 
 /// The `data.reason` enum of the `node.fenced` event (section 8.5,

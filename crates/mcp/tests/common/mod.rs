@@ -113,6 +113,15 @@ pub async fn start() -> Server {
                 "0000000000000000000000000000000000000000000000000000000000000000"
             )
             .to_string(),
+            tls: {
+                let certified =
+                    rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+                quoro_control_plane::custody::TlsIdentity::from_pem(
+                    certified.cert.pem(),
+                    certified.key_pair.serialize_pem(),
+                )
+                .unwrap()
+            },
             node_network: NodeNetwork {
                 subnet: "10.42.1.0/24".to_string(),
                 gateway: "10.42.1.1".to_string(),

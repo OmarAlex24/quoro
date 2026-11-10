@@ -335,6 +335,9 @@ fn assert_log_lag(node: &Value, before: i64, after: i64) {
         before < reported && reported <= after,
         "{before} < {reported} <= {after}: {node}"
     );
+    // Every `Node` response carries `custody` too (section 7.2, "Status"):
+    // this machine has the `node` role and reported no custody key.
+    assert_eq!(node.get("custody"), Some(&Value::from("none")), "{node}");
 }
 
 async fn lease_row(server: &Server, lease_id: &str) -> (i64, Option<String>, String) {

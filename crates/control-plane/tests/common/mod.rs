@@ -9,12 +9,13 @@ pub mod machine;
 
 use quoro_control_plane::auth::setup_token;
 use quoro_control_plane::crypto::DataKey;
+use quoro_control_plane::custody::TlsIdentity;
 use quoro_control_plane::store::{Store, random_secret};
 use quoro_control_plane::{
     AppState, DigestResolver, NodeNetwork, ReferenceAsDigest, ServerConfig, router,
 };
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const OWNER_EMAIL: &str = "owner@example.com";
@@ -106,6 +107,26 @@ impl Server {
     }
 }
 
+/// The primary's TLS pair as `quoro serve` keeps it, `<data_dir>/tls/cert.pem`
+/// and `key.pem`: a self-signed pair from rcgen written on first use and read
+/// back after, so a restart on the same directory keeps its certificate.
+pub fn tls_identity(data_dir: &Path) -> TlsIdentity {
+    let dir = data_dir.join("tls");
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    if !cert_path.exists() {
+        std::fs::create_dir_all(&dir).unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+    }
+    TlsIdentity::from_pem(
+        std::fs::read_to_string(&cert_path).unwrap(),
+        std::fs::read_to_string(&key_path).unwrap(),
+    )
+    .unwrap()
+}
+
 /// Starts a control plane on 127.0.0.1 with an empty database.
 pub async fn start() -> Server {
     start_inner(200, 800, None, false).await
@@ -120,6 +141,14 @@ pub async fn start() -> Server {
 pub async fn start_in(data_dir: PathBuf) -> Server {
     let data_key = Arc::new(DataKey::load_or_create(&data_dir).unwrap());
     start_at(data_dir, 200, 800, None, data_key, false).await
+}
+
+/// [`start_in`] with the patient node sessions of
+/// [`start_with_patient_node_session`]: every key the primary holds is a file
+/// in `data_dir`, as in production, so a test can read the key files.
+pub async fn start_patient_in(data_dir: PathBuf) -> Server {
+    let data_key = Arc::new(DataKey::load_or_create(&data_dir).unwrap());
+    start_at(data_dir, 200, 30_000, None, data_key, false).await
 }
 
 /// Starts a control plane whose node sessions outlive the time a test spends
@@ -190,6 +219,7 @@ async fn start_at(
             secure_cookies: false,
             public_url: Some("https://primary.example:8443".to_string()),
             tls_fingerprint: TLS_FINGERPRINT.to_string(),
+            tls: tls_identity(&data_dir),
             node_network: NodeNetwork {
                 subnet: "10.42.1.0/24".to_string(),
                 gateway: "10.42.1.1".to_string(),
@@ -231,6 +261,34 @@ pub async fn restart_with_resolver(server: &Server, resolver: Arc<dyn DigestReso
         server.state.store.clone(),
         (*server.state.config).clone(),
         resolver,
+        Arc::clone(&server.state.data_key),
+    )
+    .await
+    .unwrap();
+    let app = router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Server {
+        base,
+        data_dir: server.data_dir.clone(),
+        state,
+    }
+}
+
+/// [`restart_with_resolver`] with [`ReferenceAsDigest`], except that the TLS
+/// pair is read again from `<data_dir>/tls/` with [`tls_identity`], as
+/// `quoro serve` reads it at every start: a test that replaced the files
+/// restarts on the new pair. Stop the first process's node sessions first.
+pub async fn restart_reloading_tls(server: &Server) -> Server {
+    let mut config = (*server.state.config).clone();
+    config.tls = tls_identity(&server.data_dir);
+    let state = AppState::open(
+        server.state.store.clone(),
+        config,
+        Arc::new(ReferenceAsDigest),
         Arc::clone(&server.state.data_key),
     )
     .await

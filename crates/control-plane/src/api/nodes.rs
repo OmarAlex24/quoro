@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::SqliteConnection;
 use sqlx::sqlite::SqliteRow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use utoipa::{IntoParams, ToSchema};
 
 /// The operation string recorded in the audit log.
@@ -79,9 +79,9 @@ pub struct Node {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<i64>, minimum = 0, required = false)]
     pub log_lag: Option<Option<i64>>,
-    /// Whether the cluster keys are sealed to this machine, or null without
-    /// the `node` role; absent until the promotion and custody work ships
-    /// (`node-agent-protocol.md` section 7.2).
+    /// Whether the cluster keys are sealed to this machine: `sealed`,
+    /// `pending`, `none` or `key_changed`, or null without the `node` role
+    /// (`node-agent-protocol.md` section 7.2). Always present.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<NodeCustody>, inline, required = false)]
     pub custody: Option<Option<NodeCustody>>,
@@ -351,6 +351,7 @@ pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
         // Both filled by `attach_log_position` (section 7.1, "Lag").
         log_seq: row.try_get("log_seq")?,
         log_lag: None,
+        // Filled by `attach_custody` (section 7.2, "Status").
         custody: None,
         fence_failure: optional_json_column(row, "fence_failure")?,
         // Filled by `attach_tunnel` from `node_tunnels` (ADR 0095).
@@ -407,6 +408,115 @@ where
         node.log_lag = Some(follows.then(|| head.saturating_sub(node.log_seq).max(0)));
     }
     Ok(())
+}
+
+/// A node's id, whether it has a bound custody key and a refused change, and
+/// one of its seals' `key_kind` and `key_id`, or none ([`attach_custody`]).
+type CustodyRow = (String, bool, bool, Option<String>, Option<String>);
+
+/// Fills `custody` of nodes built by [`node_from_row`]
+/// (`node-agent-protocol.md` section 7.2, "Status", ADR 0231):
+///
+/// - null for a machine without the `node` role;
+/// - `key_changed` once the machine reported a key other than the bound one;
+/// - `none` before it reports a custody key;
+/// - `sealed` when every key in use has a seal row for it;
+/// - `pending` otherwise.
+///
+/// It is never absent. The keys in use are the primary's own
+/// ([`crate::custody::Keyring::key_ids_in_use`]), computed once per call; the
+/// bound key, the refused change and the seal rows of `nodes` alone are read
+/// in one query, through `executor`.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn attach_custody<'e, E>(
+    executor: E,
+    keyring: &crate::custody::Keyring<'_>,
+    nodes: &mut [Node],
+) -> Result<(), ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; nodes.len()].join(", ");
+    let sql = format!(
+        "SELECT n.id, n.custody_public_key IS NOT NULL, n.custody_key_changed_at IS NOT NULL, \
+         k.key_kind, k.key_id \
+         FROM nodes n LEFT JOIN node_key_custody k ON k.node_id = n.id \
+         WHERE n.id IN ({placeholders})"
+    );
+    let mut query = sqlx::query_as::<_, CustodyRow>(&sql);
+    for node in nodes.iter() {
+        query = query.bind(&node.id);
+    }
+    let rows = query.fetch_all(executor).await?;
+    let mut read: HashMap<&str, CustodyRead<'_>> = HashMap::new();
+    for (id, has_key, has_changed, key_kind, key_id) in &rows {
+        let entry = read.entry(id.as_str()).or_insert_with(|| CustodyRead {
+            bound: *has_key,
+            changed: *has_changed,
+            sealed: Vec::new(),
+        });
+        if let (Some(key_kind), Some(key_id)) = (key_kind, key_id) {
+            entry.sealed.push((key_kind.as_str(), key_id.as_str()));
+        }
+    }
+    let in_use = keyring.key_ids_in_use();
+    for node in nodes {
+        let (bound, changed, sealed) = read
+            .get(node.id.as_str())
+            .map_or((false, false, &[][..]), |read| {
+                (read.bound, read.changed, read.sealed.as_slice())
+            });
+        node.custody = Some(custody_status(
+            node.roles.contains(&NodeRole::Node),
+            bound,
+            changed,
+            sealed,
+            &in_use,
+        ));
+    }
+    Ok(())
+}
+
+/// What [`attach_custody`] read for one node.
+struct CustodyRead<'a> {
+    /// Whether a custody key is bound.
+    bound: bool,
+    /// Whether a changed key was refused.
+    changed: bool,
+    /// The `(key_kind, key_id)` of each of its seals.
+    sealed: Vec<(&'a str, &'a str)>,
+}
+
+/// `Node.custody` from what [`attach_custody`] read (section 7.2, "Status").
+fn custody_status(
+    follows: bool,
+    bound: bool,
+    changed: bool,
+    sealed: &[(&str, &str)],
+    in_use: &[(quoro_proto::custody::KeyKind, String)],
+) -> Option<NodeCustody> {
+    if !follows {
+        return None;
+    }
+    let status = if changed {
+        NodeCustody::KeyChanged
+    } else if !bound {
+        NodeCustody::None
+    } else if in_use
+        .iter()
+        .all(|(kind, key_id)| sealed.contains(&(kind.as_str(), key_id.as_str())))
+    {
+        NodeCustody::Sealed
+    } else {
+        NodeCustody::Pending
+    };
+    Some(status)
 }
 
 /// The node's tunnel mapping, without the run token (`NodeTunnel`).
@@ -793,6 +903,12 @@ async fn fence_ack_tx(
     let mut node = node_from_row(&row)?;
     node.tunnel = tunnel_of(&mut *w.tx, node_id).await?;
     attach_log_position(&mut *w.tx, &state.hub, std::slice::from_mut(&mut node)).await?;
+    attach_custody(
+        &mut *w.tx,
+        &state.keyring(),
+        std::slice::from_mut(&mut node),
+    )
+    .await?;
     w.commit().await?;
     // The operator checked that the failed fence's VMs are stopped, and the
     // token moved as when declaring the node lost (section 8.5 step 3), so a
@@ -922,6 +1038,12 @@ async fn set_tunnel_tx(
     let mut node = node_from_row(&node)?;
     node.tunnel = tunnel_of(&mut *w.tx, node_id).await?;
     attach_log_position(&mut *w.tx, &state.hub, std::slice::from_mut(&mut node)).await?;
+    attach_custody(
+        &mut *w.tx,
+        &state.keyring(),
+        std::slice::from_mut(&mut node),
+    )
+    .await?;
     w.commit().await?;
     Ok(node)
 }

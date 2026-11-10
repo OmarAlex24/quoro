@@ -44,3 +44,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
 # The schema test reads the frozen openapi.yaml (ADR 0048).
 serde_norway = { version = "0.9", default-features = false }
+# A self-signed TLS pair for the test primary's `AppState`, whose custody
+# seals carry the certificate and key as PEM (ADR 0181). Already in the lock
+# file through the binary, with the same provider.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

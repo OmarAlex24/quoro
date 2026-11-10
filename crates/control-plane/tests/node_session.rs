@@ -758,9 +758,9 @@ async fn a_hello_mesh_key_is_stored_with_a_mesh_address() {
 }
 
 /// Sections 2.3, 5.1 and 7.2: from M5b the enroll request and every `hello`
-/// of a machine with the `node` role carry `custody_public_key`. A primary
-/// that does not bind the key yet accepts both messages, and the session
-/// starts as it did without the member (section 3).
+/// of a machine with the `node` role carry `custody_public_key`. The primary
+/// accepts both messages, and the session starts as it did without the member
+/// (section 3); `tests/custody.rs` covers the binding itself.
 #[tokio::test]
 async fn an_enroll_and_a_hello_with_a_custody_key_are_accepted() {
     let server = start_with_patient_node_session().await;

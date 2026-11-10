@@ -75,8 +75,11 @@ impl std::fmt::Debug for Secret {
 /// The cluster data-encryption keyring: one current key, ready for more.
 pub struct DataKey {
     key_id: [u8; KEY_ID_LEN],
-    /// Built once from the key bytes, which are wiped right after; the cipher
-    /// zeroizes its own key schedule on drop (`zeroize` feature).
+    /// The key bytes, wiped on drop. Only the custody seals read them
+    /// (`node-agent-protocol.md` section 7.2, [`DataKey::held_keys`]).
+    key: Zeroizing<[u8; 32]>,
+    /// Built once from the key bytes; the cipher zeroizes its own key
+    /// schedule on drop (`zeroize` feature).
     cipher: XChaCha20Poly1305,
 }
 
@@ -119,10 +122,14 @@ impl DataKey {
     }
 
     fn from_parts(key_id: [u8; KEY_ID_LEN], key: &[u8; 32]) -> Self {
-        let mut key = Key::from(*key);
-        let cipher = XChaCha20Poly1305::new(&key);
-        key.as_mut_slice().zeroize();
-        Self { key_id, cipher }
+        let mut cipher_key = Key::from(*key);
+        let cipher = XChaCha20Poly1305::new(&cipher_key);
+        cipher_key.as_mut_slice().zeroize();
+        Self {
+            key_id,
+            key: Zeroizing::new(*key),
+            cipher,
+        }
     }
 
     /// The id stored in front of every blob.
@@ -135,6 +142,18 @@ impl DataKey {
     #[must_use]
     pub fn key_id_hex(&self) -> String {
         hex(&self.key_id)
+    }
+
+    /// Every key id this keyring holds, as 32 lowercase hex characters,
+    /// with its 32-byte key, wiped when dropped. Today one. Only the custody
+    /// seals read them (`node-agent-protocol.md` section 7.2).
+    pub(crate) fn held_keys(&self) -> Vec<(String, Zeroizing<[u8; 32]>)> {
+        vec![(self.key_id_hex(), Zeroizing::new(*self.key))]
+    }
+
+    /// The key ids [`DataKey::held_keys`] returns, without the keys.
+    pub(crate) fn held_key_ids(&self) -> Vec<String> {
+        vec![self.key_id_hex()]
     }
 
     /// Encrypts `plaintext` for the column `aad_context` and the row `row_id`.
