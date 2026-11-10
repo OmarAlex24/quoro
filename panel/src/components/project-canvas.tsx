@@ -9,15 +9,17 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { useGetApp, useListApps } from '../api/generated/apps/apps';
-import type { Project } from '../api/generated/model';
+import { getListAppDeploymentsQueryOptions } from '../api/generated/deployments/deployments';
+import type { Deployment, Project } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { useListVms } from '../api/generated/vms/vms';
 import { appsPollingInterval, serviceLampState, warmListInterval, withOpenApp } from '../lib/app-status';
 import { appFailed, chooseAuras, vmFailed, waitsOnApproval } from '../lib/canvas-aura';
 import {
   autoLayout,
+  boardZoom,
   bounds,
   browserStorage,
   CARD_H,
@@ -33,16 +35,19 @@ import {
   type Point,
   type Positions,
 } from '../lib/canvas-layout';
+import { isDeploymentLive } from '../lib/deploy-tape';
 import { listIsConverging } from '../lib/lamp';
 import { problemView } from '../lib/problem';
 import { SERVICE_LIST_PARAMS } from '../lib/projects';
 import { appIdOfKey, lastBuildFailed, projectServices, type ServiceItem } from '../lib/services';
-import { useAppRuns } from '../lib/use-app-runs';
+import { RUN_PAGE, useAppRuns } from '../lib/use-app-runs';
 import { cachedBuildLive, useRecentBuilds } from '../lib/use-builds';
+import { useMedia } from '../lib/use-media';
+import { cn } from '../lib/utils';
 import { useSession } from '../session';
-import { AccessChip } from './access-chip';
 import { Aura } from './aura';
 import { EmptyState } from './empty-state';
+import { ProjectRail } from './project-rail';
 import { AppCard, VmCard } from './service-card';
 import { usePendingApprovals } from './shell/shell-data';
 import { Button } from './ui/button';
@@ -52,6 +57,12 @@ import { ProblemBanner } from './ui/problem-banner';
 const DRAG_THRESHOLD = 4;
 /** Room past the last card, so a card can be dragged further out. */
 const WORLD_PAD = 160;
+/** From this width the cards float on the field beside the rail; below it they stack. */
+const FLOATING = '(min-width: 1101px)';
+/** Up to this width the rail is narrower. */
+const NARROW_RAIL = '(max-width: 1180px)';
+/** The rail and its margins at the right of the field: 316 px wide (280 when narrow), 12 px on each side. */
+const RAIL_SPACE = { wide: 340, narrow: 304 } as const;
 
 interface Press {
   key: string;
@@ -72,11 +83,14 @@ interface Pan {
 
 /**
  * A project's canvas: one card per app and per standalone VM on a dotted
- * field, laid out by kind until someone moves a card. Cards drag with a
- * mouse or a pen and keep their place in this browser; the field pans by
- * dragging its background and zooms from the bottom-left. Each card is a
- * link in reading order, so Tab walks the cards and Enter opens one. No
- * line joins two services.
+ * field, laid out by kind until someone moves a card, and the project rail
+ * at its right. Wide, the cards drag with a mouse or a pen and keep their
+ * place in this browser; the field pans by dragging its background and zooms
+ * from the bottom-left, starting at the zoom that fits the board beside the
+ * rail. Narrower than 1101 px the cards stack in two columns (one on a
+ * phone) with the rail under them. Each card is a link in reading order, so
+ * Tab walks the cards and Enter opens one. While a sheet is open the rail
+ * gives way and the other cards dim. No line joins two services.
  */
 export function ProjectCanvas({
   projectId,
@@ -141,11 +155,36 @@ export function ProjectCanvas({
   const vms = useMemo(() => vmsQuery.data?.items ?? [], [vmsQuery.data]);
   const builds = useRecentBuilds(apps);
   const approvals = usePendingApprovals();
+  // Each app's runs, on the page the Deployments tab reads (same query keys,
+  // so the open app's sheet adds no request): every 2 s while one rolls out.
+  const deployments = useQueries({
+    queries: apps.map((app) =>
+      getListAppDeploymentsQueryOptions(app.id, RUN_PAGE, {
+        query: {
+          retry: false,
+          refetchInterval: (query) => {
+            const newest = query.state.data?.items[0];
+            return (newest && isDeploymentLive(newest.status)) || app.status === 'deploying' ? 2_000 : 10_000;
+          },
+        },
+      }),
+    ),
+    combine: (results) => {
+      const out: Record<string, Deployment[]> = {};
+      results.forEach((result, index) => {
+        const app = apps[index];
+        if (app && result.data) out[app.id] = result.data.items;
+      });
+      return out;
+    },
+  });
+  const nodes = useMemo(() => nodesQuery.data?.items ?? [], [nodesQuery.data]);
+  const [hl, setHl] = useState<string | null>(null);
+  const highlight = useMemo(() => ({ key: hl, set: setHl }), [hl]);
+  const [said, setSaid] = useState('');
+  const onDeployed = useCallback((name: string) => setSaid(`${name} deployed`), []);
 
-  const nodeNames = useMemo(
-    () => Object.fromEntries((nodesQuery.data?.items ?? []).map((node) => [node.id, node.name])),
-    [nodesQuery.data],
-  );
+  const nodeNames = useMemo(() => Object.fromEntries(nodes.map((node) => [node.id, node.name])), [nodes]);
   const services = useMemo(() => projectServices(projectId, apps, vms), [projectId, apps, vms]);
   const keys = useMemo(() => services.map((service) => service.key), [services]);
 
@@ -154,7 +193,10 @@ export function ProjectCanvas({
   const scrollRef = useRef<HTMLDivElement>(null);
   const slotRefs = useRef(new Map<string, HTMLDivElement>());
   const [viewport, setViewport] = useState({ w: 0, h: 0 });
-  const [zoom, setZoom] = useState(1);
+  const floating = useMedia(FLOATING);
+  const narrowRail = useMedia(NARROW_RAIL);
+  // Set once someone zooms or fits; until then the zoom follows the room.
+  const [userZoom, setUserZoom] = useState<number | null>(null);
   const [saved, setSaved] = useState<Positions>(() => readPositions(browserStorage(), projectId));
   const [drag, setDrag] = useState<{ key: string; point: Point } | null>(null);
   const press = useRef<Press | null>(null);
@@ -172,8 +214,12 @@ export function ProjectCanvas({
     return () => observer.disconnect();
   }, []);
 
-  const layoutWidth = viewport.w || CARD_W + 32;
-  const frame = useMemo(() => layoutFrame(layoutWidth), [layoutWidth]);
+  // The room left of the rail. The board is laid out for it at the zoom that
+  // fits it, so a narrower window keeps its columns, only smaller.
+  const room = Math.max(CARD_W + 32, (viewport.w || CARD_W + 32) - (narrowRail ? RAIL_SPACE.narrow : RAIL_SPACE.wide));
+  const autoZoom = boardZoom(room);
+  const zoom = floating ? (userZoom ?? autoZoom) : 1;
+  const frame = useMemo(() => layoutFrame(room / autoZoom), [room, autoZoom]);
   const positions = useMemo(() => autoLayout(services, saved, frame), [services, saved, frame]);
   const shown: Positions = drag ? { ...positions, [drag.key]: drag.point } : positions;
   const order = useMemo(() => readingOrder(positions, keys), [positions, keys]);
@@ -206,7 +252,7 @@ export function ProjectCanvas({
         left: Math.max(0, middleX * next - element.clientWidth / 2),
         top: Math.max(0, middleY * next - element.clientHeight / 2),
       };
-      setZoom(next);
+      setUserZoom(next);
     },
     [zoom],
   );
@@ -222,12 +268,13 @@ export function ProjectCanvas({
     if (!all) return;
     const view = fitView(all, { w: element.clientWidth, h: element.clientHeight });
     if (view.zoom === zoom) {
+      setUserZoom(view.zoom);
       element.scrollLeft = view.left;
       element.scrollTop = view.top;
       return;
     }
     pendingScroll.current = { left: view.left, top: view.top };
-    setZoom(view.zoom);
+    setUserZoom(view.zoom);
   }, [positions, zoom]);
 
   /* ---------- auras ---------- */
@@ -265,7 +312,7 @@ export function ProjectCanvas({
   /* ---------- dragging a card ---------- */
 
   const onCardPointerDown = (key: string) => (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.pointerType === 'touch' || event.button !== 0) return;
+    if (!floating || event.pointerType === 'touch' || event.button !== 0) return;
     const origin = positions[key];
     if (!origin) return;
     press.current = {
@@ -367,63 +414,126 @@ export function ProjectCanvas({
 
   const card = (service: ServiceItem) =>
     service.kind === 'vm' ? (
-      <VmCard selected={selected === service.key} vm={service.vm} nodeNames={nodeNames} />
+      <VmCard
+        selected={selected === service.key}
+        highlighted={hl === service.key}
+        vm={service.vm}
+        node={nodes.find((node) => node.id === service.vm.node_id)}
+        nodeNames={nodeNames}
+      />
     ) : (
       <AppCard
         selected={selected === service.key}
+        highlighted={hl === service.key}
         app={service.app}
         builds={builds[service.app.id]}
         run={runOf(service.app.id)}
-        nodeIds={vms.filter((vm) => vm.app_id === service.app.id).map((vm) => vm.node_id)}
+        instances={vms.filter((vm) => vm.app_id === service.app.id)}
+        deployments={deployments[service.app.id]}
         nodeNames={nodeNames}
+        onDeployed={onDeployed}
       />
     );
 
+  /** Pointing at a card, or focusing it, lights its cells in the rail. */
+  const pointAt = (key: string) => ({
+    onPointerEnter: () => setHl(key),
+    onPointerLeave: () => setHl(null),
+    onFocus: () => setHl(key),
+    onBlur: () => setHl(null),
+  });
+
+  const tools =
+    add && !empty ? (
+      <div className={cn('canvas-tools', !floating && 'canvas-tools-flow')}>
+        <Button variant="default" onClick={add} aria-keyshortcuts="Meta+K Control+K">
+          <Plus strokeWidth={1.7} aria-hidden="true" className="size-4" />
+          Add
+        </Button>
+      </div>
+    ) : null;
+
+  const rail =
+    services.length > 0 ? (
+      <ProjectRail
+        projectId={projectId}
+        project={project}
+        apps={apps}
+        vms={vms}
+        nodes={nodes}
+        builds={builds}
+        deployments={deployments}
+        loading={!loaded}
+        highlight={highlight}
+      />
+    ) : null;
+
   return (
-    <div className="canvas-stage">
-      <div
-        ref={scrollRef}
-        className="canvas-scroll"
-        style={{ backgroundSize: `${22 * zoom}px ${22 * zoom}px` }}
-        onPointerDown={onFieldPointerDown}
-        onPointerMove={onFieldPointerMove}
-        onPointerUp={onFieldPointerUp}
-        onPointerCancel={onFieldPointerUp}
-      >
-        <div className="canvas-sizer" style={{ width: worldW * zoom, height: worldH * zoom }}>
-          <div
-            className="canvas-world"
-            style={{ width: worldW, height: worldH, transform: `scale(${zoom})` }}
-          >
+    <div className="canvas-stage" data-sheet={selected ? '' : undefined} data-layout={floating ? 'float' : 'stack'}>
+      {floating ? (
+        <div
+          ref={scrollRef}
+          className="canvas-scroll"
+          style={{ backgroundSize: `${22 * zoom}px ${22 * zoom}px` }}
+          onPointerDown={onFieldPointerDown}
+          onPointerMove={onFieldPointerMove}
+          onPointerUp={onFieldPointerUp}
+          onPointerCancel={onFieldPointerUp}
+        >
+          <div className="canvas-sizer" style={{ width: worldW * zoom, height: worldH * zoom }}>
+            <div
+              className="canvas-world"
+              style={{ width: worldW, height: worldH, transform: `scale(${zoom})` }}
+            >
+              {order.map((key) => {
+                const service = byKey.get(key);
+                const point = shown[key];
+                if (!service || !point) return null;
+                const aura = auras[key];
+                return (
+                  <div
+                    key={key}
+                    ref={(element) => {
+                      if (element) slotRefs.current.set(key, element);
+                      else slotRefs.current.delete(key);
+                    }}
+                    className="canvas-slot"
+                    data-dragging={drag?.key === key ? '' : undefined}
+                    style={{ left: point.x, top: point.y, width: CARD_W, minHeight: CARD_H / 2 }}
+                    onPointerDown={onCardPointerDown(key)}
+                    onPointerMove={onCardPointerMove}
+                    onPointerUp={onCardPointerUp}
+                    onPointerCancel={onCardPointerCancel}
+                    onClickCapture={onCardClickCapture}
+                    {...pointAt(key)}
+                  >
+                    {aura ? <Aura tone={aura.tone} breathe={aura.breathe} /> : null}
+                    {card(service)}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div ref={scrollRef} className="canvas-scroll canvas-flow">
+          {tools}
+          <div className="canvas-stack">
             {order.map((key) => {
               const service = byKey.get(key);
-              const point = shown[key];
-              if (!service || !point) return null;
+              if (!service) return null;
               const aura = auras[key];
               return (
-                <div
-                  key={key}
-                  ref={(element) => {
-                    if (element) slotRefs.current.set(key, element);
-                    else slotRefs.current.delete(key);
-                  }}
-                  className="canvas-slot"
-                  data-dragging={drag?.key === key ? '' : undefined}
-                  style={{ left: point.x, top: point.y, width: CARD_W, minHeight: CARD_H / 2 }}
-                  onPointerDown={onCardPointerDown(key)}
-                  onPointerMove={onCardPointerMove}
-                  onPointerUp={onCardPointerUp}
-                  onPointerCancel={onCardPointerCancel}
-                  onClickCapture={onCardClickCapture}
-                >
+                <div key={key} className="canvas-cell" {...pointAt(key)}>
                   {aura ? <Aura tone={aura.tone} breathe={aura.breathe} /> : null}
                   {card(service)}
                 </div>
               );
             })}
           </div>
+          {rail}
         </div>
-      </div>
+      )}
 
       {empty ? (
         <div className="canvas-empty">
@@ -443,19 +553,12 @@ export function ProjectCanvas({
         </div>
       ) : null}
 
-      <div className="canvas-tools">
-        {project ? <AccessChip project={project} /> : null}
-        {add && !empty ? (
-          <Button variant="default" onClick={add} aria-keyshortcuts="Meta+K Control+K">
-            <Plus strokeWidth={1.7} aria-hidden="true" className="size-4" />
-            Add
-          </Button>
-        ) : null}
-      </div>
+      {floating ? tools : null}
+      {floating ? rail : null}
 
       {listError ? <ProblemBanner view={listError} className="canvas-problem" /> : null}
 
-      {services.length > 0 ? (
+      {floating && services.length > 0 ? (
         <div className="zoom" role="group" aria-label="Zoom">
           <button type="button" onClick={() => zoomTo(zoomIn(zoom))} aria-label="Zoom in">
             <Plus strokeWidth={1.7} aria-hidden="true" />
@@ -468,6 +571,10 @@ export function ProjectCanvas({
           </button>
         </div>
       ) : null}
+
+      <p className="sr-only" role="status">
+        {said}
+      </p>
     </div>
   );
 }

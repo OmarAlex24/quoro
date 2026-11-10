@@ -15,6 +15,7 @@ import { CreateSheet } from '../components/create-sheet';
 import { AppMetricsBay } from '../components/metrics-bay';
 import { LogTape } from '../components/log-tape';
 import { ProjectCanvas } from '../components/project-canvas';
+import { ProjectSummaryLine } from '../components/project-rail';
 import { ServiceSheet } from '../components/service-sheet';
 import { VmSheet } from '../components/vm-sheet';
 import { ProjectShell } from '../components/shell/project-shell';
@@ -143,6 +144,7 @@ function ProjectPage() {
       leaf={leaf}
       view={view}
       canvas={onCanvas}
+      summary={onCanvas ? <ProjectSummaryLine projectId={projectId} /> : undefined}
     >
       {content}
       {canAdd ? (
