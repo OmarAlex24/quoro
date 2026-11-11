@@ -687,6 +687,73 @@ async fn a_crash_after_an_unchanged_volume_is_marked_takes_no_copy() {
 }
 
 #[tokio::test]
+async fn a_marked_unchanged_or_gone_run_changes_nothing_until_the_volume_directory_is_back() {
+    for gone in [false, true] {
+        let h = Harness::new(if gone {
+            "handover-marked-gone-unmounted"
+        } else {
+            "handover-marked-unchanged-unmounted"
+        })
+        .await;
+        let path = returning_source(&h).await;
+        let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+        if gone {
+            h.engine.delete_volume(&vol()).await.expect("delete");
+        }
+        // The run that writes the mark fails to delete the live file.
+        h.engine
+            .fail_next(FakeOp::DeleteVolume, EngineError::Io("injected".to_owned()));
+        assert!(matches!(hand_over(&h).await, HandOver::Failed(_)));
+        let mark = if gone {
+            HandOverMark::Gone
+        } else {
+            HandOverMark::Unchanged
+        };
+        assert_eq!(
+            h.store.volume_hand_over_mark(VOL).await.expect("store"),
+            Some(mark.clone())
+        );
+
+        // The state disk did not mount: the volume directory is empty, while
+        // the store and the engine still name every file.
+        let mut paths = vec![base.location.as_path()];
+        if !gone {
+            paths.push(path.as_path());
+        }
+        let moved = move_away(&h, &paths);
+        for _ in 0..2 {
+            assert!(
+                matches!(hand_over(&h).await, HandOver::Failed(_)),
+                "gone {gone}"
+            );
+            assert!(
+                h.store.volume(VOL).await.expect("store").is_some(),
+                "gone {gone}: the row stays"
+            );
+            assert_eq!(
+                h.store.volume_hand_over_mark(VOL).await.expect("store"),
+                Some(mark.clone()),
+                "gone {gone}: the mark stands"
+            );
+            let error = h.row().await.error.expect("an error is shown");
+            assert!(error.contains("may not be the real one"), "{error}");
+        }
+        // The engine was not asked to delete the live file.
+        assert_eq!(
+            h.engine.volumes().iter().any(|(id, _)| *id == vol()),
+            !gone,
+            "gone {gone}"
+        );
+
+        // Mounted again: the hand-over ends.
+        move_back(&moved);
+        assert_eq!(hand_over(&h).await, HandOver::Done(None), "gone {gone}");
+        assert_handed_over(&h).await;
+        assert!(quarantined(&h).await.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn an_operator_s_delete_removes_the_copy_and_its_records_once() {
     let h = Harness::new("handover-delete").await;
     let mut listeners = BTreeMap::new();
