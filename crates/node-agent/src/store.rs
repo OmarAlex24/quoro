@@ -2239,6 +2239,27 @@ impl NodeStore {
         row.map(volume_quarantine_record).transpose()
     }
 
+    /// The clone path of the quarantined copy `quarantine_id`, read alone, so
+    /// a marked hand-over can check the clone while the rest of the row
+    /// cannot be read whole; `None` without such a row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn volume_quarantine_path(
+        &self,
+        quarantine_id: &str,
+    ) -> Result<Option<PathBuf>, AgentError> {
+        let path: Option<String> =
+            sqlx::query_scalar("SELECT path FROM quarantine WHERE kind = ? AND quarantine_id = ?")
+                .bind(VOLUME_KIND)
+                .bind(quarantine_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_error)?;
+        Ok(path.map(PathBuf::from))
+    }
+
     /// The `snapshot_id` of the quarantined copy `quarantine_id`, read alone,
     /// so a row that cannot be read whole can still be deleted; `None`
     /// without such a row.
@@ -5756,6 +5777,21 @@ mod tests {
         assert_eq!(
             store.volume_quarantines().await.unwrap(),
             vec![record.clone()]
+        );
+        // Its clone path read alone, for a marked hand-over.
+        assert_eq!(
+            store
+                .volume_quarantine_path(&record.quarantine_id)
+                .await
+                .unwrap(),
+            Some(record.path.clone())
+        );
+        assert_eq!(
+            store
+                .volume_quarantine_path("qrn_01JD0WARM0000000000000000Z")
+                .await
+                .unwrap(),
+            None
         );
         // Its id and snapshot read alone, for a delete.
         assert_eq!(

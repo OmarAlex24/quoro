@@ -754,6 +754,35 @@ async fn a_marked_unchanged_or_gone_run_changes_nothing_until_the_volume_directo
 }
 
 #[tokio::test]
+async fn a_marked_copy_whose_row_cannot_be_read_whole_still_hands_over() {
+    let h = Harness::new("handover-marked-unreadable").await;
+    let path = returning_source(&h).await;
+    keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+    diverge(&path);
+    let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
+    let copy = marked_copy(&h).await;
+    sqlx::query("UPDATE quarantine SET app_id = NULL WHERE quarantine_id = ?")
+        .bind(&copy.quarantine_id)
+        .execute(h.store.pool())
+        .await
+        .expect("damage the row");
+    assert!(
+        h.store
+            .volume_quarantine(&copy.quarantine_id)
+            .await
+            .is_err(),
+        "the row cannot be read whole"
+    );
+
+    // The marked run reads only the clone's path: the clone is there, so
+    // the live file goes and the copy keeps its writes.
+    assert_eq!(hand_over(&h).await, HandOver::Done(None));
+    assert_handed_over(&h).await;
+    assert!(copy.path.exists());
+    assert_eq!(read_at(&copy.path, 7 * CELL + 512, 8192), pattern(8192, 4));
+}
+
+#[tokio::test]
 async fn an_operator_s_delete_removes_the_copy_and_its_records_once() {
     let h = Harness::new("handover-delete").await;
     let mut listeners = BTreeMap::new();

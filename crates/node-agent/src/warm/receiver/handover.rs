@@ -384,9 +384,12 @@ impl<E: Engine + 'static> Inner<E> {
     ///   it was hashed (section 9 step 2). The live file is all that keeps
     ///   its writes now, so the mark goes and the next pass compares the
     ///   file again.
+    ///
+    /// Only the clone's path is read from the copy's row, so a row whose
+    /// other fields cannot be read does not hold the hand-over back.
     async fn copy_kept(&self, volume_id: &str, quarantine_id: &str) -> Result<(), HandOver> {
-        let record = match self.store.volume_quarantine(quarantine_id).await {
-            Ok(Some(record)) => record,
+        let clone = match self.store.volume_quarantine_path(quarantine_id).await {
+            Ok(Some(clone)) => clone,
             Ok(None) => {
                 self.clear_mark(volume_id).await?;
                 return Err(HandOver::Failed(format!(
@@ -400,7 +403,7 @@ impl<E: Engine + 'static> Inner<E> {
                 )));
             }
         };
-        match std::fs::symlink_metadata(&record.path) {
+        match std::fs::symlink_metadata(&clone) {
             Ok(_) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
