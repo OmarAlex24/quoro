@@ -1221,8 +1221,8 @@ pub(crate) struct Ended {
     /// R wrote the row ([`end_renewals`]).
     pub wrote: bool,
     /// R turned a row that read `expiring` into `local`: a grant with a new
-    /// token held for that row and not sent is dropped as R commits, with
-    /// `app.left_stopped` ("Ending the renewals").
+    /// token held for that row and not sent is dropped as R commits, and R's
+    /// transaction records `app.left_stopped` for it ("Ending the renewals").
     pub from_expiring: bool,
     /// The same-token `local` grant that ends the renewals is held for the
     /// row: it is unrevoked, marked and reads `local`, and its newest write

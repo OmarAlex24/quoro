@@ -23,8 +23,9 @@
 //!   grant stays, and a grant with a new token never goes out through this
 //!   path, which checks no gate. When R turns a row that reads `expiring`
 //!   into `local`, a grant with a new token held for it and not sent "is
-//!   dropped when R commits", with `app.left_stopped`
-//!   ([`NodeHub::end_renewals_committed`]).
+//!   dropped when R commits" ([`NodeHub::end_renewals_committed`]), and R's
+//!   own transaction records `app.left_stopped` for it
+//!   ([`NodeHub::record_left_stopped`]).
 //! - **Evidence.** "Ending the renewals" step 2: the primary "sends it only
 //!   on a session on which the holder showed that it holds the lease at the
 //!   row's token: its `hello` listed the lease `held` or `uncertain` at that
@@ -86,7 +87,7 @@ use quoro_proto::wire;
 use serde_json::json;
 use std::collections::HashMap;
 
-/// The `updateApp` call whose policy change off `warm` committed: what
+/// The `updateApp` call whose policy change off `warm` writes R: what
 /// `app.left_stopped` carries of it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PolicyChange<'a> {
@@ -96,6 +97,16 @@ pub(crate) struct PolicyChange<'a> {
     pub request_id: &'a str,
     /// The caller of `updateApp`.
     pub actor: &'a Actor,
+}
+
+/// The grant with a new token that R drops as it commits, which
+/// `app.left_stopped` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LeftStopped {
+    /// The node the dropped grant named.
+    pub node_id: String,
+    /// The dropped grant's token.
+    pub fencing_token: i64,
 }
 
 /// What one session knows of the `local` grants that end renewals.
@@ -214,14 +225,91 @@ impl NodeHub {
         }
     }
 
+    /// The grant with a new token that R drops as it commits, read in R's
+    /// transaction (`ended`), while it holds the writer gate: R turned a row
+    /// that read `expiring` into `local`, and the registry holds a grant
+    /// with a new token for that row, naming it (holder and token), not sent
+    /// and not dropped already ("Ending the renewals": "a grant with a new
+    /// token that the primary holds for that row and has not sent … is
+    /// dropped when R commits"). A grant goes out only under the writer
+    /// gate, so none can be sent between this read and R's commit. The
+    /// registry lock is held only for the read.
+    pub(crate) fn left_stopped(&self, ended: &leases::Ended) -> Option<LeftStopped> {
+        if !(ended.wrote && ended.from_expiring) {
+            return None;
+        }
+        let lease = &ended.lease;
+        let registry = self.0.held.lock().expect("held grant lock");
+        registry
+            .entries
+            .get(&lease.id)
+            .filter(|held| {
+                held.kind == Kind::NewToken
+                    && held.sent_on.is_none()
+                    && !held.grant_dropped
+                    && held.names(lease)
+            })
+            .map(|held| LeftStopped {
+                node_id: held.holder.clone(),
+                fencing_token: held.token,
+            })
+    }
+
+    /// Records `app.left_stopped` on `conn`, R's own transaction, when R
+    /// drops a grant as it commits ([`NodeHub::left_stopped`]), and returns
+    /// that grant. "The primary emits `app.left_stopped` as it drops the
+    /// grant", and `events.schema.json` has it emitted "right after the
+    /// change of the policy commits": written in the transaction that writes
+    /// R and the policy, it commits with that change, so no drop after the
+    /// commit can lose it, and a failed commit writes neither. The actor,
+    /// request id and project are those of the `updateApp` call (`by`).
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub(crate) async fn record_left_stopped(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        ended: &leases::Ended,
+        by: &PolicyChange<'_>,
+    ) -> Result<Option<LeftStopped>, ApiError> {
+        let Some(dropped) = self.left_stopped(ended) else {
+            return Ok(None);
+        };
+        let app_id = &ended.lease.resource_id;
+        events::emit(
+            conn,
+            NewEvent {
+                kind: "app.left_stopped",
+                source: Source::ControlPlane,
+                subject_type: "app",
+                subject_id: app_id,
+                project_id: Some(by.project_id),
+                request_id: Some(by.request_id),
+                actor: Some(by.actor),
+                data: json!({
+                    "app_id": app_id,
+                    "node_id": dropped.node_id,
+                    "fencing_token": dropped.fencing_token,
+                    "reason": "policy_left_warm",
+                }),
+            },
+        )
+        .await?;
+        Ok(Some(dropped))
+    }
+
     /// What follows a policy change off `warm` once `updateApp` committed it
-    /// ("Ending the renewals"), with `by` the call that made it.
+    /// ("Ending the renewals"). It runs in the poll that commits, with no
+    /// await, so a caller that goes away after the commit cannot skip it.
     ///
     /// - **The drop.** When R wrote the row, its newest write gives no new
     ///   token any more: "a grant with a new token that the primary holds
     ///   for that row and has not sent … is dropped when R commits". It goes
     ///   now, whether or not its holder is connected, so it no longer reads
-    ///   as pending. A grant held since for a newer token stays.
+    ///   as pending. A grant held since for a newer token stays. R's
+    ///   transaction already recorded `app.left_stopped` for it
+    ///   ([`NodeHub::record_left_stopped`]); nothing is recorded here.
     /// - **A held-back revoke.** An entry whose step-4 revoke is held back
     ///   for support keeps that revoke: section 5.1 revokes the lease its
     ///   holder listed at a lower token in the other mode, whatever R
@@ -230,25 +318,13 @@ impl NodeHub {
     ///   never reads as pending, and once the revoke goes out the next
     ///   attempt drops the entry ([`NodeHub::attempt_held`]). No `local`
     ///   grant is held over it.
-    /// - **The event.** When R turned a row that read `expiring` into
-    ///   `local` and the dropped grant named that row, "The primary emits
-    ///   `app.left_stopped` as it drops the grant", once: the drop or the
-    ///   mark is decided in one hold of the registry lock, and an entry
-    ///   already marked emits nothing again. R that wrote nothing, a grant
-    ///   already sent, one held for a newer token and the `local` grant
-    ///   that ends the renewals emit nothing; nor does a restarted primary,
-    ///   which "holds no such grant".
     ///
     /// Then the same-token `local` grant is held when [`leases::leave_warm`]
     /// found the row needs it.
-    pub(crate) async fn end_renewals_committed(
-        &self,
-        ended: &leases::Ended,
-        by: &PolicyChange<'_>,
-    ) {
+    pub(crate) fn end_renewals_committed(&self, ended: &leases::Ended) {
         let lease = &ended.lease;
         if ended.wrote {
-            let (dropped, named) = {
+            let dropped = {
                 let mut registry = self.0.held.lock().expect("held grant lock");
                 match registry.entries.get_mut(&lease.id) {
                     Some(held)
@@ -257,16 +333,14 @@ impl NodeHub {
                             && !held.grant_dropped
                             && held.token <= lease.fencing_token =>
                     {
-                        let named = held.names(lease);
                         if held.revoke_first.is_some() {
                             held.grant_dropped = true;
-                            (None, named.then(|| held.clone()))
+                            None
                         } else {
-                            let dropped = registry.entries.remove(&lease.id);
-                            (dropped.clone(), dropped.filter(|_| named))
+                            registry.entries.remove(&lease.id)
                         }
                     }
-                    _ => (None, None),
+                    _ => None,
                 }
             };
             if let Some(dropped) = &dropped {
@@ -277,61 +351,9 @@ impl NodeHub {
                 );
                 self.release_held_revoke(dropped);
             }
-            if let Some(named) = named
-                && ended.from_expiring
-            {
-                self.emit_left_stopped(lease, &named, by).await;
-            }
         }
         if ended.hold {
             self.hold_local_end(lease);
-        }
-    }
-
-    /// `app.left_stopped` for the grant `dropped` of `lease`'s app, in its
-    /// own write right after the policy change committed (`events.schema.json`
-    /// `data_app_left_stopped`: "Emitted by the control plane as it drops
-    /// the grant, right after the change of the policy commits; the actor is
-    /// the caller of updateApp"). The lease does not depend on it: a failed
-    /// write is logged.
-    async fn emit_left_stopped(&self, lease: &Lease, dropped: &HeldGrant, by: &PolicyChange<'_>) {
-        let written = async {
-            let mut w = self.0.store.begin_write().await?;
-            events::emit(
-                &mut w.tx,
-                NewEvent {
-                    kind: "app.left_stopped",
-                    source: Source::ControlPlane,
-                    subject_type: "app",
-                    subject_id: &lease.resource_id,
-                    project_id: Some(by.project_id),
-                    request_id: Some(by.request_id),
-                    actor: Some(by.actor),
-                    data: json!({
-                        "app_id": lease.resource_id,
-                        "node_id": dropped.holder,
-                        "fencing_token": dropped.token,
-                        "reason": "policy_left_warm",
-                    }),
-                },
-            )
-            .await?;
-            w.commit().await?;
-            Ok::<(), ApiError>(())
-        }
-        .await;
-        match written {
-            Ok(()) => tracing::info!(
-                app_id = %lease.resource_id,
-                node_id = %dropped.holder,
-                token = dropped.token,
-                "the policy left warm: the held grant was dropped and the app stays stopped"
-            ),
-            Err(e) => tracing::warn!(
-                code = %e.code.as_str(),
-                app_id = %lease.resource_id,
-                "cannot record app.left_stopped"
-            ),
         }
     }
 
@@ -979,9 +1001,9 @@ mod tests {
             .count_log_ack(&f.node_id, live.session.generation, seq);
     }
 
-    /// A policy change off `warm` as `updateApp` commits it: R and what
-    /// follows it read in the transaction, then the hub's part once it
-    /// commits.
+    /// A policy change off `warm` as `updateApp` commits it: R, what follows
+    /// it and `app.left_stopped` in the transaction, then the hub's part
+    /// once it commits.
     async fn r(f: &Fixture) {
         if f.writes().await == 0 {
             created(f).await;
@@ -995,12 +1017,16 @@ mod tests {
         let ended = crate::leases::leave_warm(&mut w.tx, APP, &actor())
             .await
             .unwrap();
-        w.commit().await.unwrap();
-        if let Some(ended) = ended {
+        if let Some(ended) = &ended {
             f.state
                 .hub
-                .end_renewals_committed(&ended, &by(&actor()))
-                .await;
+                .record_left_stopped(&mut w.tx, ended, &by(&actor()))
+                .await
+                .unwrap();
+        }
+        w.commit().await.unwrap();
+        if let Some(ended) = ended {
+            f.state.hub.end_renewals_committed(&ended);
         }
     }
 
@@ -1926,16 +1952,21 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let hub = &f.state.hub;
+        let left = hub
+            .record_left_stopped(&mut w.tx, &ended, &by(&actor()))
+            .await
+            .unwrap();
+        assert_eq!(left, None, "nothing held at R");
         w.commit().await.unwrap();
         assert!(ended.wrote && ended.hold);
         assert_eq!(ended.lease.fencing_token, 3);
         write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
         let row = f.row().await;
-        let hub = &f.state.hub;
         hub.hold_grant(&row);
         let held = hub.0.held.lock().unwrap().entries[LEASE].clone();
         assert_eq!((held.kind, held.token), (Kind::NewToken, 4));
-        hub.end_renewals_committed(&ended, &by(&actor())).await;
+        hub.end_renewals_committed(&ended);
         assert_eq!(
             hub.0.held.lock().unwrap().entries.get(LEASE),
             Some(&held),
@@ -2366,7 +2397,8 @@ mod tests {
             from_expiring: true,
             hold: false,
         };
-        hub.end_renewals_committed(&ended, &by(&actor())).await;
+        assert_eq!(hub.left_stopped(&ended), None);
+        hub.end_renewals_committed(&ended);
         assert_eq!(
             hub.0.held.lock().unwrap().entries.get(LEASE),
             Some(&held),
