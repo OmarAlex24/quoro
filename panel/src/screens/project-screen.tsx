@@ -5,9 +5,11 @@ import type { App, Project } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { useListProjects } from '../api/generated/projects/projects';
 import { useGetVm } from '../api/generated/vms/vms';
+import { REDUCED_MOTION } from '../lib/motion';
 import { problemView } from '../lib/problem';
 import { PROJECT_LIST_PARAMS } from '../lib/projects';
-import { sheetTab, vmSheetTab, type AddKind } from '../lib/routes';
+import { sheetTab, type AddKind, type ProjectTab } from '../lib/routes';
+import { SHEET_CLOSED, sheetLeft, sheetPresence, type SheetPresence, type SheetTarget } from '../lib/sheet-presence';
 import { appKey, vmKey } from '../lib/services';
 import { useSession } from '../session';
 import { CommandMenu } from '../components/command-menu';
@@ -26,6 +28,11 @@ import { EmptyState } from '../components/empty-state';
 import { SkeletonRows } from '../components/skeleton';
 
 const projectRoute = getRouteApi('/projects/$projectId');
+
+const noop = () => undefined;
+
+const reducedMotion = () =>
+  typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia(REDUCED_MOTION).matches;
 
 /**
  * `/projects/$projectId`: the project's top bar and rail around what is open.
@@ -79,6 +86,23 @@ function ProjectPage() {
         : vmKey(serviceVm)
       : undefined;
   const shortcut = canAdd && sheet === undefined;
+
+  // The sheet on screen: what the URL opens, and for one change of state after
+  // the URL closes it, the sheet sliding out with what it showed.
+  const wanted: SheetTarget | null = serviceApp
+    ? { kind: 'app', id: serviceApp, tab: sheetTab(search), build: search.build }
+    : serviceVm
+      ? { kind: 'vm', id: serviceVm, tab: 'overview' }
+      : null;
+  const [presence, setPresence] = useState<SheetPresence>(SHEET_CLOSED);
+  const nextPresence = sheetPresence(presence, wanted, reducedMotion());
+  if (nextPresence !== presence) setPresence(nextPresence);
+  const shown = nextPresence.shown;
+  const motion = {
+    enter: nextPresence.enter,
+    leaving: nextPresence.leaving,
+    onLeft: () => setPresence((current) => sheetLeft(current, shown)),
+  };
 
   // Cmd+K (Ctrl+K elsewhere) opens the Add menu while the canvas is in view
   // and no create sheet covers it.
@@ -153,17 +177,18 @@ function ProjectPage() {
       {sheet ? (
         <CreateSheet key={sheet} kind={sheet} projectId={projectId} onClose={closeSheet} />
       ) : null}
-      {serviceApp ? (
+      {shown?.kind === 'app' ? (
         <ServiceSheet
           projectId={projectId}
-          appId={serviceApp}
-          tab={sheetTab(search)}
-          buildId={search.build}
-          onClose={closeService}
+          appId={shown.id}
+          tab={shown.tab as ProjectTab}
+          buildId={shown.build}
+          onClose={motion.leaving ? noop : closeService}
+          motion={motion}
         />
       ) : null}
-      {serviceVm ? (
-        <VmSheet projectId={projectId} vmId={serviceVm} tab={vmSheetTab(search)} onClose={closeService} />
+      {shown?.kind === 'vm' ? (
+        <VmSheet projectId={projectId} vmId={shown.id} onClose={motion.leaving ? noop : closeService} motion={motion} />
       ) : null}
     </ProjectShell>
   );

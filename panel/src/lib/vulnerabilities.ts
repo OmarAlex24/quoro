@@ -138,6 +138,32 @@ export const dataAgeSentence = (
     ? `${source.ecosystem}: no data yet`
     : `${source.ecosystem}: data from ${relativeTime(source.data_modified_at, now)}`;
 
+/** `Debian:13` as a person writes it: `Debian 13`. */
+const ecosystemWords = (ecosystem: string): string => ecosystem.replace(':', ' ');
+
+/**
+ * What a clean report was checked against, for its empty state: the data of
+ * each ecosystem the image's inventory covers and how old it is, for example
+ * `Checked against Debian 13 data from 5 h ago.` Null when no data source
+ * covers the image, so the empty state says nothing it cannot back.
+ */
+export const checkedAgainstSentence = (
+  inventory: ImageInventoryStatus,
+  data: readonly VulnerabilityDataSource[],
+  now: number = Date.now(),
+): string | null => {
+  const covered = inventory.ecosystems;
+  const sources = data.filter(
+    (source) => source.data_modified_at !== null && (covered === undefined || covered.includes(source.ecosystem)),
+  );
+  if (sources.length === 0) return null;
+  const parts = sources.map(
+    (source) => `${ecosystemWords(source.ecosystem)} data from ${relativeTime(source.data_modified_at!, now)}`,
+  );
+  const list = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+  return `Checked against ${list}.`;
+};
+
 /** A resolved reason in words, as the app screen shows it. */
 export const resolvedReasonWords = (
   reason: VulnerabilityFindingResolvedReason,

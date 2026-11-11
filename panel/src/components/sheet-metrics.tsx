@@ -20,7 +20,7 @@ import { SkeletonCards } from './skeleton';
 
 const MIB = 1024 * 1024;
 
-/** The node samples every 5 s (D-0129); used until the history read says otherwise. */
+/** The node samples every 5 s; used until the history read says otherwise. */
 const DEFAULT_INTERVAL_S = 5;
 
 const COLLECTING = 'Collecting samples — the first one arrives within 5 s';
@@ -32,9 +32,11 @@ const lastOf = <T,>(items: readonly T[]): T | undefined => items[items.length - 
 
 /**
  * The Metrics tab: one instance at a time, picked above the charts, with its
- * CPU and memory as dithered areas over the ten minutes its node keeps
- * (D-0129). History comes from `getAppMetrics` and new samples from its
- * stream, as before; there is no range to pick because there is no more data.
+ * figures above two charts, CPU and memory as dithered areas over the ten
+ * minutes its node keeps. Each chart reads its exact value under the pointer
+ * or the arrow keys, as the node cards' do. History comes from
+ * `getAppMetrics` and new samples from its stream, each one redrawn as it
+ * lands; there is no range to pick because there is no more data.
  */
 export function MetricsTab({ app, nodeNames }: { app: AppDetail; nodeNames: Record<string, string> }) {
   const { instances, intervalS, status, problem } = useAppMetricsStream(app.id, app.id !== '');
@@ -86,8 +88,8 @@ export function MetricsTab({ app, nodeNames }: { app: AppDetail; nodeNames: Reco
 function StreamState({ status }: { status: MetricsStreamStatus }) {
   const readout = streamReadout(status);
   return (
-    <span className="mtop-state">
-      <LampDot ring={readout.tone} core={readout.tone} pulse={readout.pulse} size={12} />
+    <span className="live-chip">
+      <LampDot ring={readout.tone} core={readout.tone} pulse={readout.pulse} size={9} />
       {readout.words}
     </span>
   );
@@ -195,8 +197,12 @@ function InstanceCharts({
       </dl>
 
       <DitherArea
+        compact
+        timeAxis
+        className="chart-sheet"
         title="CPU"
         subtitle={last ? vcpuShareWords(last.vcpus) : 'share of the VM’s vCPUs'}
+        reading={last ? formatCpu(cpuValue(last)) : '—'}
         samples={samples}
         value={cpuValue}
         axis={cpuAxis(cpuPeak)}
@@ -206,8 +212,12 @@ function InstanceCharts({
         emptyText={COLLECTING}
       />
       <DitherArea
+        compact
+        timeAxis
+        className="chart-sheet"
         title="Memory"
         subtitle="VMM resident memory, MiB"
+        reading={last ? formatMemory(memoryValue(last)) : '—'}
         samples={samples}
         value={memoryValue}
         axis={niceAxis(Math.max(memoryTotal, memoryPeak) / MIB)}

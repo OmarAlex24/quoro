@@ -30,9 +30,11 @@ const statusWords: Record<TapeStatus, string> = {
 /**
  * An app's live log in the shared log body: each line with its time, stderr
  * in the fault colour. Follow keeps the newest line in view; Pause holds the
- * view still while lines keep arriving.
+ * view still while lines keep arriving. `fill` is the service sheet's: the
+ * state in a small chip, and a box as tall as its lines up to the room the
+ * sheet has left, so a few lines never sit in a tall empty box.
  */
-export function LogTape({ appId, tall = false }: { appId: string; tall?: boolean }) {
+export function LogTape({ appId, fill = false }: { appId: string; fill?: boolean }) {
   const [lines, setLines] = useState<LogEntry[]>([]);
   const [status, setStatus] = useState<TapeStatus>('connecting');
   const [problem, setProblem] = useState<ProblemView | null>(null);
@@ -170,27 +172,42 @@ export function LogTape({ appId, tall = false }: { appId: string; tall?: boolean
 
   const caption = status === 'error' && problem ? problem.message : statusWords[status];
 
+  const lineCount = (
+    <span className={fill ? 'sh-lbl tabular-nums' : 'type-data ml-1 text-[13px] text-ink-2'}>
+      {lines.length} {lines.length === 1 ? 'line' : 'lines'}
+    </span>
+  );
+
   return (
-    <section>
+    <section className={fill ? 'logtape-fill' : undefined}>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <div className="flex items-center gap-2">
-          <ToneLamp
-            tone={statusTone(status)}
-            pulse={status === 'connecting'}
-            size={18}
-            label={statusWords[status]}
-          />
-          <span className="type-body-medium text-[13px] text-ink">{caption}</span>
-        </div>
+        {fill ? (
+          <span className={cn('live-chip', status === 'error' && problem && 'live-chip-wrap')}>
+            <ToneLamp tone={statusTone(status)} pulse={status === 'connecting'} size={9} label={statusWords[status]} />
+            <span>{caption}</span>
+          </span>
+        ) : (
+          <div className="flex items-center gap-2">
+            <ToneLamp
+              tone={statusTone(status)}
+              pulse={status === 'connecting'}
+              size={18}
+              label={statusWords[status]}
+            />
+            <span className="type-body-medium text-[13px] text-ink">{caption}</span>
+          </div>
+        )}
 
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          {fill ? lineCount : null}
           {!follow ? (
-            <Button variant="ghost" className="px-2.5" onClick={jumpToNewest}>
+            <Button variant="ghost" size={fill ? 'sm' : 'default'} className="px-2.5" onClick={jumpToNewest}>
               Jump to newest
             </Button>
           ) : null}
           <Button
             variant="ghost"
+            size={fill ? 'sm' : 'default'}
             className="px-2.5"
             aria-pressed={follow}
             onClick={() => setFollow((current) => !current)}
@@ -199,15 +216,14 @@ export function LogTape({ appId, tall = false }: { appId: string; tall?: boolean
           </Button>
           <Button
             variant="ghost"
+            size={fill ? 'sm' : 'default'}
             className="px-2.5"
             aria-pressed={paused}
             onClick={togglePause}
           >
             {paused ? 'Resume' : 'Pause'}
           </Button>
-          <span className="type-data ml-1 text-[13px] text-ink-2">
-            {lines.length} {lines.length === 1 ? 'line' : 'lines'}
-          </span>
+          {fill ? null : lineCount}
         </div>
       </div>
 
@@ -223,7 +239,7 @@ export function LogTape({ appId, tall = false }: { appId: string; tall?: boolean
         }}
         className={cn(
           'logs mt-2 overflow-y-auto',
-          tall ? 'h-[max(320px,calc(100dvh-300px))]' : 'h-[280px] sm:h-[360px]',
+          fill ? 'logs-fill' : 'h-[280px] sm:h-[360px]',
         )}
       >
         {lines.length === 0 ? (

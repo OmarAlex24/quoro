@@ -189,16 +189,10 @@ function DangerZone({ app }: { app: AppDetail }) {
   });
 
   return (
-    <Group title="Danger zone">
-      <div className="box box-danger flex flex-wrap items-center gap-x-4 gap-y-3 px-4 py-4">
-        <div className="min-w-0 flex-1">
-          <p className="text-[13.5px] font-medium text-ink">Delete this app</p>
-          <p className="mt-0.5 text-[12.5px] leading-snug text-ink-2">
-            Its VM, domains and environment are removed. This cannot be undone.
-          </p>
-        </div>
-        <Button variant="danger" disabled={remove.isPending} onClick={() => setConfirm(true)}>
-          Delete
+    <section className="grid gap-2.5" aria-label="Delete the app">
+      <div>
+        <Button size="sm" variant="danger" disabled={remove.isPending} onClick={() => setConfirm(true)}>
+          Delete app…
         </Button>
       </div>
       {problem ? <ProblemBanner view={problem} /> : null}
@@ -206,7 +200,7 @@ function DangerZone({ app }: { app: AppDetail }) {
       <Dialog open={confirm} onOpenChange={setConfirm}>
         <DialogContent
           title="Delete app"
-          description={`Delete ${app.name}? Its VM, domains and environment are removed.`}
+          description={`Delete ${app.name}? Its VM, domains and environment are removed. This cannot be undone.`}
         >
           <div className="flex flex-wrap justify-end gap-2">
             <Button variant="default" onClick={() => setConfirm(false)}>
@@ -218,6 +212,6 @@ function DangerZone({ app }: { app: AppDetail }) {
           </div>
         </DialogContent>
       </Dialog>
-    </Group>
+    </section>
   );
 }

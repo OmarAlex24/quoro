@@ -7604,6 +7604,419 @@
     }
   }
 
+  /* ---------- The service sheet, as the refinement proposal draws it ---------- */
+
+  /*
+   * 640 px wide, 10 px from the right and bottom edges, every corner 14 px.
+   * The slide in and out is `useSheetMotion`'s (280 ms, 200 ms fade), so the
+   * create sheets' CSS entrance stays off here.
+   */
+  .sheet.svc-sheet {
+    bottom: 10px;
+    width: min(640px, calc(100vw - 20px));
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    animation: none;
+  }
+
+  .sheet.svc-sheet[data-leaving] {
+    pointer-events: none;
+  }
+
+  .svc-sheet .sh-head {
+    gap: 8px;
+    padding: 18px 20px 0;
+  }
+
+  .svc-sheet .sh-name {
+    font-stretch: 116%;
+    font-weight: 620;
+  }
+
+  .svc-sheet .tabs.sh-tabs {
+    padding: 12px 14px 0;
+  }
+
+  /* A VM has one pane: the rule the tab row would draw, and no tabs. */
+  .sh-rule {
+    margin-top: 14px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  /* Rows as tall as their content: a box that clips its corners never shrinks to fit. */
+  .svc-sheet .sh-body {
+    grid-auto-rows: max-content;
+    gap: 14px;
+    padding: 18px 20px 22px;
+  }
+
+  /* Logs: the box is as tall as its lines, up to the room the sheet has left. */
+  .svc-sheet .sh-body.sh-body-fill {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .logtape-fill {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .logs.logs-fill {
+    flex: 0 1 auto;
+    min-height: 0;
+    box-shadow: inset 0 2px 10px rgb(0 0 0 / 0.25);
+  }
+
+  /* A small label and a row that holds one with its action. */
+  .sh-lbl {
+    font-size: var(--type-min);
+    font-weight: 500;
+    color: var(--ink-3);
+  }
+
+  .sh-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  /* The state of a live stream, in a small chip: Live, Connecting, Node unreachable. */
+  .live-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 22px;
+    padding: 0 8px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background-color: color-mix(in oklab, var(--surface) 80%, transparent);
+    font-size: var(--type-min);
+    color: var(--ink-2);
+    white-space: nowrap;
+  }
+
+  .live-chip-wrap {
+    padding-top: 3px;
+    padding-bottom: 3px;
+    white-space: normal;
+  }
+
+  /* In the sheet a label keeps its column on a phone too, as the proposal draws it. */
+  .svc-sheet .set-row {
+    grid-template-columns: 132px minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  /* Variables: the name as code, when it was set, and that its value stays hidden. */
+  .set-row dt.type-code {
+    font-size: 11.5px;
+    color: var(--ink);
+    overflow-wrap: anywhere;
+  }
+
+  .set-row dd.set-row-tags {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 10px;
+    color: var(--ink-2);
+  }
+
+  /* The newest run: its heading on the surface, its body sunk. */
+  .svc-sheet .run-box {
+    overflow: hidden;
+    background-color: var(--sunk);
+    box-shadow: inset 0 1px 0 var(--hi);
+    transition: border-color var(--motion-change) var(--ease);
+  }
+
+  .svc-sheet .run-box-live {
+    border-color: color-mix(in oklab, var(--shift) 50%, var(--line));
+  }
+
+  .svc-sheet .run-box > .box-h {
+    gap: 10px;
+    padding: 11px 14px;
+    background-color: var(--surface);
+  }
+
+  .svc-sheet .run-box > .box-h .box-t b {
+    font-weight: 600;
+  }
+
+  .svc-sheet .run-box > .box-h .box-t small,
+  .svc-sheet .run-box .phase-h small {
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+
+  .svc-sheet .run-box > .box-b {
+    display: grid;
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .svc-sheet .run-box .phase-h {
+    margin-bottom: 0;
+  }
+
+  .svc-sheet .run-box .phase-h small {
+    display: block;
+  }
+
+  .svc-sheet .run-box .phase-h b {
+    font-stretch: 108%;
+    font-weight: 620;
+    font-size: 16px;
+  }
+
+  .svc-sheet .run-box .elapsed b {
+    font-stretch: 112%;
+    font-weight: 620;
+    font-size: 24px;
+  }
+
+  /* The steps: the running one says so in amber over an amber rule, on no amber fill. */
+  .svc-sheet .stepper {
+    border-radius: 8px;
+    background-color: var(--surface);
+  }
+
+  .svc-sheet .stp {
+    padding: 8px 10px;
+  }
+
+  .svc-sheet .stp-n {
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+
+  .svc-sheet .stp-v {
+    font-size: 13.5px;
+    font-weight: 600;
+  }
+
+  .svc-sheet .stp-live,
+  .svc-sheet .stp-fail {
+    background-color: var(--sunk);
+    box-shadow: inset 0 -2px 0 var(--shift);
+  }
+
+  .svc-sheet .stp-fail {
+    box-shadow: inset 0 -2px 0 var(--fault);
+  }
+
+  /* Amber words: nearly the tone in dark, mixed with ink in light, so they read at 4.5:1. */
+  .svc-sheet .stp-live .stp-v {
+    color: color-mix(in oklab, var(--shift) var(--tag-ink), var(--ink));
+  }
+
+  .svc-sheet .stp-next .stp-v,
+  .svc-sheet .stp-skip .stp-v {
+    color: var(--ink-3);
+    font-weight: 500;
+  }
+
+  .svc-sheet .tape {
+    height: 6px;
+    margin-top: 0;
+  }
+
+  .svc-sheet .tape-seg {
+    height: 6px;
+    border-radius: 0;
+  }
+
+  .svc-sheet .run-box .bsteps,
+  .svc-sheet .run-box .progress-lines {
+    margin-top: 2px;
+  }
+
+  /* History: a label, then one row per earlier run with its kind, its words and its tape. */
+  .svc-sheet .hist {
+    display: grid;
+    gap: 8px;
+  }
+
+  .svc-sheet .hist-box {
+    overflow: hidden;
+  }
+
+  .svc-sheet .hist-box .box-row {
+    gap: 9px;
+    padding: 9px 12px;
+    transition: background-color var(--motion-feedback) var(--ease);
+  }
+
+  .svc-sheet .hist-box .box-t b {
+    font-weight: 600;
+    font-size: var(--type-small);
+  }
+
+  .svc-sheet .hist-box .box-t small {
+    flex-wrap: nowrap;
+    overflow: hidden;
+    gap: 4px;
+    font-size: var(--type-min);
+    color: var(--ink-3);
+    white-space: nowrap;
+  }
+
+  .hist-word {
+    font-weight: 560;
+  }
+
+  .hist-word-run {
+    color: color-mix(in oklab, var(--run) var(--tag-ink), var(--ink));
+  }
+
+  .hist-word-shift {
+    color: color-mix(in oklab, var(--shift) var(--tag-ink), var(--ink));
+  }
+
+  .hist-word-fault {
+    color: color-mix(in oklab, var(--fault) var(--tag-ink), var(--ink));
+  }
+
+  .hist-word-plain {
+    color: var(--ink-2);
+  }
+
+  .svc-sheet .minitape {
+    width: 70px;
+    height: 5px;
+    gap: 1px;
+  }
+
+  .svc-sheet .minitape i {
+    height: 5px;
+    border-radius: 0;
+    background-color: var(--accent);
+    background-image: repeating-conic-gradient(var(--ion) 0 25%, transparent 0 50%);
+    background-size: 4px 4px;
+  }
+
+  .svc-sheet .minitape i.mt-f {
+    background: var(--fault);
+  }
+
+  .svc-sheet .minitape i.mt-l {
+    background: var(--shift);
+  }
+
+  .svc-sheet .minitape i.mt-s {
+    background: var(--idle);
+  }
+
+  .svc-sheet .minitape i.mt-g {
+    background: transparent;
+  }
+
+  /* Figures: sunk, each with its small label over it. */
+  .svc-sheet .stats {
+    overflow: hidden;
+    background-color: var(--sunk);
+    box-shadow: inset 0 1px 0 var(--hi);
+  }
+
+  .svc-sheet .stats > div {
+    padding: 10px 14px 12px;
+  }
+
+  .svc-sheet .stats dt {
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+
+  .svc-sheet .stats dd {
+    font-stretch: 100%;
+    font-weight: 620;
+  }
+
+  .svc-sheet .stats dd em {
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+
+  .svc-sheet .stats dd.stats-word {
+    padding-top: 4px;
+    font-size: 14px;
+  }
+
+  @media (min-width: 560px) {
+    .stats.stats-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+
+  /* The sheet's charts: the newest value in the heading, 112 px of area, the time under it. */
+  .chart.chart-sm.chart-sheet {
+    gap: 8px;
+    padding: 11px 14px 10px;
+  }
+
+  .chart-sheet .chart-h span {
+    font-size: var(--type-small);
+  }
+
+  .chart-sheet .chart-plot {
+    height: 112px;
+  }
+
+  .chart-ax {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--ink-3);
+  }
+
+  @media (max-width: 767.98px) {
+    .sheet.svc-sheet {
+      /* Under the top bar and the flat rail (101 px), the screen's width and the rest of its height. */
+      top: 101px;
+      bottom: 0;
+      width: auto;
+      border: 0;
+      border-radius: 0;
+    }
+
+    .svc-sheet .sh-head {
+      padding: 14px 14px 0;
+    }
+
+    .svc-sheet .tabs.sh-tabs {
+      padding: 12px 6px 0;
+    }
+
+    .svc-sheet .sh-body {
+      padding: 14px;
+    }
+  }
+
+  @media (max-width: 559.98px) {
+    /* Four steps still fit side by side on a phone, as drawn. */
+    .svc-sheet .stepper[data-n='4'] {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .svc-sheet .stepper[data-n='4'] .stp {
+      padding: 7px 8px;
+      border-top: 0;
+      border-left: 1px solid var(--line);
+    }
+
+    .svc-sheet .stepper[data-n='4'] .stp:first-child {
+      border-left: 0;
+    }
+
+    .svc-sheet .box-row .minitape {
+      width: 56px;
+    }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .lamp-pulse,
     .sweep,

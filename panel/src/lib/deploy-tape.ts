@@ -465,6 +465,34 @@ export function remainingSeconds(timeline: RunTimeline, estimate: Estimate | nul
   return rest;
 }
 
+/* ---------- the rollout, apart from the build before it ---------- */
+
+export interface RolloutView {
+  /** The steps the run box draws as cells and on its tape. */
+  readonly steps: readonly StepSpan[];
+  /** The queue and build said in words once the build succeeded: `rollout after 5s queued and a 1m 05s build`. */
+  readonly before: string | null;
+}
+
+/**
+ * What the run box draws. Once a run's build has succeeded, its cells and
+ * tape are the rollout's four steps and the queue and build become words
+ * beside them, as the proposal draws a Git app's deploy. While the build is
+ * queued or running, or when it failed or was cancelled, all six steps stay,
+ * since the build is where the run is.
+ */
+export function rolloutView(timeline: RunTimeline): RolloutView {
+  const build = timeline.steps.find((step) => step.step === 'build');
+  if (timeline.kind !== 'git' || build === undefined || build.state !== 'done') {
+    return { steps: timeline.steps, before: null };
+  }
+  const queue = timeline.steps.find((step) => step.step === 'queue');
+  const steps = timeline.steps.filter((step) => step.step !== 'queue' && step.step !== 'build');
+  const built = build.seconds === null ? 'a build' : `a ${formatSpan(build.seconds)} build`;
+  const queued = queue?.seconds !== null && queue?.seconds !== undefined ? `${formatSpan(queue.seconds)} queued and ` : '';
+  return { steps, before: `rollout after ${queued}${built}` };
+}
+
 /* ---------- the mini tape of a history row ---------- */
 
 export type MiniTone = 'done' | 'live' | 'failed' | 'stopped' | 'rest';
@@ -750,4 +778,43 @@ export function runTag(
     case 'superseded':
       return { word: 'Superseded', tone: 'plain' };
   }
+}
+
+/** What the tape draws dotted after the recorded steps of a live run. */
+export interface TapeRest {
+  /** One dotted span per entry, in seconds, on the same scale as the recorded steps. */
+  readonly spans: readonly number[];
+  /** From the estimate of earlier deploys; false when only the steps to come are known. */
+  readonly estimated: boolean;
+  /** The steps not reached yet, in order. */
+  readonly pending: readonly TapeStep[];
+  /** The step under way. */
+  readonly live: TapeStep;
+}
+
+/**
+ * The dotted rest of a live run's tape. With an estimate it is one span of
+ * what is left. Without one, as on the first deploy of its kind, every step
+ * is taken to last as long as the mean finished step (or, before any has
+ * finished, as long as the one under way has run): the step under way gets
+ * what it has left of that and each step not reached a whole one, so the
+ * tape never looks finished while the run goes on. Null for a run that is
+ * over, or when nothing is left to draw.
+ */
+export function tapeRest(steps: readonly StepSpan[], remaining: number | null): TapeRest | null {
+  const live = steps.find((step) => step.state === 'live');
+  if (!live) return null;
+  const pending = steps.filter((step) => step.state === 'pending').map((step) => step.step);
+  if (remaining !== null) {
+    return remaining > 0 ? { spans: [remaining], estimated: true, pending, live: live.step } : null;
+  }
+  const done = steps.filter((step) => step.state === 'done' && step.seconds !== null && step.seconds > 0);
+  const typical =
+    done.length > 0 ? done.reduce((total, step) => total + (step.seconds ?? 0), 0) / done.length : (live.seconds ?? 0);
+  if (typical <= 0) return null;
+  const rest = Math.max(0, typical - (live.seconds ?? 0));
+  // What the step under way has left joins the first step to come: one dotted run of "not yet".
+  const spans = pending.map((_, index) => (index === 0 ? typical + rest : typical));
+  if (spans.length === 0 && rest > 0) spans.push(rest);
+  return spans.length > 0 ? { spans, estimated: false, pending, live: live.step } : null;
 }

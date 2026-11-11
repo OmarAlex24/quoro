@@ -16,7 +16,6 @@ import {
   validateNodesSearch,
   validateProjectSearch,
   validateProjectsSearch,
-  vmSheetTab,
   type LegacyUrl,
 } from './routes';
 
@@ -173,12 +172,7 @@ describe('search validators', () => {
     expect(validateProjectSearch({ add: 'app' })).toEqual({});
   });
 
-  it('opens a VM on Overview, or on Settings when the URL names it', () => {
-    expect(vmSheetTab(validateProjectSearch({ vm: VM }))).toBe('overview');
-    expect(vmSheetTab(validateProjectSearch({ vm: VM, tab: 'settings' }))).toBe('settings');
-    expect(vmSheetTab(validateProjectSearch({ vm: VM, tab: 'overview' }))).toBe('overview');
-    // An app's tab on a VM falls back to Overview, and the other way round.
-    expect(vmSheetTab(validateProjectSearch({ vm: VM, tab: 'deployments' }))).toBe('overview');
+  it('keeps a VM link that names a tab of the old VM sheet, and an app falls back from it', () => {
     expect(validateProjectSearch({ vm: VM, tab: 'overview' })).toEqual({ vm: VM, tab: 'overview' });
     expect(sheetTab(validateProjectSearch({ app: APP, tab: 'overview' }))).toBe('deployments');
     expect(sheetTab(validateProjectSearch({ app: APP, tab: 'settings' }))).toBe('settings');

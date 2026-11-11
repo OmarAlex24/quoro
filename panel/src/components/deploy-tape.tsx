@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { Check, X } from 'lucide-react';
+import { X } from 'lucide-react';
 import { useCallback, type CSSProperties } from 'react';
 import {
   formatClock,
   formatSpan,
   TAPE_STEP_LABELS,
+  tapeRest,
   type BuildkitStep,
   type Estimate,
   type MiniSegment,
   type NodeLineSpan,
-  type RunTimeline,
   type StepSpan,
   type StepState,
 } from '../lib/deploy-tape';
@@ -22,7 +22,6 @@ import {
 } from '../lib/dither-draw';
 import { cn } from '../lib/utils';
 import { DitherCanvas } from './dither-canvas';
-import { LampDot } from './lamp';
 import { Tag } from './ui/tag';
 
 const STATE_WORDS: Record<StepState, string> = {
@@ -43,16 +42,16 @@ const STEP_CLASS: Record<StepState, string> = {
   skipped: 'stp-skip',
 };
 
-const stepValue = (step: StepSpan, typical: number | undefined): string => {
+const stepValue = (step: StepSpan, live: boolean): string => {
   switch (step.state) {
     case 'done':
     case 'failed':
     case 'stopped':
       return step.seconds === null ? '—' : formatSpan(step.seconds);
     case 'live':
-      return formatClock(step.seconds ?? 0);
+      return 'Running';
     case 'pending':
-      return typical === undefined ? 'Waiting' : `about ${formatSpan(typical)}`;
+      return live ? 'Waiting' : 'Not reached';
     case 'skipped':
       return '—';
   }
@@ -60,11 +59,11 @@ const stepValue = (step: StepSpan, typical: number | undefined): string => {
 
 /**
  * The run's steps side by side, equal widths, so their words never collide:
- * done ones with a check and their span, the running one lit amber with its
- * clock, the ones still to come with what they usually take.
+ * done ones with their span, the running one underlined in amber and saying
+ * so, the ones still to come waiting. Only a failed step keeps a mark, so
+ * its state never rests on colour alone.
  */
-export function Stepper({ timeline, estimate }: { timeline: RunTimeline; estimate: Estimate | null }) {
-  const steps = timeline.steps;
+export function Stepper({ steps, live }: { steps: readonly StepSpan[]; live: boolean }) {
   return (
     <ol
       className="stepper"
@@ -72,29 +71,20 @@ export function Stepper({ timeline, estimate }: { timeline: RunTimeline; estimat
       style={{ '--n': steps.length } as CSSProperties}
       aria-label="Steps"
     >
-      {steps.map((step) => {
-        const label = TAPE_STEP_LABELS[step.step];
-        const value = stepValue(step, estimate?.steps[step.step]);
-        return (
-          <li
-            key={step.step}
-            className={cn('stp', STEP_CLASS[step.state])}
-            aria-current={step.state === 'live' ? 'step' : undefined}
-          >
-            {step.state === 'live' ? <span className="sweep" aria-hidden="true" /> : null}
-            <span className="stp-n">
-              {step.state === 'done' ? <Check strokeWidth={2} aria-hidden="true" /> : null}
-              {step.state === 'failed' ? <X strokeWidth={2} aria-hidden="true" /> : null}
-              {step.state === 'live' ? (
-                <LampDot ring="shift" core="shift" pulse size={8} />
-              ) : null}
-              {label}
-              <span className="sr-only">, {STATE_WORDS[step.state]}</span>
-            </span>
-            <span className="stp-v">{value}</span>
-          </li>
-        );
-      })}
+      {steps.map((step) => (
+        <li
+          key={step.step}
+          className={cn('stp', STEP_CLASS[step.state])}
+          aria-current={step.state === 'live' ? 'step' : undefined}
+        >
+          <span className="stp-n">
+            {step.state === 'failed' ? <X strokeWidth={2} aria-hidden="true" /> : null}
+            {TAPE_STEP_LABELS[step.step]}
+            <span className="sr-only">, {STATE_WORDS[step.state]}</span>
+          </span>
+          <span className="stp-v">{stepValue(step, live)}</span>
+        </li>
+      ))}
     </ol>
   );
 }
@@ -121,62 +111,65 @@ function TapeSegment({ tone, from, to, grow }: { tone: TapeTone; from: number; t
 
 /**
  * Where the time went, to scale: one dithered segment per recorded step, and
- * dotted after it what the estimate says is left. Nothing is drawn for a run
- * that recorded no time.
+ * dotted after it what is left. With an estimate that is one span of what is
+ * left; without one it is the steps still to come at the mean finished step
+ * (see `tapeRest`), so a first deploy never looks finished. Nothing is drawn
+ * for a run that recorded no time.
  */
 export function Tape({
-  timeline,
+  steps,
   remaining,
   estimate,
 }: {
-  timeline: RunTimeline;
+  steps: readonly StepSpan[];
   remaining: number | null;
   estimate: Estimate | null;
 }) {
-  const segments = timeline.steps.filter((step) => step.seconds !== null && step.seconds > 0);
+  const segments = steps.filter((step) => step.seconds !== null && step.seconds > 0);
   const recorded = segments.reduce((total, step) => total + (step.seconds ?? 0), 0);
-  const left = remaining !== null && remaining > 0 ? remaining : 0;
+  const rest = tapeRest(steps, remaining);
+  const left = rest ? rest.spans.reduce((total, span) => total + span, 0) : 0;
   const total = recorded + left;
   if (recorded <= 0) return null;
 
   const summary = segments
     .map((step) => `${TAPE_STEP_LABELS[step.step]} ${formatSpan(step.seconds ?? 0)}`)
     .join(', ');
+  const dotted = !rest
+    ? ''
+    : rest.estimated && estimate
+      ? `, dotted: about ${formatSpan(left)} left, from the last ${estimate.samples} ${estimate.samples === 1 ? 'deploy' : 'deploys'}`
+      : rest.estimated
+        ? `, about ${formatSpan(left)} left`
+        : rest.pending.length > 0
+          ? `, dotted: ${listWords(rest.pending.map((step) => TAPE_STEP_LABELS[step].toLowerCase()))} still to come`
+          : `, dotted: the rest of ${TAPE_STEP_LABELS[rest.live].toLowerCase()}`;
   let cursor = 0;
   return (
-    <>
-      <div
-        className="tape"
-        role="img"
-        aria-label={`Where the time went: ${summary}${left > 0 ? `, about ${formatSpan(left)} left` : ''}`}
-      >
-        {segments.map((step) => {
-          const from = cursor / total;
-          cursor += step.seconds ?? 0;
-          return (
-            <TapeSegment
-              key={step.step}
-              tone={tapeTone(step.state)}
-              from={from}
-              to={cursor / total}
-              grow={step.seconds ?? 0}
-            />
-          );
-        })}
-        {left > 0 ? <span className="tape-ghost d25" style={{ flexGrow: left }} /> : null}
-      </div>
-      <div className="tape-k">
-        <span>Where the time went, to scale</span>
-        {left > 0 && estimate ? (
-          <span>
-            Dotted: what is left, from the last {estimate.samples}{' '}
-            {estimate.samples === 1 ? 'deploy' : 'deploys'}
-          </span>
-        ) : null}
-      </div>
-    </>
+    <div className="tape" role="img" aria-label={`Where the time went, to scale: ${summary}${dotted}`}>
+      {segments.map((step) => {
+        const from = cursor / total;
+        cursor += step.seconds ?? 0;
+        return (
+          <TapeSegment
+            key={step.step}
+            tone={tapeTone(step.state)}
+            from={from}
+            to={cursor / total}
+            grow={step.seconds ?? 0}
+          />
+        );
+      })}
+      {rest?.spans.map((span, index) => (
+        <span key={`rest-${index}`} className="tape-ghost d25" style={{ flexGrow: span }} />
+      ))}
+    </div>
   );
 }
+
+/** "pull", "pull and boot", "pull, boot and health". */
+const listWords = (words: readonly string[]): string =>
+  words.length <= 1 ? (words[0] ?? '') : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
 
 function StepBar({ share, tone }: { share: number; tone: TapeTone }) {
   const value = round(share);
@@ -252,9 +245,12 @@ const MINI_CLASS: Record<MiniSegment['tone'], string | undefined> = {
 /** A history row's tape: its steps on the scale every row of the list shares. */
 export function MiniTape({ segments, label }: { segments: readonly MiniSegment[]; label: string }) {
   if (segments.length === 0) return <span className="minitape" aria-hidden="true" />;
+  // The unused part of the shared scale comes first, so every row's bar ends
+  // at the same right edge, as the proposal draws the history.
+  const ordered = [...segments.filter((segment) => segment.tone === 'rest'), ...segments.filter((segment) => segment.tone !== 'rest')];
   return (
     <span className="minitape" role="img" aria-label={label} title={label}>
-      {segments.map((segment, index) => (
+      {ordered.map((segment, index) => (
         <i key={index} className={MINI_CLASS[segment.tone]} style={{ flexGrow: segment.grow }} />
       ))}
     </span>

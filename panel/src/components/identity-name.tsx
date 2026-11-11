@@ -65,14 +65,17 @@ export function UserAvatar({ id }: { id: string }) {
 export function StartedBy({
   type,
   id,
+  avatar = true,
 }: {
   type: Deployment['created_by_type'] | Build['created_by_type'];
   id: string;
+  /** False: the name alone, as the service sheet's run box and history write it. */
+  avatar?: boolean;
 }) {
   if (type === 'user') {
     return (
       <>
-        <UserAvatar id={id} />
+        {avatar ? <UserAvatar id={id} /> : null}
         <UserName id={id} />
       </>
     );
@@ -80,14 +83,14 @@ export function StartedBy({
   if (type === 'agent') {
     return (
       <>
-        <Avatar kind="agent" seed={id} />
+        {avatar ? <Avatar kind="agent" seed={id} /> : null}
         <AgentName id={id} link={false} />
       </>
     );
   }
   return (
     <>
-      <Avatar kind="system" />
+      {avatar ? <Avatar kind="system" /> : null}
       System
     </>
   );

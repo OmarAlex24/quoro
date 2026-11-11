@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useMutation, useQueries } from '@tanstack/react-query';
 import { Link, useNavigate } from '@tanstack/react-router';
-import { ChevronDown, ChevronLeft, ChevronRight, GitBranch, Box, Server } from 'lucide-react';
+import { ChevronLeft, GitBranch, Box, Server } from 'lucide-react';
 import { useState, type ReactNode } from 'react';
 import type { AppDetail, Build, Deployment, DeploymentLogEntry } from '../api/generated/model';
 import { cancelBuild, startBuild, useGetBuild } from '../api/generated/builds/builds';
@@ -25,6 +25,7 @@ import {
   miniTapeScale,
   nodeLineSpans,
   remainingSeconds,
+  rolloutView,
   runSentence,
   runTag,
   runTimeline,
@@ -36,9 +37,11 @@ import { formatLogTime } from '../lib/log-buffer';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useAppRuns } from '../lib/use-app-runs';
 import { useBuildLines } from '../lib/use-build-lines';
+import { appKind } from '../lib/services';
 import { useNow } from '../lib/use-now';
 import { cn } from '../lib/utils';
 import { BuildView } from './build-view';
+import { GlyphTile } from './glyph-tile';
 import { BuildSteps, MiniTape, Stepper, Tape } from './deploy-tape';
 import { StartedBy } from './identity-name';
 import { RebuildWithRefreshedBase } from './app-vulnerabilities';
@@ -75,12 +78,9 @@ const runTitle = (run: DeployRun): string => {
   }
 };
 
-const clockTime = (ms: number): string =>
-  new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
-
 const startedBy = (run: DeployRun) => {
   const source = run.build ?? run.deployment!;
-  return <StartedBy type={source.created_by_type} id={source.created_by_id} />;
+  return <StartedBy type={source.created_by_type} id={source.created_by_id} avatar={false} />;
 };
 
 /** `2 replicas, one on lab-3 and one on lab-4`, from where the instances run. */
@@ -310,20 +310,23 @@ function RunBox({
   const inBuild = timeline.steps.some(
     (step) => (step.step === 'queue' || step.step === 'build') && step.state === 'live',
   );
+  // Once its build succeeded, a Git run is drawn as its rollout, the build in words.
+  const rollout = rolloutView(timeline);
+  const usually = live && estimate ? `usually about ${formatClock(estimate.total)}` : null;
   const sub = live
-    ? inBuild && build
-      ? `${repoLabel(build.source.repo_url)} at ${build.source.ref}`
-      : replicasLine(app, nodeNames)
-    : timeline.end !== null
-      ? `Finished ${relativeTime(new Date(timeline.end).toISOString(), now)}`
-      : null;
+    ? [inBuild && build ? `${repoLabel(build.source.repo_url)} at ${build.source.ref}` : replicasLine(app, nodeNames), usually]
+    : [
+        timeline.end !== null ? `Finished ${relativeTime(new Date(timeline.end).toISOString(), now)}` : null,
+        rollout.before,
+      ];
+  const subLine = sub.filter(Boolean).join(' · ');
   const failure =
     timeline.state === 'failed'
       ? (build?.status === 'failed' ? build.error : run.deployment?.error) ?? null
       : null;
 
   return (
-    <section className={cn('box', live && 'box-live')} aria-label="Newest deployment">
+    <section className={cn('box run-box', live && 'run-box-live')} aria-label="Newest deployment">
       <div className="box-h">
         <Tag tone={tag.tone}>{tag.word}</Tag>
         <div className="box-t">
@@ -331,7 +334,7 @@ function RunBox({
           <small>
             {startedBy(run)}
             <span aria-hidden="true">·</span>
-            {live ? `started at ${clockTime(timeline.start)}` : relativeTime(new Date(timeline.start).toISOString(), now)}
+            {live ? `started ${relativeTime(new Date(timeline.start).toISOString(), now)}` : relativeTime(new Date(timeline.start).toISOString(), now)}
           </small>
         </div>
         {buildLive && canWrite ? (
@@ -345,39 +348,32 @@ function RunBox({
             {cancel.isPending ? 'Cancelling…' : 'Cancel build'}
           </Button>
         ) : null}
-        {build ? (
-          <Button size="sm" asChild>
-            <Link
-              to="/projects/$projectId"
-              params={{ projectId }}
-              search={{ app: app.id, tab: 'deployments', build: build.id }}
-            >
-              View logs
-            </Link>
-          </Button>
-        ) : null}
+        {/* A build opens its own log; a redeploy, which has none, opens the app's logs. */}
+        <Button size="sm" asChild>
+          <Link
+            to="/projects/$projectId"
+            params={{ projectId }}
+            search={build ? { app: app.id, tab: 'deployments', build: build.id } : { app: app.id, tab: 'logs' }}
+          >
+            View logs
+          </Link>
+        </Button>
       </div>
       <div className="box-b">
-        {problem ? <ProblemBanner view={problem} className="mb-3" /> : null}
+        {problem ? <ProblemBanner view={problem} /> : null}
         <div className="phase-h">
           <div className="min-w-0" aria-live="polite">
             <b>{runSentence(timeline, app.replicas)}</b>
-            {sub ? <small>{sub}</small> : null}
+            {subLine ? <small>{subLine}</small> : null}
           </div>
           <div className="elapsed">
             <b>{formatClock(timeline.elapsed)}</b>
-            <small>
-              {live
-                ? estimate
-                  ? `usually about ${formatClock(estimate.total)}`
-                  : 'elapsed'
-                : 'in total'}
-            </small>
+            <span className="sr-only">{live ? ' elapsed' : ' in total'}</span>
           </div>
         </div>
-        <Stepper timeline={timeline} estimate={live ? estimate : null} />
-        <Tape timeline={timeline} remaining={remaining} estimate={estimate} />
-        {failure ? <p className="mt-3 text-[12.5px] leading-snug text-fault">{failure}</p> : null}
+        <Stepper steps={rollout.steps} live={live} />
+        <Tape steps={rollout.steps} remaining={remaining} estimate={estimate} />
+        {failure ? <p className="text-[12.5px] leading-snug text-fault">{failure}</p> : null}
         <BuildSteps steps={steps} nodeLines={nodeLines} />
         {run.deployment ? <ProgressLines entries={entries} error={entriesError} /> : null}
       </div>
@@ -444,12 +440,11 @@ function History({
 }) {
   const scale = miniTapeScale(timelines);
   return (
-    <details className="history" open>
-      <summary className="hist-h">
-        <ChevronDown strokeWidth={1.7} aria-hidden="true" />
+    <section className="hist" aria-labelledby="hist-title">
+      <h3 id="hist-title" className="sh-lbl">
         History
-      </summary>
-      <div className="box mt-3">
+      </h3>
+      <div className="box hist-box">
         {timelines.map((timeline) => (
           <HistoryRow
             key={timeline.run.key}
@@ -461,7 +456,7 @@ function History({
           />
         ))}
       </div>
-    </details>
+    </section>
   );
 }
 
@@ -469,6 +464,13 @@ const exitCode = (error: string | null): string | null => {
   const match = error ? /exit code:?\s*(\d+)/i.exec(error) : null;
   return match ? `exit code ${match[1]}` : null;
 };
+
+/**
+ * The run's state in its row's words. An old deploy that simply gave way to
+ * a newer one says nothing; every other state is written, so a red tape is
+ * never the only sign a run failed.
+ */
+const rowWord = (word: string): string | null => (word === 'Removed' ? null : word);
 
 function HistoryRow({
   app,
@@ -485,18 +487,27 @@ function HistoryRow({
 }) {
   const { run } = timeline;
   const tag = runTag(timeline, activeId);
+  const word = rowWord(tag.word);
   const when = relativeTime(new Date(timeline.start).toISOString());
   const failedBuild: Build | null = run.build?.status === 'failed' ? run.build : null;
   const label = `${formatSpan(timeline.recorded)} recorded${timeline.state === 'failed' ? ', failed' : ''}`;
 
   let small: ReactNode;
   if (failedBuild) {
-    small = [failedBuild.failed_step?.name, exitCode(failedBuild.error), when]
-      .filter(Boolean)
-      .join(' · ');
+    small = (
+      <span className="min-w-0 truncate">
+        {[word, failedBuild.failed_step?.name, exitCode(failedBuild.error), when].filter(Boolean).join(' · ')}
+      </span>
+    );
   } else {
     small = (
       <>
+        {word ? (
+          <>
+            <span className={cn('hist-word', `hist-word-${tag.tone}`)}>{word}</span>
+            <span aria-hidden="true">·</span>
+          </>
+        ) : null}
         {startedBy(run)}
         <span aria-hidden="true">·</span>
         {when}
@@ -512,7 +523,7 @@ function HistoryRow({
 
   const body = (
     <>
-      <Tag tone={tag.tone}>{tag.word}</Tag>
+      <GlyphTile kind={appKind(app)} size="sm" />
       <div className="box-t">
         <b>{runTitle(run)}</b>
         <small>{small}</small>
@@ -531,16 +542,10 @@ function HistoryRow({
         aria-label={`${runTitle(run)}, ${tag.word}, open the build`}
       >
         {body}
-        <ChevronRight className="row-go" strokeWidth={1.7} aria-hidden="true" />
       </Link>
     );
   }
-  return (
-    <div className="box-row">
-      {body}
-      <span className="row-go" aria-hidden="true" />
-    </div>
-  );
+  return <div className="box-row">{body}</div>;
 }
 
 /**
@@ -618,12 +623,13 @@ function DeployActions({
     <div className="grid gap-3">
       <div className="flex flex-wrap items-center gap-2">
         {source === null || app.image !== '' ? (
-          <Button size="sm" variant="ghost" disabled={redeploying} onClick={onRedeploy}>
+          <Button size="sm" disabled={redeploying} onClick={onRedeploy}>
             Redeploy
           </Button>
         ) : null}
         <Button
           size="sm"
+          variant="ghost"
           aria-expanded={open}
           onClick={() => {
             setProblem(null);

@@ -24,8 +24,11 @@ import {
   runPhase,
   runSentence,
   runTag,
+  rolloutView,
   runTimeline,
+  tapeRest,
   type RunTimeline,
+  type StepSpan,
 } from './deploy-tape';
 
 const T0 = Date.parse('2026-11-06T17:00:00Z');
@@ -726,5 +729,84 @@ describe('formats and words', () => {
     );
     expect(runTag(failed, null)).toEqual({ word: 'Failed', tone: 'fault' });
     expect(runSentence(failed)).toBe('Failed at pull');
+  });
+});
+
+describe('rolloutView', () => {
+  it('draws a Git run past its build as the rollout, with the queue and build in words', () => {
+    const run = joinRuns([build()], [deployment({ trigger: 'build', created_at: at(76), finished_at: at(128) })])[0]!;
+    const view = rolloutView(runTimeline(run, fullEntries, ms(500)));
+    expect(view.steps.map((step) => step.step)).toEqual(['pull', 'rootfs', 'boot', 'health']);
+    expect(view.before).toBe('rollout after 6s queued and a 1m 08s build');
+  });
+
+  it('keeps all six steps while the build runs', () => {
+    const run = joinRuns([build({ status: 'building', finished_at: null, deployment_id: null })], [])[0]!;
+    const view = rolloutView(runTimeline(run, undefined, ms(42)));
+    expect(view.steps).toHaveLength(6);
+    expect(view.before).toBeNull();
+  });
+
+  it('keeps all six steps when the build failed', () => {
+    const run = joinRuns(
+      [build({ status: 'failed', failed_phase: 'building', finished_at: at(39), deployment_id: null })],
+      [],
+    )[0]!;
+    const view = rolloutView(runTimeline(run, undefined, ms(500)));
+    expect(view.steps).toHaveLength(6);
+    expect(view.before).toBeNull();
+  });
+
+  it('leaves an image deploy as it is', () => {
+    const run = joinRuns([], [deployment()])[0]!;
+    const view = rolloutView(runTimeline(run, undefined, ms(500)));
+    expect(view.steps.map((step) => step.step)).toEqual(['pull', 'rootfs', 'boot', 'health']);
+    expect(view.before).toBeNull();
+  });
+});
+
+describe('tapeRest', () => {
+  const span = (step: StepSpan['step'], state: StepSpan['state'], seconds: number | null): StepSpan => ({
+    step,
+    state,
+    start: null,
+    end: null,
+    seconds,
+  });
+
+  it('keeps the tape short of full while the first step runs with no estimate', () => {
+    const steps = [span('pull', 'live', 24), span('rootfs', 'pending', null), span('boot', 'pending', null), span('health', 'pending', null)];
+    expect(tapeRest(steps, null)).toEqual({
+      spans: [24, 24, 24],
+      estimated: false,
+      pending: ['rootfs', 'boot', 'health'],
+      live: 'pull',
+    });
+  });
+
+  it('gives the step under way what it has left of the mean finished step, and each step to come a whole one', () => {
+    const steps = [span('pull', 'done', 35), span('rootfs', 'done', 45), span('boot', 'live', 31), span('health', 'pending', null)];
+    expect(tapeRest(steps, null)).toEqual({ spans: [49], estimated: false, pending: ['health'], live: 'boot' });
+  });
+
+  it('still leaves room on the last step when it has run less than the mean', () => {
+    const steps = [span('pull', 'done', 35), span('rootfs', 'done', 45), span('boot', 'done', 50), span('health', 'live', 24)];
+    const rest = tapeRest(steps, null)!;
+    expect(rest.spans).toHaveLength(1);
+    expect(rest.spans[0]).toBeCloseTo((35 + 45 + 50) / 3 - 24);
+    expect(rest).toMatchObject({ estimated: false, pending: [], live: 'health' });
+    // Past the mean, the last step fills what is left of the tape.
+    expect(tapeRest([span('pull', 'done', 10), span('health', 'live', 30)], null)).toBeNull();
+  });
+
+  it('draws the estimate as one span when there is one', () => {
+    const steps = [span('pull', 'live', 2), span('rootfs', 'pending', null)];
+    expect(tapeRest(steps, 9)).toEqual({ spans: [9], estimated: true, pending: ['rootfs'], live: 'pull' });
+    expect(tapeRest(steps, 0)).toBeNull();
+  });
+
+  it('draws nothing dotted for a run that is over', () => {
+    expect(tapeRest([span('pull', 'done', 4), span('rootfs', 'done', 7)], null)).toBeNull();
+    expect(tapeRest([span('pull', 'failed', 4), span('rootfs', 'pending', null)], null)).toBeNull();
   });
 });

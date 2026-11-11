@@ -39,11 +39,10 @@ export const PROJECT_TABS = [
 ] as const;
 export type ProjectTab = (typeof PROJECT_TABS)[number];
 
-/** The VM sheet's tabs: what the VM is, and its console and delete. */
-export const VM_TABS = ['overview', 'settings'] as const;
-export type VmTab = (typeof VM_TABS)[number];
-
-/** Every tab `?tab=` may name: an app's or a VM's. `settings` is in both. */
+/**
+ * Every tab `?tab=` may name. `overview` was the old VM sheet's first tab: a
+ * link that names it still opens, and the VM sheet, now one pane, ignores it.
+ */
 export const SHEET_TABS = [...PROJECT_TABS, 'overview'] as const;
 export type SheetTab = (typeof SHEET_TABS)[number];
 
@@ -54,11 +53,10 @@ const isProjectTab = (tab: SheetTab): tab is ProjectTab =>
 export const sheetTab = (search: Pick<ProjectSearch, 'tab'>): ProjectTab =>
   search.tab !== undefined && isProjectTab(search.tab) ? search.tab : 'deployments';
 
-/** The tab an open VM shows: Settings when the URL names it, Overview otherwise. */
-export const vmSheetTab = (search: Pick<ProjectSearch, 'tab'>): VmTab =>
-  search.tab === 'settings' ? 'settings' : 'overview';
-
-/** The project rail: canvas, metrics, logs and settings. No value means the canvas. */
+/**
+ * Every tab `?tab=` may name. `overview` was the old VM sheet's first tab: a
+ * link that names it still opens, and the VM sheet, now one pane, ignores it.
+ *//** The project rail: canvas, metrics, logs and settings. No value means the canvas. */
 export const PROJECT_VIEWS = ['canvas', 'metrics', 'logs', 'settings'] as const;
 export type ProjectView = (typeof PROJECT_VIEWS)[number];
 

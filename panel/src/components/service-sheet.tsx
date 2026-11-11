@@ -2,7 +2,7 @@
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
-import { Lock, MoreHorizontal, Play, RefreshCw, RotateCcw, Square, SquareTerminal, X } from 'lucide-react';
+import { MoreHorizontal, Plus, Play, RefreshCw, RotateCcw, Square, SquareTerminal, X } from 'lucide-react';
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import {
   getGetAppEnvQueryKey,
@@ -29,6 +29,7 @@ import { appAddress, appKind, keepInView } from '../lib/services';
 import { securityParams, securityTabCount } from '../lib/vulnerabilities';
 import { appReadInterval, RUN_PAGE, useAppRuns } from '../lib/use-app-runs';
 import { useRecentBuilds } from '../lib/use-builds';
+import { useSheetMotion, type SheetMotion } from '../lib/use-sheet-motion';
 import { usePaneEnter, useTabInk } from '../lib/use-tab-motion';
 import { useSession } from '../session';
 import { AppEnvDialog } from './app-env-dialog';
@@ -78,7 +79,8 @@ const actionDone: Record<ActionKind, string> = {
  * its lamp and its tabs. The canvas stays behind it and stays live, so
  * another card opens in the same sheet. Escape or the close button return to
  * the canvas; the caller puts focus back on the card. The tab and an open
- * build live in the URL.
+ * build live in the URL. It slides in from the right and back out, on the
+ * panel's curve, when `motion` says so.
  */
 export function ServiceSheet({
   projectId,
@@ -86,14 +88,18 @@ export function ServiceSheet({
   tab,
   buildId,
   onClose,
+  motion,
 }: {
   projectId: string;
   appId: string;
   tab: ProjectTab;
   buildId?: string;
   onClose: () => void;
+  /** How it slides in and out (`useSheetMotion`); none, and it is simply there. */
+  motion?: SheetMotion;
 }) {
   const contentRef = useRef<HTMLDivElement>(null);
+  useSheetMotion(contentRef, motion);
   const queryClient = useQueryClient();
   // The canvas draws this app's card from this same read: every 2 s while it
   // deploys, builds or its newest run moves, and for a warm app at least every
@@ -119,6 +125,9 @@ export function ServiceSheet({
         ref={contentRef}
         className="sheet svc-sheet"
         aria-describedby={undefined}
+        // On its way out it takes no pointer, key or focus.
+        inert={motion?.leaving || undefined}
+        data-leaving={motion?.leaving ? '' : undefined}
         // The canvas stays usable behind the sheet: a click on another card
         // opens it here instead of closing the sheet.
         onInteractOutside={(event) => event.preventDefault()}
@@ -301,7 +310,7 @@ function SheetBody({
         ))}
       </SheetTabs>
 
-      <div ref={bodyRef} className="sh-body">
+      <div ref={bodyRef} className={tab === 'logs' ? 'sh-body sh-body-fill' : 'sh-body'}>
         {notice ? <NoticeLine>{notice}</NoticeLine> : null}
         {problem ? <ProblemBanner view={problem} /> : null}
 
@@ -321,7 +330,7 @@ function SheetBody({
           <VariablesTab app={app} canWrite={canWrite} onSaved={invalidate} />
         ) : null}
         {tab === 'metrics' ? <MetricsTab app={app} nodeNames={nodeNames} /> : null}
-        {tab === 'logs' ? <LogTape appId={app.id} tall /> : null}
+        {tab === 'logs' ? <LogTape appId={app.id} fill /> : null}
         {tab === 'storage' ? (
           <StorageTab app={app} canWrite={canWrite} nodeNames={nodeNames} onChanged={invalidate} />
         ) : null}
@@ -469,7 +478,8 @@ function SettingsWithBuilds({
 /**
  * The app's variables by name, with when each was set. Values are
  * write-only, so the list never shows one; editing replaces the whole set
- * through the same dialog the app page used.
+ * through the same dialog the app page used. With none yet, the designed
+ * empty state offers the first one.
  */
 function VariablesTab({
   app,
@@ -487,39 +497,52 @@ function VariablesTab({
 
   return (
     <>
-      <div className="flex items-center gap-2.5">
-        <b className="text-[14px] font-semibold text-ink">
-          {envQuery.isPending ? 'Variables' : `${env.length} ${env.length === 1 ? 'variable' : 'variables'}`}
-        </b>
-        <span className="flex-1" />
-        {canWrite ? (
-          <Button size="sm" onClick={() => setOpen(true)} disabled={envQuery.isPending}>
-            Edit variables
-          </Button>
-        ) : null}
-      </div>
-      <p className="notice">
-        <Lock strokeWidth={1.7} aria-hidden="true" />
-        <span>Values are write-only: Quoro stores them encrypted and never shows them again.</span>
-      </p>
       {envQuery.error ? (
         <ProblemBanner view={problemView(envQuery.error, 'see variables')} />
       ) : envQuery.isPending ? (
         <SkeletonRows label="Loading variables" rows={2} glyph={false} />
       ) : env.length === 0 ? (
-        <EmptyState title="No variables yet">Add one to pass configuration to the app.</EmptyState>
+        <EmptyState
+          title="No variables yet"
+          action={
+            canWrite ? (
+              <Button size="sm" variant="primary" onClick={() => setOpen(true)}>
+                <Plus className="size-3.5" strokeWidth={1.8} aria-hidden="true" />
+                Add a variable
+              </Button>
+            ) : undefined
+          }
+        >
+          Pass configuration and secrets to the app. Values are write-only: Quoro stores them encrypted and never
+          shows them again.
+        </EmptyState>
       ) : (
-        <ul className="box" aria-label="Variables">
-          {env.map((item) => (
-            <li key={item.name} className="keyrow">
-              <span className="keyrow-name type-code" title={item.name}>
-                {item.name}
-              </span>
-              <span className="keyrow-when">Set {relativeTime(item.updated_at)}</span>
-              {secrets.has(item.name) ? <Tag tone="plain">Also a build secret</Tag> : null}
-            </li>
-          ))}
-        </ul>
+        <>
+          <div className="sh-row">
+            <span className="sh-lbl">
+              {env.length} {env.length === 1 ? 'variable' : 'variables'}
+            </span>
+            {canWrite ? (
+              <Button size="sm" onClick={() => setOpen(true)}>
+                Edit variables
+              </Button>
+            ) : null}
+          </div>
+          <dl className="box set-rows" aria-label="Variables">
+            {env.map((item) => (
+              <div key={item.name} className="set-row">
+                <dt className="type-code" title={item.name}>
+                  {item.name}
+                </dt>
+                <dd className="set-row-tags">
+                  <span>Set {relativeTime(item.updated_at)} · value hidden</span>
+                  {secrets.has(item.name) ? <Tag tone="plain">Also a build secret</Tag> : null}
+                </dd>
+              </div>
+            ))}
+          </dl>
+          <p className="sh-lbl">Values are write-only: Quoro stores them encrypted and never shows them again.</p>
+        </>
       )}
       <AppEnvDialog open={open} onOpenChange={setOpen} appId={app.id} env={env} onSaved={onSaved} />
     </>

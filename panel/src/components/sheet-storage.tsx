@@ -2,7 +2,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { CalendarClock, Copy, HardDrive } from 'lucide-react';
-import { useCallback, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { getGetAppQueryKey, updateApp } from '../api/generated/apps/apps';
 import {
   createBackup,
@@ -238,12 +238,24 @@ function WarmCopyBox({ warm, nodeNames }: { warm: WarmCopy; nodeNames: Record<st
   );
 }
 
-/** A stateless app: what a volume does, and the form that adds one. */
+/**
+ * A stateless app: the designed empty state says what a volume does, and its
+ * action opens the form that adds one, as the tab always had it.
+ */
 function AddVolume({ appId, canWrite, onChanged }: { appId: string; canWrite: boolean; onChanged: () => void }) {
   const [size, setSize] = useState('10');
   const [mountPath, setMountPath] = useState('/data');
   const [problem, setProblem] = useState<ProblemView | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [adding, setAdding] = useState(false);
+  // Cancel closes the form; focus goes back to the button that opened it.
+  const opener = useRef<HTMLButtonElement>(null);
+  const cancelled = useRef(false);
+  useEffect(() => {
+    if (adding || !cancelled.current) return;
+    cancelled.current = false;
+    opener.current?.focus();
+  }, [adding]);
 
   const add = useMutation({
     mutationFn: (body: { size_gb: number; mount_path: string }) =>
@@ -268,58 +280,85 @@ function AddVolume({ appId, canWrite, onChanged }: { appId: string; canWrite: bo
     add.mutate({ size_gb: Number(size), mount_path: mountPath });
   };
 
+  if (!adding) {
+    return (
+      <EmptyState
+        title="No volume"
+        action={
+          canWrite ? (
+            <Button ref={opener} size="sm" variant="primary" onClick={() => setAdding(true)}>
+              <HardDrive className="size-3.5" strokeWidth={1.7} aria-hidden="true" />
+              Add a volume
+            </Button>
+          ) : undefined
+        }
+      >
+        This app keeps no data across redeploys. A volume pins it to one node and keeps its files.
+        {canWrite ? null : ' Your role can read storage but not add a volume.'}
+      </EmptyState>
+    );
+  }
+
   return (
-    <section className="box" aria-label="Volume">
+    <section className="box" aria-label="Add a volume">
       <div className="box-h">
         <span className="glyph glyph-neutral" aria-hidden="true">
           <HardDrive strokeWidth={1.7} />
         </span>
         <div className="box-t">
-          <b>No volume</b>
-          <small>This app keeps no data across redeploys. A volume pins it to one node and keeps its files.</small>
+          <b>Add a volume</b>
+          <small>A volume pins the app to one node and keeps its files across redeploys.</small>
         </div>
       </div>
       <div className="box-b">
-        {canWrite ? (
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
-            <Field label="Size (GiB)" htmlFor="volume-size" className="sm:w-28">
-              <Input
-                id="volume-size"
-                type="number"
-                min={1}
-                max={1024}
-                step={1}
-                inputMode="numeric"
-                value={size}
-                onChange={(event) => setSize(event.target.value)}
-                aria-invalid={errors.size !== undefined}
-              />
-              {errors.size ? <p className="text-[12.5px] text-fault">{errors.size}</p> : null}
-            </Field>
-            <Field
-              label="Mount path"
-              htmlFor="volume-mount"
-              hint="Where the guest mounts it; it attaches at the next start."
-              className="min-w-0 flex-1"
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+          <Field label="Size (GiB)" htmlFor="volume-size" className="sm:w-28">
+            <Input
+              id="volume-size"
+              // Opened from the empty state's button: the form starts at its first field.
+              autoFocus
+              type="number"
+              min={1}
+              max={1024}
+              step={1}
+              inputMode="numeric"
+              value={size}
+              onChange={(event) => setSize(event.target.value)}
+              aria-invalid={errors.size !== undefined}
+            />
+            {errors.size ? <p className="text-[12.5px] text-fault">{errors.size}</p> : null}
+          </Field>
+          <Field
+            label="Mount path"
+            htmlFor="volume-mount"
+            hint="Where the guest mounts it; it attaches at the next start."
+            className="min-w-0 flex-1"
+          >
+            <Input
+              id="volume-mount"
+              value={mountPath}
+              onChange={(event) => setMountPath(event.target.value)}
+              spellCheck={false}
+              aria-invalid={errors.mount !== undefined}
+            />
+            {errors.mount ? <p className="text-[12.5px] text-fault">{errors.mount}</p> : null}
+          </Field>
+          <div className="flex gap-2 sm:pt-[22px]">
+            <Button variant="primary" disabled={add.isPending} onClick={submit}>
+              {add.isPending ? 'Adding…' : 'Add a volume'}
+            </Button>
+            <Button
+              variant="ghost"
+              disabled={add.isPending}
+              onClick={() => {
+                cancelled.current = true;
+                setAdding(false);
+              }}
             >
-              <Input
-                id="volume-mount"
-                value={mountPath}
-                onChange={(event) => setMountPath(event.target.value)}
-                spellCheck={false}
-                aria-invalid={errors.mount !== undefined}
-              />
-              {errors.mount ? <p className="text-[12.5px] text-fault">{errors.mount}</p> : null}
-            </Field>
-            <div className="sm:pt-[22px]">
-              <Button variant="primary" disabled={add.isPending} onClick={submit}>
-                {add.isPending ? 'Adding…' : 'Add a volume'}
-              </Button>
-            </div>
+              Cancel
+            </Button>
           </div>
-        ) : (
-          <p className="text-[13px] text-ink-2">Your role can read storage but not add a volume.</p>
-        )}
+        </div>
         {problem ? <ProblemBanner view={problem} className="mt-3" /> : null}
       </div>
     </section>
