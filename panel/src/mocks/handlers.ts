@@ -107,8 +107,18 @@ import { providersHandlers } from './handlers-providers';
 const CLUSTER_ID = mockId('cls');
 
 /** The mock cluster's nodes, each with what its VMs add up to as `allocated`. */
+/** Milliseconds between a connected node's heartbeats; each one refreshes `last_seen_at`. */
+const HEARTBEAT_MS = 5_000;
+
 const mockNodes = (): Node[] =>
-  [db.node, ...db.extraNodes].map((node) => ({ ...node, allocated: allocatedFrom(node.id, db.vms) }));
+  [db.node, ...db.extraNodes].map((node) => ({
+    ...node,
+    allocated: allocatedFrom(node.id, db.vms),
+    // A connected node was last heard from at its latest heartbeat.
+    ...(node.status === 'connected'
+      ? { last_seen_at: new Date(Math.floor(Date.now() / HEARTBEAT_MS) * HEARTBEAT_MS).toISOString() }
+      : {}),
+  }));
 
 const findVm = (vmId: string): Vm | undefined =>
   db.vms.find((candidate) => candidate.id === vmId);

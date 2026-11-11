@@ -18,6 +18,7 @@ import type {
   EventType,
   Grant,
   Incident,
+  Node,
   Subject,
   User,
   Webhook,
@@ -863,4 +864,59 @@ const seedAgency = (): void => {
     grant_id: incidentGrant.id,
   });
 
+  recordNodeSessions();
+};
+
+/**
+ * The machines' own events, as the seed has them: each machine but the
+ * primary enrolled with a join token, then every one connected a second after
+ * it was created. The primary was set up, not enrolled. They are emitted in
+ * time order, so `time` never goes back as `seq` rises.
+ */
+const recordNodeSessions = (): void => {
+  const sessions: { at: number; type: EventType; node: Node; data: Record<string, unknown> }[] = [];
+  for (const node of [db.node, ...db.extraNodes]) {
+    const at = Date.parse(node.created_at);
+    if (node.cp_status !== 'primary') {
+      sessions.push({
+        at,
+        type: 'node.enrolled',
+        node,
+        data: { node_id: node.id, name: node.name, roles: [...node.roles], address: node.address ?? null },
+      });
+    }
+    sessions.push({
+      at: at + 1_000,
+      type: 'node.connected',
+      node,
+      data: { node_id: node.id, ...(node.agent_version ? { agent_version: node.agent_version } : {}), log_seq: node.log_seq },
+    });
+  }
+  for (const { at, type, node, data } of sessions.sort((left, right) => left.at - right.at)) {
+    emitEvent(type, { type: 'node', id: node.id }, data, {
+      time: new Date(at).toISOString(),
+      actor: { type: 'node', id: node.id },
+    });
+  }
+};
+
+/**
+ * Mock-mode console helper: the named machine's session drops and it connects
+ * again at once, as after a restart of its agent, so a new node event arrives
+ * while the Nodes page is open. False when no machine has that name.
+ */
+export const reconnectNode = (name: string): boolean => {
+  const node = [db.node, ...db.extraNodes].find((candidate) => candidate.name === name);
+  if (!node || node.status === 'removed') return false;
+  agency();
+  const subject = { type: 'node', id: node.id };
+  const actor = { type: 'node' as const, id: node.id };
+  emitEvent('node.disconnected', subject, { node_id: node.id, last_seen_at: now(), reason: 'session_closed' }, { actor });
+  emitEvent(
+    'node.connected',
+    subject,
+    { node_id: node.id, ...(node.agent_version ? { agent_version: node.agent_version } : {}), log_seq: node.log_seq },
+    { actor },
+  );
+  return true;
 };

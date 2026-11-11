@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
-import { drawMetricArea, type DitherSurface, type TokenReader } from '../lib/dither-draw';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from 'react';
+import { drawMetricArea, type DitherSurface, type MetricAreaLook, type TokenReader } from '../lib/dither-draw';
 import {
   areaPlot,
   clockTime,
@@ -17,8 +17,10 @@ import {
   xForTime,
   yForValue,
   type Axis,
+  type PlotPad,
 } from '../lib/metric-area';
 import { METRICS_WINDOW_MS } from '../lib/metrics';
+import { cn } from '../lib/utils';
 import { DitherCanvas } from './dither-canvas';
 
 export interface DitherAreaProps<T extends { time: string }> {
@@ -37,7 +39,23 @@ export interface DitherAreaProps<T extends { time: string }> {
   /** The configured limit, drawn as a thin line: memory's configured size. */
   limit?: { value: number; label: string } | null;
   emptyText: string;
+  /**
+   * A small chart (the node cards): no tick or time labels, the plot the
+   * whole canvas, and `reading` (the newest value) at the right of the
+   * heading. The crosshair and its exact reading work as on a full chart.
+   */
+  compact?: boolean;
+  /** The newest value, set at the right of the heading. */
+  reading?: ReactNode;
+  /** The area's first tone (compact charts only): the accent, or run green. */
+  tone?: 'accent' | 'run';
+  className?: string;
 }
+
+/** A compact chart's plot: the whole canvas but headroom for the line and room for the newest dot. */
+const COMPACT_PAD: PlotPad = { left: 0, right: 4, top: 6, bottom: 0 };
+const COMPACT_LOOK: MetricAreaLook = { labels: false, dot: true, lineWidth: 1.5 };
+const COMPACT_RUN_LOOK: MetricAreaLook = { ...COMPACT_LOOK, tone: 'run' };
 
 /**
  * A metric over the last ten minutes as a dithered area. The picture is a
@@ -58,7 +76,12 @@ export function DitherArea<T extends { time: string }>({
   intervalS,
   limit = null,
   emptyText,
+  compact = false,
+  reading: newestReading,
+  tone = 'accent',
+  className,
 }: DitherAreaProps<T>) {
+  const pad = compact ? COMPACT_PAD : undefined;
   const id = useId();
   const plotRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
@@ -118,15 +141,17 @@ export function DitherArea<T extends { time: string }>({
           tickLabel,
           intervalMs,
           limit: times.length > 0 ? limit : null,
+          pad,
         }),
         read,
+        compact ? (tone === 'run' ? COMPACT_RUN_LOOK : COMPACT_LOOK) : undefined,
       );
     },
     // `dataKey` stands for the series, the axis and the limit.
-    [dataKey, intervalMs],
+    [dataKey, intervalMs, compact, tone],
   );
 
-  const box = plotBox(width, height);
+  const box = plotBox(width, height, pad);
   const index = cursor === null ? null : nearestSample(times, cursor, intervalMs);
   // A crosshair in a gap still shows where it is, and reads "No sample" there.
   // One whose sample has left the window disappears.
@@ -173,10 +198,11 @@ export function DitherArea<T extends { time: string }>({
   const tipOnLeft = tipLeft + 170 > width;
 
   return (
-    <figure className="chart">
+    <figure className={cn('chart', compact && 'chart-sm', className)}>
       <figcaption className="chart-h">
         <b id={`${id}-title`}>{title}</b>
         <span>{subtitle}</span>
+        {newestReading !== undefined ? <span className="chart-v">{newestReading}</span> : null}
       </figcaption>
       <div
         ref={plotRef}

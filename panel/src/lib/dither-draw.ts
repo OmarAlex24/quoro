@@ -466,6 +466,8 @@ export interface MetricAreaLook {
   labels?: boolean;
   dot?: boolean;
   lineWidth?: number;
+  /** The first of the two tones: the accent, or the run green for memory in use on a node card. */
+  tone?: 'accent' | 'run';
 }
 
 export function drawMetricArea(
@@ -475,8 +477,8 @@ export function drawMetricArea(
   look: MetricAreaLook = {},
 ): void {
   const { box } = plot;
-  const { labels = true, dot = true, lineWidth = 2 } = look;
-  const accent = read('--accent');
+  const { labels = true, dot = true, lineWidth = 2, tone = 'accent' } = look;
+  const accent = read(tone === 'run' ? '--run' : '--accent');
   const ion = read('--ion');
   const faint = read('--ink-3');
 

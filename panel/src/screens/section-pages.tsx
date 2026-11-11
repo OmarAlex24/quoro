@@ -14,6 +14,7 @@ import {
 import { cn } from '../lib/utils';
 import { nodeSecurityCount } from '../lib/vulnerabilities';
 import { useSession } from '../session';
+import { AddNodeButton } from '../components/add-node';
 import { ApiTokens } from '../components/api-tokens';
 import { ClusterVulnerabilities } from '../components/cluster-vulnerabilities';
 import { SettingsPage as SettingsColumn } from '../components/settings-parts';
@@ -75,6 +76,8 @@ export function NodesPage() {
     <TabbedPage
       label="Nodes"
       title="Nodes"
+      wide
+      action={<AddNodeButton />}
       current={tab ?? 'nodes'}
       tabs={
         <>

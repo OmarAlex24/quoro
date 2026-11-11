@@ -6,7 +6,6 @@ import {
   biggestNode,
   capacityShare,
   gibWords,
-  liveWords,
   loadWords,
   lossCandidates,
   meterTone,
@@ -112,7 +111,7 @@ describe('node meters', () => {
       allocated: { cpus: 8, memory_mb: 10_240, disk_gb: 48 },
     });
     expect(meters.map((meter) => meter.words)).toEqual([
-      '8 of 12 CPUs reserved',
+      '8 of 12 reserved',
       '10 of 24 GiB reserved',
       '48 of 200 GiB reserved',
     ]);
@@ -144,7 +143,7 @@ describe('node meters', () => {
       spoken: 'Disk: 2 GiB reserved, no capacity reported',
     });
     expect(disk!.words).not.toMatch(/of 0/);
-    expect(cpu).toMatchObject({ share: 1, words: '2 of 2 CPUs reserved', unknown: null });
+    expect(cpu).toMatchObject({ share: 1, words: '2 of 2 reserved', unknown: null });
     expect(memory!.unknown).toBeNull();
     expect(memory!.words).toBe('0.5 of 3.8 GiB reserved');
   });
@@ -156,18 +155,6 @@ describe('node meters', () => {
     expect(gibWords(65_536)).toBe('64');
   });
 
-  it('reads the live line from the newest sample', () => {
-    expect(liveWords(undefined)).toBeNull();
-    expect(
-      liveWords({
-        time: '2026-11-07T00:00:00Z',
-        cpu_usage: 0.274,
-        cpu_count: 4,
-        memory_total_bytes: 24 * 1024 ** 3,
-        memory_used_bytes: 9.8 * 1024 ** 3,
-      }),
-    ).toBe('27.4% busy · 9.8 of 24 GiB in use');
-  });
 
   it('counts the VMs on a node and the apps they belong to', () => {
     const vms = [

@@ -1,6 +1,7 @@
 import { http, type HttpHandler } from 'msw';
 import type {
   AuditList,
+  EventList,
   AuditRecord,
   AuditVerificationRequest,
   AuditVerificationResult,
@@ -71,6 +72,33 @@ const windowOf = (params: URLSearchParams): SeqWindow | string => {
 };
 
 export const auditHandlers: HttpHandler[] = [
+  // `listEvents`: the event log in ascending `seq`, by type (repeated), subject and after a `seq`.
+  http.get('*/api/v1/events', ({ request }) => {
+    if (!signedIn()) return unauthorized();
+    const params = new URL(request.url).searchParams;
+    const types = params.getAll('type').filter((type) => type !== '');
+    const subjectId = queryText(params, 'subject_id');
+    const afterSeq = queryInt(params, 'after_seq');
+    if (afterSeq !== null && !(afterSeq >= 0)) return validationFailed('after_seq must be a whole number of 0 or more.');
+    const cursor = queryInt(params, 'cursor');
+    if (cursor !== null && Number.isNaN(cursor)) return validationFailed('cursor is not a sequence number.');
+    const after = Math.max(afterSeq ?? 0, cursor ?? 0);
+
+    const events = agency().events.filter(
+      (event) =>
+        event.seq > after &&
+        (types.length === 0 || types.includes(event.type)) &&
+        (subjectId === '' || event.subject.id === subjectId),
+    );
+    const items = events.slice(0, pageLimit(params));
+    const last = items[items.length - 1];
+    const list: EventList = {
+      items,
+      next_cursor: events.length > items.length && last ? String(last.seq) : null,
+    };
+    return json(list);
+  }),
+
   http.get('*/api/v1/audit', ({ request }) => {
     if (!signedIn()) return unauthorized();
 

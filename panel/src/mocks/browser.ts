@@ -1,5 +1,5 @@
 import { setupWorker } from 'msw/browser';
-import { setRole, tamperAudit } from './agency';
+import { reconnectNode, setRole, tamperAudit } from './agency';
 import { fileMockApproval } from './handlers-approvals';
 import { handlers } from './handlers';
 
@@ -12,13 +12,14 @@ declare global {
       tamperAudit: typeof tamperAudit;
       setRole: typeof setRole;
       fileMockApproval: typeof fileMockApproval;
+      reconnectNode: typeof reconnectNode;
     };
   }
 }
 
 /** Start the service worker before the first render; never called in a build. */
 export const startMock = async (): Promise<void> => {
-  window.quoroMock = { tamperAudit, setRole, fileMockApproval };
+  window.quoroMock = { tamperAudit, setRole, fileMockApproval, reconnectNode };
   await worker.start({
     serviceWorker: { url: '/mockServiceWorker.js' },
     onUnhandledFrame: 'bypass',

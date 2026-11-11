@@ -4,11 +4,9 @@ import type {
   ClusterCapacity,
   ClusterCapacityApp,
   Node,
-  NodeMetricSample,
   Vm,
 } from '../api/generated/model';
 import type { MeterTone } from './dither-draw';
-import { formatPercent } from './metrics';
 
 /*
  * The node cards and the N+1 strip, as pure data from the contract: a node's
@@ -50,7 +48,7 @@ export interface NodeMeter {
   label: string;
   /** Reserved over capacity; null when the node reports no capacity. */
   share: number | null;
-  /** The reading beside the label: `8 of 12 CPUs reserved`, or `2 GiB reserved` without a capacity. */
+  /** The reading beside the label: `8 of 12 reserved`, or `2 CPUs reserved` without a capacity. */
   words: string;
   /**
    * Said in place of the meter when the node reports no capacity (a missing
@@ -99,7 +97,7 @@ export const nodeMeters = (node: Pick<Node, 'capacity' | 'allocated'>): NodeMete
   };
   return [
     meter('cpu', 'CPU', 'CPU', allocated.cpus, capacity.cpus, {
-      of: `${allocated.cpus} of ${plural(capacity.cpus, 'CPU')} reserved`,
+      of: `${allocated.cpus} of ${capacity.cpus} reserved`,
       alone: `${plural(allocated.cpus, 'CPU')} reserved`,
     }),
     meter('memory', 'Memory', 'memory', allocated.memory_mb, capacity.memory_mb, {
@@ -111,17 +109,6 @@ export const nodeMeters = (node: Pick<Node, 'capacity' | 'allocated'>): NodeMete
       alone: `${allocated.disk_gb} GiB reserved`,
     }),
   ];
-};
-
-/**
- * The node's own reading of its host, from its newest metrics sample:
- * `27.4% busy · 9.8 of 24 GiB in use`. Null before the first sample.
- */
-export const liveWords = (sample: NodeMetricSample | undefined): string | null => {
-  if (!sample) return null;
-  const used = sample.memory_used_bytes / 1024 ** 2;
-  const total = sample.memory_total_bytes / 1024 ** 2;
-  return `${formatPercent(sample.cpu_usage)} busy · ${gibWords(used)} of ${gibWords(total)} GiB in use`;
 };
 
 /* ---------- what a node runs ---------- */

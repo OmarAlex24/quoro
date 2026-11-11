@@ -1,7 +1,7 @@
 import { setupServer } from 'msw/node';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import type { AuditList, AuditRecord } from '../api/generated/model';
-import { agency, appendAudit } from './agency';
+import type { AuditList, AuditRecord, EventList } from '../api/generated/model';
+import { agency, appendAudit, reconnectNode } from './agency';
 import { db, mockId, now } from './db';
 import { auditHandlers } from './handlers-audit';
 
@@ -170,5 +170,41 @@ describe('audit list mock: validation', () => {
     expect((await listResponse({ after_seq: -1 })).status).toBe(422);
     expect((await listResponse({ before_seq: 'soon' })).status).toBe(422);
     expect((await listResponse({ order: 'desc', cursor: 'next' })).status).toBe(422);
+  });
+});
+
+describe('the event log', () => {
+  const events = async (query: string): Promise<EventList> => {
+    const response = await fetch(`${BASE}/events?${query}`);
+    expect(response.status).toBe(200);
+    return (await response.json()) as EventList;
+  };
+  const NODE_TYPES = 'type=node.enrolled&type=node.connected&type=node.disconnected';
+
+  it('holds the seeded node sessions, by type, in ascending seq', async () => {
+    const page = await events(NODE_TYPES);
+    expect(page.items.length).toBeGreaterThan(0);
+    expect(page.items.every((event) => event.type.startsWith('node.'))).toBe(true);
+    const order = page.items.map((event) => event.seq);
+    expect(order).toEqual([...order].sort((left, right) => left - right));
+    expect(page.items.some((event) => event.type === 'node.connected' && event.subject.id === db.node.id)).toBe(true);
+  });
+
+  it('serves only what came after a seq, and pages with a cursor', async () => {
+    const before = await events(NODE_TYPES);
+    const last = before.items[before.items.length - 1]!.seq;
+    expect(reconnectNode(db.node.name)).toBe(true);
+    expect(reconnectNode('no-such-node')).toBe(false);
+
+    const after = await events(`${NODE_TYPES}&after_seq=${last}`);
+    expect(after.items.map((event) => event.type)).toEqual(['node.disconnected', 'node.connected']);
+    expect(after.items[0]!.data).toMatchObject({ node_id: db.node.id, reason: 'session_closed' });
+
+    const first = await events(`${NODE_TYPES}&after_seq=${last}&limit=1`);
+    expect(first.items).toHaveLength(1);
+    expect(first.next_cursor).toBe(String(first.items[0]!.seq));
+    const second = await events(`${NODE_TYPES}&after_seq=${last}&limit=1&cursor=${first.next_cursor}`);
+    expect(second.items.map((event) => event.type)).toEqual(['node.connected']);
+    expect(second.next_cursor).toBeNull();
   });
 });
