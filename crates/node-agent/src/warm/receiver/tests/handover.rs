@@ -1956,3 +1956,96 @@ async fn a_clone_the_engine_still_names_or_that_appears_with_the_directory_keeps
     );
     assert!(base.location.exists());
 }
+
+#[tokio::test]
+async fn a_lost_clone_keeps_its_record_while_its_file_is_there_or_the_device_changes() {
+    let h = Harness::new("handover-clone-same-device").await;
+    let path = returning_source(&h).await;
+    let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+    diverge(&path);
+    let quarantines = h.receiver.inner.quarantines.clone();
+    // The hash waits; each check below runs on its own.
+    let _gate = quarantines.inner.hash_gate.lock().await;
+    let lost = marked_copy(&h).await;
+    let clone = h
+        .store
+        .kept_snapshot(&lost.snapshot_id)
+        .await
+        .expect("store")
+        .expect("kept");
+    h.engine
+        .delete_volume_snapshot(&clone.snapshot)
+        .await
+        .expect("delete the clone");
+    let kept_as_is = || {
+        let (h, lost) = (&h, &lost);
+        async move {
+            assert_eq!(quarantined(h).await, vec![lost.clone()]);
+            assert!(
+                h.store
+                    .kept_snapshot(&lost.snapshot_id)
+                    .await
+                    .expect("store")
+                    .is_some()
+            );
+        }
+    };
+
+    // The engine answers `NotFound`, but the clone's file is there.
+    std::fs::write(&lost.path, b"clone").expect("write the clone");
+    assert_eq!(
+        quarantines
+            .inner
+            .forget_lost_clone(&lost.quarantine_id)
+            .await,
+        Ok(false)
+    );
+    kept_as_is().await;
+    std::fs::remove_file(&lost.path).expect("remove the clone");
+
+    // The other file, or the clone's directory at the second lookup, is on
+    // another device than the clone's directory at the first.
+    for devices in [[7, 8, 7], [7, 7, 8], [8, 7, 7]] {
+        quarantines
+            .inner
+            .devices
+            .lock()
+            .expect("devices")
+            .extend(devices);
+        assert_eq!(
+            quarantines
+                .inner
+                .forget_lost_clone(&lost.quarantine_id)
+                .await,
+            Ok(false),
+            "{devices:?}"
+        );
+        assert!(
+            quarantines
+                .inner
+                .devices
+                .lock()
+                .expect("devices")
+                .is_empty(),
+            "{devices:?}: each read takes its device"
+        );
+        kept_as_is().await;
+    }
+
+    // One device for all three reads: the record is forgotten.
+    quarantines
+        .inner
+        .devices
+        .lock()
+        .expect("devices")
+        .extend([7, 7, 7]);
+    assert_eq!(
+        quarantines
+            .inner
+            .forget_lost_clone(&lost.quarantine_id)
+            .await,
+        Ok(true)
+    );
+    assert!(quarantined(&h).await.is_empty());
+    assert!(base.location.exists());
+}
