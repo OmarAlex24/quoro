@@ -24,7 +24,7 @@ import { relativeTime, serviceLampState, warmReadInterval } from '../lib/app-sta
 import { canOpenTerminal } from '../lib/capabilities';
 import type { RunPhase } from '../lib/deploy-tape';
 import { problemView, type ProblemView } from '../lib/problem';
-import { PROJECT_TABS, type ProjectTab } from '../lib/routes';
+import { EXACT_LINK, PROJECT_TABS, type ProjectTab } from '../lib/routes';
 import { appAddress, appKind, keepInView } from '../lib/services';
 import { securityParams, securityTabCount } from '../lib/vulnerabilities';
 import { appReadInterval, RUN_PAGE, useAppRuns } from '../lib/use-app-runs';
@@ -286,28 +286,7 @@ function SheetBody({
       </div>
 
       <SheetTabs label={`${app.name} sections`} tab={tab}>
-        {PROJECT_TABS.map((key) => (
-          <Link
-            key={key}
-            to="/projects/$projectId"
-            params={{ projectId }}
-            search={{ app: app.id, tab: key }}
-            className={key === tab ? 'on' : undefined}
-            aria-current={key === tab ? 'page' : undefined}
-          >
-            {TAB_WORDS[key]}
-            {key === 'security' && openFindings !== null ? (
-              <>
-                <span className="count count-soft" aria-hidden="true">
-                  {openFindings}
-                </span>
-                <span className="sr-only">
-                  , {openFindings} open {openFindings === 1 ? 'finding' : 'findings'}
-                </span>
-              </>
-            ) : null}
-          </Link>
-        ))}
+        <SheetTabLinks appId={app.id} projectId={projectId} tab={tab} openFindings={openFindings} />
       </SheetTabs>
 
       <div ref={bodyRef} className={tab === 'logs' ? 'sh-body sh-body-fill' : 'sh-body'}>
@@ -347,6 +326,50 @@ function SheetBody({
           />
         ) : null}
       </div>
+    </>
+  );
+}
+
+/**
+ * An app sheet's tab links. Only the tab shown is current: with no `tab` in
+ * the URL that is Deployments (`sheetTab`).
+ */
+export function SheetTabLinks({
+  appId,
+  projectId,
+  tab,
+  openFindings,
+}: {
+  appId: string;
+  projectId: string;
+  tab: ProjectTab;
+  openFindings: number | null;
+}) {
+  return (
+    <>
+      {PROJECT_TABS.map((key) => (
+        <Link
+          key={key}
+          to="/projects/$projectId"
+          params={{ projectId }}
+          search={{ app: appId, tab: key }}
+          activeOptions={EXACT_LINK}
+          className={key === tab ? 'on' : undefined}
+          aria-current={key === tab ? 'page' : undefined}
+        >
+          {TAB_WORDS[key]}
+          {key === 'security' && openFindings !== null ? (
+            <>
+              <span className="count count-soft" aria-hidden="true">
+                {openFindings}
+              </span>
+              <span className="sr-only">
+                , {openFindings} open {openFindings === 1 ? 'finding' : 'findings'}
+              </span>
+            </>
+          ) : null}
+        </Link>
+      ))}
     </>
   );
 }

@@ -13,7 +13,7 @@ import {
 } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { Project } from '../../api/generated/model';
-import type { ProjectView } from '../../lib/routes';
+import { EXACT_LINK, type ProjectView } from '../../lib/routes';
 import { cn } from '../../lib/utils';
 import { QuoroMark } from '../avatar';
 import { AvatarMenu } from './avatar-menu';
@@ -27,6 +27,32 @@ const RAIL: ReadonlyArray<{ view: ProjectView; label: string; Icon: LucideIcon }
   { view: 'logs', label: 'Logs', Icon: FileText },
   { view: 'settings', label: 'Project settings', Icon: SlidersVertical },
 ];
+
+/**
+ * The project rail's links. Only the view the URL names is current: no
+ * `view` is the canvas.
+ */
+export function RailLinks({ projectId, view }: { projectId: string; view: ProjectView }) {
+  return (
+    <>
+      {RAIL.map(({ view: item, label, Icon }) => (
+        <Link
+          key={item}
+          to="/projects/$projectId"
+          params={{ projectId }}
+          search={item === 'canvas' ? {} : { view: item }}
+          activeOptions={EXACT_LINK}
+          className={cn(view === item && 'on')}
+          aria-label={label}
+          title={label}
+          aria-current={view === item ? 'page' : undefined}
+        >
+          <Icon strokeWidth={1.7} aria-hidden="true" />
+        </Link>
+      ))}
+    </>
+  );
+}
 
 /**
  * Inside a project: a top bar with the breadcrumb and the project switcher,
@@ -99,20 +125,7 @@ export function ProjectShell({
 
       <div className="rail-col">
         <nav className="rail" aria-label="Project views">
-          {RAIL.map(({ view: item, label, Icon }) => (
-            <Link
-              key={item}
-              to="/projects/$projectId"
-              params={{ projectId }}
-              search={item === 'canvas' ? {} : { view: item }}
-              className={cn(view === item && 'on')}
-              aria-label={label}
-              title={label}
-              aria-current={view === item ? 'page' : undefined}
-            >
-              <Icon strokeWidth={1.7} aria-hidden="true" />
-            </Link>
-          ))}
+          <RailLinks projectId={projectId} view={view} />
         </nav>
       </div>
 

@@ -23,8 +23,8 @@ export function useTabInk<T extends HTMLElement = HTMLElement>(tab: string) {
     const nav = navRef.current;
     const ink = inkRef.current;
     if (!nav || !ink) return;
-    // The strips mark their active tab with `on`; a router link may carry
-    // aria-current on more than one tab (a search that is a subset matches).
+    // The strips mark their active tab with `on`, the same tab that carries
+    // aria-current (the links match their search exactly, `EXACT_LINK`).
     const active = nav.querySelector<HTMLElement>(':scope > .on');
     const at = inkGeometry(active ? { left: active.offsetLeft, width: active.offsetWidth } : null);
     if (at === null) {
