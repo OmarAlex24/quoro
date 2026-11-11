@@ -1971,6 +1971,10 @@ async fn a_lost_clone_is_checked_through_one_open_volume_directory() {
     let between = |run: Box<dyn FnOnce() + Send>| {
         *quarantines.inner.between_checks.lock().expect("hook") = Some(run);
     };
+    let kept_because = |reason: Result<(), String>, why: &str| {
+        let reason = reason.expect_err("the record stays");
+        assert!(reason.contains(why), "{reason}");
+    };
     let kept_as_is = || {
         let (h, lost) = (&h, &lost);
         async move {
@@ -1987,7 +1991,7 @@ async fn a_lost_clone_is_checked_through_one_open_volume_directory() {
 
     // The clone's file is in the volume directory.
     std::fs::write(&lost.path, b"clone").expect("write the clone");
-    assert_eq!(check().await, Ok(false));
+    kept_because(check().await, "the clone's file is in the volume directory");
     kept_as_is().await;
     std::fs::remove_file(&lost.path).expect("remove the clone");
 
@@ -1996,7 +2000,7 @@ async fn a_lost_clone_is_checked_through_one_open_volume_directory() {
     between(Box::new(move || {
         std::fs::write(&appears, b"clone").expect("write the clone");
     }));
-    assert_eq!(check().await, Ok(false));
+    kept_because(check().await, "the clone's file is in the volume directory");
     kept_as_is().await;
     std::fs::remove_file(&lost.path).expect("remove the clone");
 
@@ -2006,21 +2010,37 @@ async fn a_lost_clone_is_checked_through_one_open_volume_directory() {
     between(Box::new(move || {
         std::fs::rename(&from, &to).expect("move the base aside");
     }));
-    assert_eq!(check().await, Ok(false));
+    kept_because(check().await, "cannot read the other kept snapshot");
     kept_as_is().await;
     std::fs::rename(&aside, &base.location).expect("put the base back");
 
     // The other kept snapshot is a symlink in the volume directory.
     std::fs::rename(&base.location, &aside).expect("move the base aside");
     std::os::unix::fs::symlink(&aside, &base.location).expect("link the base");
-    assert_eq!(check().await, Ok(false));
+    kept_because(
+        check().await,
+        "the other kept snapshot is not a regular file",
+    );
     kept_as_is().await;
     std::fs::remove_file(&base.location).expect("remove the link");
     std::fs::rename(&aside, &base.location).expect("put the base back");
 
-    // The clone is missing and the other kept snapshot is a regular file
-    // beside it: the record is forgotten, and no file is touched.
-    assert_eq!(check().await, Ok(true));
+    // Right after the volume directory is opened, it is moved aside and a
+    // new one holding the clone takes its path. The reads go through the
+    // open directory, where the clone is missing and the other kept snapshot
+    // is a regular file beside it: the record is forgotten, and no file is
+    // touched. Reads by path would see the clone and keep it.
+    let dir = lost.path.parent().expect("a directory").to_path_buf();
+    let moved = dir.with_extension("moved");
+    let (from, to, clone_path) = (dir.clone(), moved.clone(), lost.path.clone());
+    *quarantines.inner.after_open.lock().expect("hook") = Some(Box::new(move || {
+        std::fs::rename(&from, &to).expect("move the directory aside");
+        std::fs::create_dir(&from).expect("a new directory");
+        std::fs::write(&clone_path, b"clone").expect("write the clone");
+    }));
+    assert_eq!(check().await, Ok(()));
+    std::fs::remove_dir_all(&dir).expect("remove the new directory");
+    std::fs::rename(&moved, &dir).expect("put the directory back");
     assert!(quarantined(&h).await.is_empty());
     assert_eq!(
         h.store
