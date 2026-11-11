@@ -1134,6 +1134,37 @@ mod tests {
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
+    /// A second session-start registration of the same row and revoke
+    /// replaces the first, equal to it in every field but its registration,
+    /// and releases the first's held-back revoke. An attempt that read the
+    /// first entry sends nothing and leaves the count alone; the fresh
+    /// entry's revoke goes out once.
+    #[tokio::test]
+    async fn a_stale_read_sends_no_held_revoke_over_a_fresh_registration() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (generation, mut rx, _closed, _changed) = hub.attach(&node_id);
+        let lease = marked("lse_one", &node_id);
+        hub.held_eligible(&lease, generation, Some(1));
+        let stale = entry(hub, "lse_one");
+        hub.held_eligible(&lease, generation, Some(1));
+        let fresh = entry(hub, "lse_one");
+        assert_ne!(stale, fresh);
+        assert_eq!(held_revokes(hub, &node_id), 1, "the first was released");
+
+        hub.send_held_revoke("lse_one", &stale, generation, 1);
+        assert!(rx.try_recv().is_err(), "the stale read sends nothing");
+        assert_eq!(held_revokes(hub, &node_id), 1);
+        assert_eq!(entry(hub, "lse_one"), fresh);
+
+        hub.send_held_revoke("lse_one", &fresh, generation, 1);
+        let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "lease_revoke");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(held_revokes(hub, &node_id), 0);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
     /// Section 4.2 rule 3: a held grant goes out only once the revokes
     /// before it are answered, and a held-back step-4 revoke of another
     /// lease is one of them. On a live session past its start with no

@@ -1390,6 +1390,56 @@ mod tests {
         (store, lease, actor, data_dir)
     }
 
+    /// Whether a lease's newest write gave it a new token, for each shape
+    /// of its change log (each list oldest first, `None` a payload with no
+    /// `fencing_token`). Only the first earlier entry that carries a token
+    /// is compared with: an older one, above or below it, changes nothing.
+    #[tokio::test]
+    async fn the_newest_write_gave_a_new_token_compares_with_the_first_earlier_token() {
+        let (store, _lease, actor, data_dir) = store_with_lease().await;
+        let cases: [(&str, &[Option<i64>], bool); 9] = [
+            ("lse_empty", &[], false),
+            ("lse_only", &[Some(3)], true),
+            ("lse_only_untokened", &[None], false),
+            ("lse_newest_untokened", &[Some(3), None], false),
+            ("lse_earlier_untokened", &[None, None, Some(4)], false),
+            ("lse_raised", &[Some(2), None, Some(3), None, Some(4)], true),
+            ("lse_kept", &[Some(3), Some(4), None, Some(4)], false),
+            ("lse_older_above", &[Some(9), Some(3), Some(4)], true),
+            ("lse_older_below", &[Some(1), Some(5), Some(4)], false),
+        ];
+        let mut w = store.begin_write().await.unwrap();
+        for (lease_id, log, _) in cases {
+            for token in log {
+                let payload = match token {
+                    Some(token) => serde_json::json!({ "fencing_token": token }),
+                    None => serde_json::json!({ "mode": "local" }),
+                };
+                crate::changelog::append(
+                    &mut w.tx,
+                    &actor,
+                    "lease",
+                    lease_id,
+                    crate::changelog::Op::Update,
+                    payload,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        for (lease_id, log, expected) in cases {
+            assert_eq!(
+                super::newest_write_gave_new_token(&mut w.tx, lease_id)
+                    .await
+                    .unwrap(),
+                expected,
+                "{lease_id}: {log:?}"
+            );
+        }
+        drop(w);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
     /// ADR 0203: the stored duration rises before a longer grant, never
     /// falls with a raise, and falls only once the longer grant's gate has
     /// passed.

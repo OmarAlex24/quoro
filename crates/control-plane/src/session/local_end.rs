@@ -1844,4 +1844,155 @@ mod tests {
         assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
         f.done();
     }
+
+    /// The grants and revokes the hub queued on the session's channel.
+    fn drained(live: &mut Live) -> Vec<Value> {
+        let mut texts = Vec::new();
+        while let Ok(text) = live.rx.try_recv() {
+            texts.push(text);
+        }
+        frames(texts)
+            .into_iter()
+            .filter(|frame| frame["type"] == "lease_grant" || frame["type"] == "lease_revoke")
+            .collect()
+    }
+
+    /// Section 5.1 and "The holder fenced first" step 4: a holder whose
+    /// store went back lists the lease `held` `local` at 3 over a step-4
+    /// row that reads `expiring` at 4. Without majority support, its session
+    /// start holds back both the revoke at 3 and the grant. The row is then
+    /// revoked at a higher token, as the raise for another lister does, so
+    /// the grant is owed no more. While support is still lacking, the entry
+    /// stays and its revoke stays held back. Once support returns, the
+    /// revoke at 3 goes out, then the entry goes, and no grant follows.
+    #[tokio::test]
+    async fn a_held_back_revoke_goes_out_after_its_row_is_revoked() {
+        let f = fixture("warm", "expiring", Some(D as i64), true).await;
+        created(&f).await;
+        write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
+        let hub = &f.state.hub;
+        hub.set_voter_support(Arc::new(NoSupport));
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        let generation = on.session.generation;
+        let held_revokes = || hub.0.sessions.lock().unwrap()[&f.node_id].held_revokes;
+        let held = hub.0.held.lock().unwrap().entries[LEASE].clone();
+        assert_eq!(
+            (held.kind, held.token, held.eligible_on, held.revoke_first),
+            (Kind::NewToken, 4, Some(generation), Some(3))
+        );
+        assert_eq!(held_revokes(), 1);
+
+        write_row(
+            &f,
+            "UPDATE leases SET fencing_token = 5, revoked_at = '2026-11-10T10:00:00Z' \
+             WHERE id = ?",
+        )
+        .await;
+        hub.attempt_held().await;
+        hub.attempt_held().await;
+        assert_eq!(
+            hub.0
+                .held
+                .lock()
+                .unwrap()
+                .entries
+                .get(LEASE)
+                .map(|held| held.revoke_first),
+            Some(Some(3)),
+            "the entry and its held-back revoke stay"
+        );
+        assert_eq!(held_revokes(), 1, "the revoke is not released");
+        assert!(drained(&mut on).is_empty());
+
+        hub.set_voter_support(Arc::new(EverySupport));
+        hub.attempt_held().await;
+        hub.attempt_held().await;
+        let sent = drained(&mut on);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["type"], "lease_revoke", "{sent:?}");
+        assert_eq!(sent[0]["body"]["lease_id"], LEASE);
+        assert_eq!(sent[0]["body"]["fencing_token"], 3);
+        assert_eq!(held_revokes(), 0);
+        assert!(!hub.0.held.lock().unwrap().entries.contains_key(LEASE));
+        f.done();
+    }
+
+    /// A policy change off `warm` over a row whose newest write gave it a
+    /// new token, `local` at 4 with the mark, after that token's grant went
+    /// out on the holder's session: R writes nothing, and the row is owed no
+    /// same-token `local` grant, so the sent grant's entry stays as it was
+    /// and no `local` grant is held in its place. Nothing more goes out.
+    #[tokio::test]
+    async fn leaving_warm_after_a_sent_new_token_grant_holds_no_local_grant() {
+        let f = fixture("warm", "local", Some(D as i64), true).await;
+        created(&f).await;
+        write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
+        let mut on = live(&f.state, &f, None).await;
+        let hub = &f.state.hub;
+        hub.hold_grant(&f.row().await);
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        new_token_grants(&queued(&mut on));
+        let sent = hub.0.held.lock().unwrap().entries[LEASE].clone();
+        assert_eq!(
+            (sent.kind, sent.token, sent.sent_on),
+            (Kind::NewToken, 4, Some(on.session.generation))
+        );
+
+        let writes = f.writes().await;
+        r(&f).await;
+        assert_eq!(f.writes().await, writes, "already local and marked");
+        assert_eq!(
+            hub.0.held.lock().unwrap().entries.get(LEASE),
+            Some(&sent),
+            "the sent grant's entry stays"
+        );
+        hub.attempt_held().await;
+        assert!(queued(&mut on).is_empty());
+        assert!(!hub.grant_pending(LEASE));
+        f.done();
+    }
+
+    /// A session start checks each entry held for its node against the row
+    /// and drops the `local` grant that R held: the session start holds it
+    /// again if its `hello` gives a reason. When the same grant is held
+    /// again while the session start reads the row, equal to the one it
+    /// read in every field but its registration, that fresh registration
+    /// stays.
+    #[tokio::test]
+    async fn a_session_start_keeps_a_registration_made_while_it_reads_the_row() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        r(&f).await;
+        let hub = &f.state.hub;
+        let (generation, _rx, _closed, _changed) = hub.attach(&f.node_id);
+        let row = f.row().await;
+        let mut conn = f.state.store.pool().acquire().await.unwrap();
+
+        hub.hold_local_end_on(&row, generation);
+        hub.held_session_start(&mut conn, &f.node_id).await.unwrap();
+        assert!(
+            !hub.0.held.lock().unwrap().entries.contains_key(LEASE),
+            "the session start drops it"
+        );
+
+        hub.hold_local_end_on(&row, generation);
+        {
+            let mut start = std::pin::pin!(hub.held_session_start(&mut conn, &f.node_id));
+            let first = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(start.as_mut(), cx))
+            })
+            .await;
+            assert!(first.is_pending(), "the session start reads the row");
+            hub.hold_local_end_on(&row, generation);
+            let fresh = hub.0.held.lock().unwrap().entries[LEASE].clone();
+            start.await.unwrap();
+            assert_eq!(
+                hub.0.held.lock().unwrap().entries.get(LEASE),
+                Some(&fresh),
+                "the fresh registration stays"
+            );
+        }
+        drop(conn);
+        f.done();
+    }
 }
