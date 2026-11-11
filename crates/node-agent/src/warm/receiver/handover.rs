@@ -55,8 +55,10 @@
 //! directory. Without one, the run fails with the warm copy's error and
 //! changes nothing, and a later pass tries again. A mark cleared
 //! for a missing clone keeps the copy's record, reported without a hash: no
-//! record is ever forgotten here, only by `quarantine_deletes`. The next pass
-//! compares the live file again.
+//! record is ever forgotten here. A record goes by `quarantine_deletes`, or,
+//! while it has no hash, when its hash shows the clone to be gone
+//! ([`crate::warm::quarantine`], section 9 step 2). The next pass compares
+//! the live file again.
 //!
 //! The mark holds only while no VM writes to the file: a node that runs the
 //! volume again before the hand-over finished clears it (the reconciler,
@@ -368,9 +370,11 @@ impl<E: Engine + 'static> Inner<E> {
     /// - Its clone is missing and so is every other recorded file of the
     ///   volume: a volume directory that did not mount looks exactly like
     ///   that. Nothing changes, and the run fails until the files are back.
-    /// - An operator deleted the copy (`quarantine_deletes`) before the file
-    ///   went: the live file is all that keeps its writes now, so the mark
-    ///   goes and the next pass compares the file again.
+    /// - The copy's record is gone before the file went: an operator deleted
+    ///   it (`quarantine_deletes`), or its clone was shown to be gone before
+    ///   it was hashed (section 9 step 2). The live file is all that keeps
+    ///   its writes now, so the mark goes and the next pass compares the
+    ///   file again.
     async fn copy_kept(&self, volume_id: &str, quarantine_id: &str) -> Result<(), HandOver> {
         let record = match self.store.volume_quarantine(quarantine_id).await {
             Ok(Some(record)) => record,
@@ -431,25 +435,13 @@ impl<E: Engine + 'static> Inner<E> {
     /// the files of a directory that did not mount. Neither does the disk
     /// alone: a file left where a moved directory was is not in the engine's.
     async fn volume_files_present(&self, volume_id: &str) -> Result<bool, String> {
-        let kept = self
-            .store
-            .kept_snapshots_of(volume_id)
-            .await
-            .map_err(|e| format!("cannot read the kept snapshots: {e}"))?;
-        for kept in kept {
-            if std::fs::symlink_metadata(&kept.snapshot.location).is_err() {
-                continue;
-            }
-            if self
-                .engine
-                .volume_changed_ranges(&RangesOf::Snapshot(kept.snapshot), None)
-                .await
-                .is_ok()
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        crate::warm::quarantine::volume_file_present(
+            self.engine.as_ref(),
+            &self.store,
+            volume_id,
+            None,
+        )
+        .await
     }
 
     /// Compares the live file with the newest kept base (binding rule of

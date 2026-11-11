@@ -1012,6 +1012,10 @@ async fn a_marked_copy_whose_clone_is_missing_is_kept_and_the_file_compared_agai
     let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
     let lost = marked_copy(&h).await;
     assert_eq!(statuses.borrow_and_update().len(), 1);
+    // Only the file goes: the fake engine still names the clone. On a real
+    // node the engine would answer `NotFound` for it, and the hash would
+    // forget the record (section 9 step 2); the record stays here because
+    // the hash gate keeps the hash from running.
     std::fs::remove_file(&lost.path).expect("remove the clone");
     // The base on disk shows the volume directory to be the real one.
     assert!(base.location.exists());
@@ -1796,4 +1800,159 @@ async fn the_target_is_reported_only_once_the_returning_flag_is_durable() {
     pass(&h, &mut listeners).await;
     assert_handed_over(&h).await;
     assert_eq!(h.status().volume_id, VOL);
+}
+
+// Section 9 step 2: the record of a copy whose clone is gone before it was
+// hashed is forgotten only when the engine answers `NotFound` for the clone
+// and another file of the volume shows the directory to be the real one.
+
+#[tokio::test]
+async fn an_unhashed_copy_whose_clone_is_gone_is_forgotten() {
+    let h = Harness::new("handover-clone-gone").await;
+    let path = returning_source(&h).await;
+    let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+    diverge(&path);
+    let quarantines = h.receiver.inner.quarantines.clone();
+    let mut statuses = h.receiver.quarantine_statuses();
+    let gate = quarantines.inner.hash_gate.lock().await;
+    let lost = marked_copy(&h).await;
+    assert_eq!(statuses.borrow_and_update().len(), 1);
+    let clone = h
+        .store
+        .kept_snapshot(&lost.snapshot_id)
+        .await
+        .expect("store")
+        .expect("kept");
+    // The engine no longer has the clone; the base still answers it.
+    h.engine
+        .delete_volume_snapshot(&clone.snapshot)
+        .await
+        .expect("delete the clone");
+
+    drop(gate);
+    quarantines_where(&mut statuses, Vec::is_empty).await;
+    assert!(quarantined(&h).await.is_empty());
+    assert_eq!(
+        h.store
+            .kept_snapshot(&lost.snapshot_id)
+            .await
+            .expect("store"),
+        None
+    );
+    assert!(!quarantines.hash_failed(&lost.quarantine_id));
+    // No file is touched.
+    assert!(base.location.exists());
+    assert!(path.exists());
+
+    // The mark stood for the copy: the next run clears it and compares the
+    // live file again.
+    assert!(matches!(hand_over(&h).await, HandOver::Failed(_)));
+    assert_eq!(
+        h.store.volume_hand_over_mark(VOL).await.expect("store"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_lost_clone_keeps_its_record_while_the_engine_cannot_tell_or_no_other_file_answers() {
+    let h = Harness::new("handover-clone-unproved").await;
+    let path = returning_source(&h).await;
+    let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+    diverge(&path);
+    let quarantines = h.receiver.inner.quarantines.clone();
+    let gate = quarantines.inner.hash_gate.lock().await;
+    let lost = marked_copy(&h).await;
+    let clone = h
+        .store
+        .kept_snapshot(&lost.snapshot_id)
+        .await
+        .expect("store")
+        .expect("kept");
+    h.engine
+        .delete_volume_snapshot(&clone.snapshot)
+        .await
+        .expect("delete the clone");
+    let kept_as_is = |h: &Harness| {
+        let store = h.store.clone();
+        let lost = lost.clone();
+        async move {
+            assert_eq!(
+                store.volume_quarantines().await.expect("records"),
+                vec![lost.clone()]
+            );
+            assert!(
+                store
+                    .kept_snapshot(&lost.snapshot_id)
+                    .await
+                    .expect("store")
+                    .is_some()
+            );
+        }
+    };
+
+    // A pool that does not mount answers `Unsupported` for the clone.
+    h.engine.fail_next(
+        FakeOp::VolumeChangedRanges,
+        EngineError::Unsupported("the volume pool does not mount".to_owned()),
+    );
+    drop(gate);
+    wait_for("the hash to fail", || async {
+        quarantines.hash_failed(&lost.quarantine_id)
+    })
+    .await;
+    kept_as_is(&h).await;
+
+    // No other file of the volume answers the engine: the directory is not
+    // shown to be the real one.
+    h.engine
+        .delete_volume_snapshot(&base)
+        .await
+        .expect("delete the base");
+    quarantines.hash(&lost);
+    wait_for("the second hash to end", || async {
+        !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert!(quarantines.hash_failed(&lost.quarantine_id));
+    kept_as_is(&h).await;
+    assert!(path.exists());
+}
+
+#[tokio::test]
+async fn a_clone_the_engine_still_names_or_that_appears_with_the_directory_keeps_its_record() {
+    let h = Harness::new("handover-clone-mount-race").await;
+    let path = returning_source(&h).await;
+    let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+    diverge(&path);
+    let quarantines = h.receiver.inner.quarantines.clone();
+    let gate = quarantines.inner.hash_gate.lock().await;
+    let lost = marked_copy(&h).await;
+    // The file is gone, but the engine still names the clone.
+    std::fs::remove_file(&lost.path).expect("remove the clone");
+    drop(gate);
+    wait_for("the hash to fail", || async {
+        quarantines.hash_failed(&lost.quarantine_id)
+    })
+    .await;
+    assert_eq!(quarantined(&h).await, vec![lost.clone()]);
+
+    // The first lookup misses the clone, as before a volume directory
+    // mounts; the base then answers, and so does the clone, as once it has.
+    h.engine
+        .fail_next(FakeOp::VolumeChangedRanges, EngineError::NotFound);
+    quarantines.hash(&lost);
+    wait_for("the second hash to end", || async {
+        !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert!(quarantines.hash_failed(&lost.quarantine_id));
+    assert_eq!(quarantined(&h).await, vec![lost.clone()]);
+    assert!(
+        h.store
+            .kept_snapshot(&lost.snapshot_id)
+            .await
+            .expect("store")
+            .is_some()
+    );
+    assert!(base.location.exists());
 }
