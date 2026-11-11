@@ -186,6 +186,29 @@ impl HeldGrant {
     }
 }
 
+/// Test seam: a pause in [`NodeHub::held_session_start`] between its read of
+/// an entry's row and its change of that entry
+/// ([`NodeHub::pause_next_held_start`]).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct Pause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl Pause {
+    /// Waits until the session start has read the row and paused.
+    pub(super) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the session start go on to its change of the entry.
+    pub(super) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
 /// What one attempt at a held grant found.
 pub(super) enum Attempt {
     /// It went out.
@@ -636,6 +659,8 @@ impl NodeHub {
                 Some(row) => leases::fenced(conn, unrecorded, row).await?,
                 None => false,
             };
+            #[cfg(test)]
+            self.held_start_paused().await;
             // What the entry was when it changed, so a revoke it held back
             // goes with the session it was eligible on.
             let changed = {
@@ -655,6 +680,26 @@ impl NodeHub {
             }
         }
         Ok(())
+    }
+
+    /// Test seam: the next [`NodeHub::held_session_start`] pauses once, after
+    /// it read the row of an entry and before it changes that entry, until
+    /// the returned pause is released.
+    #[cfg(test)]
+    pub(super) fn pause_next_held_start(&self) -> std::sync::Arc<Pause> {
+        let pause = std::sync::Arc::new(Pause::default());
+        *self.0.held_start_pause.lock().expect("pause lock") = Some(pause.clone());
+        pause
+    }
+
+    /// Waits at the pause [`NodeHub::pause_next_held_start`] set, once.
+    #[cfg(test)]
+    async fn held_start_paused(&self) {
+        let pause = self.0.held_start_pause.lock().expect("pause lock").take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     /// A session start found the step-4 row `lease` listed at the row's

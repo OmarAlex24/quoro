@@ -1034,10 +1034,15 @@ mod tests {
     /// it and `app.left_stopped` in the transaction, then the hub's part
     /// once it commits.
     async fn r(f: &Fixture) {
+        r_on(&f.state, f).await;
+    }
+
+    /// [`r`] on the primary `state`, opened on the fixture's database.
+    async fn r_on(state: &AppState, f: &Fixture) {
         if f.writes().await == 0 {
             created(f).await;
         }
-        let mut w = f.state.store.begin_write().await.unwrap();
+        let mut w = state.store.begin_write().await.unwrap();
         sqlx::query("UPDATE apps SET ha_policy = 'none' WHERE id = ?")
             .bind(APP)
             .execute(&mut *w.tx)
@@ -1047,7 +1052,7 @@ mod tests {
             .await
             .unwrap();
         if let Some(ended) = &ended {
-            f.state
+            state
                 .hub
                 .record_left_stopped(&mut w.tx, ended, &by(&actor()))
                 .await
@@ -1055,7 +1060,7 @@ mod tests {
         }
         w.commit().await.unwrap();
         if let Some(ended) = ended {
-            f.state.hub.end_renewals_committed(&ended);
+            state.hub.end_renewals_committed(&ended);
         }
     }
 
@@ -2289,12 +2294,233 @@ mod tests {
         f.done();
     }
 
+    /// "Settling a lease": "Sending the same-token `local` grant clears any
+    /// pending settle for that lease, whether planned from a `hello` or
+    /// waiting for its `pong`: none of them writes the row afterwards".
+    ///
+    /// 1. The policy leaves `warm` (R) and returns before the grant; the
+    ///    holder's renewal at 3 is answered as a settle, and its `ping` is
+    ///    recorded against R's write.
+    /// 2. The policy leaves `warm` again: the row already reads `local` with
+    ///    the mark, so nothing is written, and the settle's `ping` still
+    ///    matches the row's newest write.
+    /// 3. The `local` grant goes out: the session's settles of the lease are
+    ///    gone at once.
+    /// 4. Back on `warm`, the settle's `pong` arrives: the row stays `local`
+    ///    and marked, never `expiring` while the holder holds the lease
+    ///    `local`.
+    ///
+    /// A settle that a `hello` planned over a marked row goes the same way
+    /// as the grant goes out.
+    #[tokio::test]
+    async fn the_local_grant_clears_the_settles_pending_on_its_session() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
+        let hub = &f.state.hub;
+        let generation = on.session.generation;
+        r(&f).await;
+        set_policy(&f, "warm").await;
+        let answer = renew(&mut on.session, "msg_r1", 3).await;
+        assert_answer(&answer, "msg_r1", 3, D);
+        let settle_ping = ping_of(&answer);
+        assert_eq!(
+            hub.settle_state(&f.node_id, generation, LEASE),
+            (None, vec![3])
+        );
+        let writes = f.writes().await;
+
+        r(&f).await;
+        assert_eq!(f.writes().await, writes, "R writes nothing the second time");
+
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        grant_then_ping(&queued(&mut on), 3);
+        let after_grant = hub.settle_state(&f.node_id, generation, LEASE);
+        assert_eq!(f.writes().await, writes, "the settle's ping still matches");
+
+        set_policy(&f, "warm").await;
+        pong(&mut on.session, &settle_ping).await;
+        assert_eq!(
+            state(&f).await,
+            ("local".to_string(), 3, Some(D as i64), true, false),
+            "not settled expiring"
+        );
+        assert_eq!(f.writes().await, writes);
+        assert_eq!(
+            after_grant,
+            (None, Vec::new()),
+            "cleared as the grant went out"
+        );
+        f.done();
+
+        let f = fixture("warm", "expiring", Some(D as i64), true).await;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
+        let hub = &f.state.hub;
+        let generation = on.session.generation;
+        assert_eq!(
+            hub.settle_state(&f.node_id, generation, LEASE),
+            (Some(3), Vec::new()),
+            "planned from the hello"
+        );
+        r(&f).await;
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        grant_then_ping(&queued(&mut on), 3);
+        assert_eq!(
+            hub.settle_state(&f.node_id, generation, LEASE),
+            (None, Vec::new())
+        );
+        f.done();
+    }
+
+    /// The grant is recorded on a session only once it is queued there, in
+    /// the hold of the sessions lock that finds the session current. A
+    /// generation that is not the node's session gets nothing queued and
+    /// nothing recorded. A session whose channel is closed gets no record:
+    /// its renewals at the token are still answered, and the held grant is
+    /// not marked sent. A session start on a session that is no longer the
+    /// node's pushes neither the grant nor its `ping`.
+    #[tokio::test]
+    async fn a_local_grant_that_was_not_queued_is_not_recorded() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
+        let hub = &f.state.hub;
+        let generation = on.session.generation;
+        r(&f).await;
+        let barrier = super::Barrier {
+            lease_id: LEASE.to_string(),
+            token: 3,
+            seq: None,
+        };
+        assert!(!hub.queue_local_end(
+            &f.node_id,
+            generation + 1,
+            &barrier,
+            "msg_grant",
+            false,
+            true,
+            "msg_ping",
+            &["{}".to_string()],
+        ));
+        assert!(queued(&mut on).is_empty());
+        assert_eq!(hub.local_grant_sent(&f.node_id, generation, LEASE), None);
+
+        ack(&f.state, &f, &on).await;
+        let Live {
+            mut session, rx, ..
+        } = on;
+        drop(rx);
+        hub.attempt_held().await;
+        assert_eq!(hub.local_grant_sent(&f.node_id, generation, LEASE), None);
+        {
+            let registry = hub.0.held.lock().unwrap();
+            let held = &registry.entries[LEASE];
+            assert_eq!(
+                (held.kind, held.eligible_on, held.sent_on),
+                (Kind::LocalEnd, Some(generation), None)
+            );
+        }
+        assert_answer(&renew(&mut session, "msg_r1", 3).await, "msg_r1", 3, D);
+
+        let (newer, _rx, _closed, _changed) = hub.attach(&f.node_id);
+        let mut outbox = Vec::new();
+        session
+            .queue_local_grant(&f.row().await, 3, true, &mut outbox)
+            .await;
+        assert!(outbox.is_empty());
+        assert_eq!(hub.local_grant_sent(&f.node_id, newer, LEASE), None);
+        f.done();
+    }
+
+    /// "Grants of a marked row": "When that session ends first, the grant
+    /// again waits for such a session and is not pending", and "When the
+    /// policy returns to `warm`, the grant is dropped". `failoverApp` reads
+    /// the policy before any wait: off `warm`, it answers `not_warm`, the
+    /// grant pending or not. The holder's session ends; the policy returns
+    /// to `warm`, and until an attempt drops the grant, it is still held for
+    /// the ended session: it reads as not pending, so no failover answers
+    /// `in_progress` for it.
+    #[tokio::test]
+    async fn a_local_grant_of_an_ended_session_makes_no_failover_answer_in_progress() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        let on = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
+        let hub = &f.state.hub;
+        hub.set_voter_support(Arc::new(NoSupport));
+        r(&f).await;
+        assert!(
+            hub.row_grant_pending(&f.row().await),
+            "pending on its session"
+        );
+        assert_eq!(failover(&f).await, Some(crate::error::Reason::NotWarm));
+
+        hub.detach(&f.node_id, on.session.generation);
+        let held = hub.0.held.lock().unwrap().entries[LEASE].clone();
+        assert_eq!(
+            (held.kind, held.eligible_on, held.sent_on),
+            (Kind::LocalEnd, Some(on.session.generation), None)
+        );
+        set_policy(&f, "warm").await;
+        let row = f.row().await;
+        // As the held-grant task may not have attempted it yet; no await
+        // until the reads below.
+        hub.0
+            .held
+            .lock()
+            .unwrap()
+            .entries
+            .insert(LEASE.to_string(), held);
+        assert!(!hub.row_grant_pending(&row), "no in_progress");
+        assert!(!hub.grant_pending(LEASE));
+        assert_ne!(failover(&f).await, Some(crate::error::Reason::InProgress));
+        f.done();
+    }
+
+    /// "A primary that restarted after R committed holds no such grant, so
+    /// it drops nothing and emits nothing." R drops a failover's grant held
+    /// at 4 and records one `app.left_stopped`, which opens no incident.
+    /// The restarted primary holds nothing for the row, and the holder's
+    /// session start, an attempt, and a return to `warm` and a new change
+    /// off it record no other.
+    #[tokio::test]
+    async fn a_primary_restarted_after_r_emits_no_app_left_stopped() {
+        let f = fixture("warm", "expiring", Some(D as i64), true).await;
+        created(&f).await;
+        write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
+        f.state.hub.hold_grant(&f.row().await);
+        r(&f).await;
+        assert_eq!(left_stopped(&f).await, vec![the_event(&f, 4)]);
+
+        let (after, _clock) = restart(&f).await;
+        after.hub.set_voter_support(Arc::new(EverySupport));
+        assert!(!after.hub.grant_pending(LEASE), "nothing held");
+        let on = live(&after, &f, None).await;
+        ack(&after, &f, &on).await;
+        after.hub.attempt_held().await;
+        set_policy(&f, "warm").await;
+        r_on(&after, &f).await;
+        after.hub.attempt_held().await;
+        assert_eq!(left_stopped(&f).await, vec![the_event(&f, 4)], "once");
+        let incidents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents")
+            .fetch_one(f.state.store.pool())
+            .await
+            .unwrap();
+        let linked: Option<String> =
+            sqlx::query_scalar("SELECT incident_id FROM events WHERE type = 'app.left_stopped'")
+                .fetch_one(f.state.store.pool())
+                .await
+                .unwrap();
+        assert_eq!((incidents, linked), (0, None), "no incident");
+        f.done();
+    }
+
     /// A session start checks each entry held for its node against the row
     /// and drops the `local` grant that R held: the session start holds it
     /// again if its `hello` gives a reason. When the same grant is held
     /// again while the session start reads the row, equal to the one it
     /// read in every field but its registration, that fresh registration
-    /// stays.
+    /// stays. The session start pauses after its read of the row, so the
+    /// second registration always lands between that read and its change
+    /// of the entry.
     #[tokio::test]
     async fn a_session_start_keeps_a_registration_made_while_it_reads_the_row() {
         let f = fixture("warm", "expiring", Some(D as i64), false).await;
@@ -2312,22 +2538,26 @@ mod tests {
         );
 
         hub.hold_local_end_on(&row, generation);
-        {
-            let mut start = std::pin::pin!(hub.held_session_start(&mut conn, &f.node_id));
-            let first = std::future::poll_fn(|cx| {
-                std::task::Poll::Ready(std::future::Future::poll(start.as_mut(), cx))
-            })
-            .await;
-            assert!(first.is_pending(), "the session start reads the row");
+        let pause = hub.pause_next_held_start();
+        let start = hub.held_session_start(&mut conn, &f.node_id);
+        let meanwhile = async {
+            pause.reached().await;
             hub.hold_local_end_on(&row, generation);
             let fresh = hub.0.held.lock().unwrap().entries[LEASE].clone();
-            start.await.unwrap();
-            assert_eq!(
-                hub.0.held.lock().unwrap().entries.get(LEASE),
-                Some(&fresh),
-                "the fresh registration stays"
-            );
-        }
+            pause.release();
+            fresh
+        };
+        let (started, fresh) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(start, meanwhile)
+        })
+        .await
+        .expect("the session start pauses once it has read the row");
+        started.unwrap();
+        assert_eq!(
+            hub.0.held.lock().unwrap().entries.get(LEASE),
+            Some(&fresh),
+            "the fresh registration stays"
+        );
         drop(conn);
         f.done();
     }
@@ -2451,6 +2681,21 @@ mod tests {
     async fn update_app_off_warm(
         f: &Fixture,
     ) -> (crate::api::apps::UpdatedApp, crate::changelog::Actor) {
+        let (ctx, actor) = call(f, "PATCH /api/v1/apps/{app_id}").await;
+        let params = serde_json::json!({ "ha_policy": "none" });
+        let body = serde_json::from_value(params.clone()).unwrap();
+        let updated = crate::api::apps::update_app_tx(&f.state, &ctx, APP, &body, &params)
+            .await
+            .unwrap();
+        (updated, actor)
+    }
+
+    /// An API call `route` by a user, over the fixture's app with a health
+    /// check and resources an API read accepts, and the user's actor.
+    async fn call(
+        f: &Fixture,
+        route: &'static str,
+    ) -> (crate::request::CallCtx, crate::changelog::Actor) {
         use crate::auth::{Credential, Identity, Principal, UserIdentity};
         let health_check = serde_json::to_string(&crate::api::apps::HealthCheck::default());
         let resources = serde_json::to_string(&crate::api::apps::AppResources::default());
@@ -2476,15 +2721,20 @@ mod tests {
         let ctx = crate::request::CallCtx::new(
             identity,
             REQUEST.to_string(),
-            "PATCH /api/v1/apps/{app_id}",
+            route,
             &axum::http::HeaderMap::new(),
         );
-        let params = serde_json::json!({ "ha_policy": "none" });
-        let body = serde_json::from_value(params.clone()).unwrap();
-        let updated = crate::api::apps::update_app_tx(&f.state, &ctx, APP, &body, &params)
+        (ctx, actor)
+    }
+
+    /// The reason `failoverApp` gives for refusing a failover of the
+    /// fixture's app to its holder.
+    async fn failover(f: &Fixture) -> Option<crate::error::Reason> {
+        let (ctx, _) = call(f, "POST /api/v1/apps/{app_id}/failover").await;
+        let refused = crate::failover::run(&f.state, &ctx, APP, &f.node_id, &Value::Null)
             .await
-            .unwrap();
-        (updated, actor)
+            .expect_err("no failover of the fixture's app goes through");
+        refused.reason
     }
 
     /// "The primary emits `app.left_stopped` as it drops the grant": a

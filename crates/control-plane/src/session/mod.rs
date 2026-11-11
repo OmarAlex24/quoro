@@ -635,6 +635,10 @@ struct HubInner {
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
     /// Test seam: failures to inject, each once ([`NodeHub::inject_fault`]).
     faults: Mutex<Vec<Fault>>,
+    /// Test seam: pauses the next check of a held grant at a session start
+    /// ([`NodeHub::pause_next_held_start`]).
+    #[cfg(test)]
+    held_start_pause: Mutex<Option<Arc<held::Pause>>>,
     /// Test seam: the node ids whose session task has returned, in order,
     /// the newest [`SESSION_ENDS_KEPT`] only ([`NodeHub::session_tasks_ended`]).
     session_tasks_ended: watch::Sender<Vec<String>>,
@@ -774,6 +778,8 @@ impl NodeHub {
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             faults: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            held_start_pause: Mutex::new(None),
             session_tasks_ended: watch::channel(Vec::new()).0,
             serving_inputs: Notify::new(),
             revoke_answers: Notify::new(),
