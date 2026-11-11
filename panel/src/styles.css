@@ -4687,8 +4687,13 @@
    * neutral, so every word keeps 4.5:1 in both themes.
    */
   .ncard canvas,
-  .ncard .ncard-u i {
+  .ncard .ncard-u i,
+  .ncard .chart :is(.xh, .xh-dot) {
     transition: filter var(--motion-change) var(--ease);
+  }
+
+  .ncard :is(.chart-sm .chart-v, .ncard-r-h b, .ncard-f b) {
+    transition: color var(--motion-change) var(--ease);
   }
 
   .ncard .lamp {
@@ -4705,7 +4710,8 @@
 
   .ncard[data-lost] canvas,
   .ncard[data-lost] .lamp,
-  .ncard[data-lost] .ncard-u i {
+  .ncard[data-lost] .ncard-u i,
+  .ncard[data-lost] .chart :is(.xh, .xh-dot) {
     filter: opacity(0.5) saturate(0.3);
   }
 
