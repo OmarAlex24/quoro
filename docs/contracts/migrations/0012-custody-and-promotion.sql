@@ -59,6 +59,7 @@
 -- demoted_by_term, the higher term a primary learned of when it demoted
 -- itself (section 7.4). While it is set the primary answers every request
 -- with 503 not_primary. term (ADR 0169) is written by a promotion to t + 1.
+-- Neither exceeds 2^53 - 1, the term ceiling (section 8.8).
 --
 -- A promotion rebuilds the database by applying every followed entry to a
 -- schema of the promoting binary (section 7.3). A payload written before a
