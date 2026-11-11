@@ -230,7 +230,8 @@ export function AppCard({
       sub={appAddress(app, domains.data?.items[0]?.hostname)}
       lamp={<LampDot ring={lamp.tone} core={lamp.tone} pulse={lamp.pulse} size={15} />}
       word={progress && lamp.statusText === 'Deploying' ? progress.word : lamp.statusText}
-      since={deployments ? deployAge(app, deployments, now) : null}
+      // While a deploy runs, the tape's clock is the only time on the card.
+      since={deployments && !progress ? deployAge(app, deployments, now) : null}
       body={progress ? <PhaseTape progress={progress} /> : <AppFigures appId={app.id} chips={chips} poll={!dimmed && !metricsIdle(app.status)} />}
       foot={foot}
       deploying={lamp.pulse}

@@ -536,7 +536,8 @@ export function ProjectCanvas({
               const aura = auras[key];
               return (
                 <div key={key} className="canvas-cell" {...pointAt(key)}>
-                  {aura ? <Aura tone={aura.tone} breathe={aura.breathe} /> : null}
+                  {/* Stacked cards sit 14 px apart: the aura stays inside half the gap, off its neighbours. */}
+                  {aura ? <Aura tone={aura.tone} breathe={aura.breathe} margin={6} /> : null}
                   {card(service)}
                 </div>
               );
