@@ -328,7 +328,7 @@ export type TapeTone = 'done' | 'live' | 'failed' | 'stopped';
  * One phase of the deploy tape. Done phases share one accent-to-ion run
  * across the whole tape: `from` and `to` are where this segment starts and
  * ends on it (0..1), so neighbours meet in the same mix. The running phase
- * fills in amber towards now; a broken one is solid fault red.
+ * is an even amber checker; a broken one is solid fault red.
  */
 export function drawTapeSegment(
   { ctx, w, h }: DitherSurface,
@@ -338,7 +338,9 @@ export function drawTapeSegment(
   read: TokenReader = readToken,
 ): void {
   if (tone === 'live') {
-    dither(ctx, w, h, 2, read('--shift'), (x) => 0.3 + (0.7 * x) / w);
+    // An even checker, as the proposal draws the step under way: no ramp, so
+    // its end never reads as a finished, solid bar.
+    dither(ctx, w, h, 2, read('--shift'), () => 0.5);
     return;
   }
   if (tone === 'failed') {

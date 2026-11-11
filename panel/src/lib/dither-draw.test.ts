@@ -1,5 +1,5 @@
-import { beforeAll, describe, expect, it } from 'vitest';
-import { drawMetricArea, type DitherSurface } from './dither-draw';
+import { beforeAll, describe, expect, it, onTestFinished } from 'vitest';
+import { drawMetricArea, drawTapeSegment, type DitherSurface } from './dither-draw';
 import type { AreaPlot } from './metric-area';
 
 /** A canvas context that records what is drawn, enough for drawMetricArea. */
@@ -72,5 +72,26 @@ describe('drawMetricArea', () => {
     const surface = { ctx, w: 120, h: 60 } as DitherSurface;
     drawMetricArea(surface, plot, read);
     expect(texts).toContain('limit 512 MiB');
+  });
+});
+
+describe('drawTapeSegment', () => {
+  it('draws the step under way as an even checker, the same at its start and its end', () => {
+    const rects: Array<[number, number]> = [];
+    const stub = (globalThis as Record<string, unknown>).Path2D;
+    onTestFinished(() => {
+      (globalThis as Record<string, unknown>).Path2D = stub;
+    });
+    (globalThis as Record<string, unknown>).Path2D = class {
+      rect(x: number, y: number) {
+        rects.push([x, y]);
+      }
+    };
+    const { ctx } = recorder();
+    drawTapeSegment({ ctx, w: 64, h: 6 } as DitherSurface, 'live', 0.2, 0.9, read);
+    const cells = (32 * 3) / 2;
+    expect(rects).toHaveLength(cells);
+    const left = rects.filter(([x]) => x < 32).length;
+    expect(left).toBe(cells / 2);
   });
 });

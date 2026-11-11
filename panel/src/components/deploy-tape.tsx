@@ -5,6 +5,7 @@ import {
   formatClock,
   formatSpan,
   TAPE_STEP_LABELS,
+  tapeRest,
   type BuildkitStep,
   type Estimate,
   type MiniSegment,
@@ -110,8 +111,10 @@ function TapeSegment({ tone, from, to, grow }: { tone: TapeTone; from: number; t
 
 /**
  * Where the time went, to scale: one dithered segment per recorded step, and
- * dotted after it what the estimate says is left. Nothing is drawn for a run
- * that recorded no time.
+ * dotted after it what is left. With an estimate that is one span of what is
+ * left; without one it is the steps still to come at the mean finished step
+ * (see `tapeRest`), so a first deploy never looks finished. Nothing is drawn
+ * for a run that recorded no time.
  */
 export function Tape({
   steps,
@@ -124,19 +127,23 @@ export function Tape({
 }) {
   const segments = steps.filter((step) => step.seconds !== null && step.seconds > 0);
   const recorded = segments.reduce((total, step) => total + (step.seconds ?? 0), 0);
-  const left = remaining !== null && remaining > 0 ? remaining : 0;
+  const rest = tapeRest(steps, remaining);
+  const left = rest ? rest.spans.reduce((total, span) => total + span, 0) : 0;
   const total = recorded + left;
   if (recorded <= 0) return null;
 
   const summary = segments
     .map((step) => `${TAPE_STEP_LABELS[step.step]} ${formatSpan(step.seconds ?? 0)}`)
     .join(', ');
-  const dotted =
-    left > 0 && estimate
+  const dotted = !rest
+    ? ''
+    : rest.estimated && estimate
       ? `, dotted: about ${formatSpan(left)} left, from the last ${estimate.samples} ${estimate.samples === 1 ? 'deploy' : 'deploys'}`
-      : left > 0
+      : rest.estimated
         ? `, about ${formatSpan(left)} left`
-        : '';
+        : rest.pending.length > 0
+          ? `, dotted: ${listWords(rest.pending.map((step) => TAPE_STEP_LABELS[step].toLowerCase()))} still to come`
+          : `, dotted: the rest of ${TAPE_STEP_LABELS[rest.live].toLowerCase()}`;
   let cursor = 0;
   return (
     <div className="tape" role="img" aria-label={`Where the time went, to scale: ${summary}${dotted}`}>
@@ -153,10 +160,16 @@ export function Tape({
           />
         );
       })}
-      {left > 0 ? <span className="tape-ghost d25" style={{ flexGrow: left }} /> : null}
+      {rest?.spans.map((span, index) => (
+        <span key={`rest-${index}`} className="tape-ghost d25" style={{ flexGrow: span }} />
+      ))}
     </div>
   );
 }
+
+/** "pull", "pull and boot", "pull, boot and health". */
+const listWords = (words: readonly string[]): string =>
+  words.length <= 1 ? (words[0] ?? '') : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
 
 function StepBar({ share, tone }: { share: number; tone: TapeTone }) {
   const value = round(share);

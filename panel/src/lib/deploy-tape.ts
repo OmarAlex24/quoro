@@ -779,3 +779,42 @@ export function runTag(
       return { word: 'Superseded', tone: 'plain' };
   }
 }
+
+/** What the tape draws dotted after the recorded steps of a live run. */
+export interface TapeRest {
+  /** One dotted span per entry, in seconds, on the same scale as the recorded steps. */
+  readonly spans: readonly number[];
+  /** From the estimate of earlier deploys; false when only the steps to come are known. */
+  readonly estimated: boolean;
+  /** The steps not reached yet, in order. */
+  readonly pending: readonly TapeStep[];
+  /** The step under way. */
+  readonly live: TapeStep;
+}
+
+/**
+ * The dotted rest of a live run's tape. With an estimate it is one span of
+ * what is left. Without one, as on the first deploy of its kind, every step
+ * is taken to last as long as the mean finished step (or, before any has
+ * finished, as long as the one under way has run): the step under way gets
+ * what it has left of that and each step not reached a whole one, so the
+ * tape never looks finished while the run goes on. Null for a run that is
+ * over, or when nothing is left to draw.
+ */
+export function tapeRest(steps: readonly StepSpan[], remaining: number | null): TapeRest | null {
+  const live = steps.find((step) => step.state === 'live');
+  if (!live) return null;
+  const pending = steps.filter((step) => step.state === 'pending').map((step) => step.step);
+  if (remaining !== null) {
+    return remaining > 0 ? { spans: [remaining], estimated: true, pending, live: live.step } : null;
+  }
+  const done = steps.filter((step) => step.state === 'done' && step.seconds !== null && step.seconds > 0);
+  const typical =
+    done.length > 0 ? done.reduce((total, step) => total + (step.seconds ?? 0), 0) / done.length : (live.seconds ?? 0);
+  if (typical <= 0) return null;
+  const rest = Math.max(0, typical - (live.seconds ?? 0));
+  // What the step under way has left joins the first step to come: one dotted run of "not yet".
+  const spans = pending.map((_, index) => (index === 0 ? typical + rest : typical));
+  if (spans.length === 0 && rest > 0) spans.push(rest);
+  return spans.length > 0 ? { spans, estimated: false, pending, live: live.step } : null;
+}
