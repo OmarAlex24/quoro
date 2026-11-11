@@ -95,6 +95,7 @@
     --dot: #cdd3de;
     --ink: #11151e;
     --ink-2: #4b5467;
+    /* Tertiary words keep 4.5:1 on every surface, the raised one included. */
     --ink-3: #60697d;
     --accent: #2643b5;
     --accent-solid: #2643b5;
@@ -138,6 +139,7 @@
   --dot: #cdd3de;
   --ink: #11151e;
   --ink-2: #4b5467;
+  /* Tertiary words keep 4.5:1 on every surface, the raised one included. */
   --ink-3: #60697d;
   --accent: #2643b5;
   --accent-solid: #2643b5;
@@ -180,6 +182,7 @@
   --dot: #232a3a;
   --ink: #e8ebf3;
   --ink-2: #a3abbd;
+  /* Tertiary words keep 4.5:1 on every surface, the raised one included. */
   --ink-3: #80889c;
   --accent: #8196ff;
   --accent-solid: #4a63f0;
@@ -3748,8 +3751,8 @@
    * Label and value tables (the sheet's Settings, a webhook, a backup
    * repository, an audit entry): a sunk surface, 1 px rules between rows and
    * a highlight under the pointer. Code values set themselves in Martian
-   * Mono (`.type-code`); labels never. Labels stay --ink-2, a step above the
-   * --ink-3 notes beside some values.
+   * Mono (`.type-code`); labels never. Labels stay --ink-2 by choice, so they
+   * read above the values' own tertiary text; the proposal draws them in --ink-3.
    */
   .set-rows {
     display: grid;
