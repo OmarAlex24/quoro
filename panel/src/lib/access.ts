@@ -1,30 +1,13 @@
-import type { Approval, Grant, Project, Scope } from '../api/generated/model';
+import type { Approval, Scope } from '../api/generated/model';
 import { shortId } from './agency-format';
 
 /*
  * Who else can act on a project, and what an agent asks for, in plain words.
- * The canvas chip reads `listGrants`; the projects callout reads
+ * The project rail reads `listGrants`; the projects callout reads
  * `listApprovals`. Both say only what those fields support.
  */
 
-/* ---------- the access chip ---------- */
-
-/**
- * Does this grant let its agent act inside the project right now? Only an
- * active, unexpired grant whose selector names the project (by slug) or
- * every resource. A grant limited to some apps or nodes is not "here": it
- * covers those apps, not the project.
- */
-export const grantCoversProject = (
-  grant: Pick<Grant, 'status' | 'expires_at' | 'selector'>,
-  project: Pick<Project, 'slug'>,
-  now: number = Date.now(),
-): boolean => {
-  if (grant.status !== 'active') return false;
-  const expires = Date.parse(grant.expires_at);
-  if (Number.isNaN(expires) || expires <= now) return false;
-  return grant.selector.all === true || (grant.selector.projects ?? []).includes(project.slug);
-};
+/* ---------- what a grant lets an agent do ---------- */
 
 /** The project's resources a scope can act on, and how to name them. */
 const NOUNS: Readonly<Record<string, string>> = {
@@ -86,34 +69,6 @@ export const accessCovers = (scopes: readonly Scope[]): boolean =>
     const verb = scope.slice(scope.indexOf(':') + 1);
     return resource in NOUNS && (verb === 'logs' || VERBS.some(([known]) => known === verb));
   });
-
-/** "6 d left", "20 h left", "45 min left": the time a grant has, in its largest unit. */
-export const timeLeft = (iso: string, now: number = Date.now()): string => {
-  const seconds = Math.max(0, (Date.parse(iso) - now) / 1_000);
-  if (seconds >= 86_400) return `${Math.floor(seconds / 86_400)} d left`;
-  if (seconds >= 3_600) return `${Math.floor(seconds / 3_600)} h left`;
-  return `${Math.max(1, Math.floor(seconds / 60))} min left`;
-};
-
-export interface ProjectAccess {
-  readonly grant: Grant;
-  readonly phrase: string;
-}
-
-/**
- * The grants that let an agent act in this project, soonest expiry first,
- * each with what it lets the agent do.
- */
-export const projectAccess = (
-  grants: readonly Grant[],
-  project: Pick<Project, 'slug'>,
-  now: number = Date.now(),
-): ProjectAccess[] =>
-  grants
-    .filter((grant) => grantCoversProject(grant, project, now))
-    .map((grant) => ({ grant, phrase: accessPhrase(grant.scopes) }))
-    .filter((entry): entry is ProjectAccess => entry.phrase !== null)
-    .sort((left, right) => Date.parse(left.grant.expires_at) - Date.parse(right.grant.expires_at));
 
 /* ---------- the approval callout ---------- */
 

@@ -2738,22 +2738,20 @@
     pointer-events: auto;
   }
 
+  /* Add, top-left over the field; in the stacked canvas, the first row of the column. */
   .canvas-tools {
     position: absolute;
-    top: 16px;
-    right: 18px;
-    left: 18px;
+    top: 12px;
+    left: 14px;
     z-index: 2;
     display: flex;
     align-items: center;
-    justify-content: flex-end;
     gap: 10px;
-    pointer-events: none;
   }
 
-  /* One row on any width: the access chip gives way and truncates, Add keeps its size. */
-  .canvas-tools > * {
-    pointer-events: auto;
+  .canvas-tools.canvas-tools-flow {
+    position: static;
+    padding: 12px 14px 0;
   }
 
   .canvas-problem {
@@ -2784,7 +2782,7 @@
   .svc-body {
     display: grid;
     gap: 4px;
-    padding: 14px 16px 15px;
+    padding: 13px 14px 12px;
   }
 
   .svc-name {
@@ -2828,8 +2826,8 @@
   .svc-state {
     display: flex;
     align-items: center;
-    gap: 9px;
-    margin-top: 12px;
+    gap: 8px;
+    margin-top: 9px;
     font-size: 13px;
     white-space: nowrap;
   }
@@ -2839,7 +2837,7 @@
     align-items: center;
     gap: 8px;
     min-width: 0;
-    padding: 9px 16px;
+    padding: 8px 14px;
     border-top: 1px solid var(--line);
     font-size: var(--type-small);
     color: var(--ink-2);
@@ -2856,6 +2854,485 @@
   .svc-foot-fault,
   .svc-foot-fault svg {
     color: var(--fault);
+  }
+
+  /* The age of the last deploy, at the end of the state line. */
+  .svc-since {
+    margin-left: auto;
+    flex: none;
+    font-size: var(--type-min);
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* CPU and memory side by side: a figure over a small trace or a meter. */
+  .svc-m {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 10px;
+    margin-top: 9px;
+  }
+
+  .svc-m-c {
+    display: grid;
+    align-content: start;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .svc-k {
+    display: flex;
+    justify-content: space-between;
+    gap: 6px;
+    font-size: var(--type-min);
+    color: var(--ink-2);
+  }
+
+  .svc-k b {
+    color: var(--ink);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .svc-trace {
+    display: block;
+    width: 100%;
+    height: 18px;
+  }
+
+  .svc-meter {
+    display: block;
+    width: 100%;
+    height: 6px;
+    margin-top: 6px;
+  }
+
+  /* The nodes its instances run on. */
+  .svc-on {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 9px;
+  }
+
+  .tag.svc-chip {
+    padding: 0 6px 0 5px;
+    border-color: var(--line);
+    font-weight: 500;
+  }
+
+  /* A redeploy on the card: pull, rootfs, boot and health, the done ones filled, the running one amber. */
+  .svc-tape {
+    display: grid;
+    grid-template-columns: 14fr 15fr 22fr 13fr;
+    gap: 2px;
+    margin-top: 9px;
+  }
+
+  .svc-tape i {
+    height: 6px;
+    background-image: conic-gradient(from 270deg at 2px 2px, var(--line-2) 25%, transparent 0);
+    background-size: 4px 4px;
+  }
+
+  .svc-tape i[data-s='done'] {
+    background-color: var(--accent);
+    background-image: repeating-conic-gradient(var(--ion) 0 25%, transparent 0 50%);
+  }
+
+  .svc-tape i[data-s='live'] {
+    background-color: var(--shift);
+    background-image: repeating-conic-gradient(var(--canvas) 0 25%, transparent 0 50%);
+  }
+
+  .svc-tape-l {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 5px;
+    font-size: var(--type-min);
+    color: var(--ink-2);
+  }
+
+  .svc-clock {
+    flex: none;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Pointed at from the rail: the accent edge and the lift. */
+  .svc[data-hl] {
+    transform: translateY(-2px);
+    border-color: var(--accent);
+    box-shadow: var(--card-up);
+  }
+
+  /* A redeploy succeeded: one green ring that fades, once. */
+  .svc-ok {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    border-radius: inherit;
+    box-shadow: inset 0 0 0 2px var(--run);
+    pointer-events: none;
+    opacity: 0;
+    animation: svc-ok var(--motion-change) var(--ease);
+  }
+
+  @keyframes svc-ok {
+    from {
+      opacity: 0.9;
+    }
+  }
+
+  /* While a sheet is open, the other cards step back. */
+  .canvas-stage .svc {
+    transition:
+      transform var(--motion-feedback) var(--ease),
+      border-color var(--motion-feedback) var(--ease),
+      box-shadow var(--motion-feedback) var(--ease),
+      opacity var(--motion-change) var(--ease);
+  }
+
+  .canvas-stage[data-sheet] .svc:not([data-selected]) {
+    opacity: 0.5;
+  }
+
+  /* Below 1101 px the cards stack, two to a row (one on a phone), with the rail under them. */
+  .canvas-flow {
+    background-size: 22px 22px;
+    cursor: auto;
+  }
+
+  /* Its own stacking context, so a card's aura lies under every card, not over the one above it. */
+  .canvas-stack {
+    position: relative;
+    isolation: isolate;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: start;
+    gap: 14px;
+    padding: 14px;
+  }
+
+  .canvas-cell {
+    position: relative;
+    min-width: 0;
+  }
+
+  .canvas-cell .svc {
+    width: 100%;
+  }
+
+  .canvas-stage[data-layout='stack'] .svc[data-hl] {
+    transform: none;
+  }
+
+  @media (max-width: 767.98px) {
+    .canvas-stack {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  /*
+   * The project rail: where each instance runs, the latest deploys, the
+   * agents with access and the domains. Beside the floating cards it fills
+   * the field's right edge and gives way when a sheet opens; in the stacked
+   * canvas it sits under the cards.
+   */
+  .crail {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    bottom: 12px;
+    z-index: 3;
+    width: 316px;
+    overflow: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-2) transparent;
+    box-shadow: var(--card-up);
+    transition:
+      opacity 200ms var(--ease),
+      transform var(--motion-change) var(--ease),
+      visibility 0s linear 0s;
+  }
+
+  .canvas-stage[data-sheet] .crail {
+    opacity: 0;
+    transform: translateX(16px);
+    visibility: hidden;
+    pointer-events: none;
+    transition:
+      opacity 200ms var(--ease),
+      transform var(--motion-change) var(--ease),
+      visibility 0s linear var(--motion-change);
+  }
+
+  @media (max-width: 1180px) {
+    .crail {
+      width: 280px;
+    }
+  }
+
+  .canvas-stage[data-layout='stack'] .crail,
+  .canvas-stage[data-layout='stack'][data-sheet] .crail {
+    position: static;
+    width: auto;
+    margin: 0 14px 16px;
+    overflow: visible;
+    opacity: 1;
+    transform: none;
+    visibility: visible;
+  }
+
+  .crail-s {
+    padding-bottom: 8px;
+    border-top: 1px solid var(--line);
+  }
+
+  .crail-s:first-child {
+    border-top: 0;
+  }
+
+  .crail .psec-h {
+    padding: 11px 14px 9px;
+  }
+
+  .crail .psec-h h2 {
+    font-size: 12.5px;
+  }
+
+  .crail-none {
+    padding: 0 14px 6px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .crail-skel {
+    display: grid;
+    gap: 7px;
+    padding: 2px 14px 8px;
+  }
+
+  .crail-rack {
+    display: grid;
+    gap: 9px;
+    padding: 0 14px 4px;
+  }
+
+  .crail-node {
+    display: grid;
+    gap: 5px;
+  }
+
+  .crail-node-h {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+  }
+
+  .crail-node-h b {
+    font-weight: 560;
+  }
+
+  .crail-node-h > span:last-child {
+    margin-left: auto;
+    font-size: var(--type-min);
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* A cell is as wide as its vCPUs: the li carries the share, the link inside is the Nodes page's cell.
+     As on the Nodes strip, a cell is at least as wide as its name and the row wraps, so no name hides another. */
+  .crail-cell {
+    display: flex;
+    flex: var(--u, 1) 0 auto;
+    min-width: fit-content;
+    max-width: calc(var(--u, 1) * 70px);
+  }
+
+  .crail-cell .vcell {
+    flex: 1 1 auto;
+    max-width: none;
+    height: 22px;
+    font-size: 10px;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  /* An instance whose app deploys, or that is down, says so with its edge; its words (title, screen readers) say why.
+     The name keeps its kind colour: red 10 px text on the cell's tint would not reach 4.5:1. */
+  .crail-cell .vcell[data-tone='shift'] {
+    border-color: var(--shift);
+  }
+
+  .crail-cell .vcell[data-tone='fault'] {
+    border-color: var(--fault);
+  }
+
+  .vcell[data-hl] {
+    z-index: 1;
+    transform: translateY(-2px);
+    border-color: var(--kind);
+  }
+
+  a.vcell:focus-visible {
+    z-index: 1;
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .crail-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .crail-dep {
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr) 54px;
+    gap: 9px;
+    align-items: center;
+    padding: 7px 14px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    text-decoration: none;
+    transition: background-color var(--motion-feedback) var(--ease);
+  }
+
+  .crail-dep:hover {
+    background-color: color-mix(in oklab, var(--raised) 60%, transparent);
+  }
+
+  .crail-dep:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    border-radius: 6px;
+  }
+
+  .crail-dep-t {
+    min-width: 0;
+  }
+
+  .crail-dep-t b {
+    display: block;
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .crail-dep-t small {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--type-min);
+    color: var(--ink-2);
+  }
+
+  .crail-bar {
+    justify-self: end;
+    height: 5px;
+    background-color: var(--accent);
+    background-image: repeating-conic-gradient(var(--ion) 0 25%, transparent 0 50%);
+    background-size: 4px 4px;
+  }
+
+  .crail-bar[data-s='live'] {
+    background-color: var(--shift);
+    background-image: repeating-conic-gradient(var(--canvas) 0 25%, transparent 0 50%);
+  }
+
+  .crail-bar[data-s='failed'] {
+    background-color: var(--fault);
+    background-image: none;
+  }
+
+  .crail-bar[data-s='cancelled'],
+  .crail-bar[data-s='superseded'] {
+    background-color: var(--idle);
+    background-image: none;
+  }
+
+  /* A deploy that starts while the page is open slides in at the top. */
+  .crail-new {
+    animation: pev-in var(--motion-change) var(--ease) backwards;
+  }
+
+  .crail-acc {
+    display: grid;
+    gap: 6px;
+    padding: 2px 14px 6px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .crail-acc-who {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .crail-acc-who b {
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .crail-meter {
+    display: block;
+    width: 100%;
+    height: 6px;
+  }
+
+  .crail-acc-f {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: var(--type-min);
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .crail-dom {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 14px 6px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .crail-dom p {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .crail-dom b {
+    color: var(--ink);
+    font-weight: 560;
+  }
+
+  /* The project's state in the top bar, while the canvas is open. */
+  .top-sum {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-right: 6px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    white-space: nowrap;
+  }
+
+  .top-sum > span {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  @media (max-width: 1180px) {
+    .top-sum {
+      display: none;
+    }
   }
 
   /* What needs a person radiates; red stays still, and only one breathes. */
@@ -2879,41 +3356,6 @@
 
   .aura-breathe {
     animation: aura-breathe 2.8s ease-in-out infinite;
-  }
-
-  /* Who else can act here, top-right on the canvas. */
-  .access {
-    display: flex;
-    flex: 0 1 auto;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-    max-width: 100%;
-    height: 34px;
-    padding: 0 10px 0 6px;
-    border-radius: 8px;
-    background-color: var(--surface);
-    border: 1px solid var(--line);
-    font-size: 12px;
-    color: var(--ink-2);
-  }
-
-  .access b {
-    color: var(--ink);
-    font-weight: 600;
-  }
-
-  .access-more {
-    flex: none;
-    padding-left: 8px;
-    border-left: 1px solid var(--line);
-    color: var(--ink-2);
-    font-variant-numeric: tabular-nums;
-    text-decoration: none;
-  }
-
-  .access-more:hover {
-    color: var(--ink);
   }
 
   /* Zoom in, zoom out and fit, bottom-left. */
@@ -7212,7 +7654,29 @@
       animation: none;
     }
 
-    .vcell:hover {
+    .vcell:hover,
+    .vcell[data-hl] {
+      transform: none;
+    }
+
+    /* A card the rail points at keeps its place; a redeploy's ring and a new deploy row are just there. */
+    .svc[data-hl] {
+      transform: none;
+      box-shadow: var(--card-rest);
+    }
+
+    .crail-new {
+      animation: none;
+    }
+
+    /* Without the fade, the ring simply shows for its moment. */
+    .svc-ok {
+      animation: none;
+      opacity: 0.9;
+    }
+
+    .crail,
+    .canvas-stage[data-sheet] .crail {
       transform: none;
     }
 

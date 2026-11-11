@@ -19,6 +19,7 @@ import {
   estimateRun,
   formatClock,
   formatSpan,
+  imageLabel,
   isRunLive,
   miniTape,
   miniTapeScale,
@@ -55,12 +56,6 @@ const HISTORY_ROWS = 10;
 /** `github.com/example/api` from `https://github.com/example/api.git`. */
 const repoLabel = (url: string): string =>
   url.replace(/^https?:\/\//, '').replace(/\.git$/, '');
-
-/** The last path segment of an image reference, `atlas-worker:1.9`. */
-const imageLabel = (image: string): string => {
-  if (image.startsWith('build.quoro.invalid/')) return 'a built image';
-  return image.split('/').pop() ?? image;
-};
 
 const runTitle = (run: DeployRun): string => {
   if (run.build) {

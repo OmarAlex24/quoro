@@ -40,6 +40,7 @@ export function ProjectShell({
   leaf,
   view,
   canvas,
+  summary,
   children,
 }: {
   projectId: string;
@@ -50,6 +51,8 @@ export function ProjectShell({
   view: ProjectView;
   /** Lay the page on the dotted canvas field. */
   canvas: boolean;
+  /** How the project's services stand, in the top bar (the canvas only). */
+  summary?: ReactNode;
   children: ReactNode;
 }) {
   const pending = usePendingApprovalCount();
@@ -77,6 +80,7 @@ export function ProjectShell({
           ) : null}
         </nav>
         <span className="flex-1" />
+        {summary}
         <Link to="/activity" className="iconbtn" aria-label="Activity" title="Activity">
           <Activity strokeWidth={1.7} aria-hidden="true" />
         </Link>

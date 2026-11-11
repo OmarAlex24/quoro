@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   autoLayout,
+  BOARD_W,
+  boardZoom,
   bounds,
   CARD_W,
   CELL_H,
@@ -36,14 +38,31 @@ const refusing = {
   },
 };
 
-const frame = { columns: 3, origin: { x: 48, y: 80 } };
+const frame = { columns: 3, origin: { x: 28, y: 84 } };
 
 describe('layoutFrame', () => {
   it('fits up to four columns and leaves room for the tools', () => {
     expect(layoutFrame(390)).toEqual({ columns: 1, origin: { x: 16, y: 72 } });
     expect(layoutFrame(1384).columns).toBe(4);
     expect(layoutFrame(3000).columns).toBe(4);
-    expect(layoutFrame(900)).toEqual({ columns: 2, origin: { x: 48, y: 80 } });
+    expect(layoutFrame(900)).toEqual({ columns: 2, origin: { x: 28, y: 84 } });
+    // The board's own width holds three columns.
+    expect(layoutFrame(BOARD_W).columns).toBe(3);
+  });
+});
+
+describe('boardZoom', () => {
+  it('draws the board full size when it fits and scales it to a narrower room', () => {
+    expect(boardZoom(1044)).toBe(1);
+    expect(boardZoom(BOARD_W)).toBe(1);
+    expect(boardZoom(884)).toBe(0.88);
+    expect(boardZoom(400)).toBe(0.6);
+  });
+
+  it('keeps three columns in the room at that zoom', () => {
+    for (const room of [741, 884, 970, 1044]) {
+      expect(layoutFrame(room / boardZoom(room)).columns).toBe(3);
+    }
   });
 });
 
@@ -56,13 +75,13 @@ describe('autoLayout', () => {
     { key: 'vm:ci', kind: 'vm' as const },
   ];
 
-  it('gives each kind its own band of rows', () => {
-    expect(autoLayout(items, {}, frame)).toEqual({
-      'app:web': { x: 48, y: 80 },
-      'app:api': { x: 48 + CELL_W, y: 80 },
-      'app:pg': { x: 48, y: 80 + CELL_H },
-      'app:worker': { x: 48 + CELL_W, y: 80 + CELL_H },
-      'vm:ci': { x: 48, y: 80 + 2 * CELL_H },
+  it('fills the rows in kind order: Git apps, then image apps, then VMs', () => {
+    expect(autoLayout([items[4]!, items[2]!, items[0]!, items[3]!, items[1]!], {}, frame)).toEqual({
+      'app:web': { x: 28, y: 84 },
+      'app:api': { x: 28 + CELL_W, y: 84 },
+      'app:pg': { x: 28 + 2 * CELL_W, y: 84 },
+      'app:worker': { x: 28, y: 84 + CELL_H },
+      'vm:ci': { x: 28 + CELL_W, y: 84 + CELL_H },
     });
   });
 
@@ -74,15 +93,15 @@ describe('autoLayout', () => {
   });
 
   it('keeps a saved position and never lays a new card over it', () => {
-    const saved = { 'app:api': { x: 48, y: 80 } };
+    const saved = { 'app:api': { x: 28, y: 84 } };
     const layout = autoLayout(items.slice(0, 2), saved, frame);
-    expect(layout['app:api']).toEqual({ x: 48, y: 80 });
-    expect(layout['app:web']).toEqual({ x: 48 + CELL_W, y: 80 });
+    expect(layout['app:api']).toEqual({ x: 28, y: 84 });
+    expect(layout['app:web']).toEqual({ x: 28 + CELL_W, y: 84 });
   });
 
   it('ignores a saved position for a service that no longer exists', () => {
-    const layout = autoLayout(items.slice(0, 1), { 'app:gone': { x: 48, y: 80 } }, frame);
-    expect(layout).toEqual({ 'app:web': { x: 48, y: 80 } });
+    const layout = autoLayout(items.slice(0, 1), { 'app:gone': { x: 28, y: 84 } }, frame);
+    expect(layout).toEqual({ 'app:web': { x: 28, y: 84 } });
   });
 });
 
@@ -110,6 +129,7 @@ describe('position storage', () => {
     const storage = memory();
     writePositions(storage, 'prj_1', { 'app:a': { x: 10.4, y: 20 } }, ['app:a']);
     expect(storage.data.get(positionsKey('prj_1'))).toBe('{"app:a":{"x":10,"y":20}}');
+    expect(positionsKey('prj_1')).toBe('quoro.canvas.v2.prj_1');
     expect(readPositions(storage, 'prj_1')).toEqual({ 'app:a': { x: 10, y: 20 } });
     expect(readPositions(storage, 'prj_2')).toEqual({});
   });

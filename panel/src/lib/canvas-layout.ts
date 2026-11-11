@@ -3,9 +3,10 @@ import { SERVICE_KINDS } from './services';
 
 /*
  * Where each card sits on a project's canvas, as pure data. A first layout
- * puts the cards on a grid, one band of rows per kind. A card someone moved
- * keeps its place: the whole layout is stored per project in this browser's
- * localStorage, and a card added later takes the first free cell.
+ * puts the cards on a grid in kind order (Git apps, image apps, VMs). A card
+ * someone moved keeps its place: the whole layout is stored per project in
+ * this browser's localStorage, and a card added later takes the first free
+ * cell.
  */
 
 export interface Point {
@@ -18,11 +19,16 @@ export type Positions = Readonly<Record<string, Point>>;
 
 /** A ServiceCard's width; the canvas CSS uses the same number. */
 export const CARD_W = 264;
-/** The height the layout reserves for a card; most cards are shorter. */
-export const CARD_H = 200;
-/** One grid cell: a card and the gap after it. */
-export const CELL_W = CARD_W + 56;
-export const CELL_H = CARD_H + 40;
+/** The height the layout reserves for a card with its figures; most cards are shorter. */
+export const CARD_H = 260;
+/** One grid cell: a card and the gap after it, as the proposal spaces them. */
+export const CELL_W = CARD_W + 64;
+export const CELL_H = CARD_H + 86;
+/**
+ * The width the board is drawn for at full size: three columns of cards and
+ * their margins. A narrower room shows the same board scaled down (`boardZoom`).
+ */
+export const BOARD_W = 1000;
 
 export interface LayoutFrame {
   /** How many cards fit side by side. */
@@ -34,19 +40,27 @@ export interface LayoutFrame {
 /** The frame for a canvas this wide: room at the top for the tools, at most four columns. */
 export const layoutFrame = (width: number): LayoutFrame => {
   const narrow = width < 600;
-  const pad = narrow ? 16 : 48;
+  const pad = narrow ? 16 : 28;
   const columns = Math.max(1, Math.min(4, Math.floor((width - 2 * pad + (CELL_W - CARD_W)) / CELL_W)));
-  return { columns, origin: { x: pad, y: narrow ? 72 : 80 } };
+  return { columns, origin: { x: pad, y: narrow ? 72 : 84 } };
 };
+
+/**
+ * The zoom the board starts at in a room this wide (the canvas left of the
+ * project rail): full size when the board fits, scaled down to the room
+ * otherwise, never below 0.6. The layout is then made for the room at that
+ * zoom, so a narrower window keeps three columns, only smaller.
+ */
+export const boardZoom = (room: number): number =>
+  Math.min(1, Math.max(0.6, Math.floor((room / BOARD_W) * 100) / 100));
 
 const overlaps = (a: Point, b: Point): boolean =>
   Math.abs(a.x - b.x) < CARD_W && Math.abs(a.y - b.y) < CARD_H;
 
 /**
  * Every card's position: a saved one where there is one, otherwise the next
- * free cell of the grid. The grid starts a new band of rows for each kind
- * (Git apps, image apps, VMs), in the order the items come, and skips a cell
- * that a saved card covers.
+ * free cell of the grid, row by row, Git apps first, then image apps, then
+ * VMs, in the order the items come. A cell that a saved card covers is skipped.
  */
 export const autoLayout = (
   items: ReadonlyArray<{ key: string; kind: ServiceKind }>,
@@ -64,9 +78,8 @@ export const autoLayout = (
   }
 
   let row = 0;
+  let col = 0;
   for (const kind of SERVICE_KINDS) {
-    let col = 0;
-    let used = false;
     for (const item of items) {
       if (item.kind !== kind || out[item.key]) continue;
       for (;;) {
@@ -82,13 +95,9 @@ export const autoLayout = (
         if (!taken.some((point) => overlaps(point, cell))) {
           out[item.key] = cell;
           taken.push(cell);
-          used = true;
           break;
         }
       }
-    }
-    if (used && col > 0) {
-      row += 1;
     }
   }
   return out;
@@ -111,7 +120,12 @@ export const readingOrder = (positions: Positions, keys: readonly string[]): str
 
 /* ---------- storage ---------- */
 
-export const positionsKey = (projectId: string): string => `quoro.canvas.${projectId}`;
+/**
+ * Where a project's positions are saved. The version moves when the cards
+ * change size, so a layout dragged for smaller cards is not read back over
+ * the taller ones (v2: the cards gained their figures, #783).
+ */
+export const positionsKey = (projectId: string): string => `quoro.canvas.v2.${projectId}`;
 
 const isPoint = (value: unknown): value is Point =>
   typeof value === 'object' &&
