@@ -125,6 +125,10 @@ impl CopyRow {
 enum Flaw {
     /// `quarantine_id` is not a well-formed `qrn_` id.
     Id,
+    /// `volume_id` is not a well-formed `vol_` id.
+    VolumeId,
+    /// `app_id` is not a well-formed `app_` id.
+    AppId,
     /// `sha256` is present and not 64 lowercase hex characters.
     Sha256,
     /// `created_at` is not an RFC 3339 date-time.
@@ -139,6 +143,10 @@ enum Flaw {
 fn flaw(entry: &wire::QuarantineStatus) -> Option<Flaw> {
     if !is_id_with_prefix("qrn", &entry.quarantine_id) {
         Some(Flaw::Id)
+    } else if !is_id_with_prefix("vol", &entry.volume_id) {
+        Some(Flaw::VolumeId)
+    } else if !is_id_with_prefix("app", &entry.app_id) {
+        Some(Flaw::AppId)
     } else if entry
         .sha256
         .as_deref()
@@ -180,17 +188,28 @@ struct Found {
 /// applies, an absent or empty field leaving none; a disconnect keeps it,
 /// because the copy is still on the node's disk.
 ///
+/// A node that `removeNode` removed is forgotten for good ([`Self::forget`]):
+/// a report of it that is still being applied lists nothing any more.
+///
 /// It lives in memory only, as `status_report.warm` does: after a primary
 /// restart or a promotion it is empty, so deletes are not refused for an
 /// unhashed copy until its node reports again; until then only the recorded
-/// rows refuse.
+/// rows refuse. A removed node cannot open a session again, so it never
+/// reports after a restart.
 #[derive(Debug, Default)]
-pub(crate) struct ListedCopies(Mutex<HashMap<String, Vec<ListedCopy>>>);
+pub(crate) struct ListedCopies(Mutex<ListedState>);
+
+#[derive(Debug, Default)]
+struct ListedState {
+    by_node: HashMap<String, Vec<ListedCopy>>,
+    /// The nodes [`ListedCopies::forget`] forgot: their reports list nothing.
+    removed: HashSet<String>,
+}
 
 impl ListedCopies {
     /// Replaces the set of `node_id` with the copies its report lists,
     /// leaving out each entry with a [`Flaw`]. Silent: recording logs the
-    /// bad entries.
+    /// bad entries. Does nothing for a node that was forgotten.
     pub(crate) fn replace(&self, node_id: &str, reported: &[wire::QuarantineStatus]) {
         let copies: Vec<ListedCopy> = reported
             .iter()
@@ -201,18 +220,24 @@ impl ListedCopies {
                 app_id: entry.app_id.clone(),
             })
             .collect();
-        let mut by_node = self.0.lock().expect("listed copies lock");
+        let mut listed = self.0.lock().expect("listed copies lock");
+        if listed.removed.contains(node_id) {
+            return;
+        }
         if copies.is_empty() {
-            by_node.remove(node_id);
+            listed.by_node.remove(node_id);
         } else {
-            by_node.insert(node_id.to_string(), copies);
+            listed.by_node.insert(node_id.to_string(), copies);
         }
     }
 
-    /// Forgets the copies `node_id` listed, as a report listing none would.
+    /// Forgets the copies `node_id` listed, for good: the node was removed,
+    /// so a report of it still being applied lists nothing.
     #[cfg_attr(not(test), expect(dead_code, reason = "removeNode (#740) calls it"))]
     pub(crate) fn forget(&self, node_id: &str) {
-        self.0.lock().expect("listed copies lock").remove(node_id);
+        let mut listed = self.0.lock().expect("listed copies lock");
+        listed.by_node.remove(node_id);
+        listed.removed.insert(node_id.to_string());
     }
 
     /// A copy some node lists that `wanted` accepts. Never held across an
@@ -221,6 +246,7 @@ impl ListedCopies {
         self.0
             .lock()
             .expect("listed copies lock")
+            .by_node
             .iter()
             .flat_map(|(node_id, copies)| copies.iter().map(move |copy| (node_id, copy)))
             .find(|(_, copy)| wanted(copy))
@@ -340,8 +366,13 @@ async fn record_one(store: &Store, actor: &Actor, copy: &CopyRow) -> Result<bool
 }
 
 /// Records one copy of a volume that is gone in a write transaction of its
-/// own.
+/// own. A copy recorded before is found with a plain read first: a node
+/// reports such a copy every 30 s until its file is removed, and each report
+/// would otherwise take the write lock only to roll back.
 async fn record_gone_one(store: &Store, actor: &Actor, copy: &CopyRow) -> Result<bool, Failure> {
+    if announced(&mut *store.pool().acquire().await?, copy).await? {
+        return Ok(false);
+    }
     let mut w = store.begin_write().await?;
     let recorded = record_gone(&mut w.tx, actor, copy).await?;
     if recorded {
@@ -433,6 +464,16 @@ fn warn_flaw(node_id: &str, entry: &wire::QuarantineStatus, flaw: Flaw) {
             quarantine_id,
             "a reported quarantined copy has a malformed id; skipped"
         ),
+        Flaw::VolumeId => tracing::warn!(
+            node_id,
+            quarantine_id,
+            "a reported quarantined copy has a malformed volume_id; skipped"
+        ),
+        Flaw::AppId => tracing::warn!(
+            node_id,
+            quarantine_id,
+            "a reported quarantined copy has a malformed app_id; skipped"
+        ),
         Flaw::Sha256 => tracing::warn!(
             node_id,
             quarantine_id,
@@ -501,12 +542,17 @@ async fn volume_of(
 /// Records one copy in the caller's write transaction: the row, its
 /// change-log `create`, the event `volume.quarantined` and the system audit
 /// record `volume.quarantine`. Returns `false`, writing nothing, when the
-/// row appeared or the volume went since the read.
+/// row appeared or the volume went since the read, or when the node was
+/// removed since: [`drop_node_copies`] dropped its records, and a report
+/// still being applied must not bring one back.
 async fn record(
     conn: &mut SqliteConnection,
     actor: &Actor,
     copy: &CopyRow,
 ) -> Result<bool, Failure> {
+    if !in_cluster(&mut *conn, &copy.node_id).await? {
+        return Ok(false);
+    }
     let exists: Option<(String,)> =
         sqlx::query_as("SELECT id FROM volume_quarantines WHERE id = ?")
             .bind(&copy.id)
@@ -555,12 +601,16 @@ async fn record(
 /// own (section 9, ADR 0316). Returns `false`, writing nothing, when the
 /// copy got its audit record before, also before a restart of the primary,
 /// or now has a row, or its volume is live since the read (the next report
-/// then records a row).
+/// then records a row), or its node was removed since: a record would name
+/// a node that is no longer in the cluster.
 async fn record_gone(
     conn: &mut SqliteConnection,
     actor: &Actor,
     copy: &CopyRow,
 ) -> Result<bool, Failure> {
+    if !in_cluster(&mut *conn, &copy.node_id).await? {
+        return Ok(false);
+    }
     let row: Option<(String,)> = sqlx::query_as("SELECT id FROM volume_quarantines WHERE id = ?")
         .bind(&copy.id)
         .fetch_optional(&mut *conn)
@@ -576,21 +626,38 @@ async fn record_gone(
     if live.is_some() {
         return Ok(false);
     }
-    // Once per `quarantine_id`: the audit chain is the record, and
-    // `idx_audit_target` finds it by the volume.
+    // Checked again inside the transaction.
+    if announced(&mut *conn, copy).await? {
+        return Ok(false);
+    }
+    announce(conn, actor, copy, None).await?;
+    Ok(true)
+}
+
+/// Whether `node_id` is still in the cluster: it exists and is not
+/// `removed`. Read inside the recording transaction, so a report still being
+/// applied when `removeNode` commits records nothing afterwards.
+async fn in_cluster(conn: &mut SqliteConnection, node_id: &str) -> Result<bool, Failure> {
+    let status: Option<(String,)> = sqlx::query_as("SELECT status FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(conn)
+        .await?;
+    Ok(status.is_some_and(|(status,)| status != "removed"))
+}
+
+/// Whether `copy` already has its audit record `volume.quarantine`, also
+/// from before a restart of the primary: once per `quarantine_id`, the audit
+/// chain is the record, and `idx_audit_target` finds it by the volume.
+async fn announced(conn: &mut SqliteConnection, copy: &CopyRow) -> Result<bool, Failure> {
     let recorded: Option<(i64,)> = sqlx::query_as(
         "SELECT seq FROM audit_log WHERE target_id = ? AND operation = 'volume.quarantine' \
          AND json_extract(params, '$.quarantine_id') = ? LIMIT 1",
     )
     .bind(&copy.volume_id)
     .bind(&copy.id)
-    .fetch_optional(&mut *conn)
+    .fetch_optional(conn)
     .await?;
-    if recorded.is_some() {
-        return Ok(false);
-    }
-    announce(conn, actor, copy, None).await?;
-    Ok(true)
+    Ok(recorded.is_some())
 }
 
 /// Emits `volume.quarantined` and appends the system audit record
@@ -689,7 +756,9 @@ async fn drop_deleted(
 /// `deleteVolume` or `deleteApp`. The copies stay on the node's disk. No
 /// audit record or event is written per copy: the call's own audit record
 /// covers them. Returns the dropped ids, by id. After the transaction
-/// commits, the caller calls [`forget_listed`].
+/// commits, the caller calls [`forget_listed`]. A report of the node still
+/// being applied records no row afterwards ([`record`] reads the node's
+/// status in its own write transaction).
 ///
 /// # Errors
 ///
@@ -1065,47 +1134,94 @@ mod tests {
         };
         let hashed = wire::QuarantineStatus {
             sha256: Some("a".repeat(64)),
-            ..entry(&id(2), "vol_2", "app_1")
+            ..entry(
+                &id(2),
+                "vol_01JC9Z6Q5W8N3K4T7R2M000002",
+                "app_01JC9Z6Q5W8N3K4T7R2M000001",
+            )
         };
         let bad_sha256 = wire::QuarantineStatus {
             sha256: Some("A".repeat(64)),
-            ..entry(&id(3), "vol_3", "app_1")
+            ..entry(
+                &id(3),
+                "vol_01JC9Z6Q5W8N3K4T7R2M000003",
+                "app_01JC9Z6Q5W8N3K4T7R2M000001",
+            )
         };
         let bad_created_at = wire::QuarantineStatus {
             created_at: "2026-11-09".to_string(),
-            ..entry(&id(4), "vol_4", "app_1")
+            ..entry(
+                &id(4),
+                "vol_01JC9Z6Q5W8N3K4T7R2M000004",
+                "app_01JC9Z6Q5W8N3K4T7R2M000001",
+            )
         };
         let oversized = wire::QuarantineStatus {
             size_bytes: MAX_SAFE_INTEGER + 1,
-            ..entry(&id(5), "vol_5", "app_1")
+            ..entry(
+                &id(5),
+                "vol_01JC9Z6Q5W8N3K4T7R2M000005",
+                "app_01JC9Z6Q5W8N3K4T7R2M000001",
+            )
         };
+        // The app of a malformed `volume_id`, and the volume of a malformed
+        // `app_id`, so `find` would see each if it were listed.
+        let bad_volume_id = entry(&id(8), "vol_8", "app_01JC9Z6Q5W8N3K4T7R2M000008");
+        let bad_app_id = entry(
+            &id(9),
+            "vol_01JC9Z6Q5W8N3K4T7R2M000009",
+            &"app_x".repeat(1000),
+        );
         let listed = ListedCopies::default();
         listed.replace(
             "nod_a",
             &[
-                entry(&id(1), "vol_1", "app_1"),
+                bad_volume_id,
+                bad_app_id,
+                entry(
+                    &id(1),
+                    "vol_01JC9Z6Q5W8N3K4T7R2M000001",
+                    "app_01JC9Z6Q5W8N3K4T7R2M000001",
+                ),
                 hashed,
-                entry("qrn_bad", "vol_6", "app_1"),
+                entry(
+                    "qrn_bad",
+                    "vol_01JC9Z6Q5W8N3K4T7R2M000006",
+                    "app_01JC9Z6Q5W8N3K4T7R2M000001",
+                ),
                 bad_sha256,
                 bad_created_at,
                 oversized,
             ],
         );
-        listed.replace("nod_b", &[entry(&id(7), "vol_7", "app_7")]);
+        listed.replace(
+            "nod_b",
+            &[entry(
+                &id(7),
+                "vol_01JC9Z6Q5W8N3K4T7R2M000007",
+                "app_01JC9Z6Q5W8N3K4T7R2M000007",
+            )],
+        );
         assert_eq!(
-            listed.find(|copy| copy.volume_id == "vol_1"),
+            listed.find(|copy| copy.volume_id == "vol_01JC9Z6Q5W8N3K4T7R2M000001"),
             found("nod_a", &id(1))
         );
         assert_eq!(
-            listed.find(|copy| copy.volume_id == "vol_2"),
+            listed.find(|copy| copy.volume_id == "vol_01JC9Z6Q5W8N3K4T7R2M000002"),
             found("nod_a", &id(2)),
             "a hashed copy is listed too"
         );
         for (volume_id, case) in [
-            ("vol_3", "a malformed sha256"),
-            ("vol_4", "a created_at that is not an RFC 3339 date-time"),
-            ("vol_5", "a size_bytes above 2^53 - 1"),
-            ("vol_6", "a malformed id"),
+            ("vol_01JC9Z6Q5W8N3K4T7R2M000003", "a malformed sha256"),
+            (
+                "vol_01JC9Z6Q5W8N3K4T7R2M000004",
+                "a created_at that is not an RFC 3339 date-time",
+            ),
+            (
+                "vol_01JC9Z6Q5W8N3K4T7R2M000005",
+                "a size_bytes above 2^53 - 1",
+            ),
+            ("vol_01JC9Z6Q5W8N3K4T7R2M000006", "a malformed id"),
         ] {
             assert_eq!(
                 listed.find(|copy| copy.volume_id == volume_id),
@@ -1114,14 +1230,27 @@ mod tests {
             );
         }
         assert_eq!(
-            listed.find(|copy| copy.app_id == "app_7"),
+            listed.find(|copy| copy.app_id == "app_01JC9Z6Q5W8N3K4T7R2M000008"),
+            None,
+            "a malformed volume_id"
+        );
+        assert_eq!(
+            listed.find(|copy| copy.volume_id == "vol_01JC9Z6Q5W8N3K4T7R2M000009"),
+            None,
+            "a malformed app_id"
+        );
+        assert_eq!(
+            listed.find(|copy| copy.app_id == "app_01JC9Z6Q5W8N3K4T7R2M000007"),
             found("nod_b", &id(7))
         );
         // A report without the field leaves none for that node only.
         listed.replace("nod_a", &[]);
-        assert_eq!(listed.find(|copy| copy.app_id == "app_1"), None);
         assert_eq!(
-            listed.find(|copy| copy.volume_id == "vol_7"),
+            listed.find(|copy| copy.app_id == "app_01JC9Z6Q5W8N3K4T7R2M000001"),
+            None
+        );
+        assert_eq!(
+            listed.find(|copy| copy.volume_id == "vol_01JC9Z6Q5W8N3K4T7R2M000007"),
             found("nod_b", &id(7))
         );
     }
@@ -1167,7 +1296,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO apps (id, project_id, name, image, port, health_check, resources, \
              placement, status, created_at, updated_at) \
-             VALUES ('app_1', 'prj_1', 'db', 'image', 8080, '{}', '{}', '{}', 'running', ?, ?)",
+             VALUES ('app_01JC9Z6Q5W8N3K4T7R2M000001', 'prj_1', 'db', 'image', 8080, '{}', '{}', '{}', 'running', ?, ?)",
         )
         .bind(now)
         .bind(now)
@@ -1176,7 +1305,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO volumes (id, app_id, node_id, size_gb, mount_path, state, \
-             created_at, updated_at) VALUES ('vol_1', 'app_1', 'nod_b', 1, '/data', 'ready', ?, ?)",
+             created_at, updated_at) VALUES ('vol_01JC9Z6Q5W8N3K4T7R2M000001', 'app_01JC9Z6Q5W8N3K4T7R2M000001', 'nod_b', 1, '/data', 'ready', ?, ?)",
         )
         .bind(now)
         .bind(now)
@@ -1190,7 +1319,7 @@ mod tests {
         ] {
             sqlx::query(&format!(
                 "INSERT INTO volume_quarantines ({COLUMNS}) \
-                 VALUES (?, 'vol_1', 'app_1', ?, 7, ?, ?, ?)"
+                 VALUES (?, 'vol_01JC9Z6Q5W8N3K4T7R2M000001', 'app_01JC9Z6Q5W8N3K4T7R2M000001', ?, 7, ?, ?, ?)"
             ))
             .bind(id)
             .bind(node_id)
@@ -1249,7 +1378,7 @@ mod tests {
             );
             assert_eq!(payload["id"], expected);
             assert_eq!(payload["node_id"], "nod_a");
-            assert_eq!(payload["volume_id"], "vol_1");
+            assert_eq!(payload["volume_id"], "vol_01JC9Z6Q5W8N3K4T7R2M000001");
         }
         let (deleting_at, sha256) = (&new[0].3["deleting_at"], &new[0].3["sha256"]);
         assert_eq!(
@@ -1301,19 +1430,163 @@ mod tests {
         let entry = |volume_id: &str| wire::QuarantineStatus {
             quarantine_id: "qrn_01JC9Z6Q5W8N3K4T7R2M000001".to_string(),
             volume_id: volume_id.to_string(),
-            app_id: "app_1".to_string(),
+            app_id: "app_01JC9Z6Q5W8N3K4T7R2M000001".to_string(),
             created_at: "2026-11-09T10:00:00Z".to_string(),
             size_bytes: 1,
             sha256: None,
         };
         let listed = ListedCopies::default();
-        listed.replace("nod_a", &[entry("vol_a")]);
-        listed.replace("nod_b", &[entry("vol_b")]);
+        listed.replace("nod_a", &[entry("vol_01JC9Z6Q5W8N3K4T7R2M00000A")]);
+        listed.replace("nod_b", &[entry("vol_01JC9Z6Q5W8N3K4T7R2M00000B")]);
         listed.forget("nod_a");
-        assert_eq!(listed.find(|copy| copy.volume_id == "vol_a"), None);
-        assert!(listed.find(|copy| copy.volume_id == "vol_b").is_some());
+        assert_eq!(
+            listed.find(|copy| copy.volume_id == "vol_01JC9Z6Q5W8N3K4T7R2M00000A"),
+            None
+        );
+        assert!(
+            listed
+                .find(|copy| copy.volume_id == "vol_01JC9Z6Q5W8N3K4T7R2M00000B")
+                .is_some()
+        );
         // Forgetting a node that listed nothing changes nothing.
         listed.forget("nod_c");
-        assert!(listed.find(|copy| copy.volume_id == "vol_b").is_some());
+        assert!(
+            listed
+                .find(|copy| copy.volume_id == "vol_01JC9Z6Q5W8N3K4T7R2M00000B")
+                .is_some()
+        );
+        // A report of a forgotten node still being applied lists nothing.
+        listed.replace("nod_a", &[entry("vol_01JC9Z6Q5W8N3K4T7R2M00000A")]);
+        assert_eq!(
+            listed.find(|copy| copy.volume_id == "vol_01JC9Z6Q5W8N3K4T7R2M00000A"),
+            None
+        );
+        // Another node's report still replaces its own set.
+        listed.replace("nod_b", &[entry("vol_01JC9Z6Q5W8N3K4T7R2M00000C")]);
+        assert_eq!(
+            listed.find(|copy| copy.volume_id == "vol_01JC9Z6Q5W8N3K4T7R2M00000B"),
+            None
+        );
+        assert!(
+            listed
+                .find(|copy| copy.volume_id == "vol_01JC9Z6Q5W8N3K4T7R2M00000C")
+                .is_some()
+        );
+    }
+
+    const LATE: &str = "qrn_01JC9Z6Q5W8N3K4T7R2M000009";
+
+    /// A hashed copy of `vol_01JC9Z6Q5W8N3K4T7R2M000001` that `nod_a` reports.
+    fn late_copy() -> wire::QuarantineStatus {
+        wire::QuarantineStatus {
+            quarantine_id: LATE.to_string(),
+            volume_id: "vol_01JC9Z6Q5W8N3K4T7R2M000001".to_string(),
+            app_id: "app_01JC9Z6Q5W8N3K4T7R2M000001".to_string(),
+            created_at: "2026-11-10T10:00:00Z".to_string(),
+            size_bytes: 7,
+            sha256: Some("b".repeat(64)),
+        }
+    }
+
+    /// What `removeNode` does to `node_id`'s records: one transaction marks
+    /// the node `removed` and drops them.
+    async fn remove_node(store: &Store, node_id: &str) -> Vec<String> {
+        let mut w = store.begin_write().await.unwrap();
+        sqlx::query("UPDATE nodes SET status = 'removed' WHERE id = ?")
+            .bind(node_id)
+            .execute(&mut *w.tx)
+            .await
+            .unwrap();
+        let dropped = drop_node_copies(&mut w.tx, &Actor::system("nodes"), node_id)
+            .await
+            .unwrap();
+        w.commit().await.unwrap();
+        dropped
+    }
+
+    async fn audited(store: &Store) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_report_applied_after_the_drop_does_not_record_the_copy_again() {
+        let store = store_with_copies().await;
+        // The report records the copy while the node is in the cluster (and
+        // drops `qrn_1`, which is `deleting` and no longer listed).
+        let applied = apply(&store, "nod_a", &[late_copy()]).await;
+        assert_eq!((applied.recorded, applied.dropped), (1, 1));
+        assert_eq!(remaining(&store).await, [LATE, "qrn_2", "qrn_3"]);
+
+        let dropped = remove_node(&store, "nod_a").await;
+        assert_eq!(dropped, [LATE, "qrn_2"]);
+        let before = (log_entries(&store).await.len(), audited(&store).await);
+
+        // The same report, still being applied once the removal committed,
+        // records nothing: no row, no change-log entry, no audit record.
+        let applied = apply(&store, "nod_a", &[late_copy()]).await;
+        assert_eq!(applied, Applied::default());
+        assert_eq!(remaining(&store).await, ["qrn_3"]);
+        assert_eq!(
+            (log_entries(&store).await.len(), audited(&store).await),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_of_a_gone_volume_reported_after_the_drop_records_nothing() {
+        let store = store_with_copies().await;
+        remove_node(&store, "nod_a").await;
+        let before = (log_entries(&store).await.len(), audited(&store).await);
+        // A copy of a volume the primary never knew, never recorded before.
+        let gone = wire::QuarantineStatus {
+            volume_id: "vol_01JC9Z6Q5W8N3K4T7R2M999999".to_string(),
+            ..late_copy()
+        };
+        let applied = apply(&store, "nod_a", &[gone]).await;
+        assert_eq!(applied, Applied::default());
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                log_entries(&store).await.len(),
+                audited(&store).await,
+                events
+            ),
+            (before.0, before.1, 0),
+            "no audit record and no event about a removed node"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_change_log_replayed_after_the_drop_leaves_no_row_of_the_node() {
+        let store = store_with_copies().await;
+        apply(&store, "nod_a", &[late_copy()]).await;
+        remove_node(&store, "nod_a").await;
+        apply(&store, "nod_a", &[late_copy()]).await;
+
+        // Replayed in `seq` order, as a promotion rebuilds the table: the
+        // copy's `create` is followed by its `delete`, and nothing after.
+        let mut rebuilt: Vec<String> = Vec::new();
+        let mut ops = Vec::new();
+        for (kind, id, op, _) in log_entries(&store).await {
+            if kind != ENTITY_TYPE {
+                continue;
+            }
+            if id == LATE {
+                ops.push(op.clone());
+            }
+            match op.as_str() {
+                "create" => rebuilt.push(id),
+                "delete" => rebuilt.retain(|kept| *kept != id),
+                other => panic!("unexpected op {other}"),
+            }
+        }
+        assert_eq!(ops, ["create", "delete"]);
+        assert!(rebuilt.is_empty(), "{rebuilt:?}");
     }
 }
