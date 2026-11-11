@@ -23,7 +23,7 @@ import {
 } from '../lib/capabilities';
 import { grantKindWords, grantMeter } from '../lib/grants';
 import { problemView, type ProblemView } from '../lib/problem';
-import { agentTab, type AgentTab } from '../lib/routes';
+import { agentTab, EXACT_LINK, type AgentTab } from '../lib/routes';
 import { useAgentCalls } from '../lib/use-agent-calls';
 import { useNow } from '../lib/use-now';
 import { usePaneEnter, useTabInk } from '../lib/use-tab-motion';
@@ -146,6 +146,52 @@ export function AgentScreen({ agentId }: { agentId: string }) {
   );
 }
 
+/**
+ * One agent's tabs. Only the tab the URL names is current: no `tab` is
+ * Activity.
+ */
+export function AgentTabs({
+  agentId,
+  tab,
+  activeCount,
+}: {
+  agentId: string;
+  tab: AgentTab | 'activity';
+  activeCount: number;
+}) {
+  const tabLink = (value: AgentTab | undefined, words: string, count?: number) => {
+    const on = (value ?? 'activity') === tab;
+    return (
+      <Link
+        to="/agents"
+        search={value ? { agent: agentId, tab: value } : { agent: agentId }}
+        activeOptions={EXACT_LINK}
+        className={cn(on && 'on')}
+        aria-current={on ? 'page' : undefined}
+      >
+        {words}
+        {count !== undefined && count > 0 ? (
+          <>
+            <span className="count count-soft" aria-hidden="true">
+              {count}
+            </span>
+            <span className="sr-only">, {count}</span>
+          </>
+        ) : null}
+      </Link>
+    );
+  };
+
+  return (
+    <>
+      {tabLink(undefined, 'Activity')}
+      {tabLink('grants', 'Grants', activeCount)}
+      {tabLink('keys', 'Keys')}
+      {tabLink('settings', 'Settings')}
+    </>
+  );
+}
+
 function AgentPane({
   agent,
   tab,
@@ -169,28 +215,6 @@ function AgentPane({
   const { navRef, inkRef } = useTabInk(tab);
   const bodyRef = usePaneEnter<HTMLDivElement>(tab);
 
-  const tabLink = (value: AgentTab | undefined, words: string, count?: number) => {
-    const on = (value ?? 'activity') === tab;
-    return (
-      <Link
-        to="/agents"
-        search={value ? { agent: agent.id, tab: value } : { agent: agent.id }}
-        className={cn(on && 'on')}
-        aria-current={on ? 'page' : undefined}
-      >
-        {words}
-        {count !== undefined && count > 0 ? (
-          <>
-            <span className="count count-soft" aria-hidden="true">
-              {count}
-            </span>
-            <span className="sr-only">, {count}</span>
-          </>
-        ) : null}
-      </Link>
-    );
-  };
-
   return (
     <>
       <div className="agent-top">
@@ -213,10 +237,7 @@ function AgentPane({
       </div>
 
       <nav ref={navRef} className="tabs agent-tabs" aria-label={`${agent.name}`}>
-        {tabLink(undefined, 'Activity')}
-        {tabLink('grants', 'Grants', activeCount)}
-        {tabLink('keys', 'Keys')}
-        {tabLink('settings', 'Settings')}
+        <AgentTabs agentId={agent.id} tab={tab} activeCount={activeCount} />
         <span ref={inkRef} className="tab-ink" aria-hidden="true" />
       </nav>
 

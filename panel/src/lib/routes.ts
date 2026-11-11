@@ -27,6 +27,16 @@ const compact = <T extends object>(value: T): T =>
 
 /* ---------- search params ---------- */
 
+/**
+ * The `activeOptions` of every tab and rail link. TanStack Router marks a link
+ * active, with `aria-current="page"`, when its search is a subset of the URL's,
+ * so a row's plain tab (no `tab` in its search) would be current beside the
+ * open one. Matching the search exactly leaves the router's mark to the link
+ * the URL names; each row still sets `on` and `aria-current` itself from the
+ * tab it shows, which also covers a URL with more in it (`?tab=vms&node=`).
+ */
+export const EXACT_LINK = { exact: true, includeSearch: true } as const;
+
 /** The service sheet's tabs; the tab lives in the URL. */
 export const PROJECT_TABS = [
   'deployments',

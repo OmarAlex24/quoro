@@ -5,6 +5,7 @@ import { useGetVulnerabilitySummary } from '../api/generated/vulnerabilities/vul
 import { canManageProviders } from '../lib/capabilities';
 import { SERVICE_LIST_PARAMS } from '../lib/projects';
 import {
+  EXACT_LINK,
   SETTINGS_LABELS,
   SETTINGS_PAGES,
   settingsPageOf,
@@ -53,10 +54,46 @@ export function NodesPage() {
   );
   const securityCount = nodeSecurityCount(summary.data);
 
+  return (
+    <TabbedPage
+      label="Nodes"
+      title="Nodes"
+      wide
+      action={<AddNodeButton />}
+      current={tab ?? 'nodes'}
+      tabs={<NodesTabs tab={tab} vmCount={vmCount} securityCount={securityCount ?? undefined} />}
+    >
+      {tab === 'vms' ? (
+        <VmsScreen key={node ?? 'all'} nodeId={node} />
+      ) : tab === 'security' ? (
+        <main className="mx-auto w-full max-w-6xl px-4 pb-8 sm:px-6">
+          <ClusterVulnerabilities nodeNames={nodeNames} />
+        </main>
+      ) : (
+        <NodesScreen />
+      )}
+    </TabbedPage>
+  );
+}
+
+/**
+ * The Nodes tabs. Only the tab the URL names is current: `tab` undefined is
+ * the Nodes tab.
+ */
+export function NodesTabs({
+  tab,
+  vmCount,
+  securityCount,
+}: {
+  tab: NodesTab | undefined;
+  vmCount?: number;
+  securityCount?: number;
+}) {
   const tabLink = (value: NodesTab | undefined, words: string, count?: number) => (
     <Link
       to="/nodes"
       search={value ? { tab: value } : {}}
+      activeOptions={EXACT_LINK}
       className={cn(tab === value && 'on')}
       aria-current={tab === value ? 'page' : undefined}
     >
@@ -73,30 +110,37 @@ export function NodesPage() {
   );
 
   return (
-    <TabbedPage
-      label="Nodes"
-      title="Nodes"
-      wide
-      action={<AddNodeButton />}
-      current={tab ?? 'nodes'}
-      tabs={
-        <>
-          {tabLink(undefined, 'Nodes')}
-          {tabLink('vms', 'Virtual machines', vmCount)}
-          {tabLink('security', 'Security', securityCount ?? undefined)}
-        </>
-      }
-    >
-      {tab === 'vms' ? (
-        <VmsScreen key={node ?? 'all'} nodeId={node} />
-      ) : tab === 'security' ? (
-        <main className="mx-auto w-full max-w-6xl px-4 pb-8 sm:px-6">
-          <ClusterVulnerabilities nodeNames={nodeNames} />
-        </main>
-      ) : (
-        <NodesScreen />
-      )}
-    </TabbedPage>
+    <>
+      {tabLink(undefined, 'Nodes')}
+      {tabLink('vms', 'Virtual machines', vmCount)}
+      {tabLink('security', 'Security', securityCount)}
+    </>
+  );
+}
+
+/** The Agents tabs: the agents (and one agent's page), or the cluster's grants. */
+export function AgentsTabs({ grants }: { grants: boolean }) {
+  return (
+    <>
+      <Link
+        to="/agents"
+        search={{}}
+        activeOptions={EXACT_LINK}
+        className={cn(!grants && 'on')}
+        aria-current={!grants ? 'page' : undefined}
+      >
+        Agents
+      </Link>
+      <Link
+        to="/agents"
+        search={{ tab: 'grants' }}
+        activeOptions={EXACT_LINK}
+        className={cn(grants && 'on')}
+        aria-current={grants ? 'page' : undefined}
+      >
+        Grants
+      </Link>
+    </>
   );
 }
 
@@ -110,26 +154,7 @@ export function AgentsPage() {
     <TabbedPage
       label="Agents"
       current={grants ? 'grants' : 'agents'}
-      tabs={
-        <>
-          <Link
-            to="/agents"
-            search={{}}
-            className={cn(!grants && 'on')}
-            aria-current={!grants ? 'page' : undefined}
-          >
-            Agents
-          </Link>
-          <Link
-            to="/agents"
-            search={{ tab: 'grants' }}
-            className={cn(grants && 'on')}
-            aria-current={grants ? 'page' : undefined}
-          >
-            Grants
-          </Link>
-        </>
-      }
+      tabs={<AgentsTabs grants={grants} />}
     >
       {grants ? (
         <GrantsScreen />
