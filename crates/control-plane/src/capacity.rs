@@ -5,7 +5,8 @@
 //! The primary takes every app with an instance meant to run on the lost node
 //! or a volume there:
 //! - a stateless app, or one whose data is elsewhere, that keeps an instance
-//!   on another node loses one replica (`keep`);
+//!   on another connected node with the `node` role loses one replica
+//!   (`keep`); an instance on a node that is not connected does not count;
 //! - a stateless app whose only instance was there needs a new one (`start`);
 //! - a `warm` app starts on its warm node (`failover`), which already holds
 //!   the disk, so it needs memory and vCPUs there and may go nowhere else; it
@@ -53,7 +54,8 @@ pub(crate) struct AppFacts {
     pub disk_gb: i64,
     /// `placement.node_ids`; empty means any node.
     pub placement: Vec<String>,
-    /// The nodes of the app's VMs that are not `deleted`.
+    /// The nodes of the app's VMs meant to run: `desired_status` `running`
+    /// and not `deleted`.
     pub instance_nodes: Vec<String>,
     /// The node of the app's `creating`, `ready` or `restoring` volume.
     pub volume_node: Option<String>,
@@ -97,6 +99,9 @@ pub(crate) fn simulate(lost: &str, rooms: &[Room], apps: &[AppFacts]) -> Vec<Ent
     let mut kept = Vec::new();
     let mut settled = Vec::new();
     let mut needs = Vec::new();
+    // Only an instance on a remaining room keeps running: a VM row on a node
+    // that is not connected keeps its status.
+    let running = |node: &String| free.iter().any(|room| room.node_id == *node);
 
     for app in apps {
         let on_lost = app.instance_nodes.iter().any(|node| node == lost);
@@ -107,7 +112,7 @@ pub(crate) fn simulate(lost: &str, rooms: &[Room], apps: &[AppFacts]) -> Vec<Ent
         // An app whose data is not on the lost node, with an instance
         // elsewhere, only loses a replica.
         if !app.stateful || !volume_there {
-            if let Some(elsewhere) = app.instance_nodes.iter().find(|node| *node != lost) {
+            if let Some(elsewhere) = app.instance_nodes.iter().find(|node| running(node)) {
                 kept.push(entry(
                     app,
                     CapacityAction::Keep,
@@ -309,7 +314,7 @@ pub(crate) async fn load(
     let rows = sqlx::query(&format!(
         "SELECT {APP_COLUMNS}, warm_node_id FROM apps WHERE id IN \
          (SELECT app_id FROM vms WHERE node_id = ? AND app_id IS NOT NULL \
-            AND observed_status != 'deleted' \
+            AND desired_status = 'running' AND observed_status != 'deleted' \
           UNION SELECT app_id FROM volumes WHERE node_id = ? AND {ACTIVE_VOLUME}) \
          ORDER BY id"
     ))
@@ -327,7 +332,8 @@ pub(crate) async fn load(
     let mut instances: HashMap<String, Vec<String>> = HashMap::new();
     for row in sqlx::query(
         "SELECT app_id, node_id FROM vms WHERE app_id IS NOT NULL \
-         AND observed_status != 'deleted' ORDER BY node_id, id",
+         AND desired_status = 'running' AND observed_status != 'deleted' \
+         ORDER BY node_id, id",
     )
     .fetch_all(&mut *conn)
     .await?
@@ -473,6 +479,45 @@ mod tests {
             [("app_web", CapacityAction::Keep, Some(A), None)]
         );
         assert_eq!(summarize(&entries), (true, CapacityShortfall::default()));
+    }
+
+    #[test]
+    fn an_instance_on_a_node_that_is_not_connected_is_not_kept() {
+        // `B` gives no room: it is not connected, so its instance is not
+        // running and the app needs a node.
+        let web = AppFacts {
+            instance_nodes: vec![B.to_string(), LOST.to_string()],
+            ..app("app_web", 512)
+        };
+        let entries = simulate(LOST, &[room(A, 4, 4096, 100)], std::slice::from_ref(&web));
+        assert_eq!(
+            shape(&entries),
+            [("app_web", CapacityAction::Start, Some(A), None)]
+        );
+        // Without room for it, the answer is no.
+        let entries = simulate(LOST, &[room(A, 0, 0, 0)], &[web]);
+        assert_eq!(
+            shape(&entries),
+            [(
+                "app_web",
+                CapacityAction::Start,
+                None,
+                Some(CapacityReason::NoCapacity)
+            )]
+        );
+        assert!(!summarize(&entries).0);
+        // A stateful app whose data is on such a node needs a restore.
+        let db = AppFacts {
+            instance_nodes: vec![B.to_string(), LOST.to_string()],
+            volume_node: Some(B.to_string()),
+            has_backup: true,
+            ..stateful("app_db", HaPolicy::Cold, 512)
+        };
+        let entries = simulate(LOST, &[room(A, 4, 4096, 100)], &[db]);
+        assert_eq!(
+            shape(&entries),
+            [("app_db", CapacityAction::Restore, Some(A), None)]
+        );
     }
 
     #[test]

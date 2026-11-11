@@ -252,6 +252,25 @@ async fn the_lost_nodes_apps_are_placed_on_what_the_others_have_left() {
     )
     .await;
     stateful_on(&server, &db, &lost, "vol_00000000000000000000000001").await;
+    // `idle` is stopped on `lost`: no instance of it is meant to run, so it
+    // is not listed, and its 16 000 MiB would not fit anywhere.
+    let idle = app(&server, &owner, &project_id, "idle", 16_000).await;
+    vm(
+        &server,
+        &project_id,
+        Some(&idle),
+        &lost,
+        "vm_00000000000000000000000006",
+        16_000,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE vms SET desired_status = 'stopped', observed_status = 'stopped' WHERE id = ?",
+    )
+    .bind("vm_00000000000000000000000006")
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
     // `full` has 384 MiB left, so `web` goes to `roomy`.
     vm(
         &server,
@@ -291,17 +310,27 @@ async fn the_lost_nodes_apps_are_placed_on_what_the_others_have_left() {
                  "node_id": null, "reason": "no_backup" })
     );
 
-    // `roomy` is not connected any more: nothing has room for `web`, and the
-    // answer says what is missing. `api` still keeps its instance there.
-    set_status(&server, &roomy, "disconnected").await;
-    let answer = capacity(&owner, &server, &lost).await;
-    assert_eq!(answer["fits"], false, "{answer}");
-    assert_eq!(
-        answer["missing"],
-        json!({ "cpus": 1, "memory_mb": 1024, "disk_gb": 4 })
-    );
-    assert_eq!(entry(&answer, &web)["reason"], "no_capacity");
-    assert_eq!(entry(&answer, &web)["node_id"], Value::Null);
+    // `roomy` is not connected any more: `api`'s instance there does not
+    // count as running, so `api` needs a node as well as `web`, nothing has
+    // room for either, and the answer says what is missing.
+    for status in ["disconnected", "fenced"] {
+        set_status(&server, &roomy, status).await;
+        let answer = capacity(&owner, &server, &lost).await;
+        assert_eq!(answer["fits"], false, "{status}: {answer}");
+        assert_eq!(
+            answer["missing"],
+            json!({ "cpus": 2, "memory_mb": 1024 + 512, "disk_gb": 8 }),
+            "{status}"
+        );
+        for app_id in [&web, &api] {
+            assert_eq!(
+                entry(&answer, app_id),
+                &json!({ "app_id": app_id, "policy": "none", "action": "start",
+                         "node_id": null, "reason": "no_capacity" }),
+                "{status}"
+            );
+        }
+    }
 
     // A node that runs no app: nothing to move, it fits.
     let answer = capacity(&owner, &server, &full).await;
