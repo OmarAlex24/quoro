@@ -26,13 +26,24 @@ pub fn spawn(state: AppState) {
         let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
         loop {
             ticker.tick().await;
-            if let Err(error) = crate::service::grants::expire_due(&state).await {
+            // A demoted primary writes nothing more (`node-agent-protocol.md`
+            // section 7.4).
+            if state.store.stops_for_demotion("the expiry sweeper") {
+                break;
+            }
+            if let Err(error) = crate::service::grants::expire_due(&state).await
+                && !state.store.is_demoted()
+            {
                 tracing::warn!(error = ?error, "grant expiry sweep failed");
             }
-            if let Err(error) = crate::service::approvals::expire_due(&state).await {
+            if let Err(error) = crate::service::approvals::expire_due(&state).await
+                && !state.store.is_demoted()
+            {
                 tracing::warn!(error = ?error, "approval expiry sweep failed");
             }
-            if let Err(error) = repick_warm_nodes(&state).await {
+            if let Err(error) = repick_warm_nodes(&state).await
+                && !state.store.is_demoted()
+            {
                 tracing::warn!(error = ?error, "warm node sweep failed");
             }
         }

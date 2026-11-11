@@ -128,6 +128,13 @@ pub fn tls_identity(data_dir: &Path) -> TlsIdentity {
     .unwrap()
 }
 
+/// The router the harness serves: the API behind the demotion guard, as
+/// `quoro serve` wraps its whole service (`node-agent-protocol.md` section
+/// 7.4).
+pub fn served(state: &AppState) -> axum::Router {
+    quoro_control_plane::demotion::guard(router(state.clone()), state.store.clone())
+}
+
 /// Starts a control plane on 127.0.0.1 with an empty database.
 pub async fn start() -> Server {
     start_inner(200, 800, None, false).await
@@ -236,7 +243,7 @@ async fn start_at(
     if let Some((api_base, doh_base)) = cloudflare {
         state = state.with_cloudflare_endpoints(api_base, doh_base);
     }
-    let app = router(state.clone());
+    let app = served(&state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -266,7 +273,7 @@ pub async fn restart_with_resolver(server: &Server, resolver: Arc<dyn DigestReso
     )
     .await
     .unwrap();
-    let app = router(state.clone());
+    let app = served(&state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -294,7 +301,7 @@ pub async fn restart_reloading_tls(server: &Server) -> Server {
     )
     .await
     .unwrap();
-    let app = router(state.clone());
+    let app = served(&state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {

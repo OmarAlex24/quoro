@@ -39,7 +39,12 @@ pub struct TunnelController {
     cf: Cloudflare,
     dns: CloudflareDns,
     account_id: String,
+    /// Checked right before each Cloudflare write ([`Self::stop_when`]).
+    stopped: Arc<dyn Fn() -> bool + Send + Sync>,
 }
+
+/// The error of a write [`TunnelController::stop_when`] stopped.
+const STOPPED: &str = "the tunnel controller is stopped";
 
 impl TunnelController {
     /// `account_id` and `zone_id` are the non-secret `config` of the `tunnel`
@@ -52,7 +57,28 @@ impl TunnelController {
             cf,
             dns,
             account_id,
+            stopped: Arc::new(|| false),
         }
+    }
+
+    /// Stops this controller's writes once `stopped` returns `true`: it is
+    /// called right before each Cloudflare call that writes (a tunnel
+    /// creation or deletion, the ingress PUT, each CNAME upsert or delete),
+    /// and a stopped write returns an error without calling Cloudflare. A
+    /// write already sent finishes. The primary stops it on its demotion
+    /// (`node-agent-protocol.md` section 7.4).
+    #[must_use]
+    pub fn stop_when(mut self, stopped: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.stopped = Arc::new(stopped);
+        self
+    }
+
+    /// An error when [`Self::stop_when`]'s check says stop.
+    fn check(&self) -> Result<(), IngressError> {
+        if (self.stopped)() {
+            return Err(IngressError::Other(STOPPED.to_string()));
+        }
+        Ok(())
     }
 
     /// Finds this node's tunnel `quoro-<node_name>` or creates it, and returns
@@ -60,12 +86,16 @@ impl TunnelController {
     ///
     /// # Errors
     ///
-    /// The Cloudflare API refuses the credential, the lookup or the creation.
+    /// The Cloudflare API refuses the credential, the lookup or the creation,
+    /// or [`Self::stop_when`] stopped the creation.
     pub async fn ensure_tunnel(&self, node_name: &str) -> Result<(Tunnel, Token), IngressError> {
         let name = format!("quoro-{node_name}");
         let tunnel = match self.cf.find_tunnel(&self.account_id, &name).await? {
             Some(tunnel) => tunnel,
-            None => self.cf.create_tunnel(&self.account_id, &name).await?,
+            None => {
+                self.check()?;
+                self.cf.create_tunnel(&self.account_id, &name).await?
+            }
         };
         tracing::info!(tunnel = %tunnel.id, %name, "cloudflare tunnel ready");
         let token = self.cf.tunnel_token(&self.account_id, &tunnel.id).await?;
@@ -90,7 +120,9 @@ impl TunnelController {
     ///
     /// # Errors
     ///
-    /// The Cloudflare API refuses the ingress configuration.
+    /// The Cloudflare API refuses the ingress configuration, or
+    /// [`Self::stop_when`] stopped the sync before one of its writes;
+    /// `published` then holds what was done.
     pub async fn sync_routes(
         &self,
         tunnel_id: &str,
@@ -115,7 +147,8 @@ impl TunnelController {
     ///
     /// # Errors
     ///
-    /// The Cloudflare API refuses the ingress configuration.
+    /// The Cloudflare API refuses the ingress configuration, or
+    /// [`Self::stop_when`] stopped the sync.
     pub async fn sync_routes_draining(
         &self,
         tunnel_id: &str,
@@ -132,6 +165,7 @@ impl TunnelController {
                 service: service.clone(),
             })
             .collect();
+        self.check()?;
         self.cf
             .put_tunnel_ingress(&self.account_id, tunnel_id, &rules)
             .await?;
@@ -139,6 +173,7 @@ impl TunnelController {
         let target = format!("{tunnel_id}.cfargotunnel.com");
         let mut failures = Vec::new();
         for hostname in hostnames {
+            self.check()?;
             match self.dns.upsert_cname(hostname, &target, true).await {
                 Ok(_) => {
                     published.insert(hostname.clone());
@@ -152,6 +187,7 @@ impl TunnelController {
             .cloned()
             .collect();
         for hostname in stale {
+            self.check()?;
             match self.dns.delete_cname(&hostname, &target).await {
                 Ok(()) => {
                     published.remove(&hostname);
@@ -167,8 +203,10 @@ impl TunnelController {
     ///
     /// # Errors
     ///
-    /// The Cloudflare API refuses the deletion.
+    /// The Cloudflare API refuses the deletion, or [`Self::stop_when`]
+    /// stopped it.
     pub async fn delete_tunnel(&self, tunnel_id: &str) -> Result<(), IngressError> {
+        self.check()?;
         self.cf.delete_tunnel(&self.account_id, tunnel_id).await?;
         Ok(())
     }

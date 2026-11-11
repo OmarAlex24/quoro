@@ -21,6 +21,7 @@ use quoro_node_agent::store::NodeStore;
 use quoro_node_agent::tls;
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{ControlMessage, Welcome};
+use quoro_proto::{ErrorCode, ProtocolError};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -356,4 +357,242 @@ async fn an_advertised_address_that_never_answers_costs_a_short_timeout() {
     let _ = tokio::time::timeout(Duration::from_secs(2), running).await;
     primary.abort();
     silent_task.abort();
+}
+
+/// Serves TLS and answers every session upgrade with `503` and the
+/// `not_primary` problem, as a demoted primary does (section 7.4), counting
+/// the upgrades it refused. The handshake's callback returns tungstenite's
+/// own error response, whatever its size.
+#[allow(clippy::result_large_err)]
+async fn serve_not_primary(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    refused: Arc<AtomicUsize>,
+) {
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    loop {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let acceptor = acceptor.clone();
+        let refused = Arc::clone(&refused);
+        tokio::spawn(async move {
+            let Ok(stream) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let _ = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |_request: &Request, _response: Response| -> Result<Response, ErrorResponse> {
+                    refused.fetch_add(1, Ordering::SeqCst);
+                    let mut answer = ErrorResponse::new(Some(
+                        r#"{"type":"about:blank","title":"Not primary","status":503,"code":"not_primary"}"#
+                            .to_owned(),
+                    ));
+                    *answer.status_mut() =
+                        tokio_tungstenite::tungstenite::http::StatusCode::SERVICE_UNAVAILABLE;
+                    answer.headers_mut().insert(
+                        "content-type",
+                        tokio_tungstenite::tungstenite::http::HeaderValue::from_static(
+                            "application/problem+json",
+                        ),
+                    );
+                    Err(answer)
+                },
+            )
+            .await;
+        });
+    }
+}
+
+/// A demoted primary answers the session upgrade with `503` `not_primary`
+/// (section 7.4). That is not fatal: the node tries its next address in the
+/// same attempt, reaches the primary of the newer term there, and keeps it
+/// (sections 4.4 and 5.10).
+#[tokio::test]
+async fn an_upgrade_answered_with_503_moves_on_to_the_next_address() {
+    let dir = TempDir::new();
+    let cluster = sign::signing_key_from_seed(&[8; 32]);
+    let (cert, key) = self_signed();
+    let pin = format!("sha256:{}", tls::cert_fingerprint(cert.as_ref()));
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+
+    let demoted_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let demoted = format!(
+        "https://127.0.0.1:{}",
+        demoted_listener.local_addr().unwrap().port()
+    );
+    let refused = Arc::new(AtomicUsize::new(0));
+    let old_primary = tokio::spawn(serve_not_primary(
+        demoted_listener,
+        acceptor.clone(),
+        Arc::clone(&refused),
+    ));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let promoted = format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let welcomed = Arc::new(AtomicUsize::new(0));
+    let new_primary = tokio::spawn(serve_welcome(listener, acceptor, Arc::clone(&welcomed)));
+
+    let identity = write_identity(
+        dir.path(),
+        &cluster,
+        &demoted,
+        &pin,
+        std::slice::from_ref(&promoted),
+    );
+    let (stop, running) = session(&dir, identity.clone()).await;
+
+    within(Duration::from_secs(10), || {
+        welcomed.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    assert!(
+        refused.load(Ordering::SeqCst) >= 1,
+        "the demoted primary was dialed first"
+    );
+    within(Duration::from_secs(5), || {
+        identity.get().primary_url == promoted
+    })
+    .await;
+    assert_eq!(identity.get().primary_urls, vec![demoted]);
+    assert!(!running.is_finished(), "a 503 is not fatal");
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), running).await;
+    old_primary.abort();
+    new_primary.abort();
+}
+
+/// Serves one session as a primary that demotes itself while the node is
+/// connected (section 7.4): `welcome`, then the fatal `not_primary`, then
+/// the close. Every later dial gets the `503` of [`serve_not_primary`].
+/// `ended` counts the `not_primary` frames sent.
+async fn serve_then_demote(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    ended: Arc<AtomicUsize>,
+    refused: Arc<AtomicUsize>,
+) {
+    let Ok((tcp, _)) = listener.accept().await else {
+        return;
+    };
+    let first = acceptor.clone();
+    tokio::spawn(async move {
+        let Ok(stream) = first.accept(tcp).await else {
+            return;
+        };
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        while let Some(Ok(message)) = ws.next().await {
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) else {
+                continue;
+            };
+            if frame["type"] != "hello" {
+                continue;
+            }
+            let welcome = ControlMessage::Welcome(Welcome {
+                cluster_id: "cls_test".to_owned(),
+                term: 1,
+                server_time: "2026-11-02T10:15:30Z".to_owned(),
+                heartbeat_interval_ms: 500,
+                session_timeout_ms: 5_000,
+                primary_node_id: "nod_primary".to_owned(),
+                primary_urls: Vec::new(),
+                schema_version: None,
+            })
+            .to_frame("msg_welcome", frame["id"].as_str())
+            .to_text();
+            let not_primary = ControlMessage::Error(ProtocolError {
+                code: ErrorCode::NotPrimary,
+                message: "this primary learned of a higher term and is demoted".to_owned(),
+                fatal: true,
+                term: None,
+            })
+            .to_frame("msg_not_primary", None)
+            .to_text();
+            if ws.send(Message::Text(welcome.into())).await.is_ok()
+                && ws.send(Message::Text(not_primary.into())).await.is_ok()
+            {
+                ended.fetch_add(1, Ordering::SeqCst);
+            }
+            let _ = ws.close(None).await;
+            return;
+        }
+    });
+    serve_not_primary(listener, acceptor, refused).await;
+}
+
+/// A primary that demotes itself ends the session with a fatal
+/// `not_primary` (section 7.4). Unlike a fatal `unauthenticated`, it does not
+/// stop the agent: the node redials, gets the `503` of the demoted primary,
+/// and moves on to the primary of the newer term (sections 4.4 and 8.8).
+#[tokio::test]
+async fn a_fatal_not_primary_makes_the_node_redial_the_next_address() {
+    let dir = TempDir::new();
+    let cluster = sign::signing_key_from_seed(&[8; 32]);
+    let (cert, key) = self_signed();
+    let pin = format!("sha256:{}", tls::cert_fingerprint(cert.as_ref()));
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+
+    let demoting_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let demoting = format!(
+        "https://127.0.0.1:{}",
+        demoting_listener.local_addr().unwrap().port()
+    );
+    let ended = Arc::new(AtomicUsize::new(0));
+    let refused = Arc::new(AtomicUsize::new(0));
+    let old_primary = tokio::spawn(serve_then_demote(
+        demoting_listener,
+        acceptor.clone(),
+        Arc::clone(&ended),
+        Arc::clone(&refused),
+    ));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let promoted = format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let welcomed = Arc::new(AtomicUsize::new(0));
+    let new_primary = tokio::spawn(serve_welcome(listener, acceptor, Arc::clone(&welcomed)));
+
+    let identity = write_identity(
+        dir.path(),
+        &cluster,
+        &demoting,
+        &pin,
+        std::slice::from_ref(&promoted),
+    );
+    let (stop, running) = session(&dir, identity.clone()).await;
+
+    within(Duration::from_secs(15), || {
+        welcomed.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    assert_eq!(
+        ended.load(Ordering::SeqCst),
+        1,
+        "the session ended with not_primary"
+    );
+    assert!(
+        refused.load(Ordering::SeqCst) >= 1,
+        "the node dialed the demoted primary again first"
+    );
+    assert!(!running.is_finished(), "not_primary is not a fatal stop");
+    within(Duration::from_secs(5), || {
+        identity.get().primary_url == promoted
+    })
+    .await;
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), running).await;
+    old_primary.abort();
+    new_primary.abort();
 }

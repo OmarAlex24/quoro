@@ -134,7 +134,12 @@ pub async fn start() -> Server {
     )
     .await
     .unwrap();
-    let app = router(state.clone()).merge(quoro_mcp::router(state.clone()));
+    // The demotion guard is the outermost layer, as `quoro serve` wraps its
+    // whole service (`node-agent-protocol.md` section 7.4).
+    let app = quoro_control_plane::demotion::guard(
+        router(state.clone()).merge(quoro_mcp::router(state.clone())),
+        state.store.clone(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {

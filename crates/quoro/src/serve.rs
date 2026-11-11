@@ -27,7 +27,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// How long the local node agent gets to stop after the listener did.
 const NODE_STOP_GRACE: Duration = Duration::from_secs(15);
@@ -67,6 +67,16 @@ pub async fn run(config: Config, skip_upgrade_backup: bool) -> Result<i32, Strin
     let store = Store::open_unmigrated(&database)
         .await
         .map_err(|e| format!("cannot open {}: {e}", database.display()))?;
+    // Section 7.4: a primary that learned of a higher term stays demoted
+    // across a restart. Read only, before any start-time write.
+    let demoted_by_term = store
+        .demoted_by_term()
+        .await
+        .map_err(|e| format!("cannot read {}: {e}", database.display()))?;
+    if let Some(term) = demoted_by_term {
+        store.pool().close().await;
+        return run_demoted(config, &term).await;
+    }
     let material = tls::load_or_generate(&config.data_dir, &config.node_name, config.listen)
         .map_err(|e| format!("cannot load the TLS material: {e}"))?;
     // D-0050: the cluster data-encryption key is generated on first start,
@@ -151,34 +161,133 @@ pub async fn run(config: Config, skip_upgrade_backup: bool) -> Result<i32, Strin
         ensure_local_join(&config.data_dir, &loopback, &material.fingerprint)
             .map_err(|e| format!("cannot write the local node's join file: {e}"))?;
     }
-    let local_node = if config.node.local {
-        info!(
-            engine = config.engine.as_str(),
-            "starting the local node agent"
-        );
-        let node_config = config.clone();
-        let mut node_stop = stop_rx;
-        Some(tokio::spawn(async move {
-            let stopped = async move {
-                let _ = node_stop.wait_for(|stop| *stop).await;
-            };
-            node::run(&node_config, stopped).await
-        }))
-    } else {
-        None
-    };
-
-    let server = axum_server::from_tcp_rustls(
+    let local_node = start_local_node(&config, stop_rx);
+    let served = serve_until_stopped(
         listener,
-        axum_server::tls_rustls::RustlsConfig::from_config(material.config),
+        material.config,
+        handle,
+        service(state),
+        local_node,
     )
-    .handle(handle.clone())
-    .serve(
+    .await;
+    // A demotion whose record is still being retried gets one last attempt,
+    // so a clean stop does not come back as a primary
+    // (`node-agent-protocol.md` section 7.4).
+    store.record_demotion_before_exit().await;
+    served
+}
+
+/// `meta.demoted_by_term` of the database at `database`, read without any
+/// write or migration, or `None` when there is no database yet. The other
+/// commands that write `quoro.db` refuse on a demoted host with it
+/// (`node-agent-protocol.md` section 7.4).
+///
+/// # Errors
+///
+/// A one-line message when the database cannot be read.
+pub async fn demoted_by_term(database: &std::path::Path) -> Result<Option<String>, String> {
+    if !database.is_file() {
+        return Ok(None);
+    }
+    let store = Store::open_unmigrated(database)
+        .await
+        .map_err(|e| format!("cannot open {}: {e}", database.display()))?;
+    let term = store
+        .demoted_by_term()
+        .await
+        .map_err(|e| format!("cannot read {}: {e}", database.display()));
+    store.pool().close().await;
+    term
+}
+
+/// The whole service of a primary: the API, MCP and the panel as the
+/// fallback, with the demotion guard as the outermost layer, so a primary
+/// that demotes itself answers every request with `503` `not_primary`
+/// before any route or authentication runs (`node-agent-protocol.md`
+/// section 7.4).
+fn service(state: AppState) -> axum::Router {
+    let store = state.store.clone();
+    quoro_control_plane::demotion::guard(
         router(state.clone())
             .merge(quoro_mcp::router(state))
-            .fallback(crate::panel::serve)
-            .into_make_service_with_connect_info::<SocketAddr>(),
+            .fallback(crate::panel::serve),
+        store,
+    )
+}
+
+/// Runs a primary that a higher term demoted (`node-agent-protocol.md`
+/// section 7.4, ADR 0230): `meta.demoted_by_term` is set. It writes nothing:
+/// no upgrade backup, no migration, no first-start backfill or seal, no key,
+/// no TLS material and no join file, and it starts none of the control
+/// plane's loops. It loads the TLS material it has and answers every request
+/// with `503` `not_primary`. The host's own node agent still runs, so it
+/// reaches the new primary.
+async fn run_demoted(config: Config, term: &str) -> Result<i32, String> {
+    let material = tls::load_existing(&config.data_dir).map_err(|e| {
+        format!("cannot load the TLS material of this demoted primary, and none is generated: {e}")
+    })?;
+    let listener = TcpListener::bind(config.listen)
+        .map_err(|e| format!("cannot bind {}: {e}", config.listen))?;
+    let address = listener
+        .local_addr()
+        .map_err(|e| format!("cannot read the bound address: {e}"))?;
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let handle = Handle::new();
+    tokio::spawn(shutdown_on_signal(handle.clone(), stop_tx));
+
+    info!("listening on https://{address}");
+    info!("tls fingerprint: {}", material.fingerprint);
+    warn!(
+        "this host is a demoted primary at term {term}: it answers every request with 503 not_primary"
     );
+    let local_node = start_local_node(&config, stop_rx);
+    serve_until_stopped(
+        listener,
+        material.config,
+        handle,
+        quoro_control_plane::demotion::responder(),
+        local_node,
+    )
+    .await
+}
+
+/// Starts the in-process node agent when `[node] local` is set.
+fn start_local_node(
+    config: &Config,
+    stop_rx: watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<Result<i32, String>>> {
+    if !config.node.local {
+        return None;
+    }
+    info!(
+        engine = config.engine.as_str(),
+        "starting the local node agent"
+    );
+    let node_config = config.clone();
+    let mut node_stop = stop_rx;
+    Some(tokio::spawn(async move {
+        let stopped = async move {
+            let _ = node_stop.wait_for(|stop| *stop).await;
+        };
+        node::run(&node_config, stopped).await
+    }))
+}
+
+/// Serves `service` on `listener` until a signal, or until the local node
+/// agent stops, and returns the exit code.
+async fn serve_until_stopped(
+    listener: TcpListener,
+    tls: Arc<rustls::ServerConfig>,
+    handle: Handle,
+    service: axum::Router,
+    local_node: Option<tokio::task::JoinHandle<Result<i32, String>>>,
+) -> Result<i32, String> {
+    let server = axum_server::from_tcp_rustls(
+        listener,
+        axum_server::tls_rustls::RustlsConfig::from_config(tls),
+    )
+    .handle(handle.clone())
+    .serve(service.into_make_service_with_connect_info::<SocketAddr>());
 
     let Some(mut local_node) = local_node else {
         server
@@ -332,5 +441,90 @@ mod tests {
         assert_eq!(loopback(any6), "[::1]:8443".parse().unwrap());
         let fixed: SocketAddr = "10.0.0.5:9000".parse().unwrap();
         assert_eq!(loopback(fixed), fixed);
+    }
+
+    /// A running primary that demotes itself answers every route of the
+    /// service `quoro serve` composes with `503` `not_primary`: the API, MCP,
+    /// the panel and its assets (`node-agent-protocol.md` section 7.4).
+    #[tokio::test]
+    async fn the_composed_service_answers_not_primary_once_demoted() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let data_dir = std::env::temp_dir().join(format!(
+            "quoro-serve-demotion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let material = tls::load_or_generate(&data_dir, "primary", listen).unwrap();
+        let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
+        let state = AppState::open(
+            store,
+            ServerConfig {
+                data_dir: data_dir.clone(),
+                secure_cookies: false,
+                public_url: None,
+                tls_fingerprint: material.fingerprint.clone(),
+                tls: material.identity.clone(),
+                node_network: NodeNetwork {
+                    subnet: "10.42.1.0/24".to_string(),
+                    gateway: "10.42.1.1".to_string(),
+                },
+                heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+                session_timeout_ms: SESSION_TIMEOUT_MS,
+            },
+            Arc::new(ReferenceAsDigest),
+            Arc::new(DataKey::ephemeral()),
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind(listen).await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = service(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let mcp = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+
+        let health = client
+            .get(format!("{base}/api/v1/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), 200);
+        let before = client
+            .post(format!("{base}/mcp"))
+            .json(&mcp)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(before.status(), 503, "MCP answers before the demotion");
+
+        state.hub.stale_term(Some(5)).await;
+        for (what, request) in [
+            ("health", client.get(format!("{base}/api/v1/health"))),
+            ("an API route", client.get(format!("{base}/api/v1/nodes"))),
+            ("MCP", client.post(format!("{base}/mcp")).json(&mcp)),
+            ("the panel root", client.get(format!("{base}/"))),
+            ("a panel asset", client.get(format!("{base}/assets/app.js"))),
+            ("a panel page", client.get(format!("{base}/apps"))),
+        ] {
+            let res = request.send().await.unwrap();
+            assert_eq!(res.status(), 503, "{what}");
+            let content_type = res
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(content_type, "application/problem+json", "{what}");
+            let body: serde_json::Value = res.json().await.unwrap();
+            assert_eq!(body["code"], "not_primary", "{what}: {body}");
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

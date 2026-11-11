@@ -658,6 +658,10 @@ impl NodeHub {
                     let Some(inner) = hub.upgrade() else {
                         break;
                     };
+                    // A demoted primary grants nothing (section 7.4).
+                    if inner.store.stops_for_demotion("the held-grant task") {
+                        break;
+                    }
                     NodeHub(inner).attempt_held().await;
                 }
                 tokio::select! {

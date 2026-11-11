@@ -70,6 +70,9 @@ struct MockState {
     records: Vec<MockRecord>,
     tunnels: Vec<MockTunnel>,
     next_id: usize,
+    /// A primary the mock demotes as it answers the next ingress PUT, so the
+    /// demotion lands in the middle of a tunnel sync.
+    demote_on_configuration: Option<quoro_control_plane::store::Store>,
 }
 
 #[derive(Clone, Default)]
@@ -296,6 +299,10 @@ async fn put_configuration(
     bytes: Bytes,
 ) -> Response {
     record(&state, &method, &uri, &headers, parse_body(&bytes));
+    let demote = state.lock().unwrap().demote_on_configuration.take();
+    if let Some(store) = demote {
+        let _ = store.demote(Some(5)).await;
+    }
     ok(json!({"tunnel_id": "tun"}))
 }
 
@@ -2255,4 +2262,126 @@ async fn node_tunnel_entries_rebuild_their_rows() {
     assert!(columns.iter().any(|c| c == "created_at"), "{columns:?}");
     let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
     replay::assert_rebuilt(&server, &rebuilt, "node_tunnels", &columns, 2).await;
+}
+
+/// A demotion in the middle of a tunnel sync stops it at the next Cloudflare
+/// call (`node-agent-protocol.md` section 7.4): the ingress PUT that was
+/// under way finishes, and no CNAME is written after it.
+#[tokio::test]
+async fn a_demotion_during_a_tunnel_sync_stops_its_next_cloudflare_call() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, "node-alpha").await;
+    let provider = create_provider(
+        &server,
+        &owner,
+        "tunnel",
+        "Tunnel",
+        json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID }),
+    )
+    .await;
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+    let app_id = setup_project_and_app(&server, &owner).await;
+    create_domain(
+        &server,
+        &owner,
+        &app_id,
+        "tunnel.example.com",
+        "tunnel",
+        &provider_id,
+    )
+    .await;
+    place_vm(&server, &app_id, &node.node_id, "web-a").await;
+
+    mock.state.lock().unwrap().demote_on_configuration = Some(server.state.store.clone());
+    let res = owner
+        .put(server.url(&format!("/api/v1/nodes/{}/tunnel", node.node_id)))
+        .json(&json!({ "provider_id": provider_id, "origin_port": 8080 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    wait_for(|| server.state.store.is_demoted().then_some(())).await;
+    // The per-node lock waits for the sync that was under way to end.
+    server.state.tunnel.sync_now(&node.node_id).await;
+
+    let requests = mock.requests();
+    let put = requests
+        .iter()
+        .position(|request| request.method == "PUT" && request.path.contains("/configurations"))
+        .expect("the ingress PUT");
+    let after: Vec<String> = requests[put + 1..]
+        .iter()
+        .map(|request| format!("{} {}", request.method, request.path))
+        .collect();
+    assert!(
+        after.is_empty(),
+        "Cloudflare calls after the demotion: {after:?}"
+    );
+    assert!(mock.records().is_empty(), "{:?}", mock.records());
+}
+
+/// A DNS-01 challenge that runs after the demotion writes no record and
+/// removes none (`node-agent-protocol.md` section 7.4): the check sits right
+/// before each provider call of the challenge task.
+#[tokio::test]
+async fn a_dns_challenge_after_the_demotion_calls_no_provider() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    let alpha = enrolled(&server, &owner, "node-alpha").await;
+    let dns = create_provider(&server, &owner, "dns", "Dns", json!({ "zone_id": ZONE_ID })).await;
+    let app_id = setup_project_and_app(&server, &owner).await;
+    create_domain(
+        &server,
+        &owner,
+        &app_id,
+        "acme.example.com",
+        "acme",
+        dns["id"].as_str().unwrap(),
+    )
+    .await;
+    let routes: std::collections::HashSet<String> =
+        std::iter::once("acme.example.com".to_string()).collect();
+    let value = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
+    let set = wire::DnsChallenge {
+        action: wire::DnsChallengeAction::Set,
+        hostname: "acme.example.com".to_string(),
+        value: Some(value.to_string()),
+        record_id: None,
+    };
+
+    // Before the demotion the challenge writes its record.
+    let written = server
+        .state
+        .hub
+        .dns_challenge_for_test(&alpha.node_id, &set, &routes)
+        .await;
+    assert!(written.ok, "{:?}", written.message);
+    let record_id = written.record_id.expect("the record id");
+    assert_eq!(mock.records().len(), 1);
+
+    server.state.hub.stale_term(Some(5)).await;
+    let calls = mock.requests().len();
+    let refused = server
+        .state
+        .hub
+        .dns_challenge_for_test(&alpha.node_id, &set, &routes)
+        .await;
+    assert!(!refused.ok, "a set after the demotion");
+    let clear = wire::DnsChallenge {
+        action: wire::DnsChallengeAction::Clear,
+        hostname: "acme.example.com".to_string(),
+        value: None,
+        record_id: Some(record_id),
+    };
+    let refused = server
+        .state
+        .hub
+        .dns_challenge_for_test(&alpha.node_id, &clear, &routes)
+        .await;
+    assert!(!refused.ok, "a clear after the demotion");
+    assert_eq!(mock.requests().len(), calls, "no provider call");
+    assert_eq!(mock.records().len(), 1, "the record stays");
 }

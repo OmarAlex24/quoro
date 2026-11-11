@@ -46,7 +46,14 @@ pub fn spawn(state: AppState) {
         let mut ticker = tokio::time::interval(DISPATCH_INTERVAL);
         loop {
             ticker.tick().await;
-            if let Err(error) = run(&state, time::OffsetDateTime::now_utc()).await {
+            // A demoted primary queues and takes no backup
+            // (`node-agent-protocol.md` section 7.4).
+            if state.store.stops_for_demotion("the backup dispatch loop") {
+                break;
+            }
+            if let Err(error) = run(&state, time::OffsetDateTime::now_utc()).await
+                && !state.store.is_demoted()
+            {
                 tracing::warn!(error = ?error, "backup dispatch failed");
             }
         }

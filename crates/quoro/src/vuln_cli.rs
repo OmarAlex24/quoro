@@ -143,6 +143,13 @@ pub async fn import(data_dir: &Path, dir: &Path) -> Result<Imported, String> {
             database.display()
         ));
     }
+    // A demoted primary writes nothing more, not even the error audit record
+    // (`node-agent-protocol.md` section 7.4).
+    if let Some(term) = crate::serve::demoted_by_term(&database).await? {
+        return Err(format!(
+            "this host is a demoted primary at term {term}; it imports nothing"
+        ));
+    }
     let store = Store::open_unmigrated(&database)
         .await
         .map_err(|error| format!("cannot open {}: {error}", database.display()))?;

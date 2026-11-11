@@ -413,6 +413,22 @@ fn protocol_error(
     .to_text()
 }
 
+/// How long a session waits, from the moment it sees the demotion, to send
+/// its last frames: a frame already being sent, `not_primary` and the close
+/// frame share this one cap, and the session ends without them after it.
+const DEMOTED_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The fatal `error` `not_primary` a demoted primary ends every session with
+/// (sections 5.18 and 7.4, ADR 0230).
+fn not_primary_frame() -> String {
+    protocol_error(
+        quoro_proto::ErrorCode::NotPrimary,
+        "this primary learned of a higher term and is demoted; dial the other primary addresses",
+        true,
+        None,
+    )
+}
+
 fn decode_failure(error: &wire::DecodeError, outbox: &mut Vec<String>) -> bool {
     outbox.push(protocol_error(
         error.code(),
@@ -602,6 +618,9 @@ struct HubInner {
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
     /// Test seam: failures to inject, each once ([`NodeHub::inject_fault`]).
     faults: Mutex<Vec<Fault>>,
+    /// Test seam: the node ids whose session task has returned, in order,
+    /// the newest [`SESSION_ENDS_KEPT`] only ([`NodeHub::session_tasks_ended`]).
+    session_tasks_ended: watch::Sender<Vec<String>>,
     /// Woken by every change notification, so the domains' serving status
     /// is recomputed after the desired states it follows (ADR 0167).
     serving_inputs: Notify,
@@ -738,6 +757,7 @@ impl NodeHub {
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             faults: Mutex::new(Vec::new()),
+            session_tasks_ended: watch::channel(Vec::new()).0,
             serving_inputs: Notify::new(),
             revoke_answers: Notify::new(),
         }))
@@ -835,6 +855,10 @@ impl NodeHub {
                 let Some(inner) = hub.upgrade() else {
                     break;
                 };
+                // A demoted primary sends no desired state (section 7.4).
+                if inner.store.stops_for_demotion("the voter-set watch") {
+                    break;
+                }
                 let hub = NodeHub(inner);
                 match hub.voter_set().await {
                     Ok(set) => {
@@ -1357,6 +1381,40 @@ impl NodeHub {
         });
     }
 
+    /// Test seam: runs a node's `dns_challenge` as its session would, for
+    /// `node_id` with `acme_routes` as its acme hostnames, and returns the
+    /// result the session would send.
+    #[doc(hidden)]
+    pub async fn dns_challenge_for_test(
+        &self,
+        node_id: &str,
+        challenge: &wire::DnsChallenge,
+        acme_routes: &HashSet<String>,
+    ) -> wire::DnsChallengeResult {
+        dns_challenge(self, node_id, challenge, acme_routes).await
+    }
+
+    /// Test seam: a watch of the node ids whose session task has returned,
+    /// in order, after its last send: unlike the detach, which comes before
+    /// the close frame, this is the task's real end.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn session_tasks_ended(&self) -> watch::Receiver<Vec<String>> {
+        self.0.session_tasks_ended.subscribe()
+    }
+
+    /// Test seam: queues `message` on `node_id`'s session as
+    /// [`NodeHub::send_control`] does, for a test that a demotion drops what
+    /// was queued.
+    #[doc(hidden)]
+    pub fn queue_control_for_test(
+        &self,
+        node_id: &str,
+        message: &quoro_proto::wire::ControlMessage,
+    ) -> bool {
+        self.send_control(node_id, message)
+    }
+
     /// Queues one control frame to `node_id`'s live session, whatever its
     /// generation. Returns whether a session took the frame; a node without
     /// one receives the change with its next snapshot.
@@ -1775,6 +1833,39 @@ impl NodeHub {
             disconnect_node(self, &node_id, "session_closed", None).await?;
         }
         Ok(())
+    }
+
+    /// A machine answered `stale_term`: a higher term exists (sections 7.4
+    /// and 8.8, ADR 0230). The primary stops granting and renewing
+    /// `expiring` leases at once, then demotes itself
+    /// ([`crate::store::Store::demote`]): it sets the demoted flag, so from
+    /// then on it commits nothing, then records the term in `meta`. Every
+    /// node session ends with a fatal `not_primary` as soon as it sees the
+    /// demoted flag, and the demotion guard ([`crate::demotion`]) answers
+    /// every later request with `503`. A second `stale_term` changes
+    /// nothing.
+    ///
+    /// The flag is set before this returns; the `meta` write runs on its
+    /// own task, returned here. A node session drops it, so it ends within
+    /// its cap whatever the gate or SQLite wait for; a caller that needs the
+    /// outcome awaits it.
+    pub fn stale_term(&self, node_term: Option<u64>) -> crate::store::DemotionTask {
+        self.0.support.stale_term();
+        let demotion = self.0.store.demote(node_term);
+        crate::store::DemotionTask::spawn(async move {
+            let outcome = demotion.await;
+            match outcome {
+                Some(crate::store::Demotion::Recorded(term)) => tracing::error!(
+                    demoted_by_term = term,
+                    "this primary is demoted: it ends every node session with not_primary and answers every request with 503"
+                ),
+                Some(crate::store::Demotion::NotRecorded) => tracing::error!(
+                    "this primary is demoted until it restarts: it ends every node session with not_primary and answers every request with 503"
+                ),
+                None => tracing::debug!(?node_term, "already demoted; the first term stays"),
+            }
+            outcome
+        })
     }
 
     /// Ends every live session, for a clean shutdown.
@@ -2717,20 +2808,60 @@ async fn run_session(
     // Change-log follow sends new entries when this watch rises (section 7.1).
     let mut head = hub.0.store.change_log_head();
     let mut head_open = true;
+    // Section 7.4: once the primary is demoted, every session ends with
+    // `not_primary`, one that attached after the flag was set too.
+    let mut demoted = hub.0.store.demoted_watch();
+    let mut demoted_open = true;
     let mut session = Session::new(hub, node_id, generation);
     let mut superseded = false;
     let mut reason = "session_closed";
     let mut close_after_error = false;
+    // When the last sends after a demotion give up (`DEMOTED_SEND_TIMEOUT`).
+    let mut demoted_until: Option<Instant> = None;
     let retry = tokio::time::sleep(SNAPSHOT_RETRY);
     tokio::pin!(retry);
 
     'session: loop {
+        // Section 7.4: from the demotion on, the node receives `not_primary`
+        // and nothing else. Whatever this pass or an earlier one queued is
+        // dropped, though it was queued before the flag was set.
+        if session.hub.0.store.is_demoted() {
+            outbox.clear();
+            while rx.try_recv().is_ok() {}
+            // A node that stops reading must not hold the session open: the
+            // session ends whether the frame went out or not.
+            let until = Instant::now() + DEMOTED_SEND_TIMEOUT;
+            demoted_until = Some(until);
+            let _ = tokio::time::timeout_at(
+                until,
+                socket.send(Message::Text(not_primary_frame().into())),
+            )
+            .await;
+            break;
+        }
         while let Ok(text) = rx.try_recv() {
             outbox.push(text);
         }
         for text in outbox.drain(..) {
-            if socket.send(Message::Text(text.into())).await.is_err() {
-                break 'session;
+            // A demotion during an earlier send drops the rest.
+            if session.hub.0.store.is_demoted() {
+                continue 'session;
+            }
+            // A send to a node that stopped reading waits until the
+            // demotion, then stops waiting: the top of the loop sends
+            // `not_primary` within the cap, after the bytes of this frame
+            // that the socket already holds. A closed watch never wins.
+            tokio::select! {
+                sent = socket.send(Message::Text(text.into())) => {
+                    if sent.is_err() {
+                        break 'session;
+                    }
+                }
+                () = async {
+                    if demoted.wait_for(|demoted| *demoted).await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                } => continue 'session,
             }
         }
         if close_after_error {
@@ -2741,6 +2872,14 @@ async fn run_session(
         let follow_due = tokio::time::sleep_until(session.follow_retry.unwrap_or(deadline));
         let support_due = tokio::time::sleep_until(session.support_due.unwrap_or(deadline));
         tokio::select! {
+            // Wakes the loop on the demotion. Not biased: a branch that runs
+            // in the same pass may queue frames, and the top of the loop
+            // drops them, sends `not_primary` and ends the session.
+            seen = async { demoted.wait_for(|demoted| *demoted).await.is_ok() }, if demoted_open => {
+                if !seen {
+                    demoted_open = false;
+                }
+            }
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
@@ -2839,9 +2978,21 @@ async fn run_session(
     )
     .await;
     // A close frame tells the node the session ended; the client may already
-    // be gone, which is fine.
-    let _ = socket.send(Message::Close(None)).await;
+    // be gone, which is fine, or have stopped reading, which ends the wait.
+    // After a demotion it shares the cap of `not_primary`.
+    let until = demoted_until.unwrap_or_else(|| Instant::now() + DEMOTED_SEND_TIMEOUT);
+    let _ = tokio::time::timeout_at(until, socket.send(Message::Close(None))).await;
+    let node_id = session.node_id;
+    session.hub.0.session_tasks_ended.send_modify(|ended| {
+        ended.push(node_id);
+        let excess = ended.len().saturating_sub(SESSION_ENDS_KEPT);
+        ended.drain(..excess);
+    });
 }
+
+/// How many session ends the test seam [`NodeHub::session_tasks_ended`]
+/// keeps, so a long-running primary does not grow it without bound.
+const SESSION_ENDS_KEPT: usize = 64;
 
 /// Ends `generation`'s session: fails its pending commands and streams and,
 /// when `record_disconnect`, records the disconnect, with the
@@ -2868,6 +3019,8 @@ async fn end_session(
     // Nothing can answer this session's support requests any more; the
     // support the node already granted lasts its window (section 8.8).
     hub.0.support.session_ended(node_id, generation);
+    // A demoted primary writes nothing more (section 7.4).
+    let record_disconnect = record_disconnect && !hub.0.store.is_demoted();
     if record_disconnect && let Err(e) = disconnect_node(hub, node_id, reason, log_seq).await {
         tracing::warn!(%e, node_id = %node_id, "cannot record the disconnect");
     }
@@ -3234,9 +3387,12 @@ impl Session {
                     "node reported an error"
                 );
                 // Section 8.8, "Terms": a `stale_term`, whatever it answers,
-                // means a higher term exists.
+                // means a higher term exists. The primary demotes itself and
+                // ends this session like every other one (section 7.4).
                 if error.code == quoro_proto::ErrorCode::StaleTerm {
                     self.on_stale_term(error.term);
+                    outbox.push(not_primary_frame());
+                    return true;
                 }
                 if let Some(re) = raw.re.as_deref()
                     && self
@@ -4908,6 +5064,12 @@ async fn dns_challenge(
                 Ok(dns) => dns,
                 Err(message) => return failed_challenge(&message),
             };
+            // A demoted primary calls no provider (section 7.4): checked
+            // right before the call, as the demotion may land while this
+            // task runs.
+            if hub.0.store.stops_for_demotion("dns challenge") {
+                return failed_challenge("this primary is demoted");
+            }
             let name = format!("_acme-challenge.{}", challenge.hostname);
             match dns.create_txt(&name, value).await {
                 Ok(record_id) => {
@@ -4944,6 +5106,9 @@ async fn dns_challenge(
                 Ok(dns) => dns,
                 Err(message) => return failed_challenge(&message),
             };
+            if hub.0.store.stops_for_demotion("dns challenge") {
+                return failed_challenge("this primary is demoted");
+            }
             match dns
                 .delete_record(&quoro_providers::RecordId(record_id.to_string()))
                 .await

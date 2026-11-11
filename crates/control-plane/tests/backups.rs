@@ -1717,3 +1717,34 @@ async fn a_sweep_deletes_only_dead_old_chunks() {
     assert_eq!(last_gc["chunks_deleted"], 1);
     assert_eq!(last_gc["manifests_deleted"], 0);
 }
+
+/// A demoted primary deletes nothing (`node-agent-protocol.md` section 7.4):
+/// a sweep that runs after the demotion leaves a dead chunk in place.
+#[tokio::test]
+async fn a_sweep_after_the_demotion_deletes_nothing() {
+    let setup = setup().await;
+    let dead = ChunkId([0xaa; 32]);
+    let dead_key = format!("{}{}", root(&setup.server), layout::chunk(&dead));
+    setup
+        .memory
+        .put_new(&dead_key, b"dead".to_vec(), None)
+        .await
+        .unwrap();
+    setup.server.state.hub.stale_term(Some(5)).await;
+
+    let counts = quoro_control_plane::backups::prune::sweep(
+        &setup.server.state.store,
+        &setup.server.state.data_key,
+        &setup.server.state.keys,
+        &setup.server.state.backups,
+        &setup.repo_id,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts.chunks_deleted, 0);
+    assert!(
+        setup.memory.get(&dead_key).await.is_ok(),
+        "the dead chunk stays"
+    );
+}

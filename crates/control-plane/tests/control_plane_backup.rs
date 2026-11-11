@@ -144,6 +144,80 @@ impl BucketFactory for SealFailBuckets {
     }
 }
 
+/// A factory whose bucket demotes the primary right after one of its
+/// writes, so the demotion lands while a backup or a pruning runs, after its
+/// first check (`node-agent-protocol.md` section 7.4).
+#[derive(Clone)]
+struct DemotingBuckets {
+    bucket: Arc<MemoryStore>,
+    store: Store,
+    after: DemoteAfter,
+}
+
+/// The write [`DemotingBuckets`] demotes after: the put or the delete of a
+/// key that contains the text.
+#[derive(Clone, Copy)]
+enum DemoteAfter {
+    Put(&'static str),
+    Delete(&'static str),
+}
+
+impl BucketStore for DemotingBuckets {
+    fn put_new<'a>(
+        &'a self,
+        key: &'a str,
+        body: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ObjectStoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            let put = self.bucket.put_new(key, body, None).await.map(|_| ());
+            if let DemoteAfter::Put(text) = self.after
+                && key.contains(text)
+            {
+                let _ = self.store.demote(Some(5)).await;
+            }
+            put
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ObjectStoreError>> + Send + 'a>> {
+        Box::pin(self.bucket.get(key))
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ObjectInfo>, ObjectStoreError>> + Send + 'a>> {
+        Box::pin(self.bucket.list(prefix))
+    }
+
+    fn delete<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ObjectStoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            let deleted = self.bucket.delete(key).await;
+            if let DemoteAfter::Delete(text) = self.after
+                && key.contains(text)
+            {
+                let _ = self.store.demote(Some(5)).await;
+            }
+            deleted
+        })
+    }
+}
+
+impl BucketFactory for DemotingBuckets {
+    fn open(
+        &self,
+        _target: &RepositoryTarget,
+    ) -> Result<Bucket, quoro_control_plane::error::ApiError> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -654,6 +728,108 @@ async fn a_refused_bucket_fails_the_row_and_leaves_no_temporary_file() {
     .unwrap();
     assert_eq!(result, "error");
     assert_eq!(reason.as_deref(), Some(error.as_str()));
+}
+
+/// A primary demoted while its backup uploads writes no seal: the upload
+/// that was running reaches the seal after the demotion and stops there.
+#[tokio::test]
+async fn an_upload_running_at_the_demotion_writes_no_seal() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (server, owner, _node_id, project_id) = setup(&bucket).await;
+    create_app(&owner, &server, &project_id, "web").await;
+    create_repository(&owner, &server, 1, 7).await;
+    let now = at("2026-11-05T02:00:00Z");
+    let queued = queue_if_due(&server.state, now).await.unwrap().unwrap();
+    server.state.backups.set_factory(Arc::new(DemotingBuckets {
+        bucket: Arc::clone(&bucket),
+        store: server.state.store.clone(),
+        after: DemoteAfter::Put("manifests/"),
+    }));
+
+    // The run ends without a seal; recording its end is refused as well.
+    let _ = run_control_plane_backup(&server.state, &queued.id, now).await;
+
+    assert!(server.state.store.is_demoted());
+    let root = root(&server);
+    let manifest = format!(
+        "{root}{}",
+        layout::manifest(&server.state.cluster_id, &queued.id)
+    );
+    assert!(
+        !object(&bucket, &manifest).await.is_empty(),
+        "the upload ran up to its manifest"
+    );
+    let seals = bucket.list(&format!("{root}seals/")).await.unwrap();
+    assert!(seals.is_empty(), "no seal after the demotion: {seals:?}");
+    assert_eq!(row(&server, &queued.id).await.status, "running");
+}
+
+/// A primary demoted after a chunk of its backup landed uploads no manifest,
+/// so nothing commits the chunks.
+#[tokio::test]
+async fn an_upload_demoted_after_a_chunk_writes_no_manifest() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (server, owner, _node_id, project_id) = setup(&bucket).await;
+    create_app(&owner, &server, &project_id, "web").await;
+    create_repository(&owner, &server, 1, 7).await;
+    let now = at("2026-11-05T02:00:00Z");
+    let queued = queue_if_due(&server.state, now).await.unwrap().unwrap();
+    server.state.backups.set_factory(Arc::new(DemotingBuckets {
+        bucket: Arc::clone(&bucket),
+        store: server.state.store.clone(),
+        after: DemoteAfter::Put("chunks/"),
+    }));
+
+    let _ = run_control_plane_backup(&server.state, &queued.id, now).await;
+
+    assert!(server.state.store.is_demoted());
+    let root = root(&server);
+    let chunks = bucket.list(&format!("{root}chunks/")).await.unwrap();
+    assert_eq!(chunks.len(), 1, "one chunk, then the demotion: {chunks:?}");
+    let manifests = bucket.list(&format!("{root}manifests/")).await.unwrap();
+    assert!(manifests.is_empty(), "no manifest: {manifests:?}");
+    let seals = bucket.list(&format!("{root}seals/")).await.unwrap();
+    assert!(seals.is_empty(), "no seal: {seals:?}");
+}
+
+/// A demotion between two deletes of retention leaves the rest in place: the
+/// oldest backup loses its seal, and its manifest stays.
+#[tokio::test]
+async fn a_demotion_during_retention_stops_the_next_delete() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (server, owner, _node_id, project_id) = setup(&bucket).await;
+    create_app(&owner, &server, &project_id, "web").await;
+    create_repository(&owner, &server, 1, 1).await;
+    let cluster_id = server.state.cluster_id.clone();
+    let first = at("2026-11-05T02:00:00Z");
+    let oldest = scheduled_backup(&server, first).await;
+
+    server.state.backups.set_factory(Arc::new(DemotingBuckets {
+        bucket: Arc::clone(&bucket),
+        store: server.state.store.clone(),
+        after: DemoteAfter::Delete("seals/"),
+    }));
+    let now = first + time::Duration::hours(2);
+    let newest = queue_if_due(&server.state, now).await.unwrap().unwrap();
+    let _ = run_control_plane_backup(&server.state, &newest.id, now).await;
+
+    assert!(server.state.store.is_demoted());
+    let root = root(&server);
+    assert!(
+        bucket
+            .get(&format!("{root}{}", layout::seal(&cluster_id, &oldest)))
+            .await
+            .is_err(),
+        "the oldest seal was deleted before the demotion"
+    );
+    assert!(
+        bucket
+            .get(&format!("{root}{}", layout::manifest(&cluster_id, &oldest)))
+            .await
+            .is_ok(),
+        "the oldest manifest stays"
+    );
+    assert!(row(&server, &oldest).await.pruned_at.is_none());
 }
 
 #[tokio::test]

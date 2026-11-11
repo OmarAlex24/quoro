@@ -406,6 +406,9 @@ pub async fn backup_before_upgrade(
         sealed_at: created_at.clone(),
         signature: String::new(),
     };
+    if store.is_demoted() {
+        return Err(crate::store::DEMOTED_REFUSAL.to_string());
+    }
     match seal::put_seal(&bucket, &target, keys, seal).await {
         Ok(()) => {}
         Err(seal::SealError::Failed(reason)) => return Err(reason),
@@ -737,6 +740,12 @@ async fn upload_database(
     keys: SourceKeys,
     now: OffsetDateTime,
 ) -> Result<Uploaded, String> {
+    // `VACUUM INTO` does not go through the writer gate, so a demoted
+    // primary, which uploads nothing more, is checked here
+    // (`node-agent-protocol.md` section 7.4).
+    if store.is_demoted() {
+        return Err(crate::store::DEMOTED_REFUSAL.to_string());
+    }
     let path = temp_path(data_dir, backup_id)?;
     let quote_free = path
         .to_str()
@@ -786,6 +795,10 @@ async fn upload_database(
         let (id, object, _zero) = writer.push(chunk);
         let size = object.len() as u64;
         let key = object_key(&target.root, &layout::chunk(&id));
+        // A primary demoted during the upload uploads no further chunk.
+        if store.is_demoted() {
+            return Err(crate::store::DEMOTED_REFUSAL.to_string());
+        }
         match bucket.put_new(&key, object).await {
             Ok(()) => uploaded = uploaded.saturating_add(size),
             Err(ObjectStoreError::AlreadyExists) => {}
@@ -798,6 +811,11 @@ async fn upload_database(
         .map_err(|error| format!("could not write the manifest: {error}"))?;
     let manifest_key = layout::manifest(source_id, backup_id);
     let key = object_key(&target.root, &manifest_key);
+    // The manifest commits the uploaded chunks; a primary demoted during the
+    // upload writes it no more.
+    if store.is_demoted() {
+        return Err(crate::store::DEMOTED_REFUSAL.to_string());
+    }
     match bucket.put_new(&key, object).await {
         Ok(()) => {}
         Err(ObjectStoreError::AlreadyExists) => {

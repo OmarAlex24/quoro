@@ -39,8 +39,15 @@ pub fn spawn(state: AppState) {
         let mut ticker = tokio::time::interval(EXPORT_INTERVAL);
         loop {
             ticker.tick().await;
+            // A demoted primary exports nothing more (`node-agent-protocol.md`
+            // section 7.4): its chain stays in its database.
+            if state.store.stops_for_demotion("the audit export") {
+                break;
+            }
             let now = OffsetDateTime::now_utc();
-            if let Err(error) = cycle(&state, now, &mut last_verify).await {
+            if let Err(error) = cycle(&state, now, &mut last_verify).await
+                && !state.store.is_demoted()
+            {
                 tracing::warn!(error = ?error, "audit export pass failed");
             }
         }
@@ -68,6 +75,11 @@ async fn cycle(
         }
     };
     step(state, &store, now).await?;
+    // A pass the demotion cut short goes no further (`node-agent-protocol.md`
+    // section 7.4); the probe checks the flag again before its put.
+    if state.store.is_demoted() {
+        return Ok(());
+    }
 
     let Some(row) = load(&state.store).await? else {
         return Ok(());
@@ -189,6 +201,12 @@ pub async fn step<S: ObjectStore>(
     let lock = (row.lock_strength == quoro_providers::object_store::LockStrength::Compliance)
         .then(|| compliance_lock(now));
     let segment = segment_key(&root, first, last);
+    // A demoted primary writes no object (`node-agent-protocol.md` section
+    // 7.4): checked right before each write, as the demotion may land while
+    // a pass runs.
+    if state.store.stops_for_demotion("the audit export") {
+        return Ok(());
+    }
     if let Err(error) = store.put_new(&segment, body, lock.as_ref()).await {
         match error {
             ObjectStoreError::AlreadyExists => {
@@ -219,6 +237,9 @@ pub async fn step<S: ObjectStore>(
 
     let head = head_key(&root, last);
     let body = head_body(last, &head_hash, now);
+    if state.store.stops_for_demotion("the audit export") {
+        return Ok(());
+    }
     if let Err(error) = store.put_new(&head, body, lock.as_ref()).await {
         match error {
             ObjectStoreError::AlreadyExists => {
@@ -361,6 +382,9 @@ async fn recover<S: ObjectStore>(
             let lock = (row.lock_strength
                 == quoro_providers::object_store::LockStrength::Compliance)
                 .then(|| compliance_lock(now));
+            if state.store.stops_for_demotion("the audit export") {
+                return Ok(Recovery::Stop);
+            }
             if let Err(error) = store
                 .put_new(&head, head_body(last, &hash, now), lock.as_ref())
                 .await

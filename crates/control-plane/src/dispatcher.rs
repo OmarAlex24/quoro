@@ -330,7 +330,15 @@ fn spawn(state: AppState, cursor: i64) {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if let Err(error) = tick(&state, &client, &mut cursor).await {
+            // A demoted primary sends no delivery (`node-agent-protocol.md`
+            // section 7.4): its bookkeeping write would be refused, and the
+            // retry would send it again and again.
+            if state.store.stops_for_demotion("the webhook dispatcher") {
+                break;
+            }
+            if let Err(error) = tick(&state, &client, &mut cursor).await
+                && !state.store.is_demoted()
+            {
                 tracing::warn!(error = ?error, "webhook dispatch failed");
             }
         }
@@ -690,6 +698,9 @@ async fn send_prepared(
             return Ok(());
         }
     };
+    if state.store.is_demoted() {
+        return Ok(());
+    }
     let outcome = send_once(
         client,
         &webhook,
@@ -704,6 +715,9 @@ async fn send_prepared(
 
 /// Processes pending retry rows whose `next_attempt_at` has come.
 async fn deliver_due_retries(state: &AppState, client: &reqwest::Client) -> Result<(), ApiError> {
+    if state.store.is_demoted() {
+        return Ok(());
+    }
     let now = now_rfc3339();
     let rows = sqlx::query(
         "SELECT id, webhook_id, event_id, attempt FROM webhook_deliveries \
@@ -786,6 +800,11 @@ async fn deliver_retry(
             return Ok(());
         }
     };
+    // Checked last before the send: a demoted primary sends nothing
+    // (`node-agent-protocol.md` section 7.4).
+    if state.store.is_demoted() {
+        return Ok(());
+    }
     let outcome = send_once(client, &webhook, &event, &id, &secret, wake.as_ref()).await;
     record_outcome(state, &webhook.id, &event, &id, attempt, &outcome).await
 }

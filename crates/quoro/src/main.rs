@@ -494,6 +494,21 @@ async fn issue_token(args: &[String]) -> ExitCode {
     }
 
     let database = config.data_dir.join("quoro.db");
+    // A demoted primary writes nothing more (`node-agent-protocol.md`
+    // section 7.4): read before `Store::open` migrates.
+    match serve::demoted_by_term(&database).await {
+        Ok(None) => {}
+        Ok(Some(term)) => {
+            eprintln!(
+                "quoro setup-token: this host is a demoted primary at term {term}; it issues no setup token"
+            );
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("quoro setup-token: {e}");
+            return ExitCode::from(1);
+        }
+    }
     let store = match Store::open(&database).await {
         Ok(store) => store,
         Err(e) => {

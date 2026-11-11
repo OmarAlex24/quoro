@@ -53,11 +53,42 @@ pub fn load_or_generate(
         (Ok(cert_pem), Ok(key_pem)) => (cert_pem, Zeroizing::new(key_pem)),
         _ => generate(&cert_path, &key_path, node_name, listen)?,
     };
+    material(cert_pem, key_pem, &cert_path, &key_path)
+}
+
+/// Loads `<data_dir>/tls/cert.pem` and `key.pem` without creating or
+/// changing anything: a demoted primary serves the material it has and never
+/// generates any (`node-agent-protocol.md` section 7.4).
+///
+/// # Errors
+///
+/// An I/O error reading either file, [`io::ErrorKind::NotFound`] when one is
+/// missing, or a certificate that cannot be parsed or used.
+pub fn load_existing(data_dir: &Path) -> io::Result<Material> {
+    let dir = data_dir.join("tls");
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    let read = |path: &Path| {
+        std::fs::read(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+    };
+    let cert_pem = read(&cert_path)?;
+    let key_pem = Zeroizing::new(read(&key_path)?);
+    material(cert_pem, key_pem, &cert_path, &key_path)
+}
+
+/// The listener's material from the PEM bytes of the two files.
+fn material(
+    cert_pem: Vec<u8>,
+    key_pem: Zeroizing<Vec<u8>>,
+    cert_path: &Path,
+    key_path: &Path,
+) -> io::Result<Material> {
     let cert_der = decode_pem(&cert_pem, "CERTIFICATE")?;
     let key_der = decode_pem(&key_pem, "PRIVATE KEY")?;
     let identity = TlsIdentity::from_pem(
-        pem_text(cert_pem, &cert_path)?,
-        pem_text(key_pem.to_vec(), &key_path)?,
+        pem_text(cert_pem, cert_path)?,
+        pem_text(key_pem.to_vec(), key_path)?,
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -282,6 +313,26 @@ mod tests {
             assert_eq!(mode & 0o777, 0o700);
         }
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn loading_existing_material_creates_nothing_and_matches_the_generated_one() {
+        let dir = temp_dir();
+        let missing = load_existing(&dir).err().expect("no material yet");
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(!dir.join("tls").exists(), "nothing is created");
+
+        let listen: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let generated = load_or_generate(&dir, "node-1", listen).unwrap();
+        let loaded = load_existing(&dir).unwrap();
+        assert_eq!(loaded.fingerprint, generated.fingerprint);
+        assert_eq!(loaded.identity.cert_pem(), generated.identity.cert_pem());
+
+        std::fs::remove_file(dir.join("tls/key.pem")).unwrap();
+        let missing = load_existing(&dir).err().expect("the key is gone");
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(!dir.join("tls/key.pem").exists(), "and is not generated");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
