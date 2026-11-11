@@ -4670,8 +4670,7 @@
   .ncard {
     min-width: 0;
     transition:
-      opacity var(--motion-change) var(--ease),
-      filter var(--motion-change) var(--ease),
+      color var(--motion-change) var(--ease),
       border-color var(--motion-feedback) var(--ease),
       box-shadow var(--motion-feedback) var(--ease);
   }
@@ -4681,10 +4680,54 @@
     box-shadow: var(--card-up);
   }
 
-  /* The node whose loss is simulated: dimmed and drained of colour until the simulation stops. */
+  /*
+   * The node whose loss is simulated, until the simulation stops: its drawings
+   * (meters, charts, lamps, the mark's sample, the VM cells' fills) dim and
+   * drain of colour; its words step down to --ink-2 and its tags and cells to
+   * neutral, so every word keeps 4.5:1 in both themes.
+   */
+  .ncard canvas,
+  .ncard .ncard-u i {
+    transition: filter var(--motion-change) var(--ease);
+  }
+
+  .ncard .lamp {
+    transition:
+      background-color var(--motion-change) var(--ease),
+      box-shadow var(--motion-change) var(--ease),
+      outline-color var(--motion-change) var(--ease),
+      filter var(--motion-change) var(--ease);
+  }
+
   .ncard[data-lost] {
-    opacity: 0.5;
-    filter: saturate(0.3);
+    color: var(--ink-2);
+  }
+
+  .ncard[data-lost] canvas,
+  .ncard[data-lost] .lamp,
+  .ncard[data-lost] .ncard-u i {
+    filter: opacity(0.5) saturate(0.3);
+  }
+
+  .ncard[data-lost] :is(.chart-sm .chart-v, .ncard-r-h b, .ncard-f b) {
+    color: var(--ink-2);
+  }
+
+  .ncard[data-lost] .tag-accent {
+    background-color: var(--sunk);
+    border-color: var(--line-2);
+    color: var(--ink-2);
+  }
+
+  .ncard[data-lost] .vcell {
+    --kind: var(--idle);
+    background-color: color-mix(in oklab, var(--kind) 8%, var(--sunk));
+    background-image: conic-gradient(
+      from 270deg at 1px 1px,
+      color-mix(in oklab, var(--kind) 18%, transparent) 25%,
+      transparent 0
+    );
+    color: var(--ink-2);
   }
 
   .ncard-h {
@@ -4894,7 +4937,9 @@
     cursor: default;
     transition:
       transform var(--motion-feedback) var(--ease),
-      border-color var(--motion-feedback) var(--ease);
+      border-color var(--motion-feedback) var(--ease),
+      background-color var(--motion-change) var(--ease),
+      color var(--motion-change) var(--ease);
   }
 
   .vcell > span:not(.sr-only) {
