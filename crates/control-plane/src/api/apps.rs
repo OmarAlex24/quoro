@@ -1729,12 +1729,13 @@ pub async fn update_app(
 
     match update_app_tx(&state, &ctx, &app_id, &body, &params).await {
         Ok((mut app, vm_ids, warm_wake, ended)) => {
-            // Section 8.4, "Ending the renewals" step 2: the `local` grant that
-            // ends the renewals goes out once R is replicated and supported.
-            // Only a row R wrote is held so: one R found already `local` and
-            // marked may be a row whose grant with a new token is held.
-            if let Some(lease) = ended {
-                state.hub.hold_local_end(&lease);
+            // Section 8.4, "Ending the renewals" step 2: after any policy
+            // change off `warm`, the `local` grant that ends the renewals goes
+            // out once the row's newest write is replicated and supported. A
+            // held grant with a new token that R left standing for nothing
+            // goes first.
+            if let Some(ended) = ended {
+                state.hub.end_renewals_committed(&ended);
             }
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
@@ -1791,7 +1792,7 @@ async fn update_app_tx(
     let mut app = app_from_row(&row)?;
     let was_warm = app.ha_policy == HaPolicy::Warm;
     let mut changed = Vec::new();
-    // The lease row R wrote `local` and marked, when the policy leaves `warm`.
+    // The lease row after R, when the policy leaves `warm`.
     let mut ended = None;
 
     // A new replica count is checked against the app as it is now, and against
@@ -1862,10 +1863,10 @@ async fn update_app_tx(
         // that leaves `warm` (`hot` is read as `warm`, as the lease code
         // reads it) writes the lease row `local` with the unsettled mark in
         // this transaction (R), so a failed request writes neither. Nothing is
-        // sent here.
+        // sent here: what follows is read here and acted on once it commits.
         let warmish = |policy: HaPolicy| matches!(policy, HaPolicy::Warm | HaPolicy::Hot);
         if warmish(app.ha_policy) && !warmish(policy) {
-            ended = crate::leases::end_renewals(&mut w.tx, app_id, &ctx.identity.actor()).await?;
+            ended = crate::leases::leave_warm(&mut w.tx, app_id, &ctx.identity.actor()).await?;
         }
         app.ha_policy = policy;
         changed.push("ha_policy");
@@ -1996,13 +1997,13 @@ async fn update_app_tx(
 }
 
 /// What [`update_app_tx`] committed: the app, the VMs to wake, the nodes
-/// whose warm settings changed, and the lease row R wrote when the policy
-/// left `warm`.
+/// whose warm settings changed, and the lease row after R with what follows
+/// it, when the policy left `warm`.
 type UpdatedApp = (
     App,
     Vec<String>,
     Option<Vec<String>>,
-    Option<crate::leases::Lease>,
+    Option<crate::leases::Ended>,
 );
 
 /// Why `updateApp` refuses `ha_policy` `warm` for an app (`openapi.yaml`

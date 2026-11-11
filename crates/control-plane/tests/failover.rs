@@ -1384,6 +1384,70 @@ async fn a_held_failover_grant_answers_in_progress_then_goes_out_once_replicated
     );
 }
 
+/// #555, R over a held grant (section 8.4, "Ending the renewals" step 1 and
+/// "Grants of a marked row"). A failover's grant to the warm node is held,
+/// `expiring` at token 5 over a row that read `local` (a raise), and the
+/// warm node leaves before it goes out. The
+/// policy then leaves `warm`: R writes the row `local` with the mark, so
+/// its newest write no longer gives the lease a new token, and the held
+/// grant is dropped at once, though its holder is away: `grant_pending`
+/// reads false and `grant_waiting_on` is empty. Back on `warm`, with the old
+/// source as the warm node reporting a complete copy, a failover finds the
+/// marked row's holder away and answers `lease_held`, not `in_progress`.
+#[tokio::test]
+async fn r_drops_a_held_grant_whose_holder_is_away() {
+    let mut s = Setup::new().await;
+    s.report_copy().await;
+    set_support(&s.server, true);
+    let res = s.connected_failover().await;
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    s.moved_marked().await;
+    drop(s.on_warm.take());
+    disconnected(&s.server, &s.warm.node_id).await;
+    let lease = s.lease_view().await;
+    assert_eq!(lease["grant_pending"], true, "{lease}");
+
+    let res = s
+        .owner
+        .patch(s.server.url(&format!("/api/v1/apps/{}", s.app_id)))
+        .json(&json!({ "ha_policy": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let (mode, unsettled): (String, i64) =
+        sqlx::query_as("SELECT mode, unsettled FROM leases WHERE id = ?")
+            .bind(LEASE_ID)
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!((mode.as_str(), unsettled), ("local", 1), "R");
+    let lease = s.lease_view().await;
+    let at_once = (
+        lease["grant_pending"].clone(),
+        lease["grant_waiting_on"].clone(),
+    );
+
+    sqlx::query("UPDATE apps SET ha_policy = 'warm', warm_node_id = ? WHERE id = ?")
+        .bind(&s.source.node_id)
+        .bind(&s.app_id)
+        .execute(s.server.state.store.pool())
+        .await
+        .unwrap();
+    let app_id = s.app_id.clone();
+    let socket = s.on_source();
+    send(socket, copy_report(&app_id), None).await;
+    frames_until_settled(socket).await;
+    let res = s.call(&s.source.node_id).await.unwrap();
+    assert_eq!(res.status(), 409);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        (at_once, body["reason"].clone()),
+        ((json!(false), json!([])), json!("lease_held")),
+        "{body}"
+    );
+}
+
 /// A source that is not connected, with an unmarked `expiring` row for `D`
 /// whose gate has passed (the primary keeps none for it): the lease, the
 /// volume and the instance move to the warm node, the old source becomes the

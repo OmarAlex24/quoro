@@ -15,11 +15,15 @@
 //!   unrevoked, marked and reading `local`, the policy off `warm`, and no
 //!   failed fence or pending acknowledgement. It checks no gate and drops
 //!   none: the holder keeps its lease and its token.
-//! - **Only over R's own write.** The grant is held when R wrote the row, so
-//!   the row's newest write gave no new token. A row R finds already `local`
-//!   and marked may be one whose grant with a new token is held ("Grants of
-//!   a marked row"): that grant stays, and a grant with a new token never
-//!   goes out through this path, which checks no gate.
+//! - **After every policy change off `warm`.** The grant is held whenever
+//!   the row, after R, is unrevoked, marked, reads `local`, and its newest
+//!   write gave it no new token ([`leases::leave_warm`]), whether or not R
+//!   wrote it: a return to `warm` and back before any settle leaves the row
+//!   as R left it, and still ends the renewals. A row whose newest write gave
+//!   it a new token has its own grant held ("Grants of a marked row"): that
+//!   grant stays, and a grant with a new token never goes out through this
+//!   path, which checks no gate. When R writes over such a row, the held
+//!   grant not sent yet stands for nothing and is dropped at once.
 //! - **Evidence.** It goes out only on a session with evidence that the
 //!   holder holds the lease at the row's token: its `hello` listed it there
 //!   (`held` or `uncertain`, `expiring` or `local`), or it renewed at that
@@ -43,9 +47,9 @@
 //!   ([`NodeHub::note_conversion_sent`]). A barrier that passed on the
 //!   session before this grant no longer counts, nor does the `pong` of an
 //!   older grant's `ping`: only the newest grant's `pong` passes it. A later
-//!   R on the same session holds the grant afresh, so a grant sent at an
-//!   earlier write of the row is no reason to send none. The session-start `local`
-//!   repeat ([`Session::send_grants`]) queues the same `ping`; there a `hello`
+//!   policy change off `warm` on the same session holds the grant afresh, so
+//!   a grant sent there before is no reason to send none. The session-start
+//!   `local` repeat ([`Session::send_grants`]) queues the same `ping`; there a `hello`
 //!   that listed the lease `local` at the token stands in for its `pong`.
 //! - **The refusal.** A refusal of the grant arrives before the `pong`
 //!   (section 4.2). It drops the `ping`, so the `pong` writes nothing and
@@ -183,12 +187,50 @@ impl NodeHub {
         }
     }
 
-    /// Holds the `local` grant that ends the renewals of `lease`, the row R
-    /// wrote `local` and marked, as `updateApp` commits it. It may go out on
+    /// What follows a policy change off `warm` once `updateApp` committed it
+    /// ("Ending the renewals" step 2). When R wrote the row, its newest
+    /// write gives no new token any more, so a grant with a new token held
+    /// for it and not sent yet stands for nothing: it goes now, whether or
+    /// not its holder is connected, so it no longer reads as pending. A grant
+    /// held since for a newer token stays. Then the same-token `local` grant
+    /// is held when [`leases::leave_warm`] found the row needs it.
+    pub(crate) fn end_renewals_committed(&self, ended: &leases::Ended) {
+        let lease = &ended.lease;
+        if ended.wrote {
+            let dropped = {
+                let mut registry = self.0.held.lock().expect("held grant lock");
+                let stale = registry.entries.get(&lease.id).is_some_and(|held| {
+                    held.kind == Kind::NewToken
+                        && held.sent_on.is_none()
+                        && held.token <= lease.fencing_token
+                });
+                if stale {
+                    registry.entries.remove(&lease.id)
+                } else {
+                    None
+                }
+            };
+            if let Some(dropped) = dropped {
+                tracing::info!(
+                    lease_id = %lease.id,
+                    token = dropped.token,
+                    "R gave the row no new token: its held grant with a new token is dropped"
+                );
+                self.release_held_revoke(&dropped);
+            }
+        }
+        if ended.hold {
+            self.hold_local_end(lease);
+        }
+    }
+
+    /// Holds the `local` grant that ends the renewals of `lease`, a row that
+    /// reads `local` with the mark and whose newest write gave it no new
+    /// token, as `updateApp` commits a policy change off `warm`. It may go out on
     /// the holder's current session when that session has evidence that the
     /// holder holds the lease at the row's token; otherwise it waits for
     /// such evidence: a renewal, or the holder's next `hello`.
-    pub(crate) fn hold_local_end(&self, lease: &Lease) {
+    fn hold_local_end(&self, lease: &Lease) {
         let token = u64::try_from(lease.fencing_token).unwrap_or(0);
         let evidenced = {
             let sessions = self.0.sessions.lock().expect("session lock");
@@ -209,9 +251,10 @@ impl NodeHub {
     }
 
     /// Holds the grant afresh, eligible on `eligible`: a `local` grant held
-    /// or sent before for the same row is replaced, since the row was
-    /// written since (R, or the holder's token before the resend) or the
-    /// session is new, so a grant sent before is no reason to send none. A
+    /// or sent before for the same row is replaced, since the policy left
+    /// `warm` again, the row was written since (the holder's token before
+    /// the resend) or the session is new, so a grant sent before is no
+    /// reason to send none. A
     /// grant held for a newer token stays, and so does a grant with a new
     /// token not sent yet for this very row ("Grants of a marked row"): it is
     /// the grant the row waits for, and it goes out through its own path,
@@ -740,9 +783,10 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::super::conversion::tests::{
-        EverySupport, Fixture, LEASE, assert_answer, end_renewals, fixture, frames, hello, of_type,
-        ping_of, pong, renew, restart, set_policy, write_row,
+        APP, EverySupport, Fixture, LEASE, actor, assert_answer, end_renewals, fixture, frames,
+        hello, of_type, ping_of, pong, renew, restart, set_policy, write_row,
     };
+    use super::Kind;
     use crate::AppState;
     use crate::api::leases::Lease as LeaseView;
     use crate::authority::VoterSupport;
@@ -824,14 +868,25 @@ mod tests {
             .count_log_ack(&f.node_id, live.session.generation, seq);
     }
 
-    /// R as `updateApp` commits it, then the hold it registers when it
-    /// wrote the row.
+    /// A policy change off `warm` as `updateApp` commits it: R and what
+    /// follows it read in the transaction, then the hub's part once it
+    /// commits.
     async fn r(f: &Fixture) {
         if f.writes().await == 0 {
             created(f).await;
         }
-        if let Some(row) = end_renewals(f).await {
-            f.state.hub.hold_local_end(&row);
+        let mut w = f.state.store.begin_write().await.unwrap();
+        sqlx::query("UPDATE apps SET ha_policy = 'none' WHERE id = ?")
+            .bind(APP)
+            .execute(&mut *w.tx)
+            .await
+            .unwrap();
+        let ended = crate::leases::leave_warm(&mut w.tx, APP, &actor())
+            .await
+            .unwrap();
+        w.commit().await.unwrap();
+        if let Some(ended) = ended {
+            f.state.hub.end_renewals_committed(&ended);
         }
     }
 
@@ -1420,8 +1475,9 @@ mod tests {
 
     /// The row at token 4, `local` with the mark, written by a grant its
     /// holder never took: a step-4 row whose new-token grant is held
-    /// ("Grants of a marked row"). R writes nothing over it, so `updateApp`
-    /// holds no `local` grant, and a registration of one over it keeps the
+    /// ("Grants of a marked row"). R writes nothing over it, and its newest
+    /// write gave it a new token, so `updateApp` holds no `local` grant, and
+    /// a registration of one over it keeps the
     /// held grant a new-token grant: it goes out as before, `local` at 4,
     /// only once the gate has passed, and never as the same-token grant
     /// that ends the renewals.
@@ -1450,8 +1506,9 @@ mod tests {
 
     /// A re-entry after a restart: the restarted primary seeds the marked
     /// row's start gate, and the step-4 row's grant is held for its
-    /// holder's session. R writes nothing over it, and a registration of the
-    /// same-token grant over it changes nothing. A `hold_grant` of the row on
+    /// holder's session. R writes nothing over it, its newest write gave it
+    /// a new token so `updateApp` holds no `local` grant, and a registration
+    /// of the same-token grant over it changes nothing. A `hold_grant` of the row on
     /// that live session, whose `hello` gave no evidence (a regrant's or
     /// `createVolume`'s re-entry), keeps it a new-token grant: nothing goes
     /// out while the start gate is open, and the grant goes out after.
@@ -1531,6 +1588,39 @@ mod tests {
         f.done();
     }
 
+    /// "Ending the renewals" step 2 ("after any policy change off `warm`")
+    /// and ADR 0257. The grant (G1) and its `ping` (P1) went out; before
+    /// P1's `pong`, the policy goes back on `warm`, which sends nothing, and
+    /// off it again, where R writes nothing: the row still reads `local` with
+    /// the mark and its newest write gave no new token. A second grant (G2)
+    /// goes out with its own `ping` (P2). P1's `pong` writes nothing and
+    /// passes no barrier; P2's writes the row `local`, unmarked, and passes
+    /// it.
+    #[tokio::test]
+    async fn a_warm_round_trip_before_the_pong_sends_a_second_local_grant() {
+        let (f, mut on, _g1, p1) = sent("warm", false).await;
+        let hub = &f.state.hub;
+        set_policy(&f, "warm").await;
+        hub.attempt_held().await;
+        assert!(queued(&mut on).is_empty(), "back on warm: nothing more");
+        let writes = f.writes().await;
+        r(&f).await;
+        assert_eq!(f.writes().await, writes, "R writes nothing");
+        hub.attempt_held().await;
+        let (_g2, p2) = grant_then_ping(&queued(&mut on), 3);
+        let generation = on.session.generation;
+        pong(&mut on.session, &p1).await;
+        assert!(f.row().await.unsettled, "the older ping writes nothing");
+        assert!(!hub.barrier_passed(&f.node_id, generation, LEASE, 3));
+        pong(&mut on.session, &p2).await;
+        assert_eq!(
+            state(&f).await,
+            ("local".to_string(), 3, Some(D as i64), false, false)
+        );
+        assert!(hub.barrier_passed(&f.node_id, generation, LEASE, 3));
+        f.done();
+    }
+
     /// Section 8.5's regrant runs only on a session whose `hello` listed the
     /// lease `held` or `uncertain` at the token. R's grant on a session whose
     /// only evidence is a renewal, refused with `bad_message`: no regrant,
@@ -1565,12 +1655,12 @@ mod tests {
     /// at token 4 (a failover's grant to a node that never took it), while
     /// the holder's session gives no evidence. R writes the row `local` and
     /// marked; its newest write, R's, gave no new token, so the held grant
-    /// drops at its next attempt, and no `local` grant is held in its place
-    /// (the registration keeps the new-token grant until then). Nothing is
-    /// pending and nothing goes out: the lease is given to no one, and the
-    /// row stays `local` and marked at 4.
+    /// is dropped as `updateApp` commits, before any attempt: nothing is
+    /// pending at once. The `local` grant held in its place waits for
+    /// evidence, which is no grant pending, and nothing goes out: the lease
+    /// is given to no one, and the row stays `local` and marked at 4.
     #[tokio::test]
-    async fn r_over_a_held_expiring_grant_drops_it_and_holds_nothing() {
+    async fn r_over_a_held_expiring_grant_drops_it_at_once() {
         let f = fixture("warm", "expiring", Some(D as i64), true).await;
         created(&f).await;
         write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
@@ -1579,13 +1669,19 @@ mod tests {
         hub.hold_grant(&f.row().await);
         assert!(hub.grant_pending(LEASE));
         r(&f).await;
+        assert!(!hub.grant_pending(LEASE), "dropped at once");
+        assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
         ack(&f.state, &f, &on).await;
         hub.attempt_held().await;
         assert!(queued(&mut on).is_empty());
-        assert!(
-            !hub.0.held.lock().unwrap().entries.contains_key(LEASE),
-            "nothing held"
-        );
+        {
+            let registry = hub.0.held.lock().unwrap();
+            let held = registry
+                .entries
+                .get(LEASE)
+                .expect("the local grant is held");
+            assert_eq!((held.kind, held.eligible_on), (Kind::LocalEnd, None));
+        }
         assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
         assert_eq!(
             state(&f).await,

@@ -1176,10 +1176,9 @@ pub(crate) async fn write_local_report(
 /// mark that R set", and marking more only delays a move ("The mark"). A row
 /// that already reads `local` with the mark is left as it is. Returns the
 /// row R wrote, `None` when it wrote nothing: the app has no unrevoked
-/// lease, or its row already reads `local` with the mark. Only a row R wrote
-/// gets the same-token `local` grant that ends the renewals: its newest
-/// write is then R's, which gave no new token, so a held grant with a new
-/// token never stands behind it ([`crate::session`]'s held grants).
+/// lease, or its row already reads `local` with the mark. Whether the
+/// same-token `local` grant that ends the renewals follows is
+/// [`leave_warm`]'s answer, read after this write.
 ///
 /// # Errors
 ///
@@ -1206,6 +1205,51 @@ pub(crate) async fn end_renewals(
     lease.unsettled = true;
     changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
     Ok(Some(lease))
+}
+
+/// What a policy change off `warm` left for the hub, once its transaction
+/// commits ([`leave_warm`]).
+#[derive(Clone, Debug)]
+pub(crate) struct Ended {
+    /// The app's lease row as the transaction leaves it.
+    pub lease: Lease,
+    /// R wrote the row ([`end_renewals`]).
+    pub wrote: bool,
+    /// The same-token `local` grant that ends the renewals is held for the
+    /// row: it is unrevoked, marked and reads `local`, and its newest write
+    /// gave it no new token ([`newest_write_gave_new_token`]).
+    pub hold: bool,
+}
+
+/// R, then what follows it, in the transaction of a policy change off `warm`
+/// (section 8.4, "Ending the renewals" steps 1 and 2): `None` when the app
+/// has no unrevoked lease. Step 2 sends the same-token `local` grant "after
+/// any policy change off `warm`", not only after one that writes the row:
+/// a row R finds already `local` with the mark, as a return to `warm` and
+/// back before any settle leaves it, still gets it. A row whose newest
+/// write gave it a new token gets none: that write's grant ("Grants of a
+/// marked row") is the one the row waits for, and it goes out through its
+/// own path, gated.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn leave_warm(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    actor: &Actor,
+) -> Result<Option<Ended>, ApiError> {
+    let wrote = end_renewals(conn, app_id, actor).await?.is_some();
+    let Some(lease) = app_lease(conn, app_id).await? else {
+        return Ok(None);
+    };
+    if lease.is_revoked() {
+        return Ok(None);
+    }
+    let hold = lease.unsettled
+        && lease.mode == "local"
+        && !newest_write_gave_new_token(conn, &lease.id).await?;
+    Ok(Some(Ended { lease, wrote, hold }))
 }
 
 /// The write that precedes the resend of the same-token `local` grant when

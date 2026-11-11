@@ -2479,3 +2479,113 @@ async fn a_local_grant_waiting_for_evidence_never_answers_a_failover_in_progress
     assert_ne!(body["reason"], "in_progress", "{body}");
     assert_eq!(pending(&server, &owner, &app_id).await, (false, Vec::new()));
 }
+
+/// #555, "Ending the renewals" step 2: the `local` grant follows every
+/// policy change off `warm`, not only one that writes the row. A holds the
+/// lease `expiring` at token 1 and renews it there; no majority supports
+/// `D` yet. The policy leaves `warm`: R writes the row and its grant is
+/// held, waiting on A. Back on `warm`, the held grant is dropped. Off `warm`
+/// again before any settle: the row still reads `local` with the mark, so R
+/// writes nothing, and the grant is held again, waiting on A. Once A holds
+/// the row's newest write and supports `D`, the same-token `local` grant
+/// goes out, then its `ping`, whose `pong` writes the row `local`, unmarked.
+#[tokio::test]
+async fn a_second_change_off_warm_before_any_settle_holds_the_local_grant_again() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    set_policy(&server, &app_id, "warm").await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    on_a.send(
+        NodeMessage::LeaseRenew(quoro_proto::LeaseRenew {
+            lease_id: quoro_proto::LeaseId(lease_id.clone()),
+            fencing_token: 1,
+        }),
+        None,
+    )
+    .await;
+    on_a.settle().await;
+    let leave_warm = || async {
+        let res = owner
+            .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+            .json(&json!({ "ha_policy": "none" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    };
+
+    leave_warm().await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 1, false)
+    );
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, vec![a.node_id.clone()])
+    );
+    // Back on `warm`: the held task drops the grant. A reads no frame, so
+    // it acknowledges nothing meanwhile.
+    set_policy(&server, &app_id, "warm").await;
+    tokio::time::sleep(PAST_TICK).await;
+    assert_eq!(pending(&server, &owner, &app_id).await, (false, Vec::new()));
+
+    let entries = lease_entries(&server, &lease_id).await;
+    leave_warm().await;
+    assert_eq!(lease_entries(&server, &lease_id).await, entries, "no write");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 1, false)
+    );
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, vec![a.node_id.clone()]),
+        "held again"
+    );
+
+    let mut seen = follow_to(&mut on_a, newest_write(&server, &lease_id).await).await;
+    assert_eq!(pending(&server, &owner, &app_id).await, (true, Vec::new()));
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    seen.extend(support_keeping_frames(&mut on_a).await);
+    // The grant, then its `ping`.
+    let ping_after_grant = |seen: &[Value]| {
+        let grant = seen.iter().position(|frame| {
+            frame["type"] == "lease_grant" && frame["body"]["lease_id"] == lease_id
+        })?;
+        seen[grant..]
+            .iter()
+            .find(|frame| frame["type"] == "ping")
+            .cloned()
+    };
+    read_until(&mut on_a, &mut seen, Duration::from_secs(10), |seen| {
+        ping_after_grant(seen).is_some()
+    })
+    .await;
+    let grants = grants_of(&seen, &lease_id);
+    assert_eq!(grants.len(), 1, "{seen:?}");
+    let grant = grants[0].clone();
+    assert_eq!(grant["body"]["mode"], "local");
+    assert_eq!(grant["body"]["fencing_token"], 1);
+    assert!(grant["body"].get("duration_ms").is_none(), "{grant}");
+    let ping = ping_after_grant(&seen).unwrap();
+
+    on_a.send(NodeMessage::Pong, ping["id"].as_str()).await;
+    on_a.settle().await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 0, false)
+    );
+    let view = lease_view(&server, &owner, &app_id).await;
+    assert_eq!(view["local_pending"], false, "{view}");
+    assert_eq!(view["grant_pending"], false, "{view}");
+}
