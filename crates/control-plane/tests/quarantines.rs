@@ -895,6 +895,29 @@ async fn bad_entries_are_skipped_and_the_rest_of_the_report_applies() {
         s.copy(&qrn(11), CREATED_AT, Some(sha('A'))),
         s.copy(&qrn(12), CREATED_AT, Some("a".repeat(63))),
         s.copy(&qrn(13), CREATED_AT, Some(format!("{}g", "a".repeat(63)))),
+        // A malformed `volume_id`, also one far too long for an audit
+        // record, and a malformed `app_id`, are bad entries.
+        copy(
+            &qrn(20),
+            &format!("vol_{}", "A".repeat(5000)),
+            &s.app_id,
+            CREATED_AT,
+            Some(sha('a')),
+        ),
+        copy(
+            &qrn(21),
+            "vol_not-an-id",
+            &s.app_id,
+            CREATED_AT,
+            Some(sha('a')),
+        ),
+        copy(
+            &qrn(22),
+            &s.volume_id,
+            "app_short",
+            CREATED_AT,
+            Some(sha('a')),
+        ),
         // A copy of an unknown volume is not a bad entry: it is a copy of a
         // volume that is gone (test 8).
         copy(
@@ -1690,4 +1713,74 @@ async fn an_unhashed_copy_that_could_never_be_recorded_blocks_nothing() {
         accepted(&s, path, case).await;
     }
     assert_eq!(written(&s.server).await, (0, 0, 0, 0));
+}
+
+/// Test 14: hashed copies recorded without a row block no delete while the
+/// node keeps listing them: a copy of a `deleting` volume blocks neither
+/// `deleteVolume` of its app's new live volume nor `deleteApp` of an app
+/// with a live volume, and a copy of a volume the primary never knew blocks
+/// no `deleteApp` either. A repeated `deleteVolume` of the `deleting` volume
+/// meets the usual conflict, not `has_quarantines`.
+#[tokio::test]
+async fn copies_recorded_without_a_row_block_no_delete() {
+    let mut s = Setup::new().await;
+    let volume_path = format!("/api/v1/volumes/{}", s.volume_id);
+    accepted(&s, &volume_path, "before any copy").await;
+    let live_volume = insert_volume(&s.server, &s.app_id, &s.holder.node_id).await;
+    let other_app = create_app(&s.server, &s.owner, &s.project_id, "other").await;
+    let other_volume = insert_volume(&s.server, &other_app, &s.holder.node_id).await;
+    accepted(
+        &s,
+        &format!("/api/v1/volumes/{other_volume}"),
+        "other volume",
+    )
+    .await;
+    insert_volume(&s.server, &other_app, &s.holder.node_id).await;
+
+    let entries = vec![
+        s.copy(&qrn(1), CREATED_AT, Some(sha('a'))),
+        copy(
+            &qrn(2),
+            &other_volume,
+            &other_app,
+            CREATED_AT,
+            Some(sha('b')),
+        ),
+        copy(
+            &qrn(3),
+            "vol_01JC9Z6Q5W8N3K4T7R2M999998",
+            &other_app,
+            CREATED_AT,
+            Some(sha('c')),
+        ),
+    ];
+    report_copies(&mut s.on_returning, entries.clone()).await;
+    assert_eq!(
+        written(&s.server).await,
+        (0, 3, 3, 0),
+        "three records, no row"
+    );
+    // The node keeps listing them.
+    report_copies(&mut s.on_returning, entries).await;
+    assert_eq!(written(&s.server).await, (0, 3, 3, 0));
+
+    let res = s
+        .owner
+        .delete(s.server.url(&volume_path))
+        .send()
+        .await
+        .unwrap();
+    let (status, code, reason) = problem(res).await;
+    assert_eq!(
+        (status, code.as_str(), reason.as_deref()),
+        (409, "conflict", None)
+    );
+    accepted(
+        &s,
+        &format!("/api/v1/volumes/{live_volume}"),
+        "deleteVolume",
+    )
+    .await;
+    accepted(&s, &format!("/api/v1/apps/{other_app}"), "deleteApp").await;
+    assert_eq!(written(&s.server).await, (0, 3, 3, 0));
 }
