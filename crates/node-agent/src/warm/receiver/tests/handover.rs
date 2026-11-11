@@ -1803,8 +1803,9 @@ async fn the_target_is_reported_only_once_the_returning_flag_is_durable() {
 }
 
 // Section 9 step 2: the record of a copy whose clone is gone before it was
-// hashed is forgotten only when the engine answers `NotFound` for the clone
-// and another file of the volume shows the directory to be the real one.
+// hashed is forgotten only when the engine answers `NotFound` for the clone,
+// another kept snapshot of the volume answers it, and one open handle of the
+// clone's directory shows the clone missing and that snapshot there.
 
 #[tokio::test]
 async fn an_unhashed_copy_whose_clone_is_gone_is_forgotten() {
@@ -1919,8 +1920,8 @@ async fn a_lost_clone_keeps_its_record_while_the_engine_cannot_tell_or_no_other_
 }
 
 #[tokio::test]
-async fn a_clone_the_engine_still_names_or_that_appears_with_the_directory_keeps_its_record() {
-    let h = Harness::new("handover-clone-mount-race").await;
+async fn a_clone_the_engine_still_names_keeps_its_record() {
+    let h = Harness::new("handover-clone-named").await;
     let path = returning_source(&h).await;
     let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
     diverge(&path);
@@ -1935,18 +1936,6 @@ async fn a_clone_the_engine_still_names_or_that_appears_with_the_directory_keeps
     })
     .await;
     assert_eq!(quarantined(&h).await, vec![lost.clone()]);
-
-    // The first lookup misses the clone, as before a volume directory
-    // mounts; the base then answers, and so does the clone, as once it has.
-    h.engine
-        .fail_next(FakeOp::VolumeChangedRanges, EngineError::NotFound);
-    quarantines.hash(&lost);
-    wait_for("the second hash to end", || async {
-        !quarantines.hashing(&lost.quarantine_id)
-    })
-    .await;
-    assert!(quarantines.hash_failed(&lost.quarantine_id));
-    assert_eq!(quarantined(&h).await, vec![lost.clone()]);
     assert!(
         h.store
             .kept_snapshot(&lost.snapshot_id)
@@ -1958,8 +1947,8 @@ async fn a_clone_the_engine_still_names_or_that_appears_with_the_directory_keeps
 }
 
 #[tokio::test]
-async fn a_lost_clone_keeps_its_record_while_its_file_is_there_or_the_device_changes() {
-    let h = Harness::new("handover-clone-same-device").await;
+async fn a_lost_clone_is_checked_through_one_open_volume_directory() {
+    let h = Harness::new("handover-clone-one-dir").await;
     let path = returning_source(&h).await;
     let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
     diverge(&path);
@@ -1973,10 +1962,15 @@ async fn a_lost_clone_keeps_its_record_while_its_file_is_there_or_the_device_cha
         .await
         .expect("store")
         .expect("kept");
+    // The engine answers `NotFound` for the clone from here on.
     h.engine
         .delete_volume_snapshot(&clone.snapshot)
         .await
         .expect("delete the clone");
+    let check = || quarantines.inner.forget_lost_clone(&lost.quarantine_id);
+    let between = |run: Box<dyn FnOnce() + Send>| {
+        *quarantines.inner.between_checks.lock().expect("hook") = Some(run);
+    };
     let kept_as_is = || {
         let (h, lost) = (&h, &lost);
         async move {
@@ -1991,61 +1985,50 @@ async fn a_lost_clone_keeps_its_record_while_its_file_is_there_or_the_device_cha
         }
     };
 
-    // The engine answers `NotFound`, but the clone's file is there.
+    // The clone's file is in the volume directory.
     std::fs::write(&lost.path, b"clone").expect("write the clone");
-    assert_eq!(
-        quarantines
-            .inner
-            .forget_lost_clone(&lost.quarantine_id)
-            .await,
-        Ok(false)
-    );
+    assert_eq!(check().await, Ok(false));
     kept_as_is().await;
     std::fs::remove_file(&lost.path).expect("remove the clone");
 
-    // The other file, or the clone's directory at the second lookup, is on
-    // another device than the clone's directory at the first.
-    for devices in [[7, 8, 7], [7, 7, 8], [8, 7, 7]] {
-        quarantines
-            .inner
-            .devices
-            .lock()
-            .expect("devices")
-            .extend(devices);
-        assert_eq!(
-            quarantines
-                .inner
-                .forget_lost_clone(&lost.quarantine_id)
-                .await,
-            Ok(false),
-            "{devices:?}"
-        );
-        assert!(
-            quarantines
-                .inner
-                .devices
-                .lock()
-                .expect("devices")
-                .is_empty(),
-            "{devices:?}: each read takes its device"
-        );
-        kept_as_is().await;
-    }
+    // The clone's file appears after the engine's lookups.
+    let appears = lost.path.clone();
+    between(Box::new(move || {
+        std::fs::write(&appears, b"clone").expect("write the clone");
+    }));
+    assert_eq!(check().await, Ok(false));
+    kept_as_is().await;
+    std::fs::remove_file(&lost.path).expect("remove the clone");
 
-    // One device for all three reads: the record is forgotten.
-    quarantines
-        .inner
-        .devices
-        .lock()
-        .expect("devices")
-        .extend([7, 7, 7]);
-    assert_eq!(
-        quarantines
-            .inner
-            .forget_lost_clone(&lost.quarantine_id)
-            .await,
-        Ok(true)
-    );
+    // The other kept snapshot vanishes after it answered the engine.
+    let aside = base.location.with_extension("aside");
+    let (from, to) = (base.location.clone(), aside.clone());
+    between(Box::new(move || {
+        std::fs::rename(&from, &to).expect("move the base aside");
+    }));
+    assert_eq!(check().await, Ok(false));
+    kept_as_is().await;
+    std::fs::rename(&aside, &base.location).expect("put the base back");
+
+    // The other kept snapshot is a symlink in the volume directory.
+    std::fs::rename(&base.location, &aside).expect("move the base aside");
+    std::os::unix::fs::symlink(&aside, &base.location).expect("link the base");
+    assert_eq!(check().await, Ok(false));
+    kept_as_is().await;
+    std::fs::remove_file(&base.location).expect("remove the link");
+    std::fs::rename(&aside, &base.location).expect("put the base back");
+
+    // The clone is missing and the other kept snapshot is a regular file
+    // beside it: the record is forgotten, and no file is touched.
+    assert_eq!(check().await, Ok(true));
     assert!(quarantined(&h).await.is_empty());
+    assert_eq!(
+        h.store
+            .kept_snapshot(&lost.snapshot_id)
+            .await
+            .expect("store"),
+        None
+    );
     assert!(base.location.exists());
+    assert!(path.exists());
 }
