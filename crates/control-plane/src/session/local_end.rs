@@ -1018,6 +1018,46 @@ mod tests {
     const PROJECT: &str = "prj_c";
     const REQUEST: &str = "req_left_warm";
 
+    /// Every `app.left_stopped` stored, oldest first, as (subject, project,
+    /// request id, actor, data).
+    async fn left_stopped(f: &Fixture) -> Vec<(Value, String, String, Value, Value)> {
+        let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT subject, project_id, request_id, actor, data FROM events \
+             WHERE type = 'app.left_stopped' ORDER BY seq",
+        )
+        .fetch_all(f.state.store.pool())
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(subject, project, request, actor, data)| {
+                (
+                    serde_json::from_str(&subject).unwrap(),
+                    project,
+                    request,
+                    serde_json::from_str(&actor).unwrap(),
+                    serde_json::from_str(&data).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// The one `app.left_stopped` that the drop of the grant with a new
+    /// token held for the fixture's node at `token` emits, from [`r`].
+    fn the_event(f: &Fixture, token: u64) -> (Value, String, String, Value, Value) {
+        (
+            serde_json::json!({ "type": "app", "id": APP }),
+            PROJECT.to_string(),
+            REQUEST.to_string(),
+            serde_json::json!({ "type": "system", "id": "test" }),
+            serde_json::json!({
+                "app_id": APP,
+                "node_id": f.node_id,
+                "fencing_token": token,
+                "reason": "policy_left_warm",
+            }),
+        )
+    }
+
     async fn view(state: &AppState, f: &Fixture) -> (bool, Vec<String>, bool) {
         let row = f.row().await;
         let mut conn = state.store.pool().acquire().await.unwrap();
@@ -1795,7 +1835,8 @@ mod tests {
     /// the holder's session gives no evidence. R writes the row `local` and
     /// marked; its newest write, R's, gave no new token, so the held grant
     /// is dropped as `updateApp` commits, before any attempt: nothing is
-    /// pending at once. The `local` grant held in its place waits for
+    /// pending at once, and one `app.left_stopped` names the grant's node
+    /// and token. The `local` grant held in its place waits for
     /// evidence, which is no grant pending, and nothing goes out: the lease
     /// is given to no one, and the row stays `local` and marked at 4.
     #[tokio::test]
@@ -1809,10 +1850,12 @@ mod tests {
         assert!(hub.grant_pending(LEASE));
         r(&f).await;
         assert!(!hub.grant_pending(LEASE), "dropped at once");
+        assert_eq!(left_stopped(&f).await, vec![the_event(&f, 4)]);
         assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
         ack(&f.state, &f, &on).await;
         hub.attempt_held().await;
         assert!(queued(&mut on).is_empty());
+        assert_eq!(left_stopped(&f).await, vec![the_event(&f, 4)], "once");
         {
             let registry = hub.0.held.lock().unwrap();
             let held = registry
@@ -1833,8 +1876,9 @@ mod tests {
     /// holder's session (a failover's or a regrant's grant, `expiring` at
     /// token 4), and which the holder renewed there: R writes the row, and
     /// the sent grant's entry, which stands for nothing any more, gives way
-    /// to the `local` grant that ends the renewals. It goes out on that
-    /// session, then its `ping`.
+    /// to the `local` grant that ends the renewals, with no
+    /// `app.left_stopped`: that grant was sent. It goes out on that session,
+    /// then its `ping`.
     #[tokio::test]
     async fn r_after_a_sent_new_token_grant_sends_the_local_grant() {
         let f = fixture("warm", "expiring", Some(D as i64), true).await;
@@ -1854,6 +1898,7 @@ mod tests {
         let answer = renew(&mut on.session, "msg_r1", 4).await;
         assert_answer(&answer, "msg_r1", 4, D);
         r(&f).await;
+        assert!(left_stopped(&f).await.is_empty(), "the grant was sent");
         ack(&f.state, &f, &on).await;
         hub.attempt_held().await;
         grant_then_ping(&queued(&mut on), 4);
@@ -1865,7 +1910,8 @@ mod tests {
     /// unsent one at a token no higher than the row it wrote. R writes the
     /// row at token 3; before its hub part runs, a write gives the lease
     /// token 4, marked, and its grant is held. R's hub part then leaves that
-    /// grant as it was, and holds no `local` grant over it.
+    /// grant as it was, holds no `local` grant over it, and emits no
+    /// `app.left_stopped`.
     #[tokio::test]
     async fn r_keeps_a_grant_held_since_for_a_newer_token() {
         let f = fixture("warm", "expiring", Some(D as i64), false).await;
@@ -1896,6 +1942,7 @@ mod tests {
             "the grant for the newer token stays"
         );
         assert!(hub.row_grant_pending(&row));
+        assert!(left_stopped(&f).await.is_empty());
         f.done();
     }
 
@@ -1957,7 +2004,8 @@ mod tests {
     /// write, R's, gave no new token. It stands for nothing: the next
     /// attempt drops it, though no session of its holder may take it, and
     /// `grant_pending` reads false, so a failover after a return to `warm`
-    /// does not answer `in_progress` for it.
+    /// does not answer `in_progress` for it. It was not held when R
+    /// committed, so no `app.left_stopped` is emitted, at R or at the drop.
     #[tokio::test]
     async fn a_new_token_grant_held_after_r_goes_with_its_holder_away() {
         let f = fixture("warm", "expiring", Some(D as i64), true).await;
@@ -1965,6 +2013,7 @@ mod tests {
         write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
         let failover = f.row().await;
         r(&f).await;
+        assert!(left_stopped(&f).await.is_empty(), "nothing held at R");
         let hub = &f.state.hub;
         hub.hold_grant(&failover);
         let held = hub.0.held.lock().unwrap().entries[LEASE].clone();
@@ -1978,6 +2027,7 @@ mod tests {
         assert!(!hub.grant_pending(LEASE));
         assert!(!hub.row_grant_pending(&f.row().await));
         assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
+        assert!(left_stopped(&f).await.is_empty(), "the drop emits nothing");
         f.done();
     }
 
@@ -2064,8 +2114,12 @@ mod tests {
     /// its session start holds back both the revoke at 3 and the grant. A
     /// policy change off `warm` then writes R, which gives the row no new
     /// token. The entry and its held-back revoke stay, nothing goes out, and
-    /// no `local` grant is held over it. Once support returns, the revoke at
-    /// 3 goes out once; then the entry goes, and no grant or `ping` follows.
+    /// no `local` grant is held over it. Its grant is dropped all the same:
+    /// one `app.left_stopped` names it as R commits, and it reads as no
+    /// grant pending (`grant_pending` false, `grant_waiting_on` empty, no
+    /// failover `in_progress`). Once support returns, the revoke at 3 goes
+    /// out once; then the entry goes, with no second event, and no grant or
+    /// `ping` follows.
     #[tokio::test]
     async fn a_held_back_revoke_goes_out_after_r_writes_its_row() {
         let f = fixture("warm", "expiring", Some(D as i64), true).await;
@@ -2090,8 +2144,13 @@ mod tests {
             state(&f).await,
             ("local".to_string(), 4, Some(D as i64), true, false)
         );
+        assert_eq!(left_stopped(&f).await, vec![the_event(&f, 4)]);
+        assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
+        assert!(!hub.row_grant_pending(&f.row().await));
+        assert!(!hub.grant_pending(LEASE));
         hub.attempt_held().await;
         hub.attempt_held().await;
+        assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
         {
             let registry = hub.0.held.lock().unwrap();
             let entry = registry.entries.get(LEASE).expect("the entry stays");
@@ -2116,6 +2175,11 @@ mod tests {
         assert!(!hub.0.held.lock().unwrap().entries.contains_key(LEASE));
         hub.attempt_held().await;
         assert!(drained(&mut on).is_empty(), "no grant and no ping");
+        assert_eq!(
+            left_stopped(&f).await,
+            vec![the_event(&f, 4)],
+            "the entry's drop emits nothing"
+        );
         f.done();
     }
 
@@ -2197,6 +2261,107 @@ mod tests {
             );
         }
         drop(conn);
+        f.done();
+    }
+
+    /// "Grants of a marked row": "While the holder's current session is such
+    /// a session, `grant_pending` is true until the grant is sent on it, and
+    /// `grant_waiting_on` lists the machines of the required set that have
+    /// not acknowledged R. When that session ends first, the grant again
+    /// waits for such a session and is not pending." The holder's `hello`
+    /// lists the lease `expiring` at the row's token, and R is not
+    /// acknowledged: the `local` grant is pending, waiting on the holder.
+    /// That session ends: no grant pending, nothing waited on, no failover
+    /// `in_progress`, while `local_pending` stays true. A new session whose
+    /// `hello` shows the lease makes it pending again, waiting on the
+    /// holder, which lacks R, then on no machine once it acknowledges R.
+    #[tokio::test]
+    async fn a_pending_local_grant_is_not_pending_once_its_session_ends() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        let on = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
+        let hub = &f.state.hub;
+        hub.set_voter_support(Arc::new(NoSupport));
+        r(&f).await;
+        assert_eq!(
+            view(&f.state, &f).await,
+            (true, vec![f.node_id.clone()], true)
+        );
+        assert!(hub.row_grant_pending(&f.row().await));
+
+        hub.detach(&f.node_id, on.session.generation);
+        assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
+        assert!(!hub.row_grant_pending(&f.row().await), "no in_progress");
+        assert!(!hub.grant_pending(LEASE));
+
+        let mut again = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
+        assert_eq!(
+            view(&f.state, &f).await,
+            (true, vec![f.node_id.clone()], true),
+            "pending again, waiting on the holder, which lacks R"
+        );
+        assert!(hub.row_grant_pending(&f.row().await));
+        ack(&f.state, &f, &again).await;
+        assert_eq!(view(&f.state, &f).await, (true, Vec::new(), true));
+        hub.attempt_held().await;
+        assert!(queued(&mut again).is_empty(), "no majority support");
+        f.done();
+    }
+
+    /// "While the holder's current session is such a session, …
+    /// `grant_waiting_on` lists the machines of the required set that have
+    /// not acknowledged R": a second machine with the `node` role that has
+    /// not acknowledged R is listed, and the holder is listed only until it
+    /// acknowledges R.
+    #[tokio::test]
+    async fn a_pending_local_grant_waits_only_on_the_machines_that_lack_r() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        let other = "nod_01JC9Z0000000000000000000B".to_string();
+        sqlx::query(
+            "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, \
+             behind_nat, labels, capacity, allocated, kvm, created_at) \
+             VALUES (?, 'node-b', '[\"node\"]', NULL, 'disconnected', '', NULL, 0, '{}', \
+             '{}', '{}', '{}', ?)",
+        )
+        .bind(&other)
+        .bind(crate::store::now_rfc3339())
+        .execute(f.state.store.pool())
+        .await
+        .unwrap();
+        let on = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
+        f.state.hub.set_voter_support(Arc::new(NoSupport));
+        r(&f).await;
+        let mut both = vec![f.node_id.clone(), other.clone()];
+        both.sort();
+        assert_eq!(view(&f.state, &f).await, (true, both, true));
+        ack(&f.state, &f, &on).await;
+        assert_eq!(
+            view(&f.state, &f).await,
+            (true, vec![other], true),
+            "the holder acknowledged R"
+        );
+        f.done();
+    }
+
+    /// R that writes a row whose same-token `local` grant is held drops no
+    /// grant with a new token, so it emits no `app.left_stopped`: the
+    /// `local` grant is held again, eligible on the session whose `hello`
+    /// showed the lease.
+    #[tokio::test]
+    async fn r_over_a_held_local_grant_emits_nothing() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        created(&f).await;
+        let on = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
+        let hub = &f.state.hub;
+        hub.hold_local_end_on(&f.row().await, on.session.generation);
+        let writes = f.writes().await;
+        r(&f).await;
+        assert_eq!(f.writes().await, writes + 1, "R wrote the row");
+        assert!(left_stopped(&f).await.is_empty());
+        let held = hub.0.held.lock().unwrap().entries[LEASE].clone();
+        assert_eq!(
+            (held.kind, held.eligible_on),
+            (Kind::LocalEnd, Some(on.session.generation))
+        );
         f.done();
     }
 }

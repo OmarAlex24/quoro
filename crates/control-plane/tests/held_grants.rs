@@ -2185,6 +2185,14 @@ async fn lease_entries(server: &Server, lease_id: &str) -> i64 {
     .unwrap()
 }
 
+/// How many `app.left_stopped` events are stored.
+async fn left_stopped(server: &Server) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM events WHERE type = 'app.left_stopped'")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
 /// The app's stored `ha_policy`.
 async fn policy_of(server: &Server, app_id: &str) -> String {
     sqlx::query_scalar("SELECT ha_policy FROM apps WHERE id = ?")
@@ -2200,7 +2208,8 @@ async fn policy_of(server: &Server, app_id: &str) -> String {
 /// and with its `duration_ms` kept, in one change-log entry, and
 /// `Lease.local_pending` turns true. An `updateApp` that fails later in the
 /// same transaction (a placement for a stateful app) writes neither the
-/// policy nor R.
+/// policy nor R. No grant with a new token was held, so R drops none and
+/// no `app.left_stopped` is emitted.
 #[tokio::test]
 async fn leaving_warm_writes_r_in_the_policy_changes_transaction() {
     let server = start_with_patient_node_session().await;
@@ -2252,6 +2261,7 @@ async fn leaving_warm_writes_r_in_the_policy_changes_transaction() {
     let view = lease_view(&server, &owner, &app_id).await;
     assert_eq!(view["local_pending"], true, "{view}");
     assert_eq!(view["unsettled"], true, "{view}");
+    assert_eq!(left_stopped(&server).await, 0, "no held grant to drop");
 }
 
 /// #555, R from `hot`: `hot` is read as `warm` (section 8.4, as the lease
@@ -2595,9 +2605,10 @@ async fn a_second_change_off_warm_before_any_settle_holds_the_local_grant_again(
 /// with the mark, and its grant waits for support. The policy is set to
 /// `warm`, then `updateApp` takes it off `warm`: R writes nothing (the row
 /// already reads `local` with the mark), no same-token `local` grant is held
-/// over it, and the grant with a new token stays pending. Once a majority
-/// supports `D`, that grant goes out as before, `local` at token 2, through
-/// the path of a grant with a new token: no `ping` follows it.
+/// over it, and the grant with a new token stays pending, so no
+/// `app.left_stopped` is emitted. Once a majority supports `D`, that grant
+/// goes out as before, `local` at token 2, through the path of a grant with
+/// a new token: no `ping` follows it.
 #[tokio::test]
 async fn leaving_warm_over_a_held_new_token_grant_keeps_it() {
     let server = start_with_patient_node_session().await;
@@ -2648,6 +2659,7 @@ async fn leaving_warm_over_a_held_new_token_grant_keeps_it() {
         (true, Vec::new()),
         "the grant with a new token stays"
     );
+    assert_eq!(left_stopped(&server).await, 0, "R wrote nothing");
     let mut seen = after_a_tick(&mut on_a).await;
     assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
     assert_eq!(pending(&server, &owner, &app_id).await, (true, Vec::new()));

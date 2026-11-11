@@ -1384,6 +1384,29 @@ async fn a_held_failover_grant_answers_in_progress_then_goes_out_once_replicated
     );
 }
 
+/// Every `app.left_stopped` stored, oldest first, as (subject, project,
+/// request id, actor, data).
+async fn left_stopped(server: &Server) -> Vec<(Value, String, String, Value, Value)> {
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT subject, project_id, request_id, actor, data FROM events \
+         WHERE type = 'app.left_stopped' ORDER BY seq",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(subject, project, request, actor, data)| {
+            (
+                serde_json::from_str(&subject).unwrap(),
+                project,
+                request,
+                serde_json::from_str(&actor).unwrap(),
+                serde_json::from_str(&data).unwrap(),
+            )
+        })
+        .collect()
+}
+
 /// #555, R over a held grant (section 8.4, "Ending the renewals" step 1 and
 /// "Grants of a marked row"). A failover's grant to the warm node is held,
 /// `expiring` at token 5 over a row that read `local` (a raise), and the
@@ -1391,9 +1414,13 @@ async fn a_held_failover_grant_answers_in_progress_then_goes_out_once_replicated
 /// policy then leaves `warm`: R writes the row `local` with the mark, so
 /// its newest write no longer gives the lease a new token, and the held
 /// grant is dropped at once, though its holder is away: `grant_pending`
-/// reads false and `grant_waiting_on` is empty. Back on `warm`, with the old
+/// reads false and `grant_waiting_on` is empty. The primary emits one
+/// `app.left_stopped` as it drops the grant: the app as subject, its
+/// project, the `updateApp` call's request id and caller, and the warm node
+/// and token 5 the dropped grant named. Back on `warm`, with the old
 /// source as the warm node reporting a complete copy, a failover finds the
-/// marked row's holder away and answers `lease_held`, not `in_progress`.
+/// marked row's holder away and answers `lease_held`, not `in_progress`,
+/// and no second `app.left_stopped` follows.
 #[tokio::test]
 async fn r_drops_a_held_grant_whose_holder_is_away() {
     let mut s = Setup::new().await;
@@ -1414,7 +1441,30 @@ async fn r_drops_a_held_grant_whose_holder_is_away() {
         .send()
         .await
         .unwrap();
+    let request_id = res.headers()["quoro-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
     assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let user_id = owner_user_id(&s.owner, &s.server).await;
+    let project_id: String = sqlx::query_scalar("SELECT project_id FROM apps WHERE id = ?")
+        .bind(&s.app_id)
+        .fetch_one(s.server.state.store.pool())
+        .await
+        .unwrap();
+    let event = (
+        json!({ "type": "app", "id": s.app_id }),
+        project_id,
+        request_id,
+        json!({ "type": "user", "id": user_id }),
+        json!({
+            "app_id": s.app_id,
+            "node_id": s.warm.node_id,
+            "fencing_token": 5,
+            "reason": "policy_left_warm",
+        }),
+    );
+    assert_eq!(left_stopped(&s.server).await, vec![event.clone()]);
     let (mode, unsettled): (String, i64) =
         sqlx::query_as("SELECT mode, unsettled FROM leases WHERE id = ?")
             .bind(LEASE_ID)
@@ -1446,6 +1496,7 @@ async fn r_drops_a_held_grant_whose_holder_is_away() {
         ((json!(false), json!([])), json!("lease_held")),
         "{body}"
     );
+    assert_eq!(left_stopped(&s.server).await, vec![event], "once");
 }
 
 /// A source that is not connected, with an unmarked `expiring` row for `D`
