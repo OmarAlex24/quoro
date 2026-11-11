@@ -2148,8 +2148,9 @@ mod tests {
     /// no `local` grant is held over it. Its grant is dropped all the same:
     /// one `app.left_stopped` names it as R commits, and it reads as no
     /// grant pending (`grant_pending` false, `grant_waiting_on` empty, no
-    /// failover `in_progress`). Once support returns, the revoke at 3 goes
-    /// out once; then the entry goes, with no second event, and no grant or
+    /// failover `in_progress`). A second change off `warm` writes nothing
+    /// and emits nothing. Once support returns, the revoke at 3 goes out
+    /// once; then the entry goes, with no second event, and no grant or
     /// `ping` follows.
     #[tokio::test]
     async fn a_held_back_revoke_goes_out_after_r_writes_its_row() {
@@ -2179,6 +2180,13 @@ mod tests {
         assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
         assert!(!hub.row_grant_pending(&f.row().await));
         assert!(!hub.grant_pending(LEASE));
+        r(&f).await;
+        assert_eq!(f.writes().await, writes + 1, "a second R writes nothing");
+        assert_eq!(
+            left_stopped(&f).await,
+            vec![the_event(&f, 4)],
+            "a second R emits nothing"
+        );
         hub.attempt_held().await;
         hub.attempt_held().await;
         assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
@@ -2405,6 +2413,175 @@ mod tests {
             "the local grant stays"
         );
         assert!(left_stopped(&f).await.is_empty());
+        f.done();
+    }
+
+    /// `updateApp` taking the fixture's app off `warm`, as its handler does
+    /// up to the commit ([`crate::api::apps::update_app_tx`]), by a user
+    /// whose actor is returned.
+    async fn update_app_off_warm(
+        f: &Fixture,
+    ) -> (crate::api::apps::UpdatedApp, crate::changelog::Actor) {
+        use crate::auth::{Credential, Identity, Principal, UserIdentity};
+        let health_check = serde_json::to_string(&crate::api::apps::HealthCheck::default());
+        let resources = serde_json::to_string(&crate::api::apps::AppResources::default());
+        sqlx::query("UPDATE apps SET health_check = ?, resources = ? WHERE id = ?")
+            .bind(health_check.unwrap())
+            .bind(resources.unwrap())
+            .bind(APP)
+            .execute(f.state.store.pool())
+            .await
+            .unwrap();
+        let identity = Identity {
+            principal: Principal::User(UserIdentity {
+                user_id: "usr_01JC9Z6Q5W8N3K4T7R2M1XHB0D".into(),
+                email: "a@example.com".into(),
+                name: "A".into(),
+                role: quoro_types::Role::Owner,
+            }),
+            credential: Credential::Session {
+                session_id: "ses_1".into(),
+            },
+        };
+        let actor = identity.actor();
+        let ctx = crate::request::CallCtx::new(
+            identity,
+            REQUEST.to_string(),
+            "PATCH /api/v1/apps/{app_id}",
+            &axum::http::HeaderMap::new(),
+        );
+        let params = serde_json::json!({ "ha_policy": "none" });
+        let body = serde_json::from_value(params.clone()).unwrap();
+        let updated = crate::api::apps::update_app_tx(&f.state, &ctx, APP, &body, &params)
+            .await
+            .unwrap();
+        (updated, actor)
+    }
+
+    /// "The primary emits `app.left_stopped` as it drops the grant": a
+    /// failover's grant to a node that is away is held, `expiring` at 4,
+    /// when `updateApp` takes the app off `warm`. Once R commits, the
+    /// held-grant task reads R and drops that grant before the handler's
+    /// part after the commit runs, as it may on its tick or on any wake.
+    /// That part then finds nothing to drop, and exactly one
+    /// `app.left_stopped` stands all the same, written by R's own
+    /// transaction with the caller of `updateApp` as its actor.
+    #[tokio::test]
+    async fn a_drop_after_r_commits_loses_no_app_left_stopped() {
+        let f = fixture("warm", "expiring", Some(D as i64), true).await;
+        created(&f).await;
+        write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
+        let hub = &f.state.hub;
+        hub.hold_grant(&f.row().await);
+        assert!(hub.grant_pending(LEASE));
+        let ((_app, _vms, _warm, ended, dropped), actor) = update_app_off_warm(&f).await;
+        let ended = ended.expect("the app has a lease");
+        assert!(ended.wrote && ended.from_expiring);
+        let dropped = dropped.expect("R drops the held grant");
+        assert_eq!(
+            (dropped.node_id.as_str(), dropped.fencing_token),
+            (f.node_id.as_str(), 4)
+        );
+        hub.attempt_held().await;
+        assert!(
+            !hub.0.held.lock().unwrap().entries.contains_key(LEASE),
+            "the held-grant task dropped it first"
+        );
+        hub.end_renewals_committed(&ended);
+        let mut event = the_event(&f, 4);
+        assert_eq!(actor.kind, crate::changelog::ActorType::User);
+        event.3 = serde_json::json!({ "type": "user", "id": actor.id });
+        assert_eq!(left_stopped(&f).await, vec![event]);
+        assert!(!hub.grant_pending(LEASE));
+        f.done();
+    }
+
+    /// What R's transaction decides and records for `held`, put in the
+    /// registry for the fixture's lease right before the decision, with no
+    /// await between them, so the hub's own held-grant task cannot change
+    /// it first. The entry is taken out again afterwards.
+    async fn decide(
+        f: &Fixture,
+        ended: &crate::leases::Ended,
+        held: super::HeldGrant,
+    ) -> Option<super::LeftStopped> {
+        let hub = &f.state.hub;
+        let mut w = f.state.store.begin_write().await.unwrap();
+        hub.0.held.lock().unwrap().insert(LEASE.to_string(), held);
+        let decided = hub
+            .record_left_stopped(&mut w.tx, ended, &by(&actor()))
+            .await
+            .unwrap();
+        w.commit().await.unwrap();
+        hub.0.held.lock().unwrap().entries.remove(LEASE);
+        decided
+    }
+
+    /// Each condition of the decision in R's transaction, alone: R turned a
+    /// row that read `expiring` into `local`, and the registry holds a grant
+    /// with a new token that names the row (holder and token), not sent and
+    /// not dropped by an earlier R. The row is the one R left, `local` at 4
+    /// with the mark; the grant is a failover's at 4 to the row's holder.
+    /// That grant is reported once; with any one condition off, nothing is
+    /// recorded.
+    #[tokio::test]
+    async fn r_records_app_left_stopped_only_for_an_unsent_grant_naming_the_row() {
+        let f = fixture("none", "local", Some(D as i64), true).await;
+        write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
+        let row = f.row().await;
+        let ended = |from_expiring: bool| crate::leases::Ended {
+            lease: row.clone(),
+            wrote: true,
+            from_expiring,
+            hold: false,
+        };
+        let grant = super::HeldGrant::of(&row, None);
+        assert_eq!(
+            (grant.kind, grant.token, grant.holder.as_str()),
+            (Kind::NewToken, 4, f.node_id.as_str())
+        );
+
+        let reported = decide(&f, &ended(true), grant.clone()).await;
+        assert_eq!(
+            reported,
+            Some(super::LeftStopped {
+                node_id: f.node_id.clone(),
+                fencing_token: 4,
+            })
+        );
+        assert_eq!(left_stopped(&f).await, vec![the_event(&f, 4)]);
+
+        assert_eq!(
+            decide(&f, &ended(false), grant.clone()).await,
+            None,
+            "R over a row that did not read expiring"
+        );
+        let mut lower = grant.clone();
+        lower.token = 3;
+        assert_eq!(
+            decide(&f, &ended(true), lower).await,
+            None,
+            "a grant at a lower token"
+        );
+        let mut other = grant.clone();
+        other.holder = "nod_01JC9Z0000000000000000000B".to_string();
+        assert_eq!(
+            decide(&f, &ended(true), other).await,
+            None,
+            "a grant to another node"
+        );
+        let mut sent = grant.clone();
+        sent.sent_on = Some(1);
+        assert_eq!(decide(&f, &ended(true), sent).await, None, "a sent grant");
+        let mut dropped = grant.clone();
+        dropped.revoke_first = Some(3);
+        dropped.grant_dropped = true;
+        assert_eq!(
+            decide(&f, &ended(true), dropped).await,
+            None,
+            "a grant an earlier R dropped, kept for its held-back revoke"
+        );
+        assert_eq!(left_stopped(&f).await, vec![the_event(&f, 4)], "once");
         f.done();
     }
 }
