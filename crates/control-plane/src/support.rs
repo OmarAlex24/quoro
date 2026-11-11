@@ -436,6 +436,7 @@ mod tests {
                 .collect(),
             disagreement: None,
             countable: true,
+            open: false,
         });
         let clock = Arc::new(ManualBootClock::default());
         let tracker = SupportTracker::new(
@@ -574,6 +575,7 @@ mod tests {
             voters: voters.latest().unwrap().voters.clone(),
             disagreement: None,
             countable: true,
+            open: false,
         });
         assert!(!tracker.supports(D));
         // An answer at the new version replaces it, even one whose `p_send`

@@ -1350,6 +1350,7 @@ mod tests {
                 voter(ME, &["node"], B),
                 voter("nod_w", &["edge", "witness"], WITNESS),
             ],
+            listen: None,
         }
     }
 

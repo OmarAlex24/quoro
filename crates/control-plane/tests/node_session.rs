@@ -119,6 +119,7 @@ fn hello(node_id: &str) -> NodeMessage {
         mesh_public_key: None,
         volume_snapshot: None,
         custody_public_key: None,
+        mesh_rules: None,
     })
 }
 
@@ -727,6 +728,118 @@ async fn the_change_log_rebuilds_every_join_token_column_and_the_hash_of_its_sec
         );
         assert_eq!(node_id.as_deref(), used_by.and_then(Value::as_str));
     }
+}
+
+/// `hello` reporting `mesh_rules`.
+fn hello_with_mesh_rules(node_id: &str, mesh_rules: Option<u64>) -> NodeMessage {
+    let NodeMessage::Hello(mut body) = hello(node_id) else {
+        unreachable!("hello builds a hello");
+    };
+    body.mesh_rules = mesh_rules;
+    NodeMessage::Hello(body)
+}
+
+async fn stored_mesh_rules(server: &Server, node_id: &str) -> Option<i64> {
+    sqlx::query_scalar("SELECT mesh_rules FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
+/// Section 5.1 and migration 0015: every `hello` writes `nodes.mesh_rules`
+/// with the rest of the row, `NULL` when the field is absent, and the
+/// node's change-log entry of that write carries it under the column's name,
+/// so replaying the `node` entries rebuilds it (section 7.3 step 4). A
+/// `hello` whose `mesh_rules` is not an integer from 1 to 2^53 - 1 is
+/// answered `bad_message` and records nothing; the session still takes a
+/// valid `hello` after it.
+#[tokio::test]
+async fn hello_records_mesh_rules_with_the_row_and_its_change_log_entry() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    assert_eq!(stored_mesh_rules(&server, &node.node_id).await, None);
+
+    for (sent, kept) in [(Some(2), Some(2)), (None, None), (Some(1), Some(1))] {
+        let mut socket = connect(&server, &node.credential).await;
+        send(&mut socket, hello_with_mesh_rules(&node.node_id, sent)).await;
+        recv_type(&mut socket, "desired_state").await;
+        assert_eq!(
+            stored_mesh_rules(&server, &node.node_id).await,
+            kept,
+            "{sent:?}"
+        );
+        // The entry of the session's start write.
+        let (payload,): (String,) = sqlx::query_as(
+            "SELECT payload FROM change_log WHERE entity_type = 'node' AND entity_id = ? \
+             AND json_extract(payload, '$.status') = 'connected' ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&node.node_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload.get("mesh_rules"), Some(&json!(kept)), "{payload}");
+        drop(socket);
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let status: String = sqlx::query_scalar("SELECT status FROM nodes WHERE id = ?")
+                    .bind(&node.node_id)
+                    .fetch_one(server.state.store.pool())
+                    .await
+                    .unwrap();
+                if status == "disconnected" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the session ended");
+    }
+
+    let rebuilt = replay::rebuild(&server, &["node"]).await;
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "nodes",
+        &["id", "status", "volume_snapshot", "mesh_rules"],
+        1,
+    )
+    .await;
+    let rebuilt_rules: Option<i64> =
+        sqlx::query_scalar("SELECT mesh_rules FROM nodes WHERE id = ?")
+            .bind(&node.node_id)
+            .fetch_one(rebuilt.pool())
+            .await
+            .unwrap();
+    assert_eq!(rebuilt_rules, Some(1));
+
+    // Out of range or not an integer: `bad_message`, nothing recorded.
+    let mut socket = connect(&server, &node.credential).await;
+    for value in [
+        json!(0),
+        json!(9_007_199_254_740_992_u64),
+        json!(2.5),
+        json!(-1),
+    ] {
+        let mut frame = hello(&node.node_id).to_frame("msg_01JC9Z6Q5W8N3K4T7R2M1XHB0D", None);
+        frame.body["mesh_rules"] = value.clone();
+        send_text(&mut socket, frame.to_text()).await;
+        let error = recv_type(&mut socket, "error").await;
+        assert_eq!(error["body"]["code"], "bad_message", "{value}: {error}");
+        assert_eq!(error["body"]["fatal"], false, "{value}");
+        assert_eq!(error["re"], "msg_01JC9Z6Q5W8N3K4T7R2M1XHB0D", "{value}");
+    }
+    assert_eq!(
+        stored_mesh_rules(&server, &node.node_id).await,
+        Some(1),
+        "nothing recorded"
+    );
+    send(&mut socket, hello_with_mesh_rules(&node.node_id, Some(2))).await;
+    recv_type(&mut socket, "desired_state").await;
+    assert_eq!(stored_mesh_rules(&server, &node.node_id).await, Some(2));
 }
 
 #[tokio::test]

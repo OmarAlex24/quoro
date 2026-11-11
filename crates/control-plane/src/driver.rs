@@ -467,6 +467,7 @@ pub(crate) async fn node_payload(conn: &mut SqliteConnection, id: &str) -> Resul
         "custody_public_key": row.try_get::<Option<String>, _>("custody_public_key")?,
         "custody_key_changed_at": row.try_get::<Option<String>, _>("custody_key_changed_at")?,
         "signing_key_id": row.try_get::<Option<String>, _>("signing_key_id")?,
+        "mesh_rules": row.try_get::<Option<i64>, _>("mesh_rules")?,
     }))
 }
 

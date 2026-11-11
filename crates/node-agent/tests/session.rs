@@ -1801,6 +1801,18 @@ async fn invalid_log_entries_are_a_bad_message_and_store_nothing() {
     end_session(ws, serving).await;
 }
 
+/// Section 5.1: every `hello` reports the version of the mesh rules this
+/// agent applies, 2 for every rule of section 6.9.
+#[tokio::test]
+async fn hello_reports_the_mesh_rules_version() {
+    assert_eq!(quoro_node_agent::mesh::MESH_RULES, 2);
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let (ws, hello, serving) = follow_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["mesh_rules"], 2, "{hello}");
+    end_session(ws, serving).await;
+}
+
 /// Section 5.1: after storing entries, the `hello` of the next session
 /// reports the newest stored `seq` and its hash.
 #[tokio::test]
@@ -2743,6 +2755,9 @@ fn votes(version: u64) -> SpecVotes {
             roles: vec!["node".to_owned()],
             mesh_address: Some("10.43.0.2".to_owned()),
         }],
+        // Votes are not open: the voter still answers `support_request`
+        // (section 6.12).
+        listen: None,
     }
 }
 

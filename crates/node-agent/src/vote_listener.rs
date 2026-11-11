@@ -14,17 +14,24 @@
 //! loopback, and over loopback only from the machine's own mesh address
 //! ([`crate::mesh::nft_ruleset`]). The listener listens only while that
 //! firewall is loaded for its address
-//! ([`crate::mesh::MeshManager::firewall`]).
+//! ([`crate::mesh::MeshManager::firewall`]), and only while votes are open:
+//! `spec.votes.listen` is `true` (sections 6.12 and 8.9).
 //!
 //! The listener belongs to the agent process, not to a session: it answers
 //! with no session up, while a promotion on this host freezes the agent
 //! (section 7.3 "The freeze" does not depend on the agent's own vote), and on
 //! a witness-only machine. It follows the newest verified desired state the
 //! agent publishes to its other loops: it starts once that state carries
-//! `spec.votes` and a mesh address and the firewall for them is loaded,
-//! binds again when the address or the port changes, stops when
-//! `spec.votes` goes away or the firewall is not loaded, and retries a bind
-//! that failed, such as one on a mesh address that is not up yet.
+//! `spec.votes` with `listen: true` and a mesh address and the firewall for
+//! them is loaded, binds again when the address or the port changes, stops
+//! when `spec.votes` or its `listen` goes away or the firewall is not loaded,
+//! and retries a bind that failed, such as one on a mesh address that is not
+//! up yet. It reports the socket it holds to the mesh manager
+//! ([`crate::mesh::ListenerLink`]), which waits for it to close before it
+//! configures the peers of a state in which votes are not open (section
+//! 8.9). A request on a connection accepted before votes closed is answered
+//! `503` and decides nothing. Whether votes are open does not touch
+//! `support_request` (section 5.27): the session answers it either way.
 //!
 //! Each request reads the newest `spec.votes`, decides and writes in one
 //! transaction ([`crate::vote::answer_vote`]): a granted vote is durable
@@ -53,6 +60,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::lease::HostClock;
+use crate::mesh::ListenerLink;
 use crate::reconcile::Snapshot;
 use crate::store::NodeStore;
 use crate::util;
@@ -126,9 +134,12 @@ struct Inner {
     cluster_id: String,
     clock: Arc<dyn HostClock>,
     desired: watch::Receiver<Option<Snapshot>>,
-    /// The listener address the loaded mesh firewall covers
+    /// The listener address the mesh manager allows
     /// ([`crate::mesh::MeshManager::firewall`]).
     firewall: watch::Receiver<Option<SocketAddr>>,
+    /// Where the listener reports the address it holds a socket on, or is
+    /// about to bind ([`ListenerLink::bound`]).
+    bound: Arc<watch::Sender<Option<SocketAddr>>>,
     options: VoteListenerOptions,
     connections: Arc<Semaphore>,
     /// The `warn` for a vote request from this machine that is not root's.
@@ -144,8 +155,9 @@ struct Inner {
 impl VoteListener {
     /// A listener for the machine `node_id` of cluster `cluster_id`, which
     /// follows `desired`, the newest verified desired state, listens only on
-    /// the address `firewall` says the loaded mesh firewall covers, and reads
-    /// the time a request arrived from `clock`.
+    /// the address the mesh manager allows through `link` and reports its
+    /// socket back through it, and reads the time a request arrived from
+    /// `clock`.
     #[must_use]
     pub fn new(
         store: NodeStore,
@@ -153,7 +165,7 @@ impl VoteListener {
         cluster_id: String,
         clock: Arc<dyn HostClock>,
         desired: watch::Receiver<Option<Snapshot>>,
-        firewall: watch::Receiver<Option<SocketAddr>>,
+        link: ListenerLink,
         options: VoteListenerOptions,
     ) -> Self {
         Self {
@@ -163,7 +175,8 @@ impl VoteListener {
                 cluster_id,
                 clock,
                 desired,
-                firewall,
+                firewall: link.firewall,
+                bound: link.bound,
                 options,
                 connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
                 local_warn: Mutex::new(WarnLimit::default()),
@@ -209,8 +222,20 @@ impl VoteListener {
         }
         if let Some((_, task)) = serving {
             task.abort();
+            let _ = task.await;
         }
+        self.report(None);
         info!("vote listener stopped");
+    }
+
+    /// Reports the address the listener holds a socket on, or is about to
+    /// bind, to the mesh manager ([`ListenerLink::bound`]).
+    fn report(&self, address: Option<SocketAddr>) {
+        self.inner.bound.send_if_modified(|current| {
+            let changed = *current != address;
+            *current = address;
+            changed
+        });
     }
 
     /// One pass: closes a listener on an address no longer wanted, and binds
@@ -229,17 +254,33 @@ impl VoteListener {
         {
             *failing = None;
         }
-        if let Some((addr, task)) = serving.as_ref()
-            && (Some(*addr) != wanted || task.is_finished())
+        if serving
+            .as_ref()
+            .is_some_and(|(addr, task)| Some(*addr) != wanted || task.is_finished())
+            && let Some((addr, task)) = serving.take()
         {
+            // The listening socket closes once the aborted task is dropped:
+            // awaited, so the report below never runs ahead of it.
             task.abort();
+            let _ = task.await;
             info!(%addr, "vote listener closed");
-            *serving = None;
+        }
+        if serving.is_none() {
+            self.report(None);
         }
         let Some(addr) = wanted else {
             return;
         };
         if serving.is_some() {
+            return;
+        }
+        // Reported before the bind, and the manager's address read again
+        // after: a manager that took the address away either sees this
+        // report and waits for the socket to close, or has already taken it
+        // away, and then nothing is bound ([`crate::mesh::ListenerLink`]).
+        self.report(Some(addr));
+        if *self.inner.firewall.borrow() != Some(addr) {
+            self.report(None);
             return;
         }
         match TcpListener::bind(addr).await {
@@ -259,6 +300,7 @@ impl VoteListener {
                 ));
             }
             Err(e) => {
+                self.report(None);
                 // The mesh interface may not have its address yet; the next
                 // pass tries again. A bind that keeps failing must be seen.
                 let now = Instant::now();
@@ -462,6 +504,13 @@ impl Inner {
                 &format!("the term is above {MAX_TERM}"),
             );
         }
+        // Section 8.9: while votes are not open no vote is served. A
+        // connection accepted before they closed reaches this point; its
+        // request is answered `503`, which a candidate counts as no answer,
+        // and decides nothing.
+        if self.votes().is_some_and(|votes| !votes.open()) {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "votes are not open");
+        }
         let source = match caller {
             Caller::Peer(ip) => Some(ip),
             Caller::LocalNotRoot(uid) => {
@@ -519,7 +568,9 @@ impl Inner {
                     &vote,
                     &self.node_id,
                     &self.cluster_id,
-                    || self.votes(),
+                    // Read again inside the transaction: a state that
+                    // closed votes since the check above serves none.
+                    || self.votes().filter(SpecVotes::open),
                     source,
                     &received,
                 )
@@ -595,11 +646,12 @@ impl Inner {
 
 /// Where the vote listener of `snapshot` listens: its own mesh address,
 /// `spec.mesh.address` without its prefix length, on `spec.votes.port`.
-/// `None` without either, or with an address that is not one.
+/// `None` without either, while votes are not open (`spec.votes.listen` is
+/// not `true`, section 8.9), or with an address that is not one.
 #[must_use]
 pub fn listen_address(snapshot: Option<&Snapshot>) -> Option<SocketAddr> {
     let spec = &snapshot?.state.spec;
-    let votes = spec.votes.as_ref()?;
+    let votes = spec.votes.as_ref().filter(|votes| votes.open())?;
     let ip = mesh_ip(&spec.mesh.as_ref()?.address)?;
     Some(SocketAddr::new(ip, votes.port))
 }

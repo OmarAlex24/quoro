@@ -35,6 +35,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../../docs/contracts/migrations/0012-custody-and-promotion.sql"),
     include_str!("../../../docs/contracts/migrations/0013-lease-unsettled.sql"),
     include_str!("../../../docs/contracts/migrations/0014-audit-params-digest.sql"),
+    include_str!("../../../docs/contracts/migrations/0015-node-mesh-rules.sql"),
 ];
 
 /// 64 zeros: `prev_hash` of the first entry of a chain.
@@ -961,6 +962,71 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(version, (MIGRATIONS.len() + 2).to_string());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Migration 0015: a new database opens at schema 16 with
+    /// `nodes.mesh_rules`, and a database at schema 15 migrates to it,
+    /// keeping its rows, which read `NULL` there. The column takes no value
+    /// below 1.
+    #[tokio::test]
+    async fn the_store_opens_at_16_and_a_database_at_15_migrates() {
+        async fn version(store: &Store) -> String {
+            sqlx::query_scalar("SELECT value FROM meta WHERE key = 'schema_version'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap()
+        }
+        async fn has_mesh_rules(store: &Store) -> bool {
+            let columns: Vec<String> =
+                sqlx::query_scalar("SELECT name FROM pragma_table_info('nodes')")
+                    .fetch_all(store.pool())
+                    .await
+                    .unwrap();
+            columns.iter().any(|column| column == "mesh_rules")
+        }
+        let dir = std::env::temp_dir().join(format!("quoro-store-{}", random_secret()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let store = Store::open(&dir.join("new.db")).await.unwrap();
+        assert_eq!(Store::shipped_schema_version(), 16);
+        assert_eq!(version(&store).await, "16");
+        assert!(has_mesh_rules(&store).await);
+        drop(store);
+
+        // A database the release before this one left: schema 15.
+        let path = dir.join("old.db");
+        let mut old = Store::open_unmigrated(&path).await.unwrap();
+        old.migrations = Arc::from(&MIGRATIONS[..14]);
+        old.migrate().await.unwrap();
+        assert_eq!(version(&old).await, "15");
+        assert!(!has_mesh_rules(&old).await);
+        sqlx::query(
+            "INSERT INTO nodes (id, name, roles, status, public_key, behind_nat, labels, \
+             capacity, allocated, kvm, created_at) VALUES ('nod_1', 'node-1', '[\"node\"]', \
+             'connected', 'key', 0, '{}', '{}', '{}', '{}', '2026-11-10T10:00:00.000Z')",
+        )
+        .execute(old.pool())
+        .await
+        .unwrap();
+        drop(old);
+
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(version(&store).await, "16");
+        let rules: Option<i64> =
+            sqlx::query_scalar("SELECT mesh_rules FROM nodes WHERE id = 'nod_1'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(rules, None);
+        for (value, accepted) in [(2, true), (1, true), (0, false)] {
+            let result = sqlx::query("UPDATE nodes SET mesh_rules = ? WHERE id = 'nod_1'")
+                .bind(value)
+                .execute(store.pool())
+                .await;
+            assert_eq!(result.is_ok(), accepted, "{value}");
+        }
+        drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

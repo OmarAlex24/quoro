@@ -227,6 +227,7 @@ async fn a_witness_only_agent_runs_without_an_engine() {
             roles: vec!["witness".to_owned()],
             mesh_address: Some("10.43.0.4".to_owned()),
         }],
+        listen: None,
     });
     store
         .store_desired(5, &signed_body(&witness, &key))
@@ -336,6 +337,7 @@ async fn the_agent_answers_votes_without_a_session_and_while_frozen() {
             voter("nod_test", "witness", "127.0.0.1"),
             voter("nod_a", "node", "127.0.0.2"),
         ],
+        listen: Some(true),
     });
     store
         .store_desired(5, &signed_body(&witness, &key))

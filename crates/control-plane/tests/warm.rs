@@ -95,6 +95,7 @@ fn hello(node_id: &str, mesh_seed: u8) -> NodeMessage {
         dropped_events: 0,
         volume_snapshot: Some(wire::SnapshotMethod::Reflink),
         custody_public_key: None,
+        mesh_rules: None,
     })
 }
 

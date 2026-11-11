@@ -157,16 +157,18 @@ pub async fn run_with_mesh<E: Engine + 'static, D: MeshDriver + 'static>(
     // The vote listener (section 8.9) belongs to the process, not to a
     // session: it answers with no session up, while a promotion freezes the
     // agent, and on a witness-only machine. It follows the same verified
-    // desired state as the other loops, listens only while the mesh firewall
-    // for its address is loaded, and starts after the stored support was
-    // brought onto this boot above.
+    // desired state as the other loops, listens only while votes are open and
+    // the mesh firewall for its address is loaded, and starts after the
+    // stored support was brought onto this boot above. Its link to the mesh
+    // manager lets an apply wait for it to stop before it configures peers
+    // (section 8.9).
     let vote_listener = VoteListener::new(
         store.clone(),
         node_id.clone(),
         cluster_id.clone(),
         Arc::clone(&host_clock),
         desired.subscribe(),
-        mesh_manager.firewall(),
+        mesh_manager.listener_link(),
         VoteListenerOptions::default(),
     );
 

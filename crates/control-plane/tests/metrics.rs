@@ -104,6 +104,7 @@ fn hello(node_id: &str) -> NodeMessage {
         mesh_public_key: None,
         volume_snapshot: None,
         custody_public_key: None,
+        mesh_rules: None,
     })
 }
 
