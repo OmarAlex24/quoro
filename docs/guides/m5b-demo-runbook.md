@@ -47,7 +47,6 @@ The runbook is written against the contracts. On the day of the demo, check each
 | Needed for | Operation or behaviour | Issue |
 | --- | --- | --- |
 | Steps 2, 3 | `expiring` leases on the primary: the conversion grant and the renewals | [#555](https://github.com/OmarAlex24/quoro/issues/555) |
-| Step 2 | The panel's view of the warm copy and its last shipped snapshot (box 4) | [#562](https://github.com/OmarAlex24/quoro/issues/562) |
 | Step 3b | `quoro cluster maintenance` (a maintenance window), to widen the refusal's window | [#764](https://github.com/OmarAlex24/quoro/issues/764) |
 | Step 4 | A `deleted` entry that reaches the returning source's volume before its hand-over must not remove it | [#557](https://github.com/OmarAlex24/quoro/issues/557) |
 | Step 5 | `POST /api/v1/apps/{app_id}/switchover` (`switchoverApp`) | [#735](https://github.com/OmarAlex24/quoro/issues/735) |
@@ -68,7 +67,7 @@ These are on `main`:
 - The warm copy's progress in `App.warm`.
 - The returning source's hand-over and its quarantined copies, on the node ([#763](https://github.com/OmarAlex24/quoro/pull/763)) and on the primary ([#738](https://github.com/OmarAlex24/quoro/pull/738)).
 
-The panel on `main` has no view of the warm copy's last shipped snapshot and no switchover action. Until it does, each panel action below has an API call that does the same thing, and the API answer is the evidence.
+The panel on `main` has no switchover action. Until it does, step 5's panel action has an API call that does the same thing, and the API answer is the evidence.
 
 ## Preconditions
 
@@ -84,7 +83,7 @@ The panel on `main` has no view of the warm copy's last shipped snapshot and no 
   - writes a record to its volume when asked over HTTP, and
   - serves the records it holds, with the instance that answered.
 
-  It is deployed from an image: an app with a Git `source` cannot be `warm` in M5b. Its domain is served through lab-3's tunnel. Which image the demo uses is an [open point](#open-points).
+  It is deployed from an image: an app with a Git `source` cannot be `warm` in M5b. Its domain is served through lab-3's tunnel. The image is listed under [Decided points](#decided-points).
 - **The cut method** of [step 3](#3a-cut-lab-1-off) is ready on the operator's machine and was rehearsed. The operator reaches lab-1 over SSH from an address that is not lab-2's or lab-3's.
 - **No Git build during the demo.** A builder VM takes 2048 MiB. On lab-2 it does not fit next to the demo apps and the warm app after its failover.
 
@@ -202,13 +201,15 @@ Skip this part if the demo app already exists.
 
 ```sh
 q -X POST "$QUORO/api/v1/apps" -H 'Content-Type: application/json' -d '{
-  "project_id": "<project id>", "name": "warm-demo", "image": "<demo image>",
-  "port": <port>, "resources": {"vcpus": 1, "memory_mb": 256, "disk_gb": 1},
+  "project_id": "<project id>", "name": "warm-demo", "image": "docker.io/sigoden/dufs:v0.45.0",
+  "port": 5000, "resources": {"vcpus": 1, "memory_mb": 256, "disk_gb": 1},
   "placement": {"node_ids": ["'"$LAB1"'"]}}'
 q -X POST "$QUORO/api/v1/apps/$APP/volumes" -H 'Content-Type: application/json' \
-  -d '{"size_gb": 1, "mount_path": "<the image data path>"}'
+  -d '{"size_gb": 1, "mount_path": "/data"}'
+q -X PUT "$QUORO/api/v1/apps/$APP/env" -H 'Content-Type: application/json' \
+  -d '{"items": [{"name": "DUFS_SERVE_PATH", "value": "/data"}, {"name": "DUFS_ALLOW_UPLOAD", "value": "true"}]}'
 q -X POST "$QUORO/api/v1/apps/$APP/deployments" -H 'Content-Type: application/json' \
-  -d '{"image": "<demo image>"}'
+  -d '{"image": "docker.io/sigoden/dufs:v0.45.0"}'
 ```
 
 Take `APP` from the `id` of the first answer and `VOL` from the `id` of the second, for example `APP=$(... | jq -r .id)`. Attach the demo domain to the app, as in M5a.
@@ -235,7 +236,7 @@ Take `APP` from the `id` of the first answer and `VOL` from the `id` of the seco
 1. Write record **A** through the demo domain. Note the time.
 2. Poll `q "$QUORO/api/v1/apps/$APP" | jq '{warm, lease}'` until the shipped copy's snapshot was taken after record A: the time of the reading minus `warm.lag_s` is later than the time of record A, with `state: in_sync`. `last_shipped_at` alone is not enough, because it is when lab-2 completed the copy, and the snapshot may have been taken before A was written. Waiting until `last_snapshot_seq` has advanced twice after A also works.
 
-- **Panel:** the app's last shipped snapshot on lab-2 (not on `main` yet; see [above](#what-main-does-not-serve-yet)).
+- **Panel:** the app's last shipped snapshot on lab-2 ([#839](https://github.com/OmarAlex24/quoro/pull/839)).
 
 **Expected:** `last_snapshot_seq` grows by one about every 30 s. `lag_s` stays at or below 60 s.
 
@@ -244,7 +245,7 @@ Take `APP` from the `id` of the first answer and `VOL` from the `id` of the seco
 - the `PATCH` answer;
 - three readings of `App.warm`, at least 30 s apart;
 - the time of record A and the first `last_shipped_at` after it;
-- the screenshot of the panel when it exists.
+- a screenshot of the panel showing the last shipped snapshot.
 
 ### 2d. A held lease survives an agent restart
 
@@ -515,7 +516,7 @@ Switch `$QUORO` to lab-1's address for every call from here.
 **If it goes wrong:**
 
 - Before any real vote, the command changes nothing. Start lab-2's control plane again with `systemctl start quoro` and stop. If more than about 13 s have passed since `t2`, lab-1 has already fenced the demo app; lab-2 gives the lease back to lab-1 in the same way once it runs again.
-- If the command was interrupted after it froze lab-1's agent, run `quoro cluster promote --abort` on lab-1. If it stopped after it wrote the new database, a rerun is refused because lab-1 now has a control-plane database: move that database aside first, as for a demoted primary ([protocol section 7.3](../contracts/node-agent-protocol.md#73-promotion)).
+- If the command was interrupted after it froze lab-1's agent, run `quoro cluster promote --abort` on lab-1. If it stopped after it wrote the new database, a rerun is refused because lab-1 now has a control-plane database: move that database aside first with `quoro node rejoin --force --statement "<why>"`. lab-1 was never demoted, so rejoin needs `--force` here, and it records the statement ([protocol sections 7.3 and 7.4](../contracts/node-agent-protocol.md#73-promotion)).
 - After the real votes, go forward only. Run `quoro cluster promote` again at the same or a higher term, and do not start lab-2's control plane. A primary that sees a higher term demotes itself ([ADR 0230](../adr/0230-a-primary-that-learns-of-a-higher-term-demotes-itself-with.md)).
 - If a node does not find lab-1, point it there with `quoro node set-primary <lab-1 URL>`. The certificate pin does not change.
 
@@ -525,11 +526,11 @@ The roadmap's step 6 ends by promoting lab-2 back. The demo uses option A. Optio
 
 **Option A: promote lab-2 back (the roadmap's script).**
 
-1. On lab-2: `quoro node rejoin` ([#728](https://github.com/OmarAlex24/quoro/issues/728)). It stops and disables lab-2's control-plane unit, and moves its data directory aside as a quarantined copy named with the term and the time. Nothing is deleted. lab-2's agent finds lab-1. Its followed log differs from lab-1's, so it quarantines that log and follows again from `seq` 1 ([protocol section 7.4](../contracts/node-agent-protocol.md#74-the-old-primary)). Wait until lab-2's `log_lag` is 0 and its `custody` is `sealed`.
-2. On lab-2: `quoro cluster promote`. Expected: refused with `support_held`, because lab-1's control plane runs. It may instead be refused because lab-2 still has the control-plane unit file that `rejoin` stopped and disabled: see the [open point](#open-points). In that case the second promotion cannot run until the maintainer decides how to handle that file.
+1. On lab-2: `quoro node rejoin` ([#728](https://github.com/OmarAlex24/quoro/issues/728)). lab-2's control plane was stopped by hand in 6b and never learned of lab-1's term, but its agent has seen it, so lab-2 counts as demoted and no `--force` is needed. It stops and disables lab-2's control-plane unit, then moves its data directory and the unit file into a copy named with the term and the time. Nothing is deleted. lab-2's agent finds lab-1. Its followed log differs from lab-1's, so it quarantines that log and follows again from `seq` 1 ([protocol section 7.4](../contracts/node-agent-protocol.md#74-the-old-primary)). Wait until lab-2's `log_lag` is 0 and its `custody` is `sealed`.
+2. On lab-2: `quoro cluster promote`. Expected: refused with `support_held`, because lab-1's control plane runs. lab-2 has neither a control-plane database nor a unit any more, so section 7.3 does not refuse it for them. With its `log_lag` at 0 and its `custody` `sealed` (step 1), `support_held` is the expected refusal.
 3. On lab-1: `systemctl stop quoro`. Its agent keeps running.
 4. Wait at least 15 s, then on lab-2: `quoro cluster promote`. Expected: it waits as in 6b, then lab-2 is the primary at the next term. As in 6b, lab-1 fences the demo app once its control plane stops, and lab-2 gives the lease back to lab-1 once it holds majority support.
-5. On lab-1: `quoro node rejoin`. lab-1 is a node again.
+5. On lab-1: `quoro node rejoin`. Its control plane was stopped by hand in step 3 and never learned of the newer term, but its agent has seen lab-2's higher term, so lab-1 counts as demoted and no `--force` is needed. If it refuses, lab-1's agent has not reached lab-2 yet: check that lab-1 is `connected` and run it again. Do not use `--force`. lab-1 is a node again.
 6. Check: `GET /api/v1/cluster` against lab-2 shows `primary_node_id` lab-2. Every machine is connected, and the demo app runs.
 
 This is the state the demo started from, with a higher term and two quarantined control-plane directories, one on each host.
@@ -561,11 +562,11 @@ The maintainer approved these choices on 2026-11-10:
 - **Step 3b** uses a 30 s maintenance window, so the refusal of box 6 shows on every run ([#764](https://github.com/OmarAlex24/quoro/issues/764)). Until the command is on `main`, repeated runs.
 - **Box 12's lab run** is step 3a with a second `warm` app on lab-1, so that two `expiring` fences run at once on the same node. The second app is not failed over; it comes back on lab-1 when the cut ends.
 - **Step 6 ends with option A:** promote lab-2 back, as the roadmap says.
+- **`quoro node rejoin`** moves the control-plane unit file into the moved-aside copy together with the data directory, so a host that rejoined can be promoted again. It refuses on a machine that was never demoted unless `--force --statement "<why>"` is given. A machine counts as demoted when its database records the demotion, or when its agent has seen a higher term than its database ([protocol section 7.4](../contracts/node-agent-protocol.md#74-the-old-primary)).
+- **The demo app** is `docker.io/sigoden/dufs:v0.45.0` (index digest `sha256:9b45a406b019921c7d2a512784a8652fc23a83c5598bf0ddc81d3c130c623f31`), port 5000, with its volume at `/data` and the variables `DUFS_SERVE_PATH=/data` and `DUFS_ALLOW_UPLOAD=true`. A record is written with `PUT /<name>` (answers `201`) and read with `GET /<name>`.
 
 ## Open points
 
-- **The demo app.** Which image, its port, its data path, and the HTTP calls that write and read a record. It must be an image app, not a Git one.
-- **A disabled control-plane unit.** After `quoro node rejoin`, a promotion on the same host needs no control-plane database or unit on that host. The contracts do not say whether the unit file that `rejoin` stops and disables still counts as a control-plane unit. This decides whether option A works without removing that file by hand. A reading is being proposed to the maintainer: a stopped and disabled unit does not count, and a promotion refuses on a control-plane database or an enabled unit.
-- **The panel.** The panel on `main` shows neither the warm copy's last shipped snapshot (box 4, [#562](https://github.com/OmarAlex24/quoro/issues/562)) nor the switchover action (step 5, no issue yet). Until they ship, the API answers are the evidence for those boxes.
+- **The panel.** The panel on `main` shows the warm copy's last shipped snapshot (box 4, [#562](https://github.com/OmarAlex24/quoro/issues/562)) but not the switchover action (step 5, no issue yet). Until it ships, the API answers are the evidence for step 5.
 - **Reaching the VM from its host.** Step 3a writes record B from lab-1's host to the app's VM at its private address. The lab allows it today, but the contracts do not state that the node's firewall admits that path.
 - **TLS after the promotion.** The promoted primary keeps the old primary's certificate. Curl options that pin the certificate and do not check the host name work against lab-1. Options that check the name against the certificate fail if the certificate does not name lab-1's address. Which names the certificate carries is not stated here.
