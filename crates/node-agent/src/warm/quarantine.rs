@@ -21,15 +21,26 @@
 //!   a copy is hashed once. A copy deleted during its hash stops it, and the
 //!   hash gives up quietly. A copy whose clone is missing stays recorded and
 //!   reported without a hash; its hash fails and waits like any other, and
-//!   completes once the file is back.
+//!   completes once the file is back, unless its clone is shown to be gone
+//!   (below).
+//! - **A clone gone before its hash** (section 9 step 2). When the hash of a
+//!   copy finds no file, its record is forgotten, with its kept snapshot and
+//!   without touching any file, only when all three hold: the engine
+//!   answers `NotFound` for the clone as a snapshot of the volume (a pool
+//!   that does not mount answers `Unsupported`); another file the node
+//!   records for the volume answers the engine, so the directory is the
+//!   real one; and the record still has no SHA-256, so the primary never
+//!   recorded the copy. Otherwise the record stays, and the hash is tried
+//!   again. The next report no longer lists a forgotten copy.
 //! - **`spec.quarantine_deletes`.** Each id the node holds is deleted: the
 //!   clone first, through the engine, then its kept snapshot and its record
 //!   in one transaction. Only the record's id and `snapshot_id` are read for
 //!   it, so a row that cannot be read whole is deleted too. An id the node
 //!   does not hold is ignored, and a delete that failed is tried again with
-//!   the next pass. Nothing else forgets a record: a file lookup that came
-//!   back empty proves nothing, since a volume directory that did not mount
-//!   looks exactly like it (section 5.11, [`crate::kept`]).
+//!   the next pass. Nothing else forgets a record but the case above: a file
+//!   lookup that came back empty proves nothing alone, since a volume
+//!   directory that did not mount looks exactly like it (section 5.11,
+//!   [`crate::kept`]).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -39,7 +50,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
-use quoro_engine::Engine;
+use quoro_engine::{Engine, EngineError, RangesOf};
 use quoro_proto::wire::QuarantineStatus;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
@@ -353,13 +364,28 @@ impl<E: Engine + 'static> Quarantines<E> {
                     debug!(quarantine_id = %id, "the hash of a deleted quarantined copy stopped");
                     false
                 }
-                // Deleted before its hash, or a clone missing while its record
-                // stays: the latter is tried again, and hashed once the file
-                // is back. Until then the primary does not record the copy.
+                // Deleted before its hash, a clone shown to be gone, whose
+                // record goes, or a clone missing while its record stays: the
+                // last is tried again, and hashed once the file is back. Until
+                // then the primary does not record the copy.
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let wait = inner.failed(&id);
-                    warn!(quarantine_id = %id, retry_in = ?wait, "a quarantined copy has no file to hash; the primary records it only once it is hashed");
-                    false
+                    match inner.forget_lost_clone(&id).await {
+                        Ok(true) => {
+                            inner.lock_retry().remove(&id);
+                            info!(quarantine_id = %id, "the clone of a quarantined copy is gone before it was hashed; its record is forgotten");
+                            true
+                        }
+                        Ok(false) => {
+                            let wait = inner.failed(&id);
+                            warn!(quarantine_id = %id, retry_in = ?wait, "a quarantined copy has no file to hash; the primary records it only once it is hashed");
+                            false
+                        }
+                        Err(e) => {
+                            let wait = inner.failed(&id);
+                            warn!(quarantine_id = %id, error = %e, retry_in = ?wait, "a quarantined copy has no file to hash, and whether its clone is gone cannot be told");
+                            false
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     let wait = inner.failed(&id);
@@ -381,6 +407,51 @@ impl<E: Engine + 'static> Quarantines<E> {
 }
 
 impl<E: Engine> Inner<E> {
+    /// Forgets the record of copy `id`, with its kept snapshot, when its
+    /// clone is gone before it was hashed (section 9 step 2): the engine
+    /// answers `NotFound` for the clone, another file the node records for
+    /// the volume answers it, and the record has no SHA-256. Touches no
+    /// file. Returns whether the record went.
+    async fn forget_lost_clone(&self, id: &str) -> Result<bool, String> {
+        let record = match self.store.volume_quarantine(id).await {
+            Ok(Some(record)) if record.sha256.is_none() => record,
+            // Deleted, or hashed meanwhile.
+            Ok(_) => return Ok(false),
+            Err(e) => return Err(format!("cannot read the record: {e}")),
+        };
+        let kept = match self.store.kept_snapshot(&record.snapshot_id).await {
+            Ok(Some(kept)) => kept,
+            // Recorded together, so not expected: nothing to look the clone
+            // up by.
+            Ok(None) => return Ok(false),
+            Err(e) => return Err(format!("cannot read the kept snapshot: {e}")),
+        };
+        match self
+            .engine
+            .volume_changed_ranges(&RangesOf::Snapshot(kept.snapshot), None)
+            .await
+        {
+            Err(EngineError::NotFound) => {}
+            // The engine sees the clone, or cannot tell (a pool that does
+            // not mount answers `Unsupported`).
+            _ => return Ok(false),
+        }
+        if !volume_file_present(
+            self.engine.as_ref(),
+            &self.store,
+            &record.volume_id,
+            Some(&record.snapshot_id),
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        self.store
+            .forget_unhashed_volume_quarantine(id, &record.snapshot_id)
+            .await
+            .map_err(|e| format!("cannot forget the record: {e}"))
+    }
+
     /// Reads the records and publishes their entries when they changed.
     /// Returns the records read.
     async fn publish(&self) -> Result<Vec<VolumeQuarantineRecord>, String> {
@@ -433,6 +504,41 @@ impl<E: Engine> Inner<E> {
         );
         wait
     }
+}
+
+/// Whether a file the node records for `volume_id`, other than the kept
+/// snapshot `except`, is present: a kept snapshot of the volume that is on
+/// disk and that the engine answers for. It shows the volume directory to be
+/// the real one (section 9).
+///
+/// # Errors
+///
+/// The store's error when the kept snapshots cannot be read.
+pub(super) async fn volume_file_present<E: Engine>(
+    engine: &E,
+    store: &NodeStore,
+    volume_id: &str,
+    except: Option<&str>,
+) -> Result<bool, String> {
+    let kept = store
+        .kept_snapshots_of(volume_id)
+        .await
+        .map_err(|e| format!("cannot read the kept snapshots: {e}"))?;
+    for kept in kept {
+        if Some(kept.snapshot.snapshot_id.as_str()) == except
+            || std::fs::symlink_metadata(&kept.snapshot.location).is_err()
+        {
+            continue;
+        }
+        if engine
+            .volume_changed_ranges(&RangesOf::Snapshot(kept.snapshot), None)
+            .await
+            .is_ok()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The `status_report.quarantines` entry of a recorded copy (section 5.3).

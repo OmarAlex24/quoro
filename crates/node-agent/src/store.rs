@@ -2292,6 +2292,43 @@ impl NodeStore {
         Ok(done.rows_affected() > 0)
     }
 
+    /// Forgets the record of a quarantined copy whose clone is gone before
+    /// it was hashed (section 9 step 2), in one transaction: its `quarantine`
+    /// row, only while it has no SHA-256 and still names `snapshot_id`, and
+    /// its kept snapshot. No file is touched. Returns whether the record
+    /// went: `false` once the copy has a hash, or is gone.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure; both records stay then.
+    pub async fn forget_unhashed_volume_quarantine(
+        &self,
+        quarantine_id: &str,
+        snapshot_id: &str,
+    ) -> Result<bool, AgentError> {
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        let gone = sqlx::query(
+            "DELETE FROM quarantine WHERE kind = ? AND quarantine_id = ? AND sha256 IS NULL \
+             AND snapshot_id = ?",
+        )
+        .bind(VOLUME_KIND)
+        .bind(quarantine_id)
+        .bind(snapshot_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_error)?;
+        if gone.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM kept_snapshots WHERE snapshot_id = ?")
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        tx.commit().await.map_err(store_error)?;
+        Ok(true)
+    }
+
     /// Forgets a quarantined copy an operator deleted, in one transaction:
     /// its kept snapshot and its `quarantine` row. The caller deleted the
     /// clone first.
@@ -5447,6 +5484,84 @@ mod tests {
             sha256: None,
         };
         (kept, record)
+    }
+
+    /// Section 9 step 2: only a record without a SHA-256 that still names
+    /// the snapshot is forgotten for a lost clone, with its kept snapshot.
+    #[tokio::test]
+    async fn only_an_unhashed_record_is_forgotten_for_a_lost_clone() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let (kept, record) = volume_copy("vol_a", "snap-1");
+        store
+            .record_volume_quarantine(&kept, &record)
+            .await
+            .unwrap();
+        let (hashed_kept, hashed) = volume_copy("vol_a", "snap-2");
+        store
+            .record_volume_quarantine(&hashed_kept, &hashed)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .set_quarantine_sha256(&hashed.quarantine_id, &"ab".repeat(32))
+                .await
+                .unwrap()
+        );
+
+        // A hashed record stays, and so does its kept snapshot.
+        assert!(
+            !store
+                .forget_unhashed_volume_quarantine(&hashed.quarantine_id, "snap-2")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .volume_quarantine(&hashed.quarantine_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.kept_snapshot("snap-2").await.unwrap().is_some());
+        // Another snapshot than the record's changes nothing.
+        assert!(
+            !store
+                .forget_unhashed_volume_quarantine(&record.quarantine_id, "snap-2")
+                .await
+                .unwrap()
+        );
+        assert!(store.kept_snapshot("snap-2").await.unwrap().is_some());
+
+        assert!(
+            store
+                .forget_unhashed_volume_quarantine(&record.quarantine_id, "snap-1")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .volume_quarantine(&record.quarantine_id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.kept_snapshot("snap-1").await.unwrap(), None);
+        // Once gone, nothing more.
+        assert!(
+            !store
+                .forget_unhashed_volume_quarantine(&record.quarantine_id, "snap-1")
+                .await
+                .unwrap()
+        );
+        let left: Vec<String> = store
+            .volume_quarantines()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|left| left.quarantine_id)
+            .collect();
+        assert_eq!(left, [hashed.quarantine_id]);
     }
 
     /// Section 9: a quarantined copy is recorded with its kept snapshot and

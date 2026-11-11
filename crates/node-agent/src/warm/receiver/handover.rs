@@ -431,25 +431,13 @@ impl<E: Engine + 'static> Inner<E> {
     /// the files of a directory that did not mount. Neither does the disk
     /// alone: a file left where a moved directory was is not in the engine's.
     async fn volume_files_present(&self, volume_id: &str) -> Result<bool, String> {
-        let kept = self
-            .store
-            .kept_snapshots_of(volume_id)
-            .await
-            .map_err(|e| format!("cannot read the kept snapshots: {e}"))?;
-        for kept in kept {
-            if std::fs::symlink_metadata(&kept.snapshot.location).is_err() {
-                continue;
-            }
-            if self
-                .engine
-                .volume_changed_ranges(&RangesOf::Snapshot(kept.snapshot), None)
-                .await
-                .is_ok()
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        crate::warm::quarantine::volume_file_present(
+            self.engine.as_ref(),
+            &self.store,
+            volume_id,
+            None,
+        )
+        .await
     }
 
     /// Compares the live file with the newest kept base (binding rule of

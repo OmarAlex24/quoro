@@ -26,7 +26,11 @@
 //!   gone; the next [`release`] of it finishes the job, because the engine
 //!   answers `Ok` for a snapshot that is already gone. Nothing forgets a
 //!   record because a file lookup came back empty: a volume pool that did not
-//!   mount, or a moved state directory, looks exactly like that.
+//!   mount, or a moved state directory, looks exactly like that. The one
+//!   exception is a quarantined copy whose clone is gone before it was
+//!   hashed: its record goes only when the engine answers `NotFound` for the
+//!   clone and another file of the volume shows the directory to be the real
+//!   one (section 9 step 2, [`crate::warm::quarantine`]).
 //!
 //! The first rule only holds for snapshots this store saw being created. A
 //! store that is new, older than the table, or lost and created again cannot
