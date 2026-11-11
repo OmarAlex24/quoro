@@ -6095,8 +6095,40 @@
       var(--lift-1);
   }
 
-  .acard-off {
-    opacity: 0.72;
+  /*
+   * A disabled agent, as the Nodes page draws a lost node: its drawings (the
+   * avatar, the lamp, the spark and the meter) dim and drain of colour; its
+   * name steps down to --ink-2, and every word keeps 4.5:1 in both themes.
+   */
+  .acard .acard-av,
+  .acard .spark canvas,
+  .acard .spark-wait,
+  .acard .meter canvas {
+    transition: filter var(--motion-change) var(--ease);
+  }
+
+  .acard .acard-t b {
+    transition: color var(--motion-change) var(--ease);
+  }
+
+  .acard .lamp {
+    transition:
+      background-color var(--motion-change) var(--ease),
+      box-shadow var(--motion-change) var(--ease),
+      outline-color var(--motion-change) var(--ease),
+      filter var(--motion-change) var(--ease);
+  }
+
+  .acard-off .acard-av,
+  .acard-off .lamp,
+  .acard-off .spark canvas,
+  .acard-off .spark-wait,
+  .acard-off .meter canvas {
+    filter: opacity(0.5) saturate(0.3);
+  }
+
+  .acard-off .acard-t b {
+    color: var(--ink-2);
   }
 
   .acard-h {
