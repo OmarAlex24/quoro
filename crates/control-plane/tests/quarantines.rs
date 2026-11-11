@@ -895,13 +895,8 @@ async fn bad_entries_are_skipped_and_the_rest_of_the_report_applies() {
         s.copy(&qrn(11), CREATED_AT, Some(sha('A'))),
         s.copy(&qrn(12), CREATED_AT, Some("a".repeat(63))),
         s.copy(&qrn(13), CREATED_AT, Some(format!("{}g", "a".repeat(63)))),
-        copy(
-            &qrn(14),
-            UNKNOWN_VOLUME,
-            &s.app_id,
-            CREATED_AT,
-            Some(sha('a')),
-        ),
+        // A copy of an unknown volume is not a bad entry: it is a copy of a
+        // volume that is gone (test 8).
         copy(
             &qrn(16),
             &s.volume_id,
@@ -1224,13 +1219,15 @@ async fn only_its_own_node_drops_a_deleting_record() {
     assert_eq!(log_of(&s.server, &kept).await.len(), 1);
 }
 
-/// Test 8: a copy of a volume that is not live is a bad entry. A copy
-/// reported for a volume already `deleting` gets no record, so the volume's
-/// node can still report it `deleted` and the row goes, with the rest of
-/// that report applied; once the volume is gone, the copy names an unknown
-/// volume and still gets none.
+/// Test 8: a copy of a volume that is gone or `deleting` gets its audit
+/// record and its event, once per `quarantine_id`, and no row (section 9,
+/// ADR 0316). The volume's node can still report it `deleted` and the row
+/// goes, with the rest of that report applied; a later report of the copy,
+/// once the volume is gone, writes nothing more. A copy of a volume never
+/// known is recorded the same way, and a copy that names another app than
+/// its volume's is still skipped.
 #[tokio::test]
-async fn a_copy_of_a_deleting_volume_is_never_recorded() {
+async fn a_copy_of_a_volume_that_is_gone_gets_its_record_and_event_once() {
     let mut s = Setup::new().await;
     let other_app = create_app(&s.server, &s.owner, &s.project_id, "other").await;
     let other_volume = insert_volume(&s.server, &other_app, &s.holder.node_id).await;
@@ -1243,10 +1240,70 @@ async fn a_copy_of_a_deleting_volume_is_never_recorded() {
     assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
     assert_eq!(s.get_volume().await["state"], "deleting");
 
+    // A copy that names another app than its volume's is a bad entry, and
+    // one without its hash waits for it.
     let id = qrn(1);
+    let wrong_app = copy(
+        &qrn(2),
+        &s.volume_id,
+        &other_app,
+        CREATED_AT,
+        Some(sha('b')),
+    );
+    let unhashed = s.copy(&qrn(3), CREATED_AT, None);
+    report_copies(&mut s.on_returning, vec![wrong_app, unhashed]).await;
+    assert_eq!(written(&s.server).await, (0, 0, 0, 0));
+
     let entry = s.copy(&id, CREATED_AT, Some(sha('a')));
     report_copies(&mut s.on_returning, vec![entry]).await;
-    assert_eq!(written(&s.server).await, (0, 0, 0, 0));
+    assert_eq!(
+        written(&s.server).await,
+        (0, 1, 1, 0),
+        "a record and an event, no row"
+    );
+    let facts = json!({
+        "app_id": s.app_id,
+        "volume_id": s.volume_id,
+        "node_id": s.returning.node_id,
+        "quarantine_id": id,
+        "size_bytes": SIZE,
+        "sha256": sha('a'),
+    });
+    assert_eq!(
+        audit_of(&s.server, "volume.quarantine").await,
+        [json!({
+            "actor_type": "system",
+            "actor_id": "volumes",
+            "channel": "system",
+            "scope": null,
+            "target_type": "volume",
+            "target_id": s.volume_id,
+            "project_id": null,
+            "params": facts,
+            "result": "ok",
+            "result_detail": null,
+            "change_seq": null,
+        })]
+    );
+    let events = events(&s.server).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0]["subject"],
+        json!({ "type": "volume", "id": s.volume_id })
+    );
+    assert_eq!(events[0]["project_id"], json!(s.project_id));
+    assert_eq!(events[0]["data"], facts);
+    // Not listed in the volume, so `deleteVolumeQuarantine` cannot reach it.
+    assert_eq!(s.get_volume().await["quarantines"], json!([]));
+
+    // The same copy again, while the volume still reads `deleting`.
+    let entry = s.copy(&id, CREATED_AT, Some(sha('a')));
+    report_copies(&mut s.on_returning, vec![entry]).await;
+    assert_eq!(
+        written(&s.server).await,
+        (0, 1, 1, 0),
+        "once per quarantine_id"
+    );
 
     // The holder removed the file and reports it, with its other volume.
     send(
@@ -1291,9 +1348,67 @@ async fn a_copy_of_a_deleting_volume_is_never_recorded() {
         "the other volume of the report applied"
     );
 
+    // Gone now: the copy is still recorded once only.
     let entry = s.copy(&id, CREATED_AT, Some(sha('a')));
     report_copies(&mut s.on_returning, vec![entry]).await;
-    assert_eq!(written(&s.server).await, (0, 0, 0, 0));
+    assert_eq!(written(&s.server).await, (0, 1, 1, 0));
+
+    // A copy of a volume the primary never knew gets its own record.
+    let unknown_volume = "vol_01JC9Z6Q5W8N3K4T7R2M999999";
+    let stranger = qrn(4);
+    let entry = copy(
+        &stranger,
+        unknown_volume,
+        &s.app_id,
+        CREATED_AT,
+        Some(sha('c')),
+    );
+    report_copies(&mut s.on_returning, vec![entry]).await;
+    assert_eq!(written(&s.server).await, (0, 2, 2, 0));
+    let records = audit_of(&s.server, "volume.quarantine").await;
+    assert_eq!(records[1]["target_id"], unknown_volume);
+    assert_eq!(records[1]["params"]["quarantine_id"], json!(stranger));
+}
+
+/// Test 8b: the once-per-`quarantine_id` rule holds across a restart of the
+/// primary, which keeps nothing of it in memory: the audit record is found.
+#[tokio::test]
+async fn a_gone_volume_copy_is_not_recorded_again_after_a_restart() {
+    let Setup {
+        server,
+        owner,
+        app_id,
+        volume_id,
+        returning,
+        on_holder,
+        mut on_returning,
+        ..
+    } = Setup::new().await;
+    let res = owner
+        .delete(server.url(&format!("/api/v1/volumes/{volume_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let id = qrn(1);
+    let entry = copy(&id, &volume_id, &app_id, CREATED_AT, Some(sha('a')));
+    report_copies(&mut on_returning, vec![entry.clone()]).await;
+    assert_eq!(written(&server).await, (0, 1, 1, 0));
+
+    drop(on_returning);
+    drop(on_holder);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.state.hub.is_connected(&returning.node_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let restarted = common::restart_reloading_tls(&server).await;
+    let mut on_returning = open(&restarted, &returning).await;
+    report_copies(&mut on_returning, vec![entry]).await;
+    assert_eq!(written(&restarted).await, (0, 1, 1, 0));
 }
 
 /// Test 9: a node with no copy to delete gets a spec without the

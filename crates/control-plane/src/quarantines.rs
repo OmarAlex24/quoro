@@ -8,8 +8,11 @@
 //! `status_report.quarantines`. The first time a report lists a copy with its
 //! `sha256`, [`apply_report`] records it: the row, its change-log entry, the
 //! system audit record `volume.quarantine` (`audit-log-format.md` section 3.8)
-//! and the event `volume.quarantined`, in one write transaction. A copy stays
-//! recorded until an operator deletes it with `deleteVolumeQuarantine`
+//! and the event `volume.quarantined`, in one write transaction. A copy of a
+//! volume that is gone or `deleting` gets the audit record and the event
+//! without a row, once per `quarantine_id` ([`record_gone`], section 9, ADR
+//! 0316): the row needs the volume and would hold back its deletion. A copy
+//! with a row stays recorded until an operator deletes it with `deleteVolumeQuarantine`
 //! ([`delete_copy`]), which sets `deleting_at` and puts the id in its node's
 //! `spec.quarantine_deletes` ([`deletes_on`]); the row goes once that node's
 //! report no longer lists the copy. `removeNode` drops every record of the
@@ -277,7 +280,8 @@ async fn apply(store: &Store, node_id: &str, reported: &[wire::QuarantineStatus]
         .collect();
     for entry in reported {
         let outcome = match new_copy(store.pool(), node_id, entry).await {
-            Ok(Some(copy)) => record_one(store, &actor, &copy).await,
+            Ok(Some(NewCopy::Row(copy))) => record_one(store, &actor, &copy).await,
+            Ok(Some(NewCopy::Gone(copy))) => record_gone_one(store, &actor, &copy).await,
             Ok(None) => continue,
             Err(error) => Err(error),
         };
@@ -335,6 +339,17 @@ async fn record_one(store: &Store, actor: &Actor, copy: &CopyRow) -> Result<bool
     Ok(recorded)
 }
 
+/// Records one copy of a volume that is gone in a write transaction of its
+/// own.
+async fn record_gone_one(store: &Store, actor: &Actor, copy: &CopyRow) -> Result<bool, Failure> {
+    let mut w = store.begin_write().await?;
+    let recorded = record_gone(&mut w.tx, actor, copy).await?;
+    if recorded {
+        w.commit().await?;
+    }
+    Ok(recorded)
+}
+
 /// Drops one record in a write transaction of its own.
 async fn drop_one(store: &Store, actor: &Actor, node_id: &str, id: &str) -> Result<bool, Failure> {
     let mut w = store.begin_write().await?;
@@ -345,14 +360,26 @@ async fn drop_one(store: &Store, actor: &Actor, node_id: &str, id: &str) -> Resu
     Ok(dropped)
 }
 
-/// The row a reported entry adds, or `None` when it adds nothing: a bad
-/// entry (logged and skipped), a copy whose hash the node is still
-/// computing, or one already recorded.
+/// What a reported entry adds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NewCopy {
+    /// A copy of a live volume of its own app: its row, with the audit
+    /// record and the event ([`record`]).
+    Row(CopyRow),
+    /// A copy of a volume that is gone or `deleting`: the audit record and
+    /// the event only, once per `quarantine_id` ([`record_gone`]). Its
+    /// `deleting_at` is never used.
+    Gone(CopyRow),
+}
+
+/// What a reported entry adds, or `None` when it adds nothing: a bad entry
+/// (logged and skipped), a copy whose hash the node is still computing, or
+/// one already recorded with a row.
 async fn new_copy(
     pool: &SqlitePool,
     node_id: &str,
     entry: &wire::QuarantineStatus,
-) -> Result<Option<CopyRow>, Failure> {
+) -> Result<Option<NewCopy>, Failure> {
     let id = entry.quarantine_id.as_str();
     if let Some(flaw) = flaw(entry) {
         warn_flaw(node_id, entry, flaw);
@@ -380,10 +407,7 @@ async fn new_copy(
         }
         return Ok(None);
     }
-    if !live_volume_of_app(pool, node_id, entry).await? {
-        return Ok(None);
-    }
-    Ok(Some(CopyRow {
+    let copy = CopyRow {
         id: id.to_string(),
         volume_id: entry.volume_id.clone(),
         app_id: entry.app_id.clone(),
@@ -392,7 +416,12 @@ async fn new_copy(
         sha256: sha256.to_string(),
         created_at: entry.created_at.clone(),
         deleting_at: None,
-    }))
+    };
+    Ok(match volume_of(pool, node_id, entry).await? {
+        Named::Live => Some(NewCopy::Row(copy)),
+        Named::Gone => Some(NewCopy::Gone(copy)),
+        Named::OtherApp => None,
+    })
 }
 
 /// Logs why a reported entry is skipped.
@@ -426,42 +455,34 @@ fn warn_flaw(node_id: &str, entry: &wire::QuarantineStatus, flaw: Flaw) {
     }
 }
 
-/// Whether the entry names a live volume of its own app; a warning
-/// otherwise. A volume is live while it exists and is not `deleting`.
-async fn live_volume_of_app(
+/// What the volume a reported copy names is, for that copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Named {
+    /// It exists, is not `deleting` and belongs to the copy's app.
+    Live,
+    /// It is gone, or `deleting`. A row naming a volume already `deleting`
+    /// would make the foreign key fail the volume sweep (`DELETE FROM
+    /// volumes` when its node reports it `deleted`), which the sweep must
+    /// never meet (migration 0011), so such a copy gets no row (ADR 0316).
+    Gone,
+    /// It belongs to another app than the copy's: a bad entry, skipped with
+    /// a warning.
+    OtherApp,
+}
+
+/// What the volume `entry` names is ([`Named`]). A gone volume's app is unknown, so
+/// the copy is taken as reported.
+async fn volume_of(
     pool: &SqlitePool,
     node_id: &str,
     entry: &wire::QuarantineStatus,
-) -> Result<bool, Failure> {
+) -> Result<Named, Failure> {
     let volume: Option<(String, String)> =
         sqlx::query_as("SELECT app_id, state FROM volumes WHERE id = ?")
             .bind(&entry.volume_id)
             .fetch_optional(pool)
             .await?;
-    match volume {
-        None => {
-            tracing::warn!(
-                node_id,
-                quarantine_id = %entry.quarantine_id,
-                volume_id = %entry.volume_id,
-                "a reported quarantined copy names an unknown volume; skipped"
-            );
-            Ok(false)
-        }
-        // `has_quarantines` only guards a delete that comes after a copy is
-        // recorded. A row naming a volume already `deleting` would make the
-        // foreign key fail the volume sweep (`DELETE FROM volumes` when its
-        // node reports it `deleted`), which the sweep must never meet
-        // (migration 0011).
-        Some((_, state)) if state == "deleting" => {
-            tracing::warn!(
-                node_id,
-                quarantine_id = %entry.quarantine_id,
-                volume_id = %entry.volume_id,
-                "a reported quarantined copy names a volume that is deleting; skipped"
-            );
-            Ok(false)
-        }
+    Ok(match volume {
         Some((app_id, _)) if app_id != entry.app_id => {
             tracing::warn!(
                 node_id,
@@ -470,10 +491,11 @@ async fn live_volume_of_app(
                 reported_app_id = %entry.app_id,
                 "a reported quarantined copy names another app than its volume's; skipped"
             );
-            Ok(false)
+            Named::OtherApp
         }
-        Some(_) => Ok(true),
-    }
+        Some((_, state)) if state != "deleting" => Named::Live,
+        _ => Named::Gone,
+    })
 }
 
 /// Records one copy in the caller's write transaction: the row, its
@@ -523,6 +545,63 @@ async fn record(
         copy.payload(),
     )
     .await?;
+    announce(conn, actor, copy, Some(change_seq)).await?;
+    Ok(true)
+}
+
+/// Records one copy of a volume that is gone or `deleting` in the caller's
+/// write transaction: the event `volume.quarantined` and the system audit
+/// record `volume.quarantine`, with no row and no change-log entry of its
+/// own (section 9, ADR 0316). Returns `false`, writing nothing, when the
+/// copy got its audit record before, also before a restart of the primary,
+/// or now has a row, or its volume is live since the read (the next report
+/// then records a row).
+async fn record_gone(
+    conn: &mut SqliteConnection,
+    actor: &Actor,
+    copy: &CopyRow,
+) -> Result<bool, Failure> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT id FROM volume_quarantines WHERE id = ?")
+        .bind(&copy.id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if row.is_some() {
+        return Ok(false);
+    }
+    let live: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM volumes WHERE id = ? AND state != 'deleting'")
+            .bind(&copy.volume_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if live.is_some() {
+        return Ok(false);
+    }
+    // Once per `quarantine_id`: the audit chain is the record, and
+    // `idx_audit_target` finds it by the volume.
+    let recorded: Option<(i64,)> = sqlx::query_as(
+        "SELECT seq FROM audit_log WHERE target_id = ? AND operation = 'volume.quarantine' \
+         AND json_extract(params, '$.quarantine_id') = ? LIMIT 1",
+    )
+    .bind(&copy.volume_id)
+    .bind(&copy.id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if recorded.is_some() {
+        return Ok(false);
+    }
+    announce(conn, actor, copy, None).await?;
+    Ok(true)
+}
+
+/// Emits `volume.quarantined` and appends the system audit record
+/// `volume.quarantine` for `copy`, with `change_seq` the row's change-log
+/// entry, or `None` for a copy without a row.
+async fn announce(
+    conn: &mut SqliteConnection,
+    actor: &Actor,
+    copy: &CopyRow,
+    change_seq: Option<i64>,
+) -> Result<(), Failure> {
     let project: Option<(String,)> = sqlx::query_as("SELECT project_id FROM apps WHERE id = ?")
         .bind(&copy.app_id)
         .fetch_optional(&mut *conn)
@@ -560,10 +639,10 @@ async fn record(
         request_id: quoro_types::new_id(quoro_types::Prefix::Request),
         result: Outcome::Ok,
         result_detail: None,
-        change_seq: Some(change_seq),
+        change_seq,
     };
     audit::append(&mut *conn, &record).await?;
-    Ok(true)
+    Ok(())
 }
 
 /// Drops the record of a copy `node_id` no longer reports, when it is still
