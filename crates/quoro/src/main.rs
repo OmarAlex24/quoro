@@ -17,6 +17,7 @@ mod node;
 mod null_engine;
 mod panel;
 mod privilege;
+mod rejoin;
 mod restore;
 mod serve;
 mod tls;
@@ -48,6 +49,10 @@ commands:
   node set-primary <url> [--config PATH] [--no-restart]
                                         point this enrolled node at its
                                         primary's new address
+  node rejoin [--config PATH] [--force --statement TEXT]
+                                        as root on a demoted primary: move its
+                                        control plane aside into a copy and
+                                        make the host a node again
   mcp stdio --context NAME [--url URL] [--fingerprint FINGERPRINT]
             [--key-file PATH] [--justification TEXT]
   mcp stdio --url URL --fingerprint FINGERPRINT --key-file PATH
@@ -350,13 +355,17 @@ fn stdio_options(
 
 /// `quoro node [--config PATH]`: the node agent alone, until SIGTERM.
 /// `quoro node set-primary <url> ...` points an enrolled node at a new
-/// primary address instead of running the agent.
+/// primary address instead of running the agent, and `quoro node rejoin`
+/// moves a demoted primary's control plane aside.
 async fn node_command(args: &[String]) -> ExitCode {
     if args
         .first()
         .is_some_and(|argument| argument == "set-primary")
     {
         return set_primary_command(&args[1..]).await;
+    }
+    if args.first().is_some_and(|argument| argument == "rejoin") {
+        return rejoin::command(&args[1..]).await;
     }
     let flags = match parse_flags(args, &["config"]) {
         Ok(flags) => flags,
@@ -442,7 +451,7 @@ fn flag_boolean(flags: &[(String, String)], name: &str) -> bool {
 }
 
 /// Loads `quoro.toml`, printing the failure under `command`.
-fn load_config(command: &str, path: &std::path::Path) -> Option<config::Config> {
+pub(crate) fn load_config(command: &str, path: &std::path::Path) -> Option<config::Config> {
     match config::Config::load(path) {
         Ok(config) => Some(config),
         Err(e) => {

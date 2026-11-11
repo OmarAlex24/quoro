@@ -107,6 +107,10 @@ sqlx = { version = "0.8", default-features = false, features = [
     "sqlite",
     "runtime-tokio",
 ] }
+# `quoro node rejoin` opens a SQLite side file without following a link
+# before it changes the file's owner; the version and features the node agent
+# already uses.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 # `quoro restore` wipes the credentials file's text and its secret access key
 # from memory when they are dropped.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
