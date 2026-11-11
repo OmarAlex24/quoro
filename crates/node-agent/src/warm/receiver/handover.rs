@@ -44,8 +44,10 @@
 //! is lost without it, and it records why the file may go: the `qrn_` id of
 //! the copy that keeps its writes, written in the transaction of the copy's
 //! records; `unchanged`, on proof; or `gone`. A run that finds the mark skips
-//! the comparison and the quarantine and goes on with step 4, once the copy
-//! the mark names still has its clone.
+//! the comparison and the quarantine and goes on with step 4: for a copy,
+//! once the copy the mark names still has its clone; for `unchanged` and
+//! `gone`, once another file the node records for the volume shows the
+//! volume directory to be the real one, as it did when the mark was written.
 //!
 //! **A missing file proves nothing by itself**: a volume directory that did
 //! not mount, or a new empty pool, looks exactly like it. So the live file
@@ -291,9 +293,16 @@ impl<E: Engine + 'static> Inner<E> {
             }
             return HandOver::Nothing;
         }
-        if let Some(HandOverMark::Copy(quarantine_id)) = &mark
-            && let Err(outcome) = self.copy_kept(volume_id, quarantine_id).await
-        {
+        let kept = match &mark {
+            Some(HandOverMark::Copy(quarantine_id)) => {
+                self.copy_kept(volume_id, quarantine_id).await
+            }
+            Some(HandOverMark::Unchanged | HandOverMark::Gone) => {
+                self.marked_on_real_directory(volume_id).await
+            }
+            None => Ok(()),
+        };
+        if let Err(outcome) = kept {
             return outcome;
         }
         match self
@@ -375,9 +384,12 @@ impl<E: Engine + 'static> Inner<E> {
     ///   it was hashed (section 9 step 2). The live file is all that keeps
     ///   its writes now, so the mark goes and the next pass compares the
     ///   file again.
+    ///
+    /// Only the clone's path is read from the copy's row, so a row whose
+    /// other fields cannot be read does not hold the hand-over back.
     async fn copy_kept(&self, volume_id: &str, quarantine_id: &str) -> Result<(), HandOver> {
-        let record = match self.store.volume_quarantine(quarantine_id).await {
-            Ok(Some(record)) => record,
+        let clone = match self.store.volume_quarantine_path(quarantine_id).await {
+            Ok(Some(clone)) => clone,
             Ok(None) => {
                 self.clear_mark(volume_id).await?;
                 return Err(HandOver::Failed(format!(
@@ -391,7 +403,7 @@ impl<E: Engine + 'static> Inner<E> {
                 )));
             }
         };
-        match std::fs::symlink_metadata(&record.path) {
+        match std::fs::symlink_metadata(&clone) {
             Ok(_) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -416,6 +428,30 @@ impl<E: Engine + 'static> Inner<E> {
             "the clone of the quarantined copy {quarantine_id} the hand-over mark stood for is \
              missing; its record stays, and the next pass compares the live file again"
         )))
+    }
+
+    /// Before a file marked `unchanged` or `gone` goes. The mark was written
+    /// while another file the node records for the volume showed the volume
+    /// directory to be the real one; this run may not see that directory, as
+    /// after a restart with a state disk that did not mount. The engine
+    /// deletes a missing file without an error, so the row would go while
+    /// the real file comes back with no row. The file goes only while such a
+    /// file shows the directory to be the real one again; otherwise nothing
+    /// changes, the mark stands, and the run fails until the files are back.
+    async fn marked_on_real_directory(&self, volume_id: &str) -> Result<(), HandOver> {
+        if self
+            .volume_files_present(volume_id)
+            .await
+            .map_err(HandOver::Failed)?
+        {
+            return Ok(());
+        }
+        Err(HandOver::Failed(
+            "the hand-over mark stands, but no other file the node records for the volume is \
+             there: the volume directory may not be the real one, so nothing changes until the \
+             files are back"
+                .to_owned(),
+        ))
     }
 
     async fn clear_mark(&self, volume_id: &str) -> Result<(), HandOver> {
