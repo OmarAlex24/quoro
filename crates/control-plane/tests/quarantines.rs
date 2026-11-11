@@ -896,7 +896,9 @@ async fn bad_entries_are_skipped_and_the_rest_of_the_report_applies() {
         s.copy(&qrn(12), CREATED_AT, Some("a".repeat(63))),
         s.copy(&qrn(13), CREATED_AT, Some(format!("{}g", "a".repeat(63)))),
         // A malformed `volume_id`, also one far too long for an audit
-        // record, and a malformed `app_id`, are bad entries.
+        // record, and a malformed `app_id` far too long for one, are bad
+        // entries. The `app_id` one names an unknown volume, so only the id
+        // check keeps it out of an audit record.
         copy(
             &qrn(20),
             &format!("vol_{}", "A".repeat(5000)),
@@ -913,8 +915,8 @@ async fn bad_entries_are_skipped_and_the_rest_of_the_report_applies() {
         ),
         copy(
             &qrn(22),
-            &s.volume_id,
-            "app_short",
+            UNKNOWN_VOLUME,
+            &format!("app_{}", "A".repeat(5000)),
             CREATED_AT,
             Some(sha('a')),
         ),

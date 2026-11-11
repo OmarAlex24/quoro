@@ -550,11 +550,7 @@ async fn record(
     actor: &Actor,
     copy: &CopyRow,
 ) -> Result<bool, Failure> {
-    let status: Option<(String,)> = sqlx::query_as("SELECT status FROM nodes WHERE id = ?")
-        .bind(&copy.node_id)
-        .fetch_optional(&mut *conn)
-        .await?;
-    if !status.is_some_and(|(status,)| status != "removed") {
+    if !in_cluster(&mut *conn, &copy.node_id).await? {
         return Ok(false);
     }
     let exists: Option<(String,)> =
@@ -605,12 +601,16 @@ async fn record(
 /// own (section 9, ADR 0316). Returns `false`, writing nothing, when the
 /// copy got its audit record before, also before a restart of the primary,
 /// or now has a row, or its volume is live since the read (the next report
-/// then records a row).
+/// then records a row), or its node was removed since: a record would name
+/// a node that is no longer in the cluster.
 async fn record_gone(
     conn: &mut SqliteConnection,
     actor: &Actor,
     copy: &CopyRow,
 ) -> Result<bool, Failure> {
+    if !in_cluster(&mut *conn, &copy.node_id).await? {
+        return Ok(false);
+    }
     let row: Option<(String,)> = sqlx::query_as("SELECT id FROM volume_quarantines WHERE id = ?")
         .bind(&copy.id)
         .fetch_optional(&mut *conn)
@@ -632,6 +632,17 @@ async fn record_gone(
     }
     announce(conn, actor, copy, None).await?;
     Ok(true)
+}
+
+/// Whether `node_id` is still in the cluster: it exists and is not
+/// `removed`. Read inside the recording transaction, so a report still being
+/// applied when `removeNode` commits records nothing afterwards.
+async fn in_cluster(conn: &mut SqliteConnection, node_id: &str) -> Result<bool, Failure> {
+    let status: Option<(String,)> = sqlx::query_as("SELECT status FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(conn)
+        .await?;
+    Ok(status.is_some_and(|(status,)| status != "removed"))
 }
 
 /// Whether `copy` already has its audit record `volume.quarantine`, also
@@ -1521,6 +1532,33 @@ mod tests {
         assert_eq!(
             (log_entries(&store).await.len(), audited(&store).await),
             before
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_of_a_gone_volume_reported_after_the_drop_records_nothing() {
+        let store = store_with_copies().await;
+        remove_node(&store, "nod_a").await;
+        let before = (log_entries(&store).await.len(), audited(&store).await);
+        // A copy of a volume the primary never knew, never recorded before.
+        let gone = wire::QuarantineStatus {
+            volume_id: "vol_01JC9Z6Q5W8N3K4T7R2M999999".to_string(),
+            ..late_copy()
+        };
+        let applied = apply(&store, "nod_a", &[gone]).await;
+        assert_eq!(applied, Applied::default());
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                log_entries(&store).await.len(),
+                audited(&store).await,
+                events
+            ),
+            (before.0, before.1, 0),
+            "no audit record and no event about a removed node"
         );
     }
 
