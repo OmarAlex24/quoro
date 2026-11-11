@@ -1,0 +1,122 @@
+Contrast of every text on the lost node card while a loss is simulated (Nodes page, mock mode, 1440 px).
+Measured in Chromium with lost-card.mjs: computed colours, composited bottom-up over each ancestor fill (and either end of the card face gradient, the worse kept),
+with ancestor opacity applied; VM cell names also against their dot pattern. Threshold 4.5:1 (3:1 for 24 px, or 18.66 px bold). "drawings" shows the card itself carries no opacity or filter.
+Before this change the same instrument read 2.06–4.50:1 (dark and light), every row but three below 4.5.
+
+
+dark theme, 1440 px, lost card (54 rows) — lowest 6.20:1, 0 below threshold
+  drawings: {"cardOpacity":"1","cardFilter":"none","canvasFilter":"opacity(0.5) saturate(0.3)","lampFilter":"opacity(0.5) saturate(0.3)","cellBg":"oklab(0.217522 -0.000859014 -0.0164527)"}
+  ratio    need  px/wt     text                                             where
+  7.15:1   4.5   17/620    lab-3                                            div.ncard-h > h2.ncard-name
+  8.07:1   4.5   11.5/560  primary                                          div.ncard-h > span.tag
+  8.07:1   4.5   11.5/560  node                                             div.ncard-h > span.tag
+  7.15:1   4.5   12.5/400  Simulated: lost                                  div.ncard-h > span.ncard-conn
+  7.15:1   4.5   10.75/430 10.0.0.3                                         div.ncard-meta > span > code.type-code
+  7.15:1   4.5   12.5/400  KVM                                              div.ncard-meta > span
+  7.15:1   4.5   12.5/400  engine 0.1.0                                     div.ncard-meta > span > span.ncard-ver
+  7.15:1   4.5   10.75/430 0.1.0                                            span > span.ncard-ver > code.type-code
+  7.15:1   4.5   12.5/400  · agent 0.1.0                                    div.ncard-meta > span > span.ncard-ver
+  7.15:1   4.5   10.75/430 0.1.0                                            span > span.ncard-ver > code.type-code
+  7.15:1   4.5   12.5/600  CPU                                              div.meter > div.meter-h > b
+  7.15:1   4.5   12.5/400  14 of 16 reserved                                div.meter > div.meter-h > span
+  7.15:1   4.5   12.5/600  Memory                                           div.meter > div.meter-h > b
+  7.15:1   4.5   12.5/400  13 of 24 GiB reserved                            div.meter > div.meter-h > span
+  7.15:1   4.5   12.5/600  Disk                                             div.meter > div.meter-h > b
+  7.15:1   4.5   12.5/400  60 of 200 GiB reserved                           div.meter > div.meter-h > span
+  7.15:1   4.5   11.5/400  The mark is what is in use right now             div.ncard-b > div.ncard-mt > p.ncard-u
+  8.07:1   4.5   13.5/600  CPU                                              figure.chart > figcaption.chart-h > b
+  8.07:1   4.5   12/400    busy                                             figure.chart > figcaption.chart-h > span
+  8.07:1   4.5   12.5/600  25.2%                                            figure.chart > figcaption.chart-h > span.chart-v
+  8.07:1   4.5   13.5/600  Memory                                           figure.chart > figcaption.chart-h > b
+  8.07:1   4.5   12/400    in use                                           figure.chart > figcaption.chart-h > span
+  8.07:1   4.5   12.5/600  14.7 of 24 GiB                                   figure.chart > figcaption.chart-h > span.chart-v
+  7.15:1   4.5   12.5/600  11 VMs · 10 apps                                 div.ncard-r > div.ncard-r-h > b
+  7.15:1   4.5   12.5/400  sized by vCPU                                    div.ncard-r > div.ncard-r-h > span
+  7.55:1   4.5   11/400    blog-1                                           ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    blog-1 (on a dot)                                ul.vcells > li.vcell > span
+  7.55:1   4.5   11/400    docs-site-1                                      ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    docs-site-1 (on a dot)                           ul.vcells > li.vcell > span
+  7.55:1   4.5   11/400    web-1                                            ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    web-1 (on a dot)                                 ul.vcells > li.vcell > span
+  7.55:1   4.5   11/400    api-1                                            ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    api-1 (on a dot)                                 ul.vcells > li.vcell > span
+  7.55:1   4.5   11/400    ci-runner                                        ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    ci-runner (on a dot)                             ul.vcells > li.vcell > span
+  7.55:1   4.5   11/400    inventory-1                                      ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    inventory-1 (on a dot)                           ul.vcells > li.vcell > span
+  7.55:1   4.5   11/400    orders-1                                         ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    orders-1 (on a dot)                              ul.vcells > li.vcell > span
+  7.55:1   4.5   11/400    analytics-1                                      ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    analytics-1 (on a dot)                           ul.vcells > li.vcell > span
+  7.55:1   4.5   11/400    media-1                                          ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    media-1 (on a dot)                               ul.vcells > li.vcell > span
+  7.55:1   4.5   11/400    search-1                                         ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    search-1 (on a dot)                              ul.vcells > li.vcell > span
+  7.55:1   4.5   11/400    billing-1                                        ul.vcells > li.vcell > span
+  6.20:1   4.5   11/400    billing-1 (on a dot)                             ul.vcells > li.vcell > span
+  7.79:1   4.5   12.5/400  Change log in sync                               div.ncard-f > span
+  7.79:1   4.5   12.5/400  seq 1                                            div.ncard-f > span
+  7.79:1   4.5   12.5/560  1                                                div.ncard-f > span > b
+  7.79:1   4.5   12.5/400  lag 0                                            div.ncard-f > span
+  7.79:1   4.5   12.5/560  0                                                div.ncard-f > span > b
+  7.79:1   4.5   12.5/400  revision 1 applied                               div.ncard-f > span
+  7.79:1   4.5   12.5/560  1                                                div.ncard-f > span > b
+
+light theme, 1440 px, lost card (54 rows) — lowest 5.59:1, 0 below threshold
+  drawings: {"cardOpacity":"1","cardFilter":"none","canvasFilter":"opacity(0.5) saturate(0.3)","lampFilter":"opacity(0.5) saturate(0.3)","cellBg":"oklab(0.944873 -0.00102831 -0.00635682)"}
+  ratio    need  px/wt     text                                             where
+  7.60:1   4.5   17/620    lab-3                                            div.ncard-h > h2.ncard-name
+  6.96:1   4.5   11.5/560  primary                                          div.ncard-h > span.tag
+  6.96:1   4.5   11.5/560  node                                             div.ncard-h > span.tag
+  7.60:1   4.5   12.5/400  Simulated: lost                                  div.ncard-h > span.ncard-conn
+  7.60:1   4.5   10.75/430 10.0.0.3                                         div.ncard-meta > span > code.type-code
+  7.60:1   4.5   12.5/400  KVM                                              div.ncard-meta > span
+  7.60:1   4.5   12.5/400  engine 0.1.0                                     div.ncard-meta > span > span.ncard-ver
+  7.60:1   4.5   10.75/430 0.1.0                                            span > span.ncard-ver > code.type-code
+  7.60:1   4.5   12.5/400  · agent 0.1.0                                    div.ncard-meta > span > span.ncard-ver
+  7.60:1   4.5   10.75/430 0.1.0                                            span > span.ncard-ver > code.type-code
+  7.60:1   4.5   12.5/600  CPU                                              div.meter > div.meter-h > b
+  7.60:1   4.5   12.5/400  14 of 16 reserved                                div.meter > div.meter-h > span
+  7.60:1   4.5   12.5/600  Memory                                           div.meter > div.meter-h > b
+  7.60:1   4.5   12.5/400  13 of 24 GiB reserved                            div.meter > div.meter-h > span
+  7.60:1   4.5   12.5/600  Disk                                             div.meter > div.meter-h > b
+  7.60:1   4.5   12.5/400  60 of 200 GiB reserved                           div.meter > div.meter-h > span
+  7.60:1   4.5   11.5/400  The mark is what is in use right now             div.ncard-b > div.ncard-mt > p.ncard-u
+  6.96:1   4.5   13.5/600  CPU                                              figure.chart > figcaption.chart-h > b
+  6.96:1   4.5   12/400    busy                                             figure.chart > figcaption.chart-h > span
+  6.96:1   4.5   12.5/600  25.9%                                            figure.chart > figcaption.chart-h > span.chart-v
+  6.96:1   4.5   13.5/600  Memory                                           figure.chart > figcaption.chart-h > b
+  6.96:1   4.5   12/400    in use                                           figure.chart > figcaption.chart-h > span
+  6.96:1   4.5   12.5/600  14.8 of 24 GiB                                   figure.chart > figcaption.chart-h > span.chart-v
+  7.60:1   4.5   12.5/600  11 VMs · 10 apps                                 div.ncard-r > div.ncard-r-h > b
+  7.60:1   4.5   12.5/400  sized by vCPU                                    div.ncard-r > div.ncard-r-h > span
+  6.47:1   4.5   11/400    blog-1                                           ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    blog-1 (on a dot)                                ul.vcells > li.vcell > span
+  6.47:1   4.5   11/400    docs-site-1                                      ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    docs-site-1 (on a dot)                           ul.vcells > li.vcell > span
+  6.47:1   4.5   11/400    web-1                                            ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    web-1 (on a dot)                                 ul.vcells > li.vcell > span
+  6.47:1   4.5   11/400    api-1                                            ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    api-1 (on a dot)                                 ul.vcells > li.vcell > span
+  6.47:1   4.5   11/400    ci-runner                                        ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    ci-runner (on a dot)                             ul.vcells > li.vcell > span
+  6.47:1   4.5   11/400    inventory-1                                      ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    inventory-1 (on a dot)                           ul.vcells > li.vcell > span
+  6.47:1   4.5   11/400    orders-1                                         ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    orders-1 (on a dot)                              ul.vcells > li.vcell > span
+  6.47:1   4.5   11/400    analytics-1                                      ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    analytics-1 (on a dot)                           ul.vcells > li.vcell > span
+  6.47:1   4.5   11/400    media-1                                          ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    media-1 (on a dot)                               ul.vcells > li.vcell > span
+  6.47:1   4.5   11/400    search-1                                         ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    search-1 (on a dot)                              ul.vcells > li.vcell > span
+  6.47:1   4.5   11/400    billing-1                                        ul.vcells > li.vcell > span
+  5.59:1   4.5   11/400    billing-1 (on a dot)                             ul.vcells > li.vcell > span
+  7.34:1   4.5   12.5/400  Change log in sync                               div.ncard-f > span
+  7.34:1   4.5   12.5/400  seq 1                                            div.ncard-f > span
+  7.34:1   4.5   12.5/560  1                                                div.ncard-f > span > b
+  7.34:1   4.5   12.5/400  lag 0                                            div.ncard-f > span
+  7.34:1   4.5   12.5/560  0                                                div.ncard-f > span > b
+  7.34:1   4.5   12.5/400  revision 1 applied                               div.ncard-f > span
+  7.34:1   4.5   12.5/560  1                                                div.ncard-f > span > b
+
