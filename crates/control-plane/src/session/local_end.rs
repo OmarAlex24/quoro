@@ -1473,6 +1473,14 @@ mod tests {
         }
     }
 
+    /// Each frame, if any, is the held grant of the row at token 4, `local`,
+    /// with no `ping`: no same-token `local` grant went out.
+    fn new_token_grants_only(frames: &[Value]) {
+        if !frames.is_empty() {
+            new_token_grants(frames);
+        }
+    }
+
     /// The row at token 4, `local` with the mark, written by a grant its
     /// holder never took: a step-4 row whose new-token grant is held
     /// ("Grants of a marked row"). R writes nothing over it, and its newest
@@ -1921,7 +1929,9 @@ mod tests {
     /// new token, `local` at 4 with the mark, after that token's grant went
     /// out on the holder's session: R writes nothing, and the row is owed no
     /// same-token `local` grant, so the sent grant's entry stays as it was
-    /// and no `local` grant is held in its place. Nothing more goes out.
+    /// and no `local` grant is held in its place. No `ping` follows: the
+    /// hub's own held-grant task may still deliver the new-token grant it
+    /// attempted alongside the test's, but no same-token grant goes out.
     #[tokio::test]
     async fn leaving_warm_after_a_sent_new_token_grant_holds_no_local_grant() {
         let f = fixture("warm", "local", Some(D as i64), true).await;
@@ -1948,7 +1958,7 @@ mod tests {
             "the sent grant's entry stays"
         );
         hub.attempt_held().await;
-        assert!(queued(&mut on).is_empty());
+        new_token_grants_only(&queued(&mut on));
         assert!(!hub.grant_pending(LEASE));
         f.done();
     }
