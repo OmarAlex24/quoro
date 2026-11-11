@@ -594,6 +594,11 @@ struct HubInner {
     /// Free space on the volume filesystem each node last reported
     /// (`status_report.disk_free_gb`, section 5.3).
     disk_free_gb: Mutex<HashMap<String, f64>>,
+    /// The apps whose failover or switchover runs in this process, in
+    /// memory only (`in_progress`, [`crate::failover::Running`]). A source
+    /// that reports `frozen: true` for an app not in it gets
+    /// `switchover_thaw` ([`NodeHub::thaw_unclaimed`]).
+    running: crate::failover::Running,
     /// The revoked leases each last holder released, in memory only: a
     /// restore grants the lease to its target only once its holder did
     /// (section 5.13, issue #392).
@@ -676,6 +681,9 @@ pub enum Fault {
     /// last support check and before it writes the grant: the hub's support
     /// turns to none from then on.
     FailoverSupportLapse { app_id: String },
+    /// The next switchover of `app_id` waits at most one second for the
+    /// source's answer to `switchover_freeze`.
+    ShortFreezeBound { app_id: String },
 }
 
 /// A test seam that holds one node's next snapshot after it is built and
@@ -769,6 +777,7 @@ impl NodeHub {
             warm_facts: Mutex::new(HashMap::new()),
             warm_named: Mutex::new(HashMap::new()),
             disk_free_gb: Mutex::new(HashMap::new()),
+            running: crate::failover::Running::default(),
             releases: leases::Releases::default(),
             unrecorded_failures: crate::fences::UnrecordedFailures::default(),
             authority,
@@ -1510,6 +1519,92 @@ impl NodeHub {
     /// only (migration 0011), so it is empty after a restart until the nodes
     /// report again.
     #[must_use]
+    /// The apps whose failover or switchover runs in this process.
+    pub(crate) fn running(&self) -> &crate::failover::Running {
+        &self.0.running
+    }
+
+    /// Sends `node_id` `switchover_thaw` for `app_id`'s VM `vm_id` and waits
+    /// for its answer, for at most [`crate::switchover::THAW_WAIT`]
+    /// (section 5.17). The node answers `ok` whether or not the VM was
+    /// frozen.
+    ///
+    /// # Errors
+    ///
+    /// Why the node did not answer `ok`.
+    pub(crate) async fn thaw(
+        &self,
+        node_id: &str,
+        app_id: &str,
+        vm_id: &str,
+    ) -> Result<(), String> {
+        let result = self
+            .command(
+                node_id,
+                "switchover_thaw",
+                serde_json::json!({ "app_id": app_id, "vm_id": vm_id }),
+                crate::switchover::THAW_WAIT,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if result.status == quoro_proto::CommandStatus::Ok {
+            return Ok(());
+        }
+        Err(result
+            .error
+            .map(|error| error.message)
+            .or(result.detail)
+            .unwrap_or_else(|| "the node refused the thaw".to_owned()))
+    }
+
+    /// Section 5.17: a source that reports `frozen: true` for an app with no
+    /// failover or switchover running in this process, as after a primary
+    /// restart, gets `switchover_thaw`. Each one goes out from its own task:
+    /// its answer arrives on the session that is applying this report.
+    ///
+    /// A switchover that stopped after its revoke left the lease revoked:
+    /// the session start sent that revoke right after `welcome`, before this
+    /// report was read, so the node handles the thaw after it. When that
+    /// revoke's fence succeeded, the thaw finds nothing frozen and the VM
+    /// stays stopped. A revoke answered `fence_failed` has not confirmed the
+    /// stop, and this thaw does not cover that case.
+    fn thaw_unclaimed(&self, node_id: &str, report: &[wire::WarmStatus]) {
+        for entry in report {
+            if entry.role != wire::WarmRole::Source
+                || entry.frozen != Some(true)
+                || self.0.running.contains(&entry.app_id)
+            {
+                continue;
+            }
+            let hub = self.clone();
+            let node_id = node_id.to_owned();
+            let app_id = entry.app_id.clone();
+            tokio::spawn(async move {
+                let vm_id: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
+                    "SELECT id FROM vms WHERE app_id = ? AND node_id = ? ORDER BY id LIMIT 1",
+                )
+                .bind(&app_id)
+                .bind(&node_id)
+                .fetch_optional(hub.0.store.pool())
+                .await;
+                let vm_id = match vm_id {
+                    Ok(Some(vm_id)) => vm_id,
+                    Ok(None) => {
+                        tracing::warn!(%app_id, %node_id, "a node reports a frozen app with no VM on it: no thaw sent");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%app_id, %node_id, %error, "cannot read the VM of a frozen app: no thaw sent");
+                        return;
+                    }
+                };
+                if let Err(error) = hub.thaw(&node_id, &app_id, &vm_id).await {
+                    tracing::warn!(%app_id, %node_id, %error, "a frozen source did not answer switchover_thaw");
+                }
+            });
+        }
+    }
+
     pub(crate) fn warm_reports(&self) -> HashMap<String, Vec<wire::WarmStatus>> {
         self.0
             .warm_reports
@@ -5543,6 +5638,7 @@ async fn apply_status_report(
 ) -> Result<(), String> {
     // First, so a database error on a VM below never loses it.
     let kept = hub.apply_warm_report(node_id, &report.warm);
+    hub.thaw_unclaimed(node_id, &report.warm);
     hub.listed_copies().replace(node_id, &report.quarantines);
     if !kept.is_empty() {
         hub.recheck_kept_copies(node_id, &kept).await;
