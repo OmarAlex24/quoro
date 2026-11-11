@@ -50,9 +50,10 @@ pub struct Store {
     /// ([`Store::change_log_head`]).
     head: Arc<watch::Sender<u64>>,
     /// Whether this primary is demoted (`node-agent-protocol.md` section
-    /// 7.4, ADR 0230). Set once, by [`Store::demote`], while the writer gate
-    /// is held, and never cleared: from then on [`Store::begin_write`]
-    /// refuses. Readable without the database.
+    /// 7.4, ADR 0230). Set once, by [`Store::demote`], before it takes the
+    /// writer gate and before the `meta` write, and never cleared: from then
+    /// on [`Store::begin_write`] and [`WriteTx::commit`] refuse. Readable
+    /// without the database.
     demoted: Arc<watch::Sender<bool>>,
     /// The `meta.demoted_by_term` record of the demotion, and its retry
     /// until it is recorded ([`Store::demote`]).
@@ -60,9 +61,8 @@ pub struct Store {
     /// What [`Store::stops_for_demotion`] stopped, by name: a loop's own stop
     /// signal ([`Store::stopped_for_demotion`]).
     stopped: Arc<watch::Sender<Vec<String>>>,
-    /// Test seam: the next demotion waits here, after its `meta` write and
-    /// before it sets the flag, with the gate held
-    /// ([`Store::hold_next_demotion`]).
+    /// Test seam: the next demotion waits here, with the flag set and the
+    /// gate held, before its `meta` write ([`Store::hold_next_demotion`]).
     demotion_hold: Arc<std::sync::Mutex<Option<Arc<DemotionHold>>>>,
 }
 
@@ -73,12 +73,20 @@ pub const DEMOTION_RETRY_FIRST: Duration = Duration::from_secs(5);
 /// The longest wait between two retries of an unrecorded demotion.
 pub const DEMOTION_RETRY_MAX: Duration = Duration::from_secs(60);
 
-/// How far the demotion got with `meta.demoted_by_term`. Read and written
-/// only with the writer gate held, but the retry task reads `recorded` to
-/// stop.
+/// How far the demotion got with `meta.demoted_by_term`. The demoted flag
+/// is set before any of it: [`Store::demote`] sets the flag first, keeps
+/// `node_term`, and only then takes the writer gate to write `meta`. The
+/// rest is read and written with the gate held, but the retry task reads
+/// `recorded` to stop.
 struct DemotionRecord {
     /// Whether `meta.demoted_by_term` is recorded.
     recorded: AtomicBool,
+    /// The first `node_term` a `stale_term` carried, kept before the gate is
+    /// taken. Every attempt, a later `stale_term`'s, the retry task's and the
+    /// one at shutdown, passes this one, so an attempt that never got far
+    /// enough to choose a term still records the node's term. A `stale_term`
+    /// without a term keeps nothing, so a later one with a term is kept.
+    node_term: std::sync::Mutex<Option<u64>>,
     /// The term the first attempt that could compute one chose. Every later
     /// attempt, the retry task's and a later `stale_term`'s, records this one,
     /// so the two never record different terms.
@@ -94,6 +102,7 @@ impl Default for DemotionRecord {
     fn default() -> Self {
         Self {
             recorded: AtomicBool::new(false),
+            node_term: std::sync::Mutex::new(None),
             term: std::sync::Mutex::new(None),
             retrying: AtomicBool::new(false),
             first_retry_ms: AtomicU64::new(
@@ -103,7 +112,8 @@ impl Default for DemotionRecord {
     }
 }
 
-/// The error [`Store::begin_write`] returns once the primary is demoted.
+/// The error [`Store::begin_write`] and [`WriteTx::commit`] return once the
+/// primary is demoted.
 pub const DEMOTED_REFUSAL: &str =
     "this primary is demoted: a higher term exists, and it writes nothing more";
 
@@ -116,8 +126,8 @@ pub enum Demotion {
     NotRecorded,
 }
 
-/// A test seam that holds the next demotion after its `meta` write and before
-/// it sets the demoted flag, with the writer gate still held.
+/// A test seam that holds the next demotion with the demoted flag set and the
+/// writer gate held, before its `meta` write.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct DemotionHold {
@@ -126,12 +136,12 @@ pub struct DemotionHold {
 }
 
 impl DemotionHold {
-    /// Waits until the held demotion has written `meta`.
+    /// Waits until the held demotion has set the flag and holds the gate.
     pub async fn reached(&self) {
         self.reached.notified().await;
     }
 
-    /// Lets the held demotion go on to set the flag and release the gate.
+    /// Lets the held demotion go on to write `meta` and release the gate.
     pub fn release(&self) {
         self.release.notify_one();
     }
@@ -142,6 +152,7 @@ impl DemotionHold {
 pub struct WriteTx {
     pub tx: Transaction<'static, Sqlite>,
     head: Arc<watch::Sender<u64>>,
+    demoted: Arc<watch::Sender<bool>>,
     _gate: OwnedMutexGuard<()>,
 }
 
@@ -157,11 +168,23 @@ impl WriteTx {
     /// watch where it was: the commit itself is not refused, and the next
     /// commit raises the watch past it.
     ///
+    /// Once the primary is demoted it rolls back instead, and the watch stays
+    /// where it was: a transaction opened before the demotion commits
+    /// nothing after it (section 7.4). The flag is read right before
+    /// `COMMIT`, so only a commit already under way when it is set lands.
+    ///
     /// # Errors
     ///
-    /// The database error from `COMMIT`.
+    /// [`DEMOTED_REFUSAL`] once the primary is demoted, or the database error
+    /// from `COMMIT`.
     pub async fn commit(mut self) -> Result<(), sqlx::Error> {
         let head = head_of(&mut self.tx).await;
+        if *self.demoted.borrow() {
+            if let Err(error) = self.tx.rollback().await {
+                tracing::warn!(%error, "cannot roll back a write refused for the demotion");
+            }
+            return Err(sqlx::Error::Protocol(DEMOTED_REFUSAL.to_string()));
+        }
         self.tx.commit().await?;
         match head {
             Ok(seq) => raise(&self.head, seq),
@@ -382,8 +405,10 @@ impl Store {
     ///
     /// Once the primary is demoted it refuses, after it acquired the gate,
     /// and opens no transaction (section 7.4: a demoted primary writes
-    /// nothing more). A writer queued on the gate when the demotion took it
-    /// is refused too, because the flag is set before the gate is released.
+    /// nothing more). A writer queued on the gate when the demotion started
+    /// is refused too, because the flag is set before the demotion even
+    /// waits for the gate; one that holds the gate then is refused at
+    /// [`WriteTx::commit`].
     ///
     /// # Errors
     ///
@@ -398,6 +423,7 @@ impl Store {
         Ok(WriteTx {
             tx,
             head: Arc::clone(&self.head),
+            demoted: Arc::clone(&self.demoted),
             _gate: gate,
         })
     }
@@ -471,14 +497,18 @@ impl Store {
     /// 0230). Returns `None` when it was already demoted and its term is
     /// recorded: the first recorded term stays.
     ///
-    /// It takes the writer gate and, in one transaction, records
-    /// `meta.demoted_by_term`: the error's `node_term` when it is usable,
-    /// else `meta.term + 1` ([`demotion_term`]). The contract gives no rule
-    /// for a `stale_term` without a usable term; that case is logged at
-    /// `error` and the primary is demoted all the same, as section 8.8 sets
-    /// no condition. The flag is set after the commit and before the gate is
-    /// released, so no writer queued on the gate commits after the `meta`
-    /// write.
+    /// It sets the demoted flag first, before it waits for anything, so from
+    /// the moment the `stale_term` arrives nothing more commits and every
+    /// session sends only `not_primary`: a writer queued on the gate is
+    /// refused at [`Store::begin_write`], and one holding it at
+    /// [`WriteTx::commit`]. It keeps the first `node_term` it is given
+    /// ([`DemotionRecord`]), then takes the writer gate and, in one
+    /// transaction, records `meta.demoted_by_term`: that `node_term` when it
+    /// is usable, else `meta.term + 1` ([`demotion_term`]). The contract
+    /// gives no rule for a `stale_term` without a usable term; that case is
+    /// logged at `error` and the primary is demoted all the same, as section
+    /// 8.8 sets no condition. Until the `meta` write commits the process is
+    /// demoted but not recorded, the same state as a failed `meta` write.
     ///
     /// A failed `meta` write still sets the flag: this process is demoted,
     /// though a restart would not be. A task then retries the write under the
@@ -496,11 +526,22 @@ impl Store {
     /// ADR 0261). That restore path does not exist yet, so every primary
     /// demotes here.
     pub async fn demote(&self, node_term: Option<u64>) -> Option<Demotion> {
+        self.demoted.send_replace(true);
+        self.keep_node_term(node_term);
         let gate = Arc::clone(&self.writer).lock_owned().await;
-        if self.is_demoted() && self.demotion.recorded.load(Ordering::SeqCst) {
+        if self.demotion.recorded.load(Ordering::SeqCst) {
             return None;
         }
-        let demotion = match self.record_demotion(node_term).await {
+        let hold = self
+            .demotion_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hold) = hold {
+            hold.reached.notify_one();
+            hold.release.notified().await;
+        }
+        let demotion = match self.record_demotion(self.kept_node_term()).await {
             Ok(term) => Demotion::Recorded(term),
             Err(error) => {
                 tracing::error!(
@@ -511,21 +552,33 @@ impl Store {
                 Demotion::NotRecorded
             }
         };
-        let hold = self
-            .demotion_hold
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(hold) = hold {
-            hold.reached.notify_one();
-            hold.release.notified().await;
-        }
-        self.demoted.send_replace(true);
         drop(gate);
         if demotion == Demotion::NotRecorded {
-            self.retry_demotion(node_term);
+            self.retry_demotion();
         }
         Some(demotion)
+    }
+
+    /// Keeps `node_term` for every attempt at the `meta` write, unless an
+    /// earlier `stale_term` already gave one ([`DemotionRecord`]).
+    fn keep_node_term(&self, node_term: Option<u64>) {
+        let mut kept = self
+            .demotion
+            .node_term
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kept.is_none() {
+            *kept = node_term;
+        }
+    }
+
+    /// The `node_term` kept by [`Store::keep_node_term`].
+    fn kept_node_term(&self) -> Option<u64> {
+        *self
+            .demotion
+            .node_term
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Records `meta.demoted_by_term` with the writer gate held, and marks it
@@ -570,7 +623,7 @@ impl Store {
 
     /// Starts the task that retries an unrecorded demotion until it is
     /// recorded ([`Store::demote`]); a second call starts nothing.
-    fn retry_demotion(&self, node_term: Option<u64>) {
+    fn retry_demotion(&self) {
         if self.demotion.retrying.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -584,7 +637,7 @@ impl Store {
                 if store.demotion.recorded.load(Ordering::SeqCst) {
                     return;
                 }
-                match store.record_demotion(node_term).await {
+                match store.record_demotion(store.kept_node_term()).await {
                     Ok(term) => {
                         tracing::info!(
                             demoted_by_term = term,
@@ -606,7 +659,9 @@ impl Store {
 
     /// One last attempt at an unrecorded demotion, for a clean shutdown: the
     /// retry task stops with the process. Does nothing when the primary is not
-    /// demoted or its demotion is recorded.
+    /// demoted or its demotion is recorded. It passes the `node_term` the
+    /// first `stale_term` carried, so a first attempt that failed before it
+    /// chose a term still records the node's term, not `meta.term + 1`.
     pub async fn record_demotion_before_exit(&self) {
         if !self.is_demoted() {
             return;
@@ -615,7 +670,7 @@ impl Store {
         if self.demotion.recorded.load(Ordering::SeqCst) {
             return;
         }
-        match self.record_demotion(None).await {
+        match self.record_demotion(self.kept_node_term()).await {
             Ok(term) => tracing::info!(
                 demoted_by_term = term,
                 "meta.demoted_by_term is recorded at shutdown: a restart stays demoted"
@@ -637,8 +692,8 @@ impl Store {
         );
     }
 
-    /// Test seam: holds the next [`Store::demote`] after its `meta` write and
-    /// before it sets the flag, with the writer gate held.
+    /// Test seam: holds the next [`Store::demote`] with the flag set and the
+    /// writer gate held, before its `meta` write.
     #[doc(hidden)]
     #[must_use]
     pub fn hold_next_demotion(&self) -> Arc<DemotionHold> {
