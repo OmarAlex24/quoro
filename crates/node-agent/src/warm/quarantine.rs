@@ -26,12 +26,14 @@
 //! - **A clone gone before its hash** (section 9 step 2). When the hash of a
 //!   copy finds no file, its record is forgotten, with its kept snapshot and
 //!   without touching any file, only when all three hold: the engine
-//!   answers `NotFound` for the clone as a snapshot of the volume (a pool
-//!   that does not mount answers `Unsupported`); another file the node
-//!   records for the volume answers the engine, so the directory is the
-//!   real one; and the record still has no SHA-256, so the primary never
-//!   recorded the copy. Otherwise the record stays, and the hash is tried
-//!   again. The next report no longer lists a forgotten copy.
+//!   answers `NotFound` for the clone as a snapshot of the volume, and its
+//!   path is missing (a pool that does not mount answers `Unsupported`);
+//!   another kept snapshot of the volume answers the engine, so the
+//!   directory is the real one; and the record still has no SHA-256, so the
+//!   primary never recorded the copy. The clone is looked up again after the
+//!   other file answered, and the clone's directory at both lookups and the
+//!   other file must be on one device. Otherwise the record stays, and the
+//!   hash is tried again. The next report no longer lists a forgotten copy.
 //! - **`spec.quarantine_deletes`.** Each id the node holds is deleted: the
 //!   clone first, through the engine, then its kept snapshot and its record
 //!   in one transaction. Only the record's id and `snapshot_id` are read for
@@ -96,6 +98,9 @@ pub(super) struct Inner<E: Engine> {
     /// How many of the next hashes a test makes fail.
     #[cfg(test)]
     pub(super) fail_hashes: std::sync::atomic::AtomicUsize,
+    /// Devices a test makes the next device reads answer, in order.
+    #[cfg(test)]
+    pub(super) devices: StdMutex<std::collections::VecDeque<u64>>,
 }
 
 impl<E: Engine> Drop for Inner<E> {
@@ -136,6 +141,8 @@ impl<E: Engine + 'static> Quarantines<E> {
                     hash_gate: tokio::sync::Mutex::new(()),
                     #[cfg(test)]
                     fail_hashes: std::sync::atomic::AtomicUsize::new(0),
+                    #[cfg(test)]
+                    devices: StdMutex::new(std::collections::VecDeque::new()),
                 }),
             },
             rx,
@@ -422,9 +429,12 @@ impl<E: Engine> Inner<E> {
     ///
     /// The clone is looked up again after the other file answered: a volume
     /// directory that mounted between the two lookups shows the other file
-    /// and would hide the clone the first lookup missed. A copy with no other
-    /// kept snapshot is never forgotten.
-    async fn forget_lost_clone(&self, id: &str) -> Result<bool, String> {
+    /// and would hide the clone the first lookup missed. Every read must also
+    /// see the same volume directory: the device of the clone's directory at
+    /// both lookups and the device of the other file must be one, so a
+    /// directory that mounted and unmounted again between the reads keeps the
+    /// record. A copy with no other kept snapshot is never forgotten.
+    pub(super) async fn forget_lost_clone(&self, id: &str) -> Result<bool, String> {
         let record = match self.store.volume_quarantine(id).await {
             Ok(Some(record)) if record.sha256.is_none() => record,
             // Deleted, or hashed meanwhile.
@@ -438,21 +448,31 @@ impl<E: Engine> Inner<E> {
             Ok(None) => return Ok(false),
             Err(e) => return Err(format!("cannot read the kept snapshot: {e}")),
         };
-        if !self.clone_gone(&kept.snapshot, &record.path).await {
+        let Some(before) = self.clone_gone(&kept.snapshot, &record.path).await else {
             return Ok(false);
-        }
-        if !volume_file_present(
+        };
+        let Some(other) = present_volume_file(
             self.engine.as_ref(),
             &self.store,
             &record.volume_id,
             Some(&record.snapshot_id),
         )
         .await?
-        {
+        else {
             return Ok(false);
-        }
+        };
+        let Some(shown) = self.device(&other) else {
+            return Ok(false);
+        };
         // Again, now that the directory is shown to be the real one.
-        if !self.clone_gone(&kept.snapshot, &record.path).await {
+        let Some(after) = self.clone_gone(&kept.snapshot, &record.path).await else {
+            return Ok(false);
+        };
+        if before != shown || shown != after {
+            warn!(
+                quarantine_id = %id,
+                "the volume directory changed while a lost clone was checked; its record stays"
+            );
             return Ok(false);
         }
         self.store
@@ -461,11 +481,13 @@ impl<E: Engine> Inner<E> {
             .map_err(|e| format!("cannot forget the record: {e}"))
     }
 
-    /// Whether the clone is gone: the engine answers `NotFound` for it as a
-    /// snapshot of the volume, and its path is missing. Any other answer,
-    /// `Unsupported` from a pool that does not mount among them, keeps it.
-    async fn clone_gone(&self, clone: &quoro_engine::VolumeSnapshot, path: &Path) -> bool {
-        matches!(
+    /// The device of the clone's directory when the clone is gone: the
+    /// engine answers `NotFound` for it as a snapshot of the volume, and its
+    /// path is missing. `None` for any other answer, `Unsupported` from a
+    /// pool that does not mount among them, or a directory that cannot be
+    /// read.
+    async fn clone_gone(&self, clone: &quoro_engine::VolumeSnapshot, path: &Path) -> Option<u64> {
+        let gone = matches!(
             self.engine
                 .volume_changed_ranges(&RangesOf::Snapshot(clone.clone()), None)
                 .await,
@@ -473,7 +495,26 @@ impl<E: Engine> Inner<E> {
         ) && matches!(
             std::fs::symlink_metadata(path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound
-        )
+        );
+        if !gone {
+            return None;
+        }
+        self.device(path.parent()?)
+    }
+
+    /// The device `path` is on, from `lstat`; `None` when it cannot be read.
+    fn device(&self, path: &Path) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(device) = self
+            .devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+        {
+            return Some(device);
+        }
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(path).ok().map(|meta| meta.dev())
     }
 
     /// Reads the records and publishes their entries when they changed.
@@ -544,6 +585,22 @@ pub(super) async fn volume_file_present<E: Engine>(
     volume_id: &str,
     except: Option<&str>,
 ) -> Result<bool, String> {
+    Ok(present_volume_file(engine, store, volume_id, except)
+        .await?
+        .is_some())
+}
+
+/// The location of the file [`volume_file_present`] finds, if any.
+///
+/// # Errors
+///
+/// The store's error when the kept snapshots cannot be read.
+async fn present_volume_file<E: Engine>(
+    engine: &E,
+    store: &NodeStore,
+    volume_id: &str,
+    except: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, String> {
     let kept = store
         .kept_snapshots_of(volume_id)
         .await
@@ -554,15 +611,16 @@ pub(super) async fn volume_file_present<E: Engine>(
         {
             continue;
         }
+        let location = kept.snapshot.location.clone();
         if engine
             .volume_changed_ranges(&RangesOf::Snapshot(kept.snapshot), None)
             .await
             .is_ok()
         {
-            return Ok(true);
+            return Ok(Some(location));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// The `status_report.quarantines` entry of a recorded copy (section 5.3).

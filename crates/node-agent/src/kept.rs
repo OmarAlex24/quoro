@@ -30,8 +30,8 @@
 //!   exception is a quarantined copy whose clone is gone before it was
 //!   hashed: its record goes only while it has no SHA-256, when the engine
 //!   answers `NotFound` for the clone before and after another kept snapshot
-//!   of the volume shows the directory to be the real one (section 9 step 2,
-//!   [`crate::warm::quarantine`]).
+//!   of the volume shows the directory to be the real one, and all three
+//!   reads see one device (section 9 step 2, [`crate::warm::quarantine`]).
 //!
 //! The first rule only holds for snapshots this store saw being created. A
 //! store that is new, older than the table, or lost and created again cannot
