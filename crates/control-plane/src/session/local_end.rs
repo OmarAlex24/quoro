@@ -1861,7 +1861,8 @@ mod tests {
         f.done();
     }
 
-    /// The grants and revokes the hub queued on the session's channel.
+    /// The grants, revokes and `ping`s the hub queued on the session's
+    /// channel.
     fn drained(live: &mut Live) -> Vec<Value> {
         let mut texts = Vec::new();
         while let Ok(text) = live.rx.try_recv() {
@@ -1869,7 +1870,11 @@ mod tests {
         }
         frames(texts)
             .into_iter()
-            .filter(|frame| frame["type"] == "lease_grant" || frame["type"] == "lease_revoke")
+            .filter(|frame| {
+                frame["type"] == "lease_grant"
+                    || frame["type"] == "lease_revoke"
+                    || frame["type"] == "ping"
+            })
             .collect()
     }
 
@@ -1930,6 +1935,67 @@ mod tests {
         assert_eq!(sent[0]["body"]["fencing_token"], 3);
         assert_eq!(held_revokes(), 0);
         assert!(!hub.0.held.lock().unwrap().entries.contains_key(LEASE));
+        f.done();
+    }
+
+    /// Section 5.1 and "The holder fenced first" step 4, with R: a holder
+    /// whose store went back lists the lease `held` `local` at 3 over a
+    /// step-4 row that reads `expiring` at 4, and without majority support
+    /// its session start holds back both the revoke at 3 and the grant. A
+    /// policy change off `warm` then writes R, which gives the row no new
+    /// token. The entry and its held-back revoke stay, nothing goes out, and
+    /// no `local` grant is held over it. Once support returns, the revoke at
+    /// 3 goes out once; then the entry goes, and no grant or `ping` follows.
+    #[tokio::test]
+    async fn a_held_back_revoke_goes_out_after_r_writes_its_row() {
+        let f = fixture("warm", "expiring", Some(D as i64), true).await;
+        created(&f).await;
+        write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
+        let hub = &f.state.hub;
+        hub.set_voter_support(Arc::new(NoSupport));
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        let generation = on.session.generation;
+        let held_revokes = || hub.0.sessions.lock().unwrap()[&f.node_id].held_revokes;
+        let held = hub.0.held.lock().unwrap().entries[LEASE].clone();
+        assert_eq!(
+            (held.kind, held.token, held.eligible_on, held.revoke_first),
+            (Kind::NewToken, 4, Some(generation), Some(3))
+        );
+        assert_eq!(held_revokes(), 1);
+
+        let writes = f.writes().await;
+        r(&f).await;
+        assert_eq!(f.writes().await, writes + 1, "R wrote the row");
+        assert_eq!(
+            state(&f).await,
+            ("local".to_string(), 4, Some(D as i64), true, false)
+        );
+        hub.attempt_held().await;
+        hub.attempt_held().await;
+        {
+            let registry = hub.0.held.lock().unwrap();
+            let entry = registry.entries.get(LEASE).expect("the entry stays");
+            assert_eq!(
+                (entry.kind, entry.token, entry.revoke_first),
+                (Kind::NewToken, 4, Some(3)),
+                "the held-back revoke stays, and no local grant is held over it"
+            );
+        }
+        assert_eq!(held_revokes(), 1, "the revoke is not released");
+        assert!(drained(&mut on).is_empty());
+
+        hub.set_voter_support(Arc::new(EverySupport));
+        hub.attempt_held().await;
+        hub.attempt_held().await;
+        let sent = drained(&mut on);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["type"], "lease_revoke", "{sent:?}");
+        assert_eq!(sent[0]["body"]["lease_id"], LEASE);
+        assert_eq!(sent[0]["body"]["fencing_token"], 3);
+        assert_eq!(held_revokes(), 0);
+        assert!(!hub.0.held.lock().unwrap().entries.contains_key(LEASE));
+        hub.attempt_held().await;
+        assert!(drained(&mut on).is_empty(), "no grant and no ping");
         f.done();
     }
 
