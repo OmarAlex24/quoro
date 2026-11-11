@@ -2284,6 +2284,24 @@ table inet quoro_mesh {
             .collect()
     }
 
+    /// An unspecified or multicast mesh address publishes no listener
+    /// address and loads no vote rule, so the listener never binds an
+    /// address other than the one the vote rules name.
+    #[test]
+    fn an_unspecified_or_multicast_address_gets_no_vote_listener() {
+        for address in ["0.0.0.0/16", "0.0.0.0", "224.0.0.1/4"] {
+            let mut on_node = mesh();
+            on_node.address = address.to_owned();
+            assert_eq!(
+                vote_listen_address(&on_node, Some(&votes())),
+                None,
+                "{address}"
+            );
+            let rules = nft_ruleset(Some(&on_node), Some(&votes()));
+            assert!(!rules.contains("dport 51821"), "{address}: {rules}");
+        }
+    }
+
     /// With `spec.votes` the general mesh rules stay as they are: the
     /// forward chain drops new connections forwarded out through the mesh
     /// before its `iifname` rules, and the output chain lets only root's new

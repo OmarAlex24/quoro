@@ -455,7 +455,10 @@ pub enum VoteDecision {
 const NODE_ROLE: &str = "node";
 
 /// An address that may carry a prefix length, as an IP address in its
-/// canonical form.
+/// canonical form. `None` for an unspecified or multicast address, which
+/// names no one machine: a listener bound to it would not be the address the
+/// mesh firewall's vote rules name. A loopback address is kept, and those
+/// rules match it as they match any other.
 #[must_use]
 pub fn mesh_ip(address: &str) -> Option<IpAddr> {
     address
@@ -465,6 +468,7 @@ pub fn mesh_ip(address: &str) -> Option<IpAddr> {
         .parse::<IpAddr>()
         .ok()
         .map(|ip| ip.to_canonical())
+        .filter(|ip| !(ip.is_unspecified() || ip.is_multicast()))
 }
 
 /// The mesh addresses that may ask for votes: those of every voter with the
@@ -761,7 +765,7 @@ mod tests {
     use super::{
         Received, StoredSupport, StoredVote, SupportAnswer, TermCheck, VoteDecision, VoteState,
         VoteWrite, answer_support, answer_vote, check_term, decide_support, decide_vote,
-        horizon_span, may_ask, not_allowed, rebase_at_start, support_after,
+        horizon_span, may_ask, mesh_ip, not_allowed, rebase_at_start, support_after,
     };
     use crate::lease::{HostClock, ManualHostClock};
     use crate::store::{NodeStore, VOTE};
@@ -769,6 +773,33 @@ mod tests {
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    /// A mesh address names one machine. An unspecified or multicast
+    /// address, in either family or IPv4-mapped, is none.
+    #[test]
+    fn mesh_ip_refuses_an_unspecified_or_multicast_address() {
+        for (address, ip) in [
+            ("10.43.0.2/16", "10.43.0.2"),
+            (" fd00::2/64", "fd00::2"),
+            ("::ffff:10.43.0.2", "10.43.0.2"),
+            ("127.0.0.2/8", "127.0.0.2"),
+        ] {
+            assert_eq!(mesh_ip(address), Some(ip.parse().unwrap()), "{address}");
+        }
+        for address in [
+            "0.0.0.0/16",
+            "0.0.0.0",
+            "224.0.0.1/4",
+            "239.255.255.250",
+            "::",
+            "::/0",
+            "ff02::1",
+            "::ffff:0.0.0.0",
+            "::ffff:224.0.0.1",
+        ] {
+            assert_eq!(mesh_ip(address), None, "{address}");
+        }
     }
 
     fn ms(ms: u64) -> Duration {
