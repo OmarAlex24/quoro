@@ -33,7 +33,7 @@
 //!   primary never recorded the copy. The path checks read one open handle
 //!   of the clone's directory: the clone is missing, the other kept snapshot
 //!   is a regular file there, and the clone is still missing. Otherwise the
-//!   record stays with a warning that says why, and the hash is tried again.
+//!   record stays, the hash's warning says why, and the hash is tried again.
 //!   The next report no longer lists a forgotten copy.
 //! - **`spec.quarantine_deletes`.** Each id the node holds is deleted: the
 //!   clone first, through the engine, then its kept snapshot and its record
@@ -103,6 +103,10 @@ pub(super) struct Inner<E: Engine> {
     /// the volume directory is read.
     #[cfg(test)]
     pub(super) between_checks: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// What a test runs right after the volume directory of a lost clone is
+    /// opened, before it is read.
+    #[cfg(test)]
+    pub(super) after_open: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<E: Engine> Drop for Inner<E> {
@@ -145,6 +149,8 @@ impl<E: Engine + 'static> Quarantines<E> {
                     fail_hashes: std::sync::atomic::AtomicUsize::new(0),
                     #[cfg(test)]
                     between_checks: StdMutex::new(None),
+                    #[cfg(test)]
+                    after_open: StdMutex::new(None),
                 }),
             },
             rx,
@@ -381,7 +387,7 @@ impl<E: Engine + 'static> Quarantines<E> {
                 // then the primary does not record the copy.
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                     match inner.forget_lost_clone(&id).await {
-                        Ok(true) => {
+                        Ok(()) => {
                             inner.lock_retry().remove(&id);
                             warn!(
                                 quarantine_id = %id,
@@ -391,14 +397,16 @@ impl<E: Engine + 'static> Quarantines<E> {
                             );
                             true
                         }
-                        Ok(false) => {
+                        Err(reason) => {
                             let wait = inner.failed(&id);
-                            warn!(quarantine_id = %id, retry_in = ?wait, "a quarantined copy has no file to hash; the primary records it only once it is hashed");
-                            false
-                        }
-                        Err(e) => {
-                            let wait = inner.failed(&id);
-                            warn!(quarantine_id = %id, error = %e, retry_in = ?wait, "a quarantined copy has no file to hash, and whether its clone is gone cannot be told");
+                            warn!(
+                                quarantine_id = %id,
+                                volume_id = %volume_id,
+                                snapshot_id = %snapshot_id,
+                                reason = %reason,
+                                retry_in = ?wait,
+                                "a quarantined copy has no file to hash, and its clone is not shown to be gone; its record stays, and the primary records it only once it is hashed"
+                            );
                             false
                         }
                     }
@@ -427,37 +435,27 @@ impl<E: Engine> Inner<E> {
     /// clone is gone before it was hashed (section 9 step 2): the engine
     /// answers `NotFound` for the clone, another kept snapshot of the volume
     /// answers it, and the record has no SHA-256. Touches no file. Returns
-    /// whether the record went.
+    /// why the record stays when it does.
     ///
     /// The engine's answers are then checked against one open handle of the
     /// clone's directory: the clone is missing from it, the other kept
     /// snapshot is a regular file in it, and the clone is still missing. A
     /// volume directory that mounts or unmounts meanwhile cannot split those
     /// three reads. A copy with no other kept snapshot in that directory is
-    /// never forgotten, and each record kept for a reason other than a hash
-    /// gets a warning that names it.
-    pub(super) async fn forget_lost_clone(&self, id: &str) -> Result<bool, String> {
+    /// never forgotten.
+    pub(super) async fn forget_lost_clone(&self, id: &str) -> Result<(), String> {
         let record = match self.store.volume_quarantine(id).await {
             Ok(Some(record)) if record.sha256.is_none() => record,
-            // Deleted, or hashed meanwhile.
-            Ok(_) => return Ok(false),
+            Ok(Some(_)) => return Err("the copy was hashed meanwhile".to_owned()),
+            Ok(None) => return Err("the copy was deleted meanwhile".to_owned()),
             Err(e) => return Err(format!("cannot read the record: {e}")),
         };
         let kept = match self.store.kept_snapshot(&record.snapshot_id).await {
             Ok(Some(kept)) => kept,
             // Recorded together, so not expected: nothing to look the clone
             // up by.
-            Ok(None) => return Ok(false),
+            Ok(None) => return Err("the copy's own kept snapshot is not recorded".to_owned()),
             Err(e) => return Err(format!("cannot read the kept snapshot: {e}")),
-        };
-        let kept_because = |reason: &str| -> Result<bool, String> {
-            warn!(
-                quarantine_id = %id,
-                volume_id = %record.volume_id,
-                reason,
-                "the clone of an unhashed quarantined copy is not shown to be gone; its record stays"
-            );
-            Ok(false)
         };
         match self
             .engine
@@ -465,9 +463,9 @@ impl<E: Engine> Inner<E> {
             .await
         {
             Err(EngineError::NotFound) => {}
-            Ok(_) => return kept_because("the engine still names the clone"),
+            Ok(_) => return Err("the engine still names the clone".to_owned()),
             // `Unsupported` from a pool that does not mount among them.
-            Err(e) => return kept_because(&format!("the engine cannot look the clone up: {e}")),
+            Err(e) => return Err(format!("the engine cannot look the clone up: {e}")),
         }
         let Some(other) = present_volume_file(
             self.engine.as_ref(),
@@ -477,24 +475,59 @@ impl<E: Engine> Inner<E> {
         )
         .await?
         else {
-            return kept_because("no other kept snapshot of the volume answers the engine");
+            return Err("no other kept snapshot of the volume answers the engine".to_owned());
         };
         #[cfg(test)]
-        if let Some(between) = self
-            .between_checks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            between();
-        }
-        if let Err(reason) = clone_missing_beside(&record.path, &other) {
-            return kept_because(&reason);
-        }
-        self.store
+        run_hook(&self.between_checks);
+        self.clone_missing_beside(&record.path, &other)?;
+        match self
+            .store
             .forget_unhashed_volume_quarantine(id, &record.snapshot_id)
             .await
-            .map_err(|e| format!("cannot forget the record: {e}"))
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("the copy was hashed or deleted meanwhile".to_owned()),
+            Err(e) => Err(format!("cannot forget the record: {e}")),
+        }
+    }
+
+    /// Reads, through one handle of the clone's directory opened with
+    /// `O_DIRECTORY | O_NOFOLLOW`, that `clone` is missing from it, that
+    /// `other` is a regular file in it, and that `clone` is still missing.
+    /// The error says which read failed.
+    fn clone_missing_beside(&self, clone: &Path, other: &Path) -> Result<(), String> {
+        use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, statat};
+        let Some(dir) = clone.parent() else {
+            return Err("the clone's path names no directory".to_owned());
+        };
+        if other.parent() != Some(dir) {
+            return Err(
+                "no other kept snapshot of the volume is in the clone's directory".to_owned(),
+            );
+        }
+        let (Some(clone_name), Some(other_name)) = (clone.file_name(), other.file_name()) else {
+            return Err("the clone's or the other kept snapshot's path names no file".to_owned());
+        };
+        let dir = open(
+            dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| format!("cannot open the volume directory: {e}"))?;
+        #[cfg(test)]
+        run_hook(&self.after_open);
+        let clone_missing = || match statat(&dir, clone_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(rustix::io::Errno::NOENT) => Ok(()),
+            Ok(_) => Err("the clone's file is in the volume directory".to_owned()),
+            Err(e) => Err(format!("cannot read the clone's file: {e}")),
+        };
+        clone_missing()?;
+        match statat(&dir, other_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {}
+            Ok(_) => return Err("the other kept snapshot is not a regular file".to_owned()),
+            Err(e) => return Err(format!("cannot read the other kept snapshot: {e}")),
+        }
+        clone_missing()
     }
 
     /// Reads the records and publishes their entries when they changed.
@@ -603,39 +636,16 @@ async fn present_volume_file<E: Engine>(
     Ok(None)
 }
 
-/// Reads, through one handle of the clone's directory opened with
-/// `O_DIRECTORY | O_NOFOLLOW`, that `clone` is missing from it, that `other`
-/// is a regular file in it, and that `clone` is still missing. The error says
-/// which read failed.
-fn clone_missing_beside(clone: &Path, other: &Path) -> Result<(), String> {
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, statat};
-    let Some(dir) = clone.parent() else {
-        return Err("the clone's path names no directory".to_owned());
-    };
-    if other.parent() != Some(dir) {
-        return Err("no other kept snapshot of the volume is in the clone's directory".to_owned());
+/// Runs and clears the hook a test set.
+#[cfg(test)]
+fn run_hook(hook: &StdMutex<Option<Box<dyn FnOnce() + Send>>>) {
+    let hook = hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(hook) = hook {
+        hook();
     }
-    let (Some(clone_name), Some(other_name)) = (clone.file_name(), other.file_name()) else {
-        return Err("the clone's or the other kept snapshot's path names no file".to_owned());
-    };
-    let dir = open(
-        dir,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| format!("cannot open the volume directory: {e}"))?;
-    let clone_missing = || match statat(&dir, clone_name, AtFlags::SYMLINK_NOFOLLOW) {
-        Err(rustix::io::Errno::NOENT) => Ok(()),
-        Ok(_) => Err("the clone's file is in the volume directory".to_owned()),
-        Err(e) => Err(format!("cannot read the clone's file: {e}")),
-    };
-    clone_missing()?;
-    match statat(&dir, other_name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {}
-        Ok(_) => return Err("the other kept snapshot is not a regular file".to_owned()),
-        Err(e) => return Err(format!("cannot read the other kept snapshot: {e}")),
-    }
-    clone_missing()
 }
 
 /// The `status_report.quarantines` entry of a recorded copy (section 5.3).
