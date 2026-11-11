@@ -1763,9 +1763,9 @@ mod tests {
         f.done();
     }
 
-    /// F1's drop when the row moves: a `local` grant held while its holder
-    /// is away (no session, so none is eligible) goes once the row moves, to
-    /// a new token or revoked. Before that it stays, waiting; after it, the
+    /// The drop of a `local` grant whose row moved: one held while its
+    /// holder is away (no session, so none is eligible) goes once the row
+    /// moves, to a new token or revoked. Before that it stays, waiting; after it, the
     /// registry holds nothing for the lease and no grant is pending.
     #[tokio::test]
     async fn a_local_grant_with_its_holder_away_goes_once_the_row_moves() {
