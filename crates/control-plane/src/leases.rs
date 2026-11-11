@@ -15,6 +15,7 @@ use crate::deploy;
 use crate::error::ApiError;
 use crate::fences::UnrecordedFailures;
 use crate::store::now_rfc3339;
+use futures_util::TryStreamExt as _;
 use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ResourceType, RevokeReason};
 use serde_json::{Value, json};
 use sqlx::sqlite::SqliteRow;
@@ -225,6 +226,10 @@ pub(crate) async fn newest_write_seq(
 /// lack a `fencing_token` give nothing to compare with, and read as no new
 /// token, the side that grants less.
 ///
+/// The entries are read newest first, one at a time, and the read stops at
+/// the first earlier entry that carries a token: a held grant's attempt asks
+/// this on every tick, and a lease's log only grows.
+///
 /// # Errors
 ///
 /// A database error.
@@ -232,31 +237,31 @@ pub(crate) async fn newest_write_gave_new_token(
     conn: &mut SqliteConnection,
     lease_id: &str,
 ) -> Result<bool, ApiError> {
-    let payloads: Vec<String> = sqlx::query_scalar(
-        "SELECT payload FROM change_log WHERE entity_type = 'lease' AND entity_id = ? \
-         ORDER BY seq DESC",
-    )
-    .bind(lease_id)
-    .fetch_all(&mut *conn)
-    .await?;
     let token = |payload: &str| {
         serde_json::from_str::<Value>(payload)
             .ok()
             .and_then(|payload| payload.get("fencing_token").and_then(Value::as_i64))
     };
-    let mut entries = payloads.iter();
-    let Some(newest) = entries.next() else {
+    let mut payloads = sqlx::query_scalar::<_, String>(
+        "SELECT payload FROM change_log WHERE entity_type = 'lease' AND entity_id = ? \
+         ORDER BY seq DESC",
+    )
+    .bind(lease_id)
+    .fetch(&mut *conn);
+    let Some(newest) = payloads.try_next().await? else {
         return Ok(false);
     };
-    let Some(newest) = token(newest) else {
+    let Some(newest) = token(&newest) else {
         return Ok(false);
     };
-    if payloads.len() == 1 {
-        return Ok(true);
+    let mut earlier = false;
+    while let Some(payload) = payloads.try_next().await? {
+        earlier = true;
+        if let Some(before) = token(&payload) {
+            return Ok(newest > before);
+        }
     }
-    Ok(entries
-        .find_map(|payload| token(payload))
-        .is_some_and(|before| newest > before))
+    Ok(!earlier)
 }
 
 /// Whether `lease` is a step-4 row for the node it names ("The holder fenced

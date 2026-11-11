@@ -736,8 +736,11 @@ impl NodeHub {
             // nothing left to end, the policy back on `warm` included
             // ([`super::local_end`]); a grant with a new token goes on the
             // test its send makes under the writer gate ([`new_token_row`]),
-            // such as once R has written its row since it was held.
-            if held.sent_on.is_none() {
+            // such as once R has written its row since it was held. An entry
+            // whose step-4 revoke is held back for support stays until that
+            // revoke goes out: section 5.1 revokes the lease the node listed,
+            // whatever the row says since, and the next attempt drops it.
+            if held.sent_on.is_none() && held.revoke_first.is_none() {
                 let obsolete = match held.kind {
                     Kind::LocalEnd => self.local_end_obsolete(&lease_id, &held).await,
                     Kind::NewToken => self.new_token_obsolete(&lease_id, &held).await,
