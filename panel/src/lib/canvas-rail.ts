@@ -266,7 +266,7 @@ export interface DomainRow {
   id: string;
   hostname: string;
   tone: LampTone;
-  /** `serving · TLS by Cloudflare Tunnel`, `serving · certificate until 12 Feb`. */
+  /** `serving · TLS by Cloudflare Tunnel`, `serving · certificate valid 81 d`. */
   words: string;
 }
 
@@ -285,8 +285,8 @@ export const certPhrase = (
   if (Number.isNaN(expires)) return 'certificate issued';
   const left = expires - now;
   if (left <= 0) return 'certificate expired';
-  if (left < DAY) return `certificate expires in ${Math.max(1, Math.round(left / 3_600_000))} h`;
-  return `certificate expires in ${Math.floor(left / DAY)} d`;
+  if (left < DAY) return `certificate valid ${Math.max(1, Math.round(left / 3_600_000))} h`;
+  return `certificate valid ${Math.floor(left / DAY)} d`;
 };
 
 /** The project's domains, by hostname, each with whether a machine serves it and its certificate. */

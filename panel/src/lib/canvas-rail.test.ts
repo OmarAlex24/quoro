@@ -249,10 +249,10 @@ describe('domains', () => {
     });
   });
 
-  it('says when an ACME certificate expires', () => {
+  it('says how long an ACME certificate stays valid', () => {
     const acme = (patch: Partial<Domain>) => certPhrase(domain({ tls_mode: 'acme', ...patch }), NOW);
-    expect(acme({ cert_status: 'issued', cert_expires_at: ahead(62 * 86_400 + 600) })).toBe('certificate expires in 62 d');
-    expect(acme({ cert_status: 'issued', cert_expires_at: ahead(5 * 3_600) })).toBe('certificate expires in 5 h');
+    expect(acme({ cert_status: 'issued', cert_expires_at: ahead(62 * 86_400 + 600) })).toBe('certificate valid 62 d');
+    expect(acme({ cert_status: 'issued', cert_expires_at: ahead(5 * 3_600) })).toBe('certificate valid 5 h');
     expect(acme({ cert_status: 'issued', cert_expires_at: at(60) })).toBe('certificate expired');
     expect(acme({ cert_status: 'pending' })).toBe('certificate pending');
     expect(acme({ cert_status: 'failed' })).toBe('certificate failed');

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useQueries } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
-import { useCallback, useEffect, useMemo, useRef, type CSSProperties } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { getListAppDomainsQueryOptions } from '../api/generated/domains/domains';
 import { useListApps } from '../api/generated/apps/apps';
 import { useListGrants } from '../api/generated/grants/grants';
@@ -229,8 +229,14 @@ function RailCell({ cell, projectId, highlight }: { cell: PlacementCell; project
   );
 }
 
-/** The latest deploys; a row that arrives while the page is open slides in at the top. */
+/**
+ * The latest deploys; a run that starts while the list is open slides in at
+ * the top. A row counts as new only when its run started after the list
+ * mounted: a row whose key changes because its build was read late (a
+ * deployment becomes its build) is not new.
+ */
 function DeployList({ rows, now, projectId }: { rows: readonly DeployRow[]; now: number; projectId: string }) {
+  const [mountedAt] = useState(() => Date.now());
   const seen = useRef<Set<string> | null>(null);
   const first = seen.current;
   useEffect(() => {
@@ -240,7 +246,7 @@ function DeployList({ rows, now, projectId }: { rows: readonly DeployRow[]; now:
   return (
     <ul className="crail-list">
       {rows.map((row) => (
-        <li key={row.key} className={cn(first !== null && !first.has(row.key) && 'crail-new')}>
+        <li key={row.key} className={cn(first !== null && !first.has(row.key) && row.start > mountedAt && 'crail-new')}>
           <Link
             to="/projects/$projectId"
             params={{ projectId }}
