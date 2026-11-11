@@ -1220,6 +1220,10 @@ pub(crate) struct Ended {
     pub lease: Lease,
     /// R wrote the row ([`end_renewals`]).
     pub wrote: bool,
+    /// R turned a row that read `expiring` into `local`: a grant with a new
+    /// token held for that row and not sent is dropped as R commits, with
+    /// `app.left_stopped` ("Ending the renewals").
+    pub from_expiring: bool,
     /// The same-token `local` grant that ends the renewals is held for the
     /// row: it is unrevoked, marked and reads `local`, and its newest write
     /// gave it no new token ([`newest_write_gave_new_token`]).
@@ -1247,7 +1251,9 @@ pub(crate) async fn leave_warm(
     app_id: &str,
     actor: &Actor,
 ) -> Result<Option<Ended>, ApiError> {
+    let before = app_lease(conn, app_id).await?;
     let wrote = end_renewals(conn, app_id, actor).await?.is_some();
+    let from_expiring = wrote && before.is_some_and(|before| before.mode == "expiring");
     let Some(lease) = app_lease(conn, app_id).await? else {
         return Ok(None);
     };
@@ -1257,7 +1263,12 @@ pub(crate) async fn leave_warm(
     let hold = lease.unsettled
         && lease.mode == "local"
         && !newest_write_gave_new_token(conn, &lease.id).await?;
-    Ok(Some(Ended { lease, wrote, hold }))
+    Ok(Some(Ended {
+        lease,
+        wrote,
+        from_expiring,
+        hold,
+    }))
 }
 
 /// The write that precedes the resend of the same-token `local` grant when

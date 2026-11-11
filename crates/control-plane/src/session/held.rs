@@ -44,7 +44,7 @@
 //! its grant is taken, and moves only as a `local` lease does, which is
 //! safe. `failoverApp` ([`crate::failover`]) holds its
 //! waiting grant with [`NodeHub::hold_grant`] and answers `in_progress` while
-//! [`NodeHub::grant_pending`] (ADR 0292).
+//! [`NodeHub::row_grant_pending`] (ADR 0292).
 
 use super::{ControlMessage, NodeHub, new_msg_id};
 use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind};
@@ -120,6 +120,12 @@ pub(super) struct HeldGrant {
     /// held back until support returns; the grant follows its answer ("The
     /// holder fenced first" step 4).
     pub(super) revoke_first: Option<u64>,
+    /// R dropped this grant with a new token when it committed ("Ending the
+    /// renewals": "is dropped when R commits"), and the entry stays only for
+    /// its held-back revoke ([`Self::revoke_first`]): the grant never goes
+    /// out and never reads as pending, and the next attempt after the
+    /// revoke drops the entry.
+    pub(super) grant_dropped: bool,
     /// Which registration this is, given by [`Registry::insert`]: an entry
     /// held again for the same row is never equal to the one before it,
     /// though every other field may match.
@@ -150,6 +156,7 @@ impl HeldGrant {
             eligible_on,
             sent_on: None,
             revoke_first: None,
+            grant_dropped: false,
             registration: 0,
         }
     }
@@ -158,11 +165,24 @@ impl HeldGrant {
         self.token == lease.fencing_token && self.holder == lease.holder_node_id
     }
 
-    /// Not sent yet, and waiting as a grant does: a same-token `local`
-    /// grant that waits for evidence that the holder holds the lease is no
-    /// grant pending ([`super::local_end`]); it may never go out.
-    fn pending(&self) -> bool {
-        self.sent_on.is_none() && (self.kind == Kind::NewToken || self.eligible_on.is_some())
+    /// Not sent yet, and waiting as a grant does, with `live` the holder's
+    /// current session after its `hello`. A grant with a new token is
+    /// pending until it is sent, unless R dropped it. The same-token `local`
+    /// grant that ends the renewals is pending only while `live` is the
+    /// session it may go out on ("Grants of a marked row": "While the
+    /// holder's current session is such a session, `grant_pending` is true
+    /// until the grant is sent on it"); while it waits for such a session,
+    /// it is not ("`grant_pending` stays false for it"), and "When that
+    /// session ends first, the grant again waits for such a session and is
+    /// not pending".
+    fn pending(&self, live: Option<u64>) -> bool {
+        if self.sent_on.is_some() || self.grant_dropped {
+            return false;
+        }
+        match self.kind {
+            Kind::NewToken => true,
+            Kind::LocalEnd => self.eligible_on.is_some() && self.eligible_on == live,
+        }
     }
 }
 
@@ -406,32 +426,53 @@ impl NodeHub {
     /// rather than write a second token (ADR 0295). What the API shows, and
     /// what a failover's `in_progress` reads, is [`Self::row_grant_pending`].
     pub(crate) fn grant_pending(&self, lease_id: &str) -> bool {
-        self.0
+        let held = self
+            .0
             .held
             .lock()
             .expect("held grant lock")
             .entries
             .get(lease_id)
-            .is_some_and(HeldGrant::pending)
+            .cloned();
+        held.is_some_and(|held| self.is_pending(&held))
+    }
+
+    /// Whether `held` reads as pending ([`HeldGrant::pending`]) against its
+    /// holder's current session after its `hello`, read now. The caller
+    /// holds no lock: the registry lock and the sessions lock are never
+    /// held together here.
+    fn is_pending(&self, held: &HeldGrant) -> bool {
+        let live = self
+            .0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(&held.holder)
+            .filter(|handle| handle.hello_recorded)
+            .map(|handle| handle.generation);
+        held.pending(live)
     }
 
     /// The held grant of `lease` as `Lease.grant_pending` shows it: an entry
     /// not sent yet that names the row as it stands, at its token and
-    /// holder, for a row that carries the mark and is not revoked (section
-    /// 8.4, "Grants of a marked row"). Whichever operation held it counts:
-    /// a failover, a restore, a regrant or `createVolume`.
+    /// holder, for a row that carries the mark and is not revoked, and that
+    /// reads as pending ([`HeldGrant::pending`]; section 8.4, "Grants of a
+    /// marked row"). Whichever operation held it counts: a failover, a
+    /// restore, a regrant or `createVolume`.
     fn held_of_row(&self, lease: &leases::Lease) -> Option<HeldGrant> {
         if !lease.unsettled || lease.is_revoked() {
             return None;
         }
-        self.0
+        let held = self
+            .0
             .held
             .lock()
             .expect("held grant lock")
             .entries
             .get(&lease.id)
-            .filter(|held| held.names(lease) && held.pending())
-            .cloned()
+            .filter(|held| held.names(lease))
+            .cloned()?;
+        self.is_pending(&held).then_some(held)
     }
 
     /// `Lease.grant_pending` of `lease`, the row as just read, with no
@@ -445,8 +486,14 @@ impl NodeHub {
     /// `Lease.grant_pending` and `Lease.grant_waiting_on` of `lease`, read on
     /// `conn` with no write: whether a grant of the row as it stands waits,
     /// and the machines of the required set that have not acknowledged the
-    /// row's newest write, with its holder while the grant waits for that
-    /// holder's next session start (section 8.4, "Grants of a marked row").
+    /// row's newest write (section 8.4, "Grants of a marked row"). A grant
+    /// with a new token also lists its holder while it waits for that
+    /// holder's next session start: "`grant_waiting_on` also lists that
+    /// node until its session starts". The same-token `local` grant that
+    /// ends the renewals lists only "the machines of the required set that
+    /// have not acknowledged R", and only while it is pending; while it
+    /// waits for a session that shows the lease, "`grant_waiting_on` stays
+    /// empty".
     ///
     /// # Errors
     ///
@@ -460,7 +507,7 @@ impl NodeHub {
             return Ok((false, Vec::new()));
         };
         let mut waiting = BTreeSet::new();
-        if held.eligible_on.is_none() {
+        if held.kind == Kind::NewToken && held.eligible_on.is_none() {
             waiting.insert(held.holder.clone());
         }
         if let Some(seq) = leases::newest_write_seq(conn, &lease.id).await?
@@ -739,9 +786,12 @@ impl NodeHub {
             // such as once R has written its row since it was held. An entry
             // whose step-4 revoke is held back for support stays until that
             // revoke goes out: section 5.1 revokes the lease the node listed,
-            // whatever the row says since, and the next attempt drops it.
+            // whatever the row says since, and the next attempt drops it. A
+            // grant that R dropped as it committed goes then, unread: it
+            // never goes out ("Ending the renewals").
             if held.sent_on.is_none() && held.revoke_first.is_none() {
                 let obsolete = match held.kind {
+                    _ if held.grant_dropped => Ok(true),
                     Kind::LocalEnd => self.local_end_obsolete(&lease_id, &held).await,
                     Kind::NewToken => self.new_token_obsolete(&lease_id, &held).await,
                 };

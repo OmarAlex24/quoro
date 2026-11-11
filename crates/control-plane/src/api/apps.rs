@@ -1734,10 +1734,16 @@ pub async fn update_app(
             // primary holds majority support, the holder gets the
             // same-token `local` grant. This change left the policy off
             // `warm`, so the grant is held whether or not R wrote the row
-            // this time. A held grant with a new token that R left standing
-            // for nothing goes first.
+            // this time. A held grant with a new token that R dropped goes
+            // first, with `app.left_stopped`, whose actor is this call's.
             if let Some(ended) = ended {
-                state.hub.end_renewals_committed(&ended);
+                let actor = ctx.identity.actor();
+                let by = crate::session::PolicyChange {
+                    project_id: &app.project_id,
+                    request_id: &ctx.request_id,
+                    actor: &actor,
+                };
+                state.hub.end_renewals_committed(&ended, &by).await;
             }
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);

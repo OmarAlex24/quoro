@@ -24,6 +24,8 @@ pub(crate) mod mesh;
 pub mod serving;
 mod votes;
 
+pub(crate) use local_end::PolicyChange;
+
 use crate::AppState;
 use crate::changelog::{self, Actor, ActorType, Op};
 use crate::crypto::DataKey;
