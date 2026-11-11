@@ -348,17 +348,16 @@ function RunBox({
             {cancel.isPending ? 'Cancelling…' : 'Cancel build'}
           </Button>
         ) : null}
-        {build ? (
-          <Button size="sm" asChild>
-            <Link
-              to="/projects/$projectId"
-              params={{ projectId }}
-              search={{ app: app.id, tab: 'deployments', build: build.id }}
-            >
-              View logs
-            </Link>
-          </Button>
-        ) : null}
+        {/* A build opens its own log; a redeploy, which has none, opens the app's logs. */}
+        <Button size="sm" asChild>
+          <Link
+            to="/projects/$projectId"
+            params={{ projectId }}
+            search={build ? { app: app.id, tab: 'deployments', build: build.id } : { app: app.id, tab: 'logs' }}
+          >
+            View logs
+          </Link>
+        </Button>
       </div>
       <div className="box-b">
         {problem ? <ProblemBanner view={problem} /> : null}
