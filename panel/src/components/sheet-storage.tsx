@@ -2,7 +2,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { CalendarClock, Copy, HardDrive } from 'lucide-react';
-import { useCallback, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { getGetAppQueryKey, updateApp } from '../api/generated/apps/apps';
 import {
   createBackup,
@@ -248,6 +248,14 @@ function AddVolume({ appId, canWrite, onChanged }: { appId: string; canWrite: bo
   const [problem, setProblem] = useState<ProblemView | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [adding, setAdding] = useState(false);
+  // Cancel closes the form; focus goes back to the button that opened it.
+  const opener = useRef<HTMLButtonElement>(null);
+  const cancelled = useRef(false);
+  useEffect(() => {
+    if (adding || !cancelled.current) return;
+    cancelled.current = false;
+    opener.current?.focus();
+  }, [adding]);
 
   const add = useMutation({
     mutationFn: (body: { size_gb: number; mount_path: string }) =>
@@ -278,7 +286,7 @@ function AddVolume({ appId, canWrite, onChanged }: { appId: string; canWrite: bo
         title="No volume"
         action={
           canWrite ? (
-            <Button size="sm" variant="primary" onClick={() => setAdding(true)}>
+            <Button ref={opener} size="sm" variant="primary" onClick={() => setAdding(true)}>
               <HardDrive className="size-3.5" strokeWidth={1.7} aria-hidden="true" />
               Add a volume
             </Button>
@@ -339,7 +347,14 @@ function AddVolume({ appId, canWrite, onChanged }: { appId: string; canWrite: bo
             <Button variant="primary" disabled={add.isPending} onClick={submit}>
               {add.isPending ? 'Adding…' : 'Add a volume'}
             </Button>
-            <Button variant="ghost" disabled={add.isPending} onClick={() => setAdding(false)}>
+            <Button
+              variant="ghost"
+              disabled={add.isPending}
+              onClick={() => {
+                cancelled.current = true;
+                setAdding(false);
+              }}
+            >
               Cancel
             </Button>
           </div>
