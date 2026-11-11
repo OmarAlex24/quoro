@@ -4220,7 +4220,9 @@ components:
             is `warm` (ADR 0285). After a `local` grant with a new token, such
             as a restore's, it stays true until the holder's next session. The
             grant waits until every machine with the `node` role holds the
-            row's newest write and the primary holds majority support;
+            row's newest write and the primary holds majority support, and
+            the grant that ends the renewals also until a session of the
+            holder shows that it holds the lease at the row's token;
             meanwhile a holder that still holds the lease `expiring` renews,
             and it fences only if the primary loses majority support. The mark
             is stored in the row, so a restarted primary still knows it. False
@@ -4260,8 +4262,12 @@ components:
             row whose newest write gave the lease a new token, from the
             primary's start until that grant is sent at the session start of
             the node the row names, or that node reports the row's token
-            (section 8.4, "The holder fenced first" step 4, ADR 0295). False
-            otherwise.
+            (section 8.4, "The holder fenced first" step 4, ADR 0295). The
+            same-token `local` grant that ends an `expiring` lease's renewals
+            does not count while it waits for a session on which its holder
+            shows that it holds the lease at the row's token (section 8.4,
+            "Ending the renewals" step 2): no failover or switchover of the
+            app answers `in_progress` for it. False otherwise.
         grant_waiting_on:
           type: array
           items:
