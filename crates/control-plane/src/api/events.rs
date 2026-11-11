@@ -36,7 +36,7 @@ const POLL: Duration = Duration::from_secs(1);
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 /// The closed set of event types (`events.schema.json`, `EventType`).
-pub const EVENT_TYPES: [&str; 49] = [
+pub const EVENT_TYPES: [&str; 50] = [
     "node.enrolled",
     "node.connected",
     "node.disconnected",
