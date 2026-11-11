@@ -244,6 +244,7 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 | `app.failed_over` | The lease of a `warm` app moved to its warm node, which starts the app from its last complete copy (ADR 0175). It opens no incident | |
 | `app.switched_over` | A planned switchover of a `warm` app completed with no data lost; the former node is now its warm copy (ADR 0177). It opens no incident | |
 | `app.switchover_failed` | A planned switchover stopped before the lease moved; the app resumed on its node and nothing moved. It opens no incident | |
+| `app.left_stopped` | The app's HA policy left `warm` while a grant of its lease with a new token waited; the primary dropped that grant, and the app stays stopped until an operator starts it. It opens no incident | |
 | `deployment.started` | A deployment began | |
 | `deployment.succeeded` | A deployment's instances are healthy | |
 | `deployment.failed` | A deployment failed (image pull, rootfs, boot, health) | |

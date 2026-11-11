@@ -48,6 +48,7 @@
         "app.failed_over",
         "app.switched_over",
         "app.switchover_failed",
+        "app.left_stopped",
         "deployment.started",
         "deployment.succeeded",
         "deployment.failed",
@@ -113,6 +114,7 @@
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.failed_over" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_failed_over" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.switched_over" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_switched_over" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.switchover_failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_switchover_failed" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "app.left_stopped" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_left_stopped" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.started" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_started" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.succeeded" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_succeeded" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_failed" } } } },
@@ -593,6 +595,19 @@
         "to_node_id": { "$ref": "#/$defs/NodeId" },
         "step": { "type": "string", "enum": ["freeze", "revoke"] },
         "error": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_app_left_stopped": {
+      "type": "object",
+      "description": "The app's HA policy left `warm` while the primary held a grant of its lease with a new token that it had not sent, such as a failover's grant to the warm node. The primary dropped that grant, so the node it named holds no lease for the app, and the app stays stopped until an operator starts it (node-agent-protocol.md section 8.4, \"Ending the renewals\"). Emitted by the control plane as it drops the grant, right after the change of the policy commits; the actor is the caller of updateApp. A primary that restarted after that change committed holds no such grant and emits none. Opens no incident. Payload fields are additive within schema_version 1.",
+      "required": ["app_id", "node_id", "fencing_token", "reason"],
+      "properties": {
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "node_id": { "$ref": "#/$defs/NodeId", "description": "The node the dropped grant named." },
+        "fencing_token": { "type": "integer", "minimum": 1, "description": "The token of the dropped grant." },
+        "reason": { "type": "string", "enum": ["policy_left_warm"], "description": "Why the grant was dropped: the app's HA policy left `warm`." }
       },
       "additionalProperties": true
     },
@@ -1351,6 +1366,24 @@
         "fencing_token": 9,
         "snapshot_seq": 1042,
         "snapshot_taken_at": "2026-11-07T10:40:31Z"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JCA5D2E3F4G5H6J7K8M9N0P1",
+      "seq": 318,
+      "type": "app.left_stopped",
+      "time": "2026-11-07T10:44:02Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "app", "id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E" },
+      "project_id": "prj_01JC9Z5A1B2C3D4E5F6G7H8J9K",
+      "request_id": "req_01JCA5D1E2F3G4H5J6K7M8N9P0",
+      "actor": { "type": "user", "id": "usr_01JC9Y0A1B2C3D4E5F6G7H8J9K" },
+      "data": {
+        "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+        "node_id": "nod_01JC9Z0000000000000000000Q",
+        "fencing_token": 9,
+        "reason": "policy_left_warm"
       }
     }
   ]
