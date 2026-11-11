@@ -15,14 +15,23 @@
 //! the same boot; after a reboot both start again from the agent's first
 //! start ([`rebase_at_start`]).
 //!
+//! A voter also answers promotion votes on its mesh address (section 8.9,
+//! [`crate::vote_listener`]): [`decide_vote`] decides each one on the vote
+//! state one transaction reads, and [`answer_vote`] writes a granted vote in
+//! that transaction before the answer goes out.
+//!
 //! Every value this module stores errs late: a later promise only keeps the
 //! voter from supporting another candidate a little longer, and a later
 //! horizon only makes a candidate wait a little longer (section 8.9), while an
 //! earlier one could let two primaries grant the same lease.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
-use quoro_proto::wire::{MIN_SUPPORT_MS, SupportGrant, SupportRequest};
+use quoro_proto::wire::{
+    MIN_SUPPORT_MS, SpecVoter, SpecVotes, SupportGrant, SupportRequest, VoteAnswer, VoteOutcome,
+    VoteRefusal, VoteRequest,
+};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -198,9 +207,7 @@ pub enum TermCheck {
 /// [`AgentError::Store`] when the stored term cannot be read or the higher one
 /// cannot be stored. The caller then acts on nothing the frame carries.
 pub async fn check_term(store: &NodeStore, term: u64) -> Result<TermCheck, AgentError> {
-    let stored = store.highest_term().await?.unwrap_or(0);
-    let voted = store.vote().await?.map_or(0, |vote| vote.term);
-    let highest = stored.max(voted);
+    let highest = current_term(store).await?;
     if term < highest {
         return Ok(TermCheck::Stale { highest });
     }
@@ -291,6 +298,9 @@ pub struct VoteWrite {
     pub term: Option<u64>,
     /// The new support, written before the grant that promises it goes out.
     pub support: Option<StoredSupport>,
+    /// The vote of a real promotion vote, written before its `granted`
+    /// answer goes out (section 8.9).
+    pub vote: Option<StoredVote>,
 }
 
 /// Decides the answer to one `support_request` from the vote state `state`
@@ -339,13 +349,13 @@ pub fn decide_support(
     if request.term < highest {
         let write = VoteWrite {
             term: (state.highest_term.unwrap_or(0) < highest).then_some(highest),
-            support: None,
+            ..VoteWrite::default()
         };
         return (SupportAnswer::Stale { highest }, write);
     }
     let raise = VoteWrite {
         term: (state.highest_term.unwrap_or(0) < request.term).then_some(request.term),
-        support: None,
+        ..VoteWrite::default()
     };
     let Some(voters_version) = voters_version else {
         return (SupportAnswer::Ignore, raise);
@@ -429,6 +439,282 @@ pub async fn answer_support(
         .unwrap_or_else(|e| SupportAnswer::Withhold(format!("could not keep the vote state: {e}")))
 }
 
+/// What the vote listener answers a `POST /v1/vote` with (section 8.9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VoteDecision {
+    /// The `200` answer.
+    Answer(VoteAnswer),
+    /// The voter cannot tell whether it may grant: it answers `503` with this
+    /// reason as the text of its `{"error": "<text>"}` body (section 8.9),
+    /// and never `granted`.
+    Unavailable(String),
+}
+
+/// The role a voter must have for its mesh address to ask for votes
+/// (section 8.9): only such a machine holds custody seals (ADR 0180).
+const NODE_ROLE: &str = "node";
+
+/// An address that may carry a prefix length, as an IP address in its
+/// canonical form.
+#[must_use]
+pub fn mesh_ip(address: &str) -> Option<IpAddr> {
+    address
+        .split('/')
+        .next()?
+        .trim()
+        .parse::<IpAddr>()
+        .ok()
+        .map(|ip| ip.to_canonical())
+}
+
+/// The mesh addresses that may ask for votes: those of every voter with the
+/// `node` role in `votes.voters` (sections 6.9 and 8.9). A voter without a
+/// mesh address, or with one that is not an address, is left out.
+pub fn node_voter_addresses(votes: &SpecVotes) -> impl Iterator<Item = (&SpecVoter, IpAddr)> {
+    votes
+        .voters
+        .iter()
+        .filter(|voter| voter.roles.iter().any(|role| role == NODE_ROLE))
+        .filter_map(|voter| Some((voter, mesh_ip(voter.mesh_address.as_deref()?)?)))
+}
+
+/// `duration` in whole milliseconds, rounded up: a wait the voter reports
+/// is never shorter than the one it measured (section 8.9).
+fn ceil_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+}
+
+/// Decides the answer to one `POST /v1/vote` from the vote state `state`
+/// read in the transaction (section 8.9), and what to write with it.
+///
+/// `node_id` and `cluster_id` are this machine's, `votes` is `spec.votes` of
+/// its newest stored desired state, read in the same transaction, `peer` the
+/// TCP peer address of the connection (never a header), and `received` the
+/// clock read when the request arrived. `peer` is `None` when the listener
+/// does not take the connection as a source at all: a caller on this machine
+/// that is not root (see `crate::vote_listener`).
+///
+/// The rules are checked in section 8.9's order of the refusals,
+/// `not_allowed`, `stale_term`, `voters_changed`, `support_held`, and the
+/// first that applies decides. The `503` of a voter that cannot tell comes
+/// before `support_held`, which section 8.9 allows ("A `503` may come before
+/// a refusal that would otherwise apply"):
+///
+/// 1. `not_allowed`: another `cluster_id`, no `peer`, a peer that is not the
+///    mesh address of a voter with the `node` role, or a `candidate_node_id`
+///    other than that voter's. This machine's own mesh address passes when
+///    it has the `node` role: the candidate asks its own agent too, as root.
+/// 2. `stale_term`: `term` is below the highest term seen, or equals it and
+///    the stored vote is not this very (`term`, candidate).
+/// 3. `voters_changed`: `voters_version` is not `votes.version`; the answer
+///    lists the voter set (section 8.10 rule 4).
+/// 4. A host with no `CLOCK_BOOTTIME` or no boot id, or whose stored support
+///    is on another boot and was not brought onto this one, cannot tell
+///    whether its promise ran out or how long the lease horizon lasts:
+///    [`VoteDecision::Unavailable`], never `granted`.
+/// 5. `support_held`: the promise has not run out (`now < promise`) and the
+///    candidate is not the primary supported; `retry_after_ms` is
+///    `promise - now`, rounded up.
+/// 6. Otherwise `granted`, with `lease_wait_ms` = `max(0, horizon - now)`,
+///    rounded up, or 0 with no support stored.
+///
+/// Every answer carries the voter's highest term after the request: `T`
+/// after a real grant, the unchanged one otherwise, `check` included, so a
+/// candidate's `T` from a `check` answer is never pushed up by its own
+/// request (section 7.3). Only a real grant that the voter had not granted
+/// already writes: the vote (`T`, candidate) and `T` as the highest term,
+/// in the same transaction. A refusal and a `check` write nothing, not even
+/// a higher term.
+#[must_use]
+pub fn decide_vote(
+    state: &VoteState,
+    request: &VoteRequest,
+    node_id: &str,
+    cluster_id: &str,
+    votes: &SpecVotes,
+    peer: Option<IpAddr>,
+    received: &Received,
+) -> (VoteDecision, VoteWrite) {
+    let highest = state.highest();
+    let answer = |vote: VoteOutcome, term: u64| VoteAnswer {
+        node_id: node_id.to_owned(),
+        term,
+        vote,
+        reason: None,
+        retry_after_ms: None,
+        lease_wait_ms: None,
+        voters_version: votes.version,
+        voters: None,
+    };
+    // A refusal writes nothing and carries the unchanged term.
+    let refused = |reason: VoteRefusal| VoteAnswer {
+        reason: Some(reason),
+        ..answer(VoteOutcome::Refused, highest)
+    };
+    let refuse = |answer: VoteAnswer| (VoteDecision::Answer(answer), VoteWrite::default());
+
+    let source = peer.and_then(|peer| {
+        let peer = peer.to_canonical();
+        node_voter_addresses(votes).find(|(_, address)| *address == peer)
+    });
+    if request.cluster_id != cluster_id
+        || source.is_none_or(|(voter, _)| voter.node_id != request.candidate_node_id)
+    {
+        return refuse(refused(VoteRefusal::NotAllowed));
+    }
+
+    let granted_already = state.vote.as_ref().is_some_and(|vote| {
+        vote.term == request.term && vote.candidate == request.candidate_node_id
+    });
+    if request.term < highest || (request.term == highest && !granted_already) {
+        return refuse(refused(VoteRefusal::StaleTerm));
+    }
+
+    if request.voters_version != votes.version {
+        let voters = votes
+            .voters
+            .iter()
+            .map(|voter| voter.node_id.clone())
+            .collect();
+        return refuse(VoteAnswer {
+            voters: Some(voters),
+            ..refused(VoteRefusal::VotersChanged)
+        });
+    }
+
+    let (Some(boot_id), Some(now)) = (received.boot_id.as_deref(), received.boottime) else {
+        return (
+            VoteDecision::Unavailable(
+                "this host has no CLOCK_BOOTTIME or no boot id, so it cannot tell whether its \
+                 promise ran out"
+                    .to_owned(),
+            ),
+            VoteWrite::default(),
+        );
+    };
+    if let Some(support) = &state.support
+        && support.boot_id != boot_id
+    {
+        return (
+            VoteDecision::Unavailable(
+                "the stored support is on another boot and was not brought onto this one"
+                    .to_owned(),
+            ),
+            VoteWrite::default(),
+        );
+    }
+
+    if let Some(support) = &state.support
+        && now < support.promise()
+        && support.primary_node_id != request.candidate_node_id
+    {
+        return refuse(VoteAnswer {
+            retry_after_ms: Some(ceil_ms(support.promise().saturating_sub(now))),
+            ..refused(VoteRefusal::SupportHeld)
+        });
+    }
+
+    let lease_wait_ms = state
+        .support
+        .as_ref()
+        .map_or(0, |support| ceil_ms(support.horizon().saturating_sub(now)));
+    let real = !request.is_check();
+    let term = if real { request.term } else { highest };
+    let write = if real && !granted_already {
+        VoteWrite {
+            term: (state.highest_term.unwrap_or(0) < request.term).then_some(request.term),
+            vote: Some(StoredVote {
+                term: request.term,
+                candidate: request.candidate_node_id.clone(),
+            }),
+            ..VoteWrite::default()
+        }
+    } else {
+        VoteWrite::default()
+    };
+    (
+        VoteDecision::Answer(VoteAnswer {
+            lease_wait_ms: Some(lease_wait_ms),
+            ..answer(VoteOutcome::Granted, term)
+        }),
+        write,
+    )
+}
+
+/// Whether `peer` may ask for votes under `votes` at all: it is the mesh
+/// address of a voter with the `node` role (section 8.9). `None`, a caller
+/// the listener does not take as a source, never may. A `peer` for which
+/// this is false is refused `not_allowed` by [`decide_vote`]'s first rule.
+#[must_use]
+pub fn may_ask(votes: &SpecVotes, peer: Option<IpAddr>) -> bool {
+    peer.is_some_and(|peer| {
+        let peer = peer.to_canonical();
+        node_voter_addresses(votes).any(|(_, address)| address == peer)
+    })
+}
+
+/// The `not_allowed` answer of the voter `node_id`, whose highest term is
+/// `highest`, under `votes`: the answer [`decide_vote`] gives to a caller
+/// that may not ask ([`may_ask`]).
+#[must_use]
+pub fn not_allowed(node_id: &str, highest: u64, votes: &SpecVotes) -> VoteAnswer {
+    VoteAnswer {
+        node_id: node_id.to_owned(),
+        term: highest,
+        vote: VoteOutcome::Refused,
+        reason: Some(VoteRefusal::NotAllowed),
+        retry_after_ms: None,
+        lease_wait_ms: None,
+        voters_version: votes.version,
+        voters: None,
+    }
+}
+
+/// The voter's highest term, its stored term or the term of its stored vote,
+/// read without a write transaction.
+///
+/// # Errors
+///
+/// [`AgentError::Store`] when either cannot be read.
+pub async fn current_term(store: &NodeStore) -> Result<u64, AgentError> {
+    let stored = store.highest_term().await?.unwrap_or(0);
+    let voted = store.vote().await?.map_or(0, |vote| vote.term);
+    Ok(stored.max(voted))
+}
+
+/// Answers one `POST /v1/vote` (section 8.9): reads the vote state and the
+/// newest `spec.votes` (`votes`), decides ([`decide_vote`]) and writes the
+/// vote, in one `BEGIN IMMEDIATE` transaction, and returns the answer only
+/// once it committed. `spec.votes` is read once the transaction holds the
+/// write lock, so the vote is decided against the voter-set version that any
+/// `support_grant` written meanwhile carries (section 8.10 rule 4). A state
+/// that cannot be read or written, or no `spec.votes`, is
+/// [`VoteDecision::Unavailable`], never `granted`.
+pub async fn answer_vote(
+    store: &NodeStore,
+    request: &VoteRequest,
+    node_id: &str,
+    cluster_id: &str,
+    votes: impl FnOnce() -> Option<SpecVotes>,
+    peer: Option<IpAddr>,
+    received: &Received,
+) -> VoteDecision {
+    store
+        .update_vote_state(|state| {
+            let Some(votes) = votes() else {
+                return (
+                    VoteDecision::Unavailable("this machine is not a voter".to_owned()),
+                    VoteWrite::default(),
+                );
+            };
+            decide_vote(state, request, node_id, cluster_id, &votes, peer, received)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            VoteDecision::Unavailable(format!("could not keep the vote state: {e}"))
+        })
+}
+
 /// Brings the stored support onto the current boot at agent start, before any
 /// session answers a `support_request` (section 8.8 "Restarts").
 ///
@@ -466,9 +752,16 @@ mod tests {
 
     use quoro_proto::wire::SupportRequest;
 
+    use std::net::IpAddr;
+
+    use quoro_proto::wire::{
+        SpecVoter, SpecVotes, VoteAnswer, VoteOutcome, VoteRefusal, VoteRequest,
+    };
+
     use super::{
-        Received, StoredSupport, StoredVote, SupportAnswer, TermCheck, VoteState, VoteWrite,
-        answer_support, check_term, decide_support, horizon_span, rebase_at_start, support_after,
+        Received, StoredSupport, StoredVote, SupportAnswer, TermCheck, VoteDecision, VoteState,
+        VoteWrite, answer_support, answer_vote, check_term, decide_support, decide_vote,
+        horizon_span, may_ask, not_allowed, rebase_at_start, support_after,
     };
     use crate::lease::{HostClock, ManualHostClock};
     use crate::store::{NodeStore, VOTE};
@@ -996,5 +1289,522 @@ mod tests {
             "{answer:?}"
         );
         assert_eq!(store.support().await.unwrap(), None, "nothing promised");
+    }
+
+    // ---- Promotion votes (section 8.9) ----
+
+    /// This machine: node B of section 6.12's example.
+    const ME: &str = "nod_b";
+    const CLUSTER: &str = "cls_1";
+    const A: &str = "10.43.0.2";
+    const B: &str = "10.43.0.3";
+    const WITNESS: &str = "10.43.0.1";
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    /// Two voters with the `node` role, A and this machine B, and a witness.
+    fn spec_votes() -> SpecVotes {
+        let voter = |node_id: &str, roles: &[&str], address: &str| SpecVoter {
+            node_id: node_id.to_owned(),
+            roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+            mesh_address: Some(address.to_owned()),
+        };
+        SpecVotes {
+            version: 3120,
+            port: 51821,
+            voters: vec![
+                voter("nod_a", &["node"], A),
+                voter(ME, &["node"], B),
+                voter("nod_w", &["edge", "witness"], WITNESS),
+            ],
+        }
+    }
+
+    fn vote_request(term: u64, candidate: &str) -> VoteRequest {
+        VoteRequest {
+            cluster_id: CLUSTER.to_owned(),
+            term,
+            candidate_node_id: candidate.to_owned(),
+            voters_version: 3120,
+            check: None,
+        }
+    }
+
+    fn checked(request: &VoteRequest) -> VoteRequest {
+        VoteRequest {
+            check: Some(true),
+            ..request.clone()
+        }
+    }
+
+    /// The support of `primary`, received at 490 s on boot-a with `S` =
+    /// 15 s and `L` = 15 s: promise at 505 s, horizon at 523 s.
+    fn support_of(primary: &str) -> StoredSupport {
+        let mut request = request(1, 15_000, 15_000);
+        request.primary_node_id = primary.to_owned();
+        support_after(None, &request, "boot-a", secs(490))
+    }
+
+    fn state(highest: Option<u64>, vote: Option<(u64, &str)>) -> VoteState {
+        VoteState {
+            highest_term: highest,
+            vote: vote.map(|(term, candidate)| StoredVote {
+                term,
+                candidate: candidate.to_owned(),
+            }),
+            support: None,
+        }
+    }
+
+    fn decide_at(
+        state: &VoteState,
+        request: &VoteRequest,
+        peer: &str,
+        now: &Received,
+    ) -> (VoteDecision, VoteWrite) {
+        decide_vote(
+            state,
+            request,
+            ME,
+            CLUSTER,
+            &spec_votes(),
+            Some(ip(peer)),
+            now,
+        )
+    }
+
+    fn decide(state: &VoteState, request: &VoteRequest, peer: &str) -> (VoteDecision, VoteWrite) {
+        decide_at(state, request, peer, &at("boot-a", secs(500)))
+    }
+
+    fn answered(decision: VoteDecision) -> VoteAnswer {
+        match decision {
+            VoteDecision::Answer(answer) => answer,
+            VoteDecision::Unavailable(reason) => panic!("unavailable: {reason}"),
+        }
+    }
+
+    /// The reason of a refusal that writes nothing.
+    fn refusal(state: &VoteState, request: &VoteRequest, peer: &str) -> VoteRefusal {
+        let (decision, write) = decide(state, request, peer);
+        let answer = answered(decision);
+        assert_eq!(answer.vote, VoteOutcome::Refused, "{answer:?}");
+        assert_eq!(write, VoteWrite::default(), "a refusal writes nothing");
+        assert_eq!(answer.term, state.highest(), "the term is unchanged");
+        assert_eq!((answer.node_id.as_str(), answer.voters_version), (ME, 3120));
+        answer.reason.expect("a refusal has a reason")
+    }
+
+    /// Section 8.9: a real vote from a voter with the `node` role is granted,
+    /// carries `T`, and writes the vote and `T` as the highest term.
+    #[test]
+    fn a_node_voter_s_vote_is_granted_and_written() {
+        let (decision, write) = decide(&state(Some(1), None), &vote_request(2, "nod_a"), A);
+        assert_eq!(
+            answered(decision),
+            VoteAnswer {
+                node_id: ME.to_owned(),
+                term: 2,
+                vote: VoteOutcome::Granted,
+                reason: None,
+                retry_after_ms: None,
+                lease_wait_ms: Some(0),
+                voters_version: 3120,
+                voters: None,
+            }
+        );
+        assert_eq!(
+            write,
+            VoteWrite {
+                term: Some(2),
+                vote: Some(StoredVote {
+                    term: 2,
+                    candidate: "nod_a".to_owned(),
+                }),
+                support: None,
+            }
+        );
+        // The candidate asks its own agent too: this machine's own address
+        // passes, since it has the `node` role.
+        let (decision, _) = decide(&state(Some(1), None), &vote_request(2, ME), B);
+        assert_eq!(answered(decision).vote, VoteOutcome::Granted);
+    }
+
+    /// Section 8.9: another cluster, a source that is not a voter with the
+    /// `node` role, and a candidate that is not the source's voter are
+    /// `not_allowed`.
+    #[test]
+    fn requests_from_outside_the_node_voters_are_not_allowed() {
+        let state = state(Some(1), None);
+        let mut other_cluster = vote_request(2, "nod_a");
+        other_cluster.cluster_id = "cls_other".to_owned();
+        assert_eq!(refusal(&state, &other_cluster, A), VoteRefusal::NotAllowed);
+        assert_eq!(
+            refusal(&state, &vote_request(2, "nod_a"), "10.43.0.9"),
+            VoteRefusal::NotAllowed,
+            "an address not in spec.votes"
+        );
+        assert_eq!(
+            refusal(&state, &vote_request(2, "nod_w"), WITNESS),
+            VoteRefusal::NotAllowed,
+            "a witness-only voter"
+        );
+        assert_eq!(
+            refusal(&state, &vote_request(2, ME), A),
+            VoteRefusal::NotAllowed,
+            "a candidate that is not the source's voter"
+        );
+        assert_eq!(
+            refusal(&state, &vote_request(2, "nod_a"), "::ffff:10.43.0.9"),
+            VoteRefusal::NotAllowed
+        );
+        // An IPv4-mapped peer address is the voter's address.
+        let (decision, _) = decide(&state, &vote_request(2, "nod_a"), "::ffff:10.43.0.2");
+        assert_eq!(answered(decision).vote, VoteOutcome::Granted);
+
+        // A connection the listener does not take as a source (a caller on
+        // this machine that is not root) is `not_allowed`, even for a vote
+        // this machine would grant to itself, and writes nothing.
+        let request = vote_request(2, ME);
+        let (decision, write) = decide_vote(
+            &state,
+            &request,
+            ME,
+            CLUSTER,
+            &spec_votes(),
+            None,
+            &at("boot-a", secs(500)),
+        );
+        let answer = answered(decision);
+        assert_eq!(
+            (answer.vote, answer.reason, answer.term),
+            (VoteOutcome::Refused, Some(VoteRefusal::NotAllowed), 1)
+        );
+        assert_eq!(write, VoteWrite::default());
+    }
+
+    /// The listener's early refusal matches [`decide_vote`]: a peer that may
+    /// not ask is exactly one the first rule refuses, with the same answer,
+    /// whatever else the request would fail; a node voter's address may ask.
+    #[test]
+    fn the_early_refusal_is_the_first_rule_s_answer() {
+        let votes = spec_votes();
+        let mut state = state(Some(4), Some((4, ME)));
+        state.support = Some(support_of("nod_other"));
+        let mut request = vote_request(3, "nod_a");
+        request.voters_version = 1;
+        for peer in [
+            Some("10.43.0.9"),
+            Some(WITNESS),
+            Some("::ffff:10.43.0.9"),
+            None,
+        ] {
+            let peer = peer.map(ip);
+            assert!(!may_ask(&votes, peer), "{peer:?}");
+            let (decision, write) = decide_vote(
+                &state,
+                &request,
+                ME,
+                CLUSTER,
+                &votes,
+                peer,
+                &at("boot-a", secs(500)),
+            );
+            assert_eq!(write, VoteWrite::default());
+            assert_eq!(
+                answered(decision),
+                not_allowed(ME, state.highest(), &votes),
+                "{peer:?}"
+            );
+        }
+        for peer in [A, B, "::ffff:10.43.0.2"] {
+            assert!(may_ask(&votes, Some(ip(peer))), "{peer}");
+        }
+    }
+
+    /// Section 8.9 rule 1: a term below the voter's, or equal to it without
+    /// this very vote, is `stale_term`; a vote at the current term for
+    /// another candidate refuses this one.
+    #[test]
+    fn a_term_not_above_the_voter_s_is_stale() {
+        let request = vote_request(3, "nod_a");
+        assert_eq!(
+            refusal(&state(Some(4), None), &request, A),
+            VoteRefusal::StaleTerm
+        );
+        assert_eq!(
+            refusal(&state(Some(3), None), &request, A),
+            VoteRefusal::StaleTerm
+        );
+        assert_eq!(
+            refusal(&state(Some(3), Some((3, ME))), &request, A),
+            VoteRefusal::StaleTerm,
+            "the voter voted in term 3 for another candidate"
+        );
+        assert_eq!(
+            refusal(&state(Some(2), Some((3, ME))), &request, A),
+            VoteRefusal::StaleTerm,
+            "the vote's term counts even if the stored term was not raised"
+        );
+        assert_eq!(
+            refusal(&state(Some(4), Some((3, "nod_a"))), &request, A),
+            VoteRefusal::StaleTerm,
+            "a vote for this candidate in a lower term binds nothing"
+        );
+    }
+
+    /// Section 8.9 rule 1: a repeated request for a term the voter already
+    /// granted to this candidate is granted again and writes nothing new.
+    #[test]
+    fn a_repeated_grant_is_granted_and_writes_nothing() {
+        let state = state(Some(3), Some((3, "nod_a")));
+        let (decision, write) = decide(&state, &vote_request(3, "nod_a"), A);
+        let answer = answered(decision);
+        assert_eq!((answer.vote, answer.term), (VoteOutcome::Granted, 3));
+        assert_eq!(write, VoteWrite::default());
+    }
+
+    /// Section 8.10 rule 4: another voter-set version is `voters_changed`,
+    /// with the voter's own set.
+    #[test]
+    fn another_voters_version_is_voters_changed() {
+        let mut request = vote_request(2, "nod_a");
+        request.voters_version = 3119;
+        let state = state(Some(1), None);
+        assert_eq!(refusal(&state, &request, A), VoteRefusal::VotersChanged);
+        let answer = answered(decide(&state, &request, A).0);
+        assert_eq!(
+            answer.voters,
+            Some(vec!["nod_a".to_owned(), ME.to_owned(), "nod_w".to_owned()])
+        );
+        assert_eq!(answer.voters_version, 3120);
+    }
+
+    /// Section 8.9 rule 2: while the promise to another primary runs, the
+    /// vote is `support_held` with the rest of the promise, rounded up; the
+    /// primary it supports is granted, as is anyone once it ran out.
+    #[test]
+    fn a_running_promise_holds_the_vote() {
+        let mut state = state(Some(1), None);
+        state.support = Some(support_of("nod_other"));
+        let request = vote_request(2, "nod_a");
+        assert_eq!(refusal(&state, &request, A), VoteRefusal::SupportHeld);
+        let held = |now: Duration| {
+            answered(decide_at(&state, &request, A, &at("boot-a", now)).0).retry_after_ms
+        };
+        assert_eq!(held(secs(500)), Some(5_000));
+        assert_eq!(held(secs(500) + Duration::from_micros(400)), Some(5_000));
+        assert_eq!(held(secs(505) - Duration::from_nanos(1)), Some(1));
+        // At the promise itself it has run out.
+        let (decision, write) = decide_at(&state, &request, A, &at("boot-a", secs(505)));
+        let answer = answered(decision);
+        assert_eq!(answer.vote, VoteOutcome::Granted);
+        assert_eq!(answer.lease_wait_ms, Some(18_000));
+        assert_eq!(write.vote.unwrap().term, 2);
+
+        // The primary it supports may take the term while the promise runs.
+        state.support = Some(support_of("nod_a"));
+        let answer = answered(decide(&state, &request, A).0);
+        assert_eq!(answer.vote, VoteOutcome::Granted);
+        assert_eq!(answer.lease_wait_ms, Some(23_000));
+    }
+
+    /// Section 8.9: `lease_wait_ms` is the rest of the lease horizon, rounded
+    /// up to whole ms, 0 once it passed, and 0 with no support stored.
+    #[test]
+    fn the_lease_wait_is_the_rest_of_the_horizon() {
+        let mut state = state(Some(1), None);
+        state.support = Some(support_of("nod_a"));
+        let request = vote_request(2, "nod_a");
+        let wait = |now: Duration| {
+            answered(decide_at(&state, &request, A, &at("boot-a", now)).0).lease_wait_ms
+        };
+        assert_eq!(wait(secs(500)), Some(23_000));
+        assert_eq!(wait(secs(500) + Duration::from_nanos(1)), Some(23_000));
+        assert_eq!(wait(secs(523) - Duration::from_micros(1_500)), Some(2));
+        assert_eq!(wait(secs(523)), Some(0));
+        assert_eq!(wait(secs(600)), Some(0));
+    }
+
+    /// Section 8.9: the first rule that fails decides. A request that fails
+    /// two rules gets the first one's reason.
+    #[test]
+    fn the_first_failing_rule_decides() {
+        let mut state = state(Some(4), None);
+        state.support = Some(support_of("nod_other"));
+        let mut changed = vote_request(3, "nod_a");
+        changed.voters_version = 1;
+        // not_allowed before stale_term.
+        assert_eq!(refusal(&state, &changed, WITNESS), VoteRefusal::NotAllowed);
+        // stale_term before voters_changed.
+        assert_eq!(refusal(&state, &changed, A), VoteRefusal::StaleTerm);
+        // voters_changed before support_held.
+        changed.term = 5;
+        assert_eq!(refusal(&state, &changed, A), VoteRefusal::VotersChanged);
+        // support_held last.
+        assert_eq!(
+            refusal(&state, &vote_request(5, "nod_a"), A),
+            VoteRefusal::SupportHeld
+        );
+        // A host that cannot read its clock still refuses on the clock-free
+        // rules, and never grants.
+        let blind = Received {
+            boot_id: None,
+            boottime: None,
+        };
+        let (decision, _) = decide_at(&state, &changed, A, &blind);
+        assert_eq!(answered(decision).reason, Some(VoteRefusal::VotersChanged));
+    }
+
+    /// Sections 7.3 and 8.9: a `check` answers what a real vote would, with
+    /// the voter's unchanged term, and writes nothing, not even a higher
+    /// term.
+    #[test]
+    fn a_check_answers_as_a_vote_and_writes_nothing() {
+        let mut held = state(Some(1), None);
+        held.support = Some(support_of("nod_other"));
+        let cases = [
+            (state(Some(1), None), vote_request(2, "nod_a"), A),
+            (state(Some(4), None), vote_request(3, "nod_a"), A),
+            (state(Some(1), None), vote_request(2, "nod_w"), WITNESS),
+            (held, vote_request(2, "nod_a"), A),
+            (
+                state(Some(3), Some((3, "nod_a"))),
+                vote_request(3, "nod_a"),
+                A,
+            ),
+        ];
+        for (state, request, peer) in cases {
+            let (real, _) = decide(&state, &request, peer);
+            let (check, write) = decide(&state, &checked(&request), peer);
+            assert_eq!(write, VoteWrite::default(), "{request:?}");
+            let (real, check) = (answered(real), answered(check));
+            assert_eq!(check.term, state.highest(), "the term is unchanged");
+            assert_eq!(
+                VoteAnswer {
+                    term: real.term,
+                    ..check
+                },
+                real
+            );
+        }
+    }
+
+    /// Section 8.8 "Restarts": a support from another boot that the start
+    /// did not bring onto this one, or a host that cannot read its clock or
+    /// boot id, never grants.
+    #[test]
+    fn an_unrebased_support_or_a_blind_clock_never_grants() {
+        let mut state = state(Some(1), None);
+        state.support = Some(support_of("nod_a"));
+        let request = vote_request(2, "nod_a");
+        let (decision, write) = decide_at(&state, &request, A, &at("boot-b", secs(9_000)));
+        assert!(
+            matches!(decision, VoteDecision::Unavailable(_)),
+            "{decision:?}"
+        );
+        assert_eq!(write, VoteWrite::default());
+
+        state.support = None;
+        for blind in [
+            Received {
+                boot_id: None,
+                boottime: Some(secs(500)),
+            },
+            Received {
+                boot_id: Some("boot-a".to_owned()),
+                boottime: None,
+            },
+        ] {
+            let (decision, write) = decide_at(&state, &request, A, &blind);
+            assert!(
+                matches!(decision, VoteDecision::Unavailable(_)),
+                "{decision:?}"
+            );
+            assert_eq!(write, VoteWrite::default());
+        }
+    }
+
+    async fn vote(store: &NodeStore, request: &VoteRequest, peer: &str) -> VoteDecision {
+        answer_vote(
+            store,
+            request,
+            ME,
+            CLUSTER,
+            || Some(spec_votes()),
+            Some(ip(peer)),
+            &at("boot-a", secs(500)),
+        )
+        .await
+    }
+
+    /// Sections 8.8 and 8.9: a granted vote is stored with its term before
+    /// the answer, survives an agent restart, and then refuses a lower term
+    /// to the old primary's `support_request` and another candidate's vote
+    /// at the same term; a `check` stored nothing before it.
+    #[tokio::test]
+    async fn a_granted_vote_survives_a_restart_and_refuses_lower_terms() {
+        let (dir, store) = open().await;
+        store.raise_term(1).await.unwrap();
+        let check = vote(&store, &checked(&vote_request(2, "nod_a")), A).await;
+        assert_eq!(answered(check).term, 1);
+        assert_eq!(store.vote().await.unwrap(), None, "a check writes nothing");
+        assert_eq!(store.highest_term().await.unwrap(), Some(1));
+
+        let answer = answered(vote(&store, &vote_request(2, "nod_a"), A).await);
+        assert_eq!((answer.vote, answer.term), (VoteOutcome::Granted, 2));
+        store.pool().close().await;
+        drop(store);
+
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        assert_eq!(
+            store.vote().await.unwrap(),
+            Some(StoredVote {
+                term: 2,
+                candidate: "nod_a".to_owned(),
+            })
+        );
+        assert_eq!(store.highest_term().await.unwrap(), Some(2));
+        assert_eq!(
+            answer_support(
+                &store,
+                Some(3120),
+                PRIMARY,
+                &request(1, 15_000, 15_000),
+                &at("boot-a", secs(500)),
+            )
+            .await,
+            SupportAnswer::Stale { highest: 2 }
+        );
+        let other = answered(vote(&store, &vote_request(2, ME), B).await);
+        assert_eq!(other.reason, Some(VoteRefusal::StaleTerm));
+        let again = answered(vote(&store, &vote_request(2, "nod_a"), A).await);
+        assert_eq!(again.vote, VoteOutcome::Granted, "a repeated grant");
+    }
+
+    /// Section 8.9: a vote that cannot be written is never answered
+    /// `granted`, and neither its term nor the vote is kept.
+    #[tokio::test]
+    async fn a_vote_that_cannot_be_written_is_never_granted() {
+        let (_dir, store) = open().await;
+        store.raise_term(1).await.unwrap();
+        for event in ["INSERT", "UPDATE"] {
+            sqlx::query(&format!(
+                "CREATE TRIGGER no_vote_{event} BEFORE {event} ON node_meta \
+                 WHEN NEW.key = '{VOTE}' BEGIN SELECT RAISE(ABORT, 'read-only'); END"
+            ))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        let decision = vote(&store, &vote_request(2, "nod_a"), A).await;
+        assert!(
+            matches!(decision, VoteDecision::Unavailable(_)),
+            "{decision:?}"
+        );
+        assert_eq!(store.vote().await.unwrap(), None);
+        assert_eq!(store.highest_term().await.unwrap(), Some(1), "rolled back");
     }
 }

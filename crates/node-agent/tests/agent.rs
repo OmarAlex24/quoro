@@ -259,3 +259,148 @@ async fn a_witness_only_agent_runs_without_an_engine() {
         .expect("the agent task did not panic");
     assert!(result.is_ok(), "{result:?}");
 }
+
+/// Sends one vote request from the source address `from` to the vote
+/// listener on `127.0.0.1:port`, and reads the JSON answer.
+#[cfg(target_os = "linux")]
+async fn vote_from(from: &str, port: u16, term: u64, candidate: &str) -> Value {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let body = serde_json::json!({
+        "cluster_id": "cls_test",
+        "term": term,
+        "candidate_node_id": candidate,
+        "voters_version": 12
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/vote HTTP/1.1\r\nhost: voter\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind(format!("{from}:0").parse().unwrap()).unwrap();
+    let mut stream = socket
+        .connect(format!("127.0.0.1:{port}").parse().unwrap())
+        .await
+        .expect("connect to the vote listener");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+        .await
+        .expect("an answer in time")
+        .unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").expect("a reply");
+    assert!(head.starts_with("HTTP/1.1 200"), "{text}");
+    serde_json::from_str(body).unwrap()
+}
+
+/// Section 8.9: the vote listener belongs to the agent process. A
+/// witness-only agent with no session ever up answers a vote from a `node`
+/// voter's mesh address on its own mesh address and `spec.votes.port`, and
+/// still answers while a promotion on its host froze it (section 7.3). It
+/// listens only once the mesh, and so its firewall, is applied: while the
+/// apply fails nothing listens, and the retry after it brings the listener
+/// up. Loopback addresses stand in for mesh addresses.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_agent_answers_votes_without_a_session_and_while_frozen() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[4; 32]);
+    // Port 1 refuses immediately: no session ever comes up.
+    identity_files_with_url(dir.path(), &key, "https://127.0.0.1:1");
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let voter = |node_id: &str, role: &str, address: &str| quoro_proto::wire::SpecVoter {
+        node_id: node_id.to_owned(),
+        roles: vec![role.to_owned()],
+        mesh_address: Some(address.to_owned()),
+    };
+    let mut witness = snapshot(5, Vec::new());
+    witness.state.spec.network = None;
+    witness.state.spec.witness = Some(quoro_proto::wire::SpecWitness {});
+    witness.state.spec.mesh = Some(quoro_proto::wire::SpecMesh {
+        address: "127.0.0.1/8".to_owned(),
+        listen_port: 51820,
+        peers: Vec::new(),
+        allow: Vec::new(),
+    });
+    witness.state.spec.votes = Some(quoro_proto::wire::SpecVotes {
+        version: 12,
+        port,
+        voters: vec![
+            voter("nod_test", "witness", "127.0.0.1"),
+            voter("nod_a", "node", "127.0.0.2"),
+        ],
+    });
+    store
+        .store_desired(5, &signed_body(&witness, &key))
+        .await
+        .unwrap();
+
+    let mut config = config(&dir);
+    config.roles = vec!["witness".to_owned()];
+    let (shutdown, stop) = tokio::sync::oneshot::channel();
+    let mesh = quoro_node_agent::mesh::RecordingMeshDriver::new();
+    mesh.fail_applies(true);
+    let task = tokio::spawn(quoro_node_agent::run_with_mesh(
+        config,
+        RecordingEngine::new(),
+        facts(),
+        mesh.clone(),
+        async move {
+            let _ = stop.await;
+        },
+    ));
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while mesh.calls().is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the agent applied the mesh");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "no vote listener while the mesh firewall is not applied"
+    );
+    mesh.fail_applies(false);
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the vote listener came up");
+
+    let answer = vote_from("127.0.0.2", port, 2, "nod_a").await;
+    assert_eq!(answer["vote"], "granted", "{answer}");
+    assert_eq!(answer["node_id"], "nod_test", "{answer}");
+    assert_eq!(answer["term"], 2, "{answer}");
+
+    quoro_node_agent::freeze::freeze(dir.path()).await.unwrap();
+    let answer = vote_from("127.0.0.2", port, 3, "nod_a").await;
+    assert_eq!(
+        answer["vote"], "granted",
+        "a frozen agent still votes: {answer}"
+    );
+    assert_eq!(store.highest_term().await.unwrap(), Some(3));
+
+    shutdown.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the agent stops on shutdown")
+        .expect("the agent task did not panic");
+    assert!(result.is_ok(), "{result:?}");
+}

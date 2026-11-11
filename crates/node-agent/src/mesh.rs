@@ -11,11 +11,14 @@
 //! address (section 6.13). The table also keeps new connections out of the
 //! mesh unless a root process on this machine opens them, and forwards none:
 //! the mesh carries no traffic between guests, and a guest opens no
-//! connection on it (section 6.9).
+//! connection on it (section 6.9). On a voter it also admits the vote
+//! listener from every other voter with the `node` role (sections 6.9 and
+//! 8.9), a rule that follows from `spec.votes` and is not in `allow`, and
+//! takes TCP to the listener only over the mesh interface or loopback.
 //!
 //! [`MeshManager`] keeps the interface equal to the newest verified snapshot:
-//! every changed snapshot is evaluated, and a failed apply or an unchanged one
-//! is retried at least every [`REAPPLY`].
+//! every snapshot whose `spec.mesh` or `spec.votes` changed is evaluated, and
+//! a failed apply or an unchanged one is retried at least every [`REAPPLY`].
 
 use std::fmt::{self, Write as _};
 use std::future::Future;
@@ -28,9 +31,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use curve25519_dalek::MontgomeryPoint;
 use quoro_engine::MESH_MARK;
-use quoro_proto::wire::{MeshPeer, SpecMesh};
+use quoro_proto::wire::{MeshPeer, SpecMesh, SpecVotes};
 use tokio::sync::watch;
-use tracing::warn;
+use tracing::{debug, error, warn};
 
 use crate::AgentError;
 use crate::identity;
@@ -47,6 +50,20 @@ const TABLE: &str = "quoro_mesh";
 
 /// How long an applied mesh may stand without being re-applied.
 pub const REAPPLY: Duration = Duration::from_secs(60);
+
+/// How long the manager waits before it retries a failed apply the first
+/// time. Each failure in a row doubles the wait, up to [`REAPPLY`].
+pub const RETRY_FIRST: Duration = Duration::from_secs(2);
+
+/// The wait before the next retry of a failed apply, after `previous`, the
+/// wait before this failure's attempt, if it was a retry: [`RETRY_FIRST`],
+/// then twice the previous wait, never more than [`REAPPLY`].
+#[must_use]
+pub fn retry_delay(previous: Option<Duration>) -> Duration {
+    previous.map_or(RETRY_FIRST, |previous| {
+        previous.saturating_mul(2).min(REAPPLY)
+    })
+}
 
 /// The machine's X25519 private key.
 ///
@@ -169,8 +186,22 @@ pub fn desired_routes(mesh: &SpecMesh) -> Vec<String> {
 /// both rules let them through.
 /// Any entry whose `source` or `address` is not an IPv4 address is skipped
 /// with a warning: unparsed text is never written into nftables syntax.
+///
+/// On a voter, `votes` adds the vote listener's rules (sections 6.9 and 8.9).
+/// Prerouting marks TCP to this machine's own mesh address on `votes.port`
+/// from the mesh address of every other voter with the `node` role, like an
+/// `allow` entry, so the input chain admits it ([`vote_rules`]). A
+/// witness-only voter is never a source: only a machine with the `node` role
+/// can be promoted. A caller on this machine reaches the listener over `lo`,
+/// so it needs no rule. The input chain's first two rules drop TCP to the own
+/// mesh address on `votes.port` that arrives on any interface other than the
+/// mesh interface and `lo`, and, over `lo`, from any source other than that
+/// address ([`vote_input_rules`]).
+///
+/// Every rule names an interface by `iifname` or `oifname`, never by index,
+/// so the ruleset loads before [`INTERFACE`] exists.
 #[must_use]
-pub fn nft_ruleset(mesh: Option<&SpecMesh>) -> String {
+pub fn nft_ruleset(mesh: Option<&SpecMesh>, votes: Option<&SpecVotes>) -> String {
     let mut rules = String::with_capacity(1024);
     let _ = writeln!(rules, "table inet {TABLE} {{}}");
     let _ = writeln!(rules, "delete table inet {TABLE}");
@@ -204,6 +235,7 @@ pub fn nft_ruleset(mesh: Option<&SpecMesh>) -> String {
             allow.port
         );
     }
+    vote_rules(&mut rules, mesh, votes);
     let _ = writeln!(rules, "    }}");
     let _ = writeln!(rules, "    chain forward {{");
     let _ = writeln!(
@@ -236,6 +268,9 @@ pub fn nft_ruleset(mesh: Option<&SpecMesh>) -> String {
         rules,
         "        type filter hook input priority filter - 2; policy accept;"
     );
+    // First, so that no accept below it can let the listener's port through
+    // from another interface.
+    vote_input_rules(&mut rules, mesh, votes);
     let _ = writeln!(
         rules,
         "        iifname \"{INTERFACE}\" ct state established,related accept"
@@ -251,6 +286,74 @@ pub fn nft_ruleset(mesh: Option<&SpecMesh>) -> String {
     let _ = writeln!(rules, "    }}");
     let _ = writeln!(rules, "}}");
     rules
+}
+
+/// The prerouting rules that admit the vote listener (sections 6.9 and 8.9):
+/// one per voter with the `node` role and an IPv4 mesh address other than
+/// this machine's own. Each marks the packet, so the input chain accepts it.
+fn vote_rules(rules: &mut String, mesh: &SpecMesh, votes: Option<&SpecVotes>) {
+    let Some(votes) = votes else {
+        return;
+    };
+    let Some(IpAddr::V4(own)) = crate::vote::mesh_ip(&mesh.address) else {
+        warn!(
+            address = %mesh.address,
+            "this machine's mesh address is not an IPv4 address; the vote listener is not admitted"
+        );
+        return;
+    };
+    let mut sources: Vec<Ipv4Addr> = crate::vote::node_voter_addresses(votes)
+        .filter_map(|(_, address)| match address {
+            IpAddr::V4(address) if address != own => Some(address),
+            _ => None,
+        })
+        .collect();
+    sources.sort_unstable();
+    sources.dedup();
+    for source in sources {
+        let _ = writeln!(
+            rules,
+            "        iifname \"{INTERFACE}\" ip saddr {source} ip daddr {own} tcp dport {} meta mark set {MESH_MARK:#010x}",
+            votes.port
+        );
+    }
+}
+
+/// The input rules that keep the vote listener's TCP to the mesh interface
+/// and loopback. They are this implementation's rules under section 6.9's
+/// mesh firewall, for the listener of section 8.9. TCP to this machine's own
+/// mesh address on `votes.port` is dropped when it arrives on an interface
+/// other than [`INTERFACE`] and `lo`. Over `lo`, it is dropped unless its
+/// source is that same mesh address, so only connections from the machine's
+/// own mesh address reach the listener over loopback, and the listener's
+/// owner check always applies to them. Nothing without `votes` or without an
+/// IPv4 mesh address ([`vote_rules`] warns about the latter).
+fn vote_input_rules(rules: &mut String, mesh: &SpecMesh, votes: Option<&SpecVotes>) {
+    let Some(listener) = vote_listen_address(mesh, votes) else {
+        return;
+    };
+    let (own, port) = (listener.ip(), listener.port());
+    let _ = writeln!(
+        rules,
+        "        iifname != \"{INTERFACE}\" iifname != \"lo\" ip daddr {own} tcp dport {port} drop"
+    );
+    let _ = writeln!(
+        rules,
+        "        iifname \"lo\" ip daddr {own} tcp dport {port} ip saddr != {own} drop"
+    );
+}
+
+/// The vote listener's address whose rules the ruleset of `mesh` and `votes`
+/// loads ([`vote_input_rules`]): this machine's IPv4 mesh address on
+/// `votes.port`. `None` without `votes`, or with a mesh address that is not
+/// IPv4, whose ruleset has no such rules.
+#[must_use]
+pub fn vote_listen_address(mesh: &SpecMesh, votes: Option<&SpecVotes>) -> Option<SocketAddr> {
+    let votes = votes?;
+    let Some(IpAddr::V4(own)) = crate::vote::mesh_ip(&mesh.address) else {
+        return None;
+    };
+    Some(SocketAddr::new(IpAddr::V4(own), votes.port))
 }
 
 /// Parses an endpoint as `IPv4:port` or `[IPv6]:port`.
@@ -331,7 +434,8 @@ pub fn sets_endpoint(peer: &MeshPeer, on_device: bool, previous: Option<&SpecMes
 /// the manager logs it and retries, and the driver never needs to be inspected
 /// by the rest of the agent.
 pub trait MeshDriver: Send + Sync {
-    /// Makes the interface equal to `mesh`, using `key` as its private key.
+    /// Makes the interface equal to `mesh`, using `key` as its private key,
+    /// and its firewall admit the vote listener of `votes` ([`nft_ruleset`]).
     /// `previous` is the mesh the last successful apply set, if any, less the
     /// peers whose endpoint a failed apply since may have changed: a peer's
     /// endpoint is set only when [`sets_endpoint`] says so.
@@ -339,6 +443,7 @@ pub trait MeshDriver: Send + Sync {
         &self,
         key: &MeshKey,
         mesh: &SpecMesh,
+        votes: Option<&SpecVotes>,
         previous: Option<&SpecMesh>,
     ) -> impl Future<Output = Result<(), String>> + Send;
 
@@ -351,7 +456,9 @@ pub trait MeshDriver: Send + Sync {
 pub struct RecordingMeshDriver {
     calls: Arc<Mutex<Vec<MeshCall>>>,
     previous: Arc<Mutex<Vec<Option<SpecMesh>>>>,
+    votes: Arc<Mutex<Vec<Option<SpecVotes>>>>,
     failing: Arc<std::sync::atomic::AtomicBool>,
+    failing_removes: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One call a [`RecordingMeshDriver`] saw.
@@ -383,10 +490,26 @@ impl RecordingMeshDriver {
             .store(failing, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Makes every later [`MeshDriver::remove`] fail after it is recorded,
+    /// or succeed again.
+    pub fn fail_removes(&self, failing: bool) {
+        self.failing_removes
+            .store(failing, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The `previous` mesh of every [`MeshDriver::apply`] call, in order.
     #[must_use]
     pub fn previous(&self) -> Vec<Option<SpecMesh>> {
         self.previous
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The `votes` of every [`MeshDriver::apply`] call, in order.
+    #[must_use]
+    pub fn votes(&self) -> Vec<Option<SpecVotes>> {
+        self.votes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -404,12 +527,15 @@ impl MeshDriver for RecordingMeshDriver {
         &self,
         _key: &MeshKey,
         mesh: &SpecMesh,
+        votes: Option<&SpecVotes>,
         previous: Option<&SpecMesh>,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let mesh = mesh.clone();
         let previous = previous.cloned();
         let calls = Arc::clone(&self.calls);
         let previous_meshes = Arc::clone(&self.previous);
+        let applied_votes = Arc::clone(&self.votes);
+        let votes = votes.cloned();
         let failing = self.failing.load(std::sync::atomic::Ordering::SeqCst);
         async move {
             calls
@@ -420,6 +546,10 @@ impl MeshDriver for RecordingMeshDriver {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(previous);
+            applied_votes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(votes);
             if failing {
                 Err("a failing test driver".to_owned())
             } else {
@@ -430,12 +560,19 @@ impl MeshDriver for RecordingMeshDriver {
 
     fn remove(&self) -> impl Future<Output = Result<(), String>> + Send {
         let calls = Arc::clone(&self.calls);
+        let failing = self
+            .failing_removes
+            .load(std::sync::atomic::Ordering::SeqCst);
         async move {
             calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(MeshCall::Remove);
-            Ok(())
+            if failing {
+                Err("a failing test driver".to_owned())
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -470,6 +607,7 @@ impl MeshDriver for UnsupportedMeshDriver {
         &self,
         _key: &MeshKey,
         _mesh: &SpecMesh,
+        _votes: Option<&SpecVotes>,
         _previous: Option<&SpecMesh>,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let warned = &self.warned;
@@ -498,22 +636,56 @@ pub type PlatformMeshDriver = UnsupportedMeshDriver;
 pub struct MeshManager<D: MeshDriver> {
     driver: D,
     key: MeshKey,
+    firewall: watch::Sender<Option<SocketAddr>>,
 }
 
 impl<D: MeshDriver> MeshManager<D> {
     /// A manager that applies `desired` with `driver` and `key`.
     #[must_use]
     pub fn new(driver: D, key: MeshKey) -> Self {
-        Self { driver, key }
+        Self {
+            driver,
+            key,
+            firewall: watch::Sender::new(None),
+        }
+    }
+
+    /// The vote listener's address whose firewall rules are loaded
+    /// ([`vote_listen_address`]): set by a successful apply of a mesh with
+    /// `spec.votes`, and `None` from the moment an apply fails or the mesh is
+    /// removed. The vote listener listens only on this address.
+    #[must_use]
+    pub fn firewall(&self) -> watch::Receiver<Option<SocketAddr>> {
+        self.firewall.subscribe()
+    }
+
+    /// Publishes the address the loaded firewall covers.
+    fn publish_firewall(&self, address: Option<SocketAddr>) {
+        self.firewall.send_if_modified(|current| {
+            let changed = *current != address;
+            *current = address;
+            changed
+        });
     }
 
     /// Applies the mesh of every snapshot until `stop` resolves.
     ///
-    /// A snapshot whose `spec.mesh` differs from the last applied one, a
-    /// snapshot after a failed apply, and every [`REAPPLY`] period all cause an
-    /// apply. A snapshot without a mesh removes the interface; the first start
+    /// A snapshot whose `spec.mesh` or `spec.votes` differs from the last
+    /// applied one, a snapshot after a failed apply, and every [`REAPPLY`]
+    /// period all cause an apply. A snapshot without a mesh removes the interface; the first start
     /// also removes it once, so an interface left by a previous run cannot
     /// survive with stale peers.
+    ///
+    /// A failed apply is retried without waiting for a snapshot or the
+    /// period: after [`RETRY_FIRST`], then after twice the last wait, up to
+    /// [`REAPPLY`] ([`retry_delay`]). A successful apply resets the wait. An
+    /// apply whose firewall does not load leaves WireGuard with no peers, so
+    /// the retry is what brings the peers back within seconds. A machine
+    /// without `nft` installed keeps an empty mesh and retries; the failure is
+    /// logged at `error` at most once per [`REAPPLY`], with how many were held
+    /// back since, and at `debug` otherwise. A snapshot without a mesh ends
+    /// the retries of an apply; a removal that fails is retried with the same
+    /// growing wait, and logged at `warn` under the same limit.
     pub async fn run(
         self,
         mut desired: watch::Receiver<Option<Snapshot>>,
@@ -544,6 +716,13 @@ impl<D: MeshDriver> MeshManager<D> {
                     let current = desired.borrow_and_update().clone();
                     self.sync(current.as_ref(), &mut state, true).await;
                 }
+                () = sleep_until(state.retry_at) => {
+                    // Consumed here, so a pass that schedules nothing never
+                    // finds it due again.
+                    state.retry_at = None;
+                    let current = desired.borrow_and_update().clone();
+                    self.sync(current.as_ref(), &mut state, false).await;
+                }
             }
         }
     }
@@ -551,51 +730,97 @@ impl<D: MeshDriver> MeshManager<D> {
     /// One evaluation of the newest snapshot.
     async fn sync(&self, snapshot: Option<&Snapshot>, state: &mut ManagerState, force: bool) {
         let mesh = snapshot.and_then(|snapshot| snapshot.state.spec.mesh.as_ref());
+        let votes = snapshot.and_then(|snapshot| snapshot.state.spec.votes.as_ref());
         match mesh {
             Some(mesh) => {
-                if state.should_apply(mesh, force) {
-                    match self
-                        .driver
-                        .apply(&self.key, mesh, state.applied.as_ref())
-                        .await
-                    {
-                        Ok(()) => {
-                            state.applied = Some(mesh.clone());
-                            state.failed = false;
-                            state.removed = false;
-                            state.last_apply = Some(tokio::time::Instant::now());
+                if !state.should_apply(mesh, votes, force) {
+                    return;
+                }
+                if std::mem::take(&mut state.removal_failed) {
+                    // The retries of a removal do not set this apply's wait.
+                    state.retry_delay = None;
+                }
+                match self
+                    .driver
+                    .apply(&self.key, mesh, votes, state.applied.as_ref())
+                    .await
+                {
+                    Ok(()) => {
+                        state.applied = Some(mesh.clone());
+                        state.applied_votes = votes.cloned();
+                        state.failed = false;
+                        state.removed = false;
+                        state.last_apply = Some(tokio::time::Instant::now());
+                        state.retry_delay = None;
+                        state.retry_at = None;
+                        self.publish_firewall(vote_listen_address(mesh, votes));
+                    }
+                    Err(error) => {
+                        self.publish_firewall(None);
+                        let now = tokio::time::Instant::now();
+                        match state.error_log.admit(now) {
+                            Some(suppressed) => error!(
+                                error = %error,
+                                suppressed,
+                                "could not apply the mesh; retrying"
+                            ),
+                            None => debug!(error = %error, "could not apply the mesh; retrying"),
                         }
-                        Err(error) => {
-                            warn!(error = %error, "could not apply the mesh");
-                            state.failed = true;
-                            // The apply may have set WireGuard before a later
-                            // step failed, so the device may hold this mesh's
-                            // endpoints. Forget the peers whose endpoint it
-                            // changed: the next apply sets theirs again.
-                            if let Some(applied) = &mut state.applied {
-                                applied.peers.retain(|old| {
-                                    !mesh.peers.iter().any(|new| {
-                                        new.public_key == old.public_key
-                                            && new.endpoint != old.endpoint
-                                    })
-                                });
-                            }
+                        state.schedule_retry(now);
+                        state.failed = true;
+                        // The apply may have changed the device before it
+                        // failed, so a snapshot without a mesh removes it.
+                        state.removed = false;
+                        // The apply may have set WireGuard before a later
+                        // step failed, so the device may hold this mesh's
+                        // endpoints. Forget the peers whose endpoint it
+                        // changed: the next apply sets theirs again.
+                        if let Some(applied) = &mut state.applied {
+                            applied.peers.retain(|old| {
+                                !mesh.peers.iter().any(|new| {
+                                    new.public_key == old.public_key && new.endpoint != old.endpoint
+                                })
+                            });
                         }
                     }
                 }
             }
             None => {
-                if state.applied.is_some() || !state.removed {
-                    match self.driver.remove().await {
-                        Ok(()) => {
-                            state.applied = None;
-                            state.failed = false;
-                            state.removed = true;
-                            state.last_apply = None;
+                self.publish_firewall(None);
+                // No mesh: the retries of an apply end here. Only a removal
+                // that fails below schedules a retry, of itself.
+                let removal_wait = if state.removal_failed {
+                    state.retry_delay
+                } else {
+                    None
+                };
+                state.retry_delay = None;
+                state.retry_at = None;
+                if state.applied.is_none() && state.removed {
+                    return;
+                }
+                match self.driver.remove().await {
+                    Ok(()) => {
+                        state.applied = None;
+                        state.applied_votes = None;
+                        state.failed = false;
+                        state.removed = true;
+                        state.removal_failed = false;
+                        state.last_apply = None;
+                    }
+                    Err(error) => {
+                        let now = tokio::time::Instant::now();
+                        match state.remove_log.admit(now) {
+                            Some(suppressed) => warn!(
+                                error = %error,
+                                suppressed,
+                                "could not remove the mesh; retrying"
+                            ),
+                            None => debug!(error = %error, "could not remove the mesh; retrying"),
                         }
-                        Err(error) => {
-                            warn!(error = %error, "could not remove the mesh");
-                        }
+                        state.retry_delay = removal_wait;
+                        state.schedule_retry(now);
+                        state.removal_failed = true;
                     }
                 }
             }
@@ -607,17 +832,71 @@ impl<D: MeshDriver> MeshManager<D> {
 #[derive(Default)]
 struct ManagerState {
     applied: Option<SpecMesh>,
+    /// The `spec.votes` the firewall of the last successful apply admits.
+    applied_votes: Option<SpecVotes>,
     failed: bool,
     last_apply: Option<tokio::time::Instant>,
     removed: bool,
+    /// The wait before the pending retry of a failed apply or removal.
+    retry_delay: Option<Duration>,
+    /// When the pending retry of a failed apply or removal runs.
+    retry_at: Option<tokio::time::Instant>,
+    /// Whether the pending retry is of a removal that failed.
+    removal_failed: bool,
+    /// The `error` for a failed apply.
+    error_log: LogLimit,
+    /// The `warn` for a failed removal.
+    remove_log: LogLimit,
+}
+
+/// Lets a repeated `error` through at most once per [`REAPPLY`], counting
+/// the ones it holds back.
+#[derive(Default)]
+struct LogLimit {
+    last: Option<tokio::time::Instant>,
+    suppressed: u64,
+}
+
+impl LogLimit {
+    /// At `now`, `Some` with the number held back since the last one when
+    /// this one goes out, or `None` when it is held back.
+    fn admit(&mut self, now: tokio::time::Instant) -> Option<u64> {
+        match self.last {
+            Some(last) if now.saturating_duration_since(last) < REAPPLY => {
+                self.suppressed = self.suppressed.saturating_add(1);
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                Some(std::mem::take(&mut self.suppressed))
+            }
+        }
+    }
+}
+
+/// Resolves at `at`, or never without one.
+async fn sleep_until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 impl ManagerState {
+    /// Schedules the next retry after a failure at `now`, with a wait one
+    /// step longer than the last ([`retry_delay`]).
+    fn schedule_retry(&mut self, now: tokio::time::Instant) {
+        let delay = retry_delay(self.retry_delay);
+        self.retry_delay = Some(delay);
+        self.retry_at = Some(now + delay);
+    }
+
     /// Whether this mesh must be applied now.
-    fn should_apply(&self, mesh: &SpecMesh, force: bool) -> bool {
+    fn should_apply(&self, mesh: &SpecMesh, votes: Option<&SpecVotes>, force: bool) -> bool {
         force
             || self.failed
             || self.applied.as_ref() != Some(mesh)
+            || self.applied_votes.as_ref() != votes
             || self.last_apply.is_none_or(|last| last.elapsed() >= REAPPLY)
     }
 }
@@ -626,7 +905,8 @@ impl ManagerState {
 /// WireGuard, and `nft` for the firewall.
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::net::IpAddr;
+    use std::future::Future;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
@@ -645,7 +925,7 @@ mod linux {
         WireguardAddressFamily, WireguardAllowedIp, WireguardAllowedIpAttr, WireguardAttribute,
         WireguardCmd, WireguardMessage, WireguardPeer, WireguardPeerAttribute, WireguardPeerFlags,
     };
-    use quoro_proto::wire::{MeshPeer, SpecMesh};
+    use quoro_proto::wire::{MeshPeer, SpecMesh, SpecVotes};
     use tokio::io::AsyncWriteExt as _;
     use tokio::process::Command;
     use tracing::warn;
@@ -680,12 +960,14 @@ mod linux {
             &self,
             key: &MeshKey,
             mesh: &SpecMesh,
+            votes: Option<&SpecVotes>,
             previous: Option<&SpecMesh>,
         ) -> Result<(), String> {
             let key = key.clone();
             let mesh = mesh.clone();
+            let votes = votes.cloned();
             let previous = previous.cloned();
-            apply(&key, &mesh, previous.as_ref()).await
+            apply(&key, &mesh, votes.as_ref(), previous.as_ref()).await
         }
 
         async fn remove(&self) -> Result<(), String> {
@@ -693,57 +975,174 @@ mod linux {
         }
     }
 
-    /// Applies one mesh specification.
+    /// Applies one mesh specification ([`apply_steps`]).
     async fn apply(
         key: &MeshKey,
         mesh: &SpecMesh,
+        votes: Option<&SpecVotes>,
         previous: Option<&SpecMesh>,
     ) -> Result<(), String> {
         let ip = find_tool("ip", "iproute2")?;
-        let nft = find_tool("nft", "nftables")?;
         let own = parse_cidr(&mesh.address)
             .ok_or_else(|| format!("mesh address {:?} is not an IPv4 CIDR", mesh.address))?;
         let IpAddr::V4(own_address) = own.0 else {
             return Err(format!("mesh address {:?} is not IPv4", mesh.address));
         };
-
-        // Creating the link loads the WireGuard module, so it must happen
-        // before the generic netlink family is resolved below.
-        if !Path::new("/sys/class/net").join(INTERFACE).exists() {
-            run(&ip, &["link", "add", "dev", INTERFACE, "type", "wireguard"]).await?;
-        }
-
-        let address = format!("{own_address}/{}", own.1);
-        run(&ip, &["address", "replace", &address, "dev", INTERFACE]).await?;
-        remove_other_addresses(&ip, own_address, own.1).await?;
-        run(&ip, &["link", "set", "dev", INTERFACE, "up"]).await?;
-
-        set_wireguard(key, mesh, previous).await?;
-
-        let desired = desired_routes(mesh);
-        for cidr in &desired {
-            run(&ip, &["route", "replace", cidr, "dev", INTERFACE]).await?;
-        }
-        remove_other_routes(&ip, &desired, own).await?;
-
-        run_with_stdin(&nft, &["-f", "-"], &nft_ruleset(Some(mesh))).await?;
-        Ok(())
+        let mut steps = HostSteps {
+            key,
+            ip,
+            own_address,
+            own_prefix: own.1,
+        };
+        apply_steps(&mut steps, mesh, votes, previous).await
     }
 
-    /// Removes the firewall table and the interface.
+    /// The steps of one apply, in the order [`apply_steps`] runs them.
+    trait ApplySteps {
+        /// Creates the link if it is missing, sets its address and brings it
+        /// up.
+        fn link(&mut self) -> impl Future<Output = Result<(), String>> + Send;
+        /// Loads `ruleset` with `nft -f -`.
+        fn ruleset(&mut self, ruleset: &str) -> impl Future<Output = Result<(), String>> + Send;
+        /// Configures WireGuard with the peers of `mesh` ([`set_wireguard`]).
+        fn wireguard(
+            &mut self,
+            mesh: &SpecMesh,
+            previous: Option<&SpecMesh>,
+        ) -> impl Future<Output = Result<(), String>> + Send;
+        /// Sets the routes of `mesh` and removes the others.
+        fn routes(&mut self, mesh: &SpecMesh) -> impl Future<Output = Result<(), String>> + Send;
+    }
+
+    /// Runs one apply's steps: the link and its address, then the firewall,
+    /// then WireGuard, then the routes.
+    ///
+    /// The firewall comes before WireGuard, so this apply configures no peer
+    /// before the ruleset it computed is loaded. The ruleset needs
+    /// nothing from the link: every rule names an interface by `iifname` or
+    /// `oifname`, which match by name and load before the interface exists
+    /// ([`nft_ruleset`]). The link comes first anyway, because creating it
+    /// loads the WireGuard module that the generic netlink family needs, and
+    /// a failed ruleset still needs the device to remove peers from.
+    ///
+    /// When the ruleset does not load, WireGuard is configured with no peers,
+    /// which also removes every peer an earlier apply set, and the ruleset's
+    /// error is returned, with the removal's error after it if that failed
+    /// too.
+    async fn apply_steps<S: ApplySteps>(
+        steps: &mut S,
+        mesh: &SpecMesh,
+        votes: Option<&SpecVotes>,
+        previous: Option<&SpecMesh>,
+    ) -> Result<(), String> {
+        steps.link().await?;
+        if let Err(error) = steps.ruleset(&nft_ruleset(Some(mesh), votes)).await {
+            let no_peers = SpecMesh {
+                peers: Vec::new(),
+                ..mesh.clone()
+            };
+            return Err(match steps.wireguard(&no_peers, None).await {
+                Ok(()) => error,
+                Err(cleared) => format!("{error}; could not remove the mesh peers: {cleared}"),
+            });
+        }
+        steps.wireguard(mesh, previous).await?;
+        steps.routes(mesh).await
+    }
+
+    /// The steps on this host, with its `ip`, `nft` and generic netlink.
+    struct HostSteps<'a> {
+        key: &'a MeshKey,
+        ip: PathBuf,
+        own_address: Ipv4Addr,
+        own_prefix: u8,
+    }
+
+    impl ApplySteps for HostSteps<'_> {
+        async fn link(&mut self) -> Result<(), String> {
+            let ip = &self.ip;
+            // Creating the link loads the WireGuard module, so it must happen
+            // before the generic netlink family is resolved.
+            if !Path::new("/sys/class/net").join(INTERFACE).exists() {
+                run(ip, &["link", "add", "dev", INTERFACE, "type", "wireguard"]).await?;
+            }
+            let address = format!("{}/{}", self.own_address, self.own_prefix);
+            run(ip, &["address", "replace", &address, "dev", INTERFACE]).await?;
+            remove_other_addresses(ip, self.own_address, self.own_prefix).await?;
+            run(ip, &["link", "set", "dev", INTERFACE, "up"]).await?;
+            Ok(())
+        }
+
+        async fn ruleset(&mut self, ruleset: &str) -> Result<(), String> {
+            // Looked up here, so a missing `nft` is a ruleset that did not
+            // load.
+            let nft = find_tool("nft", "nftables")?;
+            run_with_stdin(&nft, &["-f", "-"], ruleset).await?;
+            Ok(())
+        }
+
+        async fn wireguard(
+            &mut self,
+            mesh: &SpecMesh,
+            previous: Option<&SpecMesh>,
+        ) -> Result<(), String> {
+            set_wireguard(self.key, mesh, previous).await
+        }
+
+        async fn routes(&mut self, mesh: &SpecMesh) -> Result<(), String> {
+            let desired = desired_routes(mesh);
+            for cidr in &desired {
+                run(&self.ip, &["route", "replace", cidr, "dev", INTERFACE]).await?;
+            }
+            let own = (IpAddr::V4(self.own_address), self.own_prefix);
+            remove_other_routes(&self.ip, &desired, own).await
+        }
+    }
+
+    /// Removes the interface and then the firewall table ([`remove_steps`]).
     async fn remove() -> Result<(), String> {
-        let nft = find_tool("nft", "nftables")?;
-        if let Err(error) = run_with_stdin(&nft, &["-f", "-"], &nft_ruleset(None)).await {
+        remove_steps(&mut HostRemoval).await
+    }
+
+    /// The steps of a removal, in the order [`remove_steps`] runs them.
+    trait RemoveSteps {
+        /// Deletes the WireGuard link, and its peers with it, if it exists.
+        fn delete_link(&mut self) -> impl Future<Output = Result<(), String>> + Send;
+        /// Loads `ruleset` with `nft -f -`.
+        fn ruleset(&mut self, ruleset: &str) -> impl Future<Output = Result<(), String>> + Send;
+    }
+
+    /// Runs a removal: the link first, then the table, so that no peer ever
+    /// runs without the table. A link that cannot be deleted keeps the table
+    /// and returns its error.
+    async fn remove_steps<S: RemoveSteps>(steps: &mut S) -> Result<(), String> {
+        steps.delete_link().await?;
+        if let Err(error) = steps.ruleset(&nft_ruleset(None, None)).await {
             // The table may never have been created on this machine.
             if !error.contains("No such file or directory") {
                 return Err(error);
             }
         }
-        let ip = find_tool("ip", "iproute2")?;
-        if Path::new("/sys/class/net").join(INTERFACE).exists() {
-            run(&ip, &["link", "del", "dev", INTERFACE]).await?;
-        }
         Ok(())
+    }
+
+    /// The removal on this host, with its `ip` and `nft`.
+    struct HostRemoval;
+
+    impl RemoveSteps for HostRemoval {
+        async fn delete_link(&mut self) -> Result<(), String> {
+            let ip = find_tool("ip", "iproute2")?;
+            if Path::new("/sys/class/net").join(INTERFACE).exists() {
+                run(&ip, &["link", "del", "dev", INTERFACE]).await?;
+            }
+            Ok(())
+        }
+
+        async fn ruleset(&mut self, ruleset: &str) -> Result<(), String> {
+            let nft = find_tool("nft", "nftables")?;
+            run_with_stdin(&nft, &["-f", "-"], ruleset).await?;
+            Ok(())
+        }
     }
 
     /// Sets the private key, listen port and peers in one `SetDevice` request.
@@ -1256,6 +1655,293 @@ mod linux {
             ];
             assert_eq!(peer_keys(&attributes), vec![key(1), key(2)]);
         }
+
+        /// One step a [`FakeSteps`] ran.
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum Step {
+            Link,
+            DeleteLink,
+            /// The ruleset text it was given.
+            Ruleset(String),
+            /// The number of peers WireGuard was given, and whether a
+            /// previous mesh came with them.
+            Wireguard(usize, bool),
+            Routes,
+        }
+
+        /// Steps that record what ran and fail where they are told to.
+        #[derive(Default)]
+        struct FakeSteps {
+            ran: Vec<Step>,
+            fail_link: bool,
+            fail_ruleset: bool,
+            fail_wireguard: bool,
+            fail_delete_link: bool,
+            /// The peers the device has after the steps so far.
+            peers: usize,
+        }
+
+        fn outcome(failing: bool, what: &str) -> Result<(), String> {
+            if failing {
+                Err(format!("{what} failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        impl ApplySteps for FakeSteps {
+            async fn link(&mut self) -> Result<(), String> {
+                self.ran.push(Step::Link);
+                outcome(self.fail_link, "the link")
+            }
+
+            async fn ruleset(&mut self, ruleset: &str) -> Result<(), String> {
+                self.ran.push(Step::Ruleset(ruleset.to_owned()));
+                outcome(self.fail_ruleset, "nft")
+            }
+
+            async fn wireguard(
+                &mut self,
+                mesh: &SpecMesh,
+                previous: Option<&SpecMesh>,
+            ) -> Result<(), String> {
+                self.ran
+                    .push(Step::Wireguard(mesh.peers.len(), previous.is_some()));
+                outcome(self.fail_wireguard, "WireGuard")?;
+                self.peers = mesh.peers.len();
+                Ok(())
+            }
+
+            async fn routes(&mut self, _mesh: &SpecMesh) -> Result<(), String> {
+                self.ran.push(Step::Routes);
+                Ok(())
+            }
+        }
+
+        impl RemoveSteps for FakeSteps {
+            async fn delete_link(&mut self) -> Result<(), String> {
+                self.ran.push(Step::DeleteLink);
+                outcome(self.fail_delete_link, "ip link del")?;
+                self.peers = 0;
+                Ok(())
+            }
+
+            async fn ruleset(&mut self, ruleset: &str) -> Result<(), String> {
+                self.ran.push(Step::Ruleset(ruleset.to_owned()));
+                outcome(self.fail_ruleset, "nft")
+            }
+        }
+
+        /// A driver that runs [`apply_steps`] and [`remove_steps`] over one
+        /// shared [`FakeSteps`].
+        #[derive(Clone)]
+        struct StepsDriver(std::sync::Arc<tokio::sync::Mutex<FakeSteps>>);
+
+        impl MeshDriver for StepsDriver {
+            fn apply(
+                &self,
+                _key: &MeshKey,
+                mesh: &SpecMesh,
+                votes: Option<&SpecVotes>,
+                previous: Option<&SpecMesh>,
+            ) -> impl Future<Output = Result<(), String>> + Send {
+                let steps = std::sync::Arc::clone(&self.0);
+                let mesh = mesh.clone();
+                let votes = votes.cloned();
+                let previous = previous.cloned();
+                async move {
+                    let mut steps = steps.lock().await;
+                    apply_steps(&mut *steps, &mesh, votes.as_ref(), previous.as_ref()).await
+                }
+            }
+
+            fn remove(&self) -> impl Future<Output = Result<(), String>> + Send {
+                let steps = std::sync::Arc::clone(&self.0);
+                async move { remove_steps(&mut *steps.lock().await).await }
+            }
+        }
+
+        fn two_peer_mesh() -> SpecMesh {
+            SpecMesh {
+                address: "10.43.0.2/16".to_owned(),
+                listen_port: 51820,
+                peers: vec![mesh_peer(1, None), mesh_peer(2, Some("192.0.2.10:51820"))],
+                allow: Vec::new(),
+            }
+        }
+
+        /// The ruleset this apply computed is loaded before WireGuard gets
+        /// any peer, and the routes come last.
+        #[tokio::test]
+        async fn the_ruleset_loads_before_any_peer_is_configured() {
+            let mesh = two_peer_mesh();
+            let mut steps = FakeSteps::default();
+            apply_steps(&mut steps, &mesh, None, Some(&mesh))
+                .await
+                .unwrap();
+            assert_eq!(
+                steps.ran,
+                vec![
+                    Step::Link,
+                    Step::Ruleset(nft_ruleset(Some(&mesh), None)),
+                    Step::Wireguard(2, true),
+                    Step::Routes,
+                ]
+            );
+        }
+
+        /// A ruleset that does not load leaves WireGuard with no peers, which
+        /// removes those an earlier apply set, and the apply returns the
+        /// ruleset's error. No route is set.
+        #[tokio::test]
+        async fn a_failed_ruleset_leaves_wireguard_with_no_peers() {
+            let mesh = two_peer_mesh();
+            let mut steps = FakeSteps {
+                fail_ruleset: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, Some(&mesh))
+                .await
+                .unwrap_err();
+            assert_eq!(error, "nft failed");
+            assert_eq!(
+                steps.ran,
+                vec![
+                    Step::Link,
+                    Step::Ruleset(nft_ruleset(Some(&mesh), None)),
+                    Step::Wireguard(0, false),
+                ]
+            );
+
+            // When removing the peers fails too, both errors are returned,
+            // the ruleset's first.
+            let mut steps = FakeSteps {
+                fail_ruleset: true,
+                fail_wireguard: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "nft failed; could not remove the mesh peers: WireGuard failed"
+            );
+            assert_eq!(steps.ran.last(), Some(&Step::Wireguard(0, false)));
+        }
+
+        /// A ruleset that does not load leaves the device with no peers, and
+        /// the manager retries after [`super::super::RETRY_FIRST`] without a
+        /// new snapshot: once the ruleset loads, the peers are back, long
+        /// before the reapply period.
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_ruleset_is_retried_within_seconds_and_the_peers_come_back() {
+            let mesh = two_peer_mesh();
+            let votes = SpecVotes {
+                version: 1,
+                port: 51821,
+                voters: Vec::new(),
+            };
+            let state = quoro_proto::wire::DesiredState {
+                rev: 1,
+                issued_at: String::new(),
+                term: 0,
+                spec: quoro_proto::wire::Spec {
+                    mesh: Some(mesh.clone()),
+                    votes: Some(votes.clone()),
+                    ..quoro_proto::wire::Spec::default()
+                },
+                signature: String::new(),
+            };
+            let snapshot = crate::reconcile::Snapshot { rev: 1, state };
+            let (_desired_tx, desired_rx) = tokio::sync::watch::channel(Some(snapshot));
+            let steps = std::sync::Arc::new(tokio::sync::Mutex::new(FakeSteps {
+                fail_ruleset: true,
+                ..FakeSteps::default()
+            }));
+            let manager = super::super::MeshManager::new(
+                StepsDriver(std::sync::Arc::clone(&steps)),
+                MeshKey { private: [7; 32] },
+            );
+            let firewall = manager.firewall();
+            let task = tokio::spawn(manager.run(desired_rx, std::future::pending()));
+
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            {
+                let steps = steps.lock().await;
+                assert_eq!(steps.peers, 0, "{:?}", steps.ran);
+                assert_eq!(steps.ran.last(), Some(&Step::Wireguard(0, false)));
+            }
+            assert_eq!(*firewall.borrow(), None, "no firewall, no vote listener");
+            steps.lock().await.fail_ruleset = false;
+
+            tokio::time::sleep(super::super::RETRY_FIRST - Duration::from_millis(10)).await;
+            assert_eq!(steps.lock().await.peers, 0, "no retry before its time");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            {
+                let steps = steps.lock().await;
+                assert_eq!(steps.peers, 2, "{:?}", steps.ran);
+                assert_eq!(
+                    steps.ran[steps.ran.len() - 3..],
+                    [
+                        Step::Ruleset(nft_ruleset(Some(&mesh), Some(&votes))),
+                        Step::Wireguard(2, false),
+                        Step::Routes,
+                    ]
+                );
+            }
+            assert_eq!(
+                *firewall.borrow(),
+                Some("10.43.0.2:51821".parse().unwrap()),
+                "the loaded firewall covers the vote listener"
+            );
+            task.abort();
+        }
+
+        /// A removal deletes the link, and its peers with it, before the
+        /// table.
+        #[tokio::test]
+        async fn a_removal_deletes_the_link_before_the_table() {
+            let mut steps = FakeSteps {
+                peers: 2,
+                ..FakeSteps::default()
+            };
+            remove_steps(&mut steps).await.unwrap();
+            assert_eq!(
+                steps.ran,
+                vec![Step::DeleteLink, Step::Ruleset(nft_ruleset(None, None))]
+            );
+            assert_eq!(steps.peers, 0);
+        }
+
+        /// A link that cannot be deleted keeps the table: the peers never run
+        /// without it.
+        #[tokio::test]
+        async fn a_link_that_cannot_be_deleted_keeps_the_table() {
+            let mut steps = FakeSteps {
+                fail_delete_link: true,
+                peers: 2,
+                ..FakeSteps::default()
+            };
+            let error = remove_steps(&mut steps).await.unwrap_err();
+            assert_eq!(error, "ip link del failed");
+            assert_eq!(steps.ran, vec![Step::DeleteLink]);
+        }
+
+        /// A link that cannot be set up stops the apply before the ruleset
+        /// and before any peer.
+        #[tokio::test]
+        async fn a_failed_link_configures_nothing_else() {
+            let mut steps = FakeSteps {
+                fail_link: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &two_peer_mesh(), None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error, "the link failed");
+            assert_eq!(steps.ran, vec![Step::Link]);
+        }
     }
 }
 
@@ -1265,7 +1951,7 @@ pub use linux::LinuxMeshDriver;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quoro_proto::wire::{MeshAllow, MeshPeer};
+    use quoro_proto::wire::{MeshAllow, MeshPeer, SpecVoter};
 
     struct TempDir(std::path::PathBuf);
 
@@ -1436,7 +2122,7 @@ table inet quoro_mesh {
     }
 }
 ";
-        assert_eq!(nft_ruleset(Some(&mesh())), expected);
+        assert_eq!(nft_ruleset(Some(&mesh()), None), expected);
     }
 
     /// The warm target's entry names its own mesh address, so the marked
@@ -1450,7 +2136,7 @@ table inet quoro_mesh {
             address: "10.43.0.5".to_owned(),
             port: 51822,
         }];
-        let rules = nft_ruleset(Some(&mesh));
+        let rules = nft_ruleset(Some(&mesh), None);
         assert!(rules.contains(
             "iifname \"quoro-wg0\" ip saddr 10.43.0.2 ip daddr 10.43.0.5 tcp dport 51822 meta mark set 0x5155008c"
         ));
@@ -1469,7 +2155,7 @@ table inet quoro_mesh {
     /// it.
     #[test]
     fn new_connections_leave_the_mesh_only_from_root_processes() {
-        let rules = nft_ruleset(Some(&mesh()));
+        let rules = nft_ruleset(Some(&mesh()), None);
         let root_accept = "oifname \"quoro-wg0\" ct state new meta skuid 0 accept";
         let new_drop = "oifname \"quoro-wg0\" ct state new drop";
 
@@ -1506,6 +2192,284 @@ table inet quoro_mesh {
         );
     }
 
+    /// Two voters with the `node` role and a witness (section 6.12's
+    /// example): A at 10.43.0.2, B at 10.43.0.3, the witness at 10.43.0.1.
+    fn votes() -> SpecVotes {
+        let voter = |node_id: &str, roles: &[&str], address: Option<&str>| SpecVoter {
+            node_id: node_id.to_owned(),
+            roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+            mesh_address: address.map(str::to_owned),
+        };
+        SpecVotes {
+            version: 3120,
+            port: 51821,
+            voters: vec![
+                voter("nod_a", &["node"], Some("10.43.0.2")),
+                voter("nod_b", &["node"], Some("10.43.0.3")),
+                voter("nod_w", &["edge", "witness"], Some("10.43.0.1")),
+                voter("nod_new", &["node"], None),
+            ],
+        }
+    }
+
+    /// Every rule that marks a packet, so admits it.
+    fn marking(rules: &str) -> Vec<&str> {
+        rules
+            .lines()
+            .filter(|line| line.contains("meta mark set"))
+            .map(str::trim)
+            .collect()
+    }
+
+    fn vote_rule(source: &str, own: &str) -> String {
+        format!(
+            "iifname \"quoro-wg0\" ip saddr {source} ip daddr {own} tcp dport 51821 meta mark set 0x5155008c"
+        )
+    }
+
+    /// Sections 6.9 and 8.9: the vote listener is admitted from the mesh
+    /// address of every voter with the `node` role and from nothing else,
+    /// to this machine's own address and `spec.votes.port`. On the witness
+    /// both nodes are admitted; on node A only node B, never the witness
+    /// nor A itself.
+    #[test]
+    fn the_vote_listener_admits_exactly_the_node_voters() {
+        let mut on_witness = mesh();
+        on_witness.address = "10.43.0.1/16".to_owned();
+        on_witness.allow.clear();
+        let rules = nft_ruleset(Some(&on_witness), Some(&votes()));
+        assert_eq!(
+            marking(&rules),
+            vec![
+                vote_rule("10.43.0.2", "10.43.0.1"),
+                vote_rule("10.43.0.3", "10.43.0.1"),
+            ]
+        );
+        let input = &rules[rules.find("chain input").expect("an input chain")..];
+        assert!(input.contains("iifname \"quoro-wg0\" meta mark 0x5155008c accept"));
+
+        let mut on_node = mesh();
+        on_node.address = "10.43.0.2/16".to_owned();
+        let rules = nft_ruleset(Some(&on_node), Some(&votes()));
+        assert_eq!(
+            marking(&rules),
+            vec![
+                "iifname \"quoro-wg0\" ip saddr 10.43.0.1 ip daddr 10.99.5.10 tcp dport 8080 meta mark set 0x5155008c".to_owned(),
+                vote_rule("10.43.0.3", "10.43.0.2"),
+            ],
+            "the allow entry stays, and only the other node is a vote source"
+        );
+    }
+
+    /// Section 6.9: without `spec.votes` there is no vote rule at all.
+    #[test]
+    fn no_votes_is_no_vote_rule() {
+        let mut on_node = mesh();
+        on_node.allow.clear();
+        assert!(marking(&nft_ruleset(Some(&on_node), None)).is_empty());
+        assert_eq!(nft_ruleset(None, Some(&votes())), nft_ruleset(None, None));
+    }
+
+    /// The rules of the chain named `name`, without its `type` line; empty
+    /// when the ruleset has no such chain.
+    fn chain<'a>(rules: &'a str, name: &str) -> Vec<&'a str> {
+        let header = format!("    chain {name} {{");
+        rules
+            .lines()
+            .skip_while(|line| *line != header)
+            .skip(1)
+            .take_while(|line| *line != "    }")
+            .map(str::trim)
+            .filter(|line| !line.starts_with("type "))
+            .collect()
+    }
+
+    /// With `spec.votes` the general mesh rules stay as they are: the
+    /// forward chain drops new connections forwarded out through the mesh
+    /// before its `iifname` rules, and the output chain lets only root's new
+    /// connections out. The vote rule is a prerouting mark that the input
+    /// chain accepts, and the input chain starts with the off-mesh drop.
+    #[test]
+    fn the_general_rules_hold_with_votes() {
+        let mut on_node = mesh();
+        on_node.address = "10.43.0.2/16".to_owned();
+        let rules = nft_ruleset(Some(&on_node), Some(&votes()));
+        assert_eq!(
+            chain(&rules, "forward"),
+            vec![
+                "oifname \"quoro-wg0\" ct state new drop",
+                "iifname \"quoro-wg0\" meta mark 0x5155008c accept",
+                "iifname \"quoro-wg0\" drop",
+            ]
+        );
+        assert_eq!(
+            chain(&rules, "output"),
+            vec![
+                "oifname \"quoro-wg0\" ct state new meta skuid 0 accept",
+                "oifname \"quoro-wg0\" ct state new drop",
+            ]
+        );
+        assert!(
+            chain(&rules, "prerouting").contains(&vote_rule("10.43.0.3", "10.43.0.2").as_str()),
+            "{rules}"
+        );
+        assert_eq!(
+            chain(&rules, "input"),
+            vec![
+                off_mesh_rule("10.43.0.2", 51821).as_str(),
+                loopback_rule("10.43.0.2", 51821).as_str(),
+                "iifname \"quoro-wg0\" ct state established,related accept",
+                "iifname \"quoro-wg0\" meta mark 0x5155008c accept",
+                "iifname \"quoro-wg0\" drop",
+            ]
+        );
+        assert!(!rules.contains("skuid != 0"), "no vote-only output rule");
+        assert_eq!(
+            rules.matches("oifname").count(),
+            3,
+            "only the general oifname rules"
+        );
+    }
+
+    fn off_mesh_rule(own: &str, port: u16) -> String {
+        format!("iifname != \"quoro-wg0\" iifname != \"lo\" ip daddr {own} tcp dport {port} drop")
+    }
+
+    fn loopback_rule(own: &str, port: u16) -> String {
+        format!("iifname \"lo\" ip daddr {own} tcp dport {port} ip saddr != {own} drop")
+    }
+
+    /// Over loopback, only connections from the machine's own mesh address
+    /// reach the listener, so its owner check always applies: with
+    /// `spec.votes`, the input chain's second rule drops TCP on `lo` to the
+    /// own mesh address on `spec.votes.port` from any other source, ahead of
+    /// every accept. Without `spec.votes` there is no such rule, and it
+    /// follows the port and the own address.
+    #[test]
+    fn over_loopback_only_the_own_mesh_address_reaches_the_listener() {
+        let mut on_node = mesh();
+        on_node.address = "10.43.0.2/16".to_owned();
+        let rules = nft_ruleset(Some(&on_node), Some(&votes()));
+        let input = chain(&rules, "input");
+        assert_eq!(
+            input.get(1).copied(),
+            Some(loopback_rule("10.43.0.2", 51821).as_str())
+        );
+        let accept = input
+            .iter()
+            .position(|rule| rule.ends_with("accept"))
+            .expect("an accept");
+        assert!(
+            accept > 1,
+            "both vote rules come before every accept: {input:?}"
+        );
+        assert_eq!(rules.matches("iifname \"lo\"").count(), 1, "{rules}");
+
+        assert!(
+            !nft_ruleset(Some(&on_node), None).contains("saddr !="),
+            "no loopback rule without spec.votes"
+        );
+
+        let mut moved = votes();
+        moved.port = 51900;
+        let rules = nft_ruleset(Some(&on_node), Some(&moved));
+        assert_eq!(
+            chain(&rules, "input").get(1).copied(),
+            Some(loopback_rule("10.43.0.2", 51900).as_str())
+        );
+        let mut on_witness = mesh();
+        on_witness.address = "10.43.0.1/16".to_owned();
+        let rules = nft_ruleset(Some(&on_witness), Some(&votes()));
+        assert_eq!(
+            chain(&rules, "input").get(1).copied(),
+            Some(loopback_rule("10.43.0.1", 51821).as_str())
+        );
+    }
+
+    /// The listener takes TCP only over the mesh interface or loopback. With
+    /// `spec.votes`, the input chain's first rule drops TCP to the own mesh
+    /// address on `spec.votes.port` from every interface but the mesh one
+    /// and `lo`, ahead of every accept. Without `spec.votes` there is no such
+    /// rule, and a new port moves it.
+    #[test]
+    fn the_vote_listener_takes_tcp_only_over_the_mesh() {
+        let mut on_node = mesh();
+        on_node.address = "10.43.0.2/16".to_owned();
+        let rules = nft_ruleset(Some(&on_node), Some(&votes()));
+        let input = chain(&rules, "input");
+        assert_eq!(
+            input.first().copied(),
+            Some(off_mesh_rule("10.43.0.2", 51821).as_str())
+        );
+        assert_eq!(
+            rules.matches("iifname != ").count(),
+            2,
+            "one rule, with its two negated interfaces: {rules}"
+        );
+
+        let without = nft_ruleset(Some(&on_node), None);
+        assert!(!without.contains("iifname != "), "{without}");
+        assert!(!without.contains("lo\""), "{without}");
+        assert_eq!(
+            chain(&without, "input").first().copied(),
+            Some("iifname \"quoro-wg0\" ct state established,related accept")
+        );
+
+        let mut moved = votes();
+        moved.port = 51900;
+        let rules = nft_ruleset(Some(&on_node), Some(&moved));
+        assert_eq!(
+            chain(&rules, "input").first().copied(),
+            Some(off_mesh_rule("10.43.0.2", 51900).as_str())
+        );
+        assert!(!rules.contains("dport 51821"), "the old port is gone");
+
+        // On the witness the rule names the witness's own address.
+        let mut on_witness = mesh();
+        on_witness.address = "10.43.0.1/16".to_owned();
+        let rules = nft_ruleset(Some(&on_witness), Some(&votes()));
+        assert_eq!(
+            chain(&rules, "input").first().copied(),
+            Some(off_mesh_rule("10.43.0.1", 51821).as_str())
+        );
+    }
+
+    /// The vote rule follows `spec.votes`: a snapshot whose mesh is
+    /// unchanged but whose voter set changed is applied at once, not at the
+    /// next reapply period.
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_voter_set_is_applied_at_once() {
+        let with_votes = |votes: Option<SpecVotes>| {
+            let mut snapshot = snapshot(mesh());
+            snapshot.state.spec.votes = votes;
+            Some(snapshot)
+        };
+        let (desired_tx, desired_rx) = watch::channel(with_votes(Some(votes())));
+        let driver = RecordingMeshDriver::new();
+        let recorded = driver.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(
+            MeshManager::new(driver, test_key()).run(desired_rx, stop_future(stop_rx)),
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(recorded.votes(), vec![Some(votes())]);
+
+        let mut changed = votes();
+        changed.version += 1;
+        changed.voters.pop();
+        desired_tx.send(with_votes(Some(changed.clone()))).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(recorded.votes(), vec![Some(votes()), Some(changed.clone())]);
+
+        desired_tx.send(with_votes(None)).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(recorded.votes(), vec![Some(votes()), Some(changed), None]);
+        assert_eq!(recorded.calls().len(), 3, "the mesh itself never changed");
+
+        stop_tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
     #[test]
     fn an_endpoint_is_set_only_when_new_or_changed() {
         let mesh = mesh();
@@ -1530,7 +2494,7 @@ table inet quoro_mesh {
     #[test]
     fn no_mesh_is_only_the_two_table_lines() {
         assert_eq!(
-            nft_ruleset(None),
+            nft_ruleset(None, None),
             "table inet quoro_mesh {}\ndelete table inet quoro_mesh\n"
         );
     }
@@ -1543,7 +2507,7 @@ table inet quoro_mesh {
             address: "10.99.5.11".to_owned(),
             port: 80,
         });
-        let rules = nft_ruleset(Some(&mesh));
+        let rules = nft_ruleset(Some(&mesh), None);
         assert!(!rules.contains("not-an-ip"));
         assert_eq!(rules.matches("tcp dport").count(), 1);
     }
@@ -1641,6 +2605,180 @@ table inet quoro_mesh {
 
         stop_tx.send(true).unwrap();
         task.await.unwrap();
+    }
+
+    /// The wait before a retry starts at [`RETRY_FIRST`], doubles, and stops
+    /// at [`REAPPLY`].
+    #[test]
+    fn the_retry_wait_doubles_up_to_the_reapply_period() {
+        let mut waits = Vec::new();
+        let mut previous = None;
+        for _ in 0..7 {
+            let wait = retry_delay(previous);
+            waits.push(wait.as_secs());
+            previous = Some(wait);
+        }
+        assert_eq!(waits, vec![2, 4, 8, 16, 32, 60, 60]);
+    }
+
+    /// A failed apply is retried with no new snapshot: after 2 s, then 4 s
+    /// later; a success stops the retries until the reapply period, and the
+    /// next failure waits 2 s again.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_apply_is_retried_with_a_growing_wait() {
+        let (desired_tx, desired_rx) = watch::channel(Some(snapshot(mesh())));
+        let driver = RecordingMeshDriver::new();
+        let recorded = driver.clone();
+        recorded.fail_applies(true);
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(
+            MeshManager::new(driver, test_key()).run(desired_rx, stop_future(stop_rx)),
+        );
+        let applies = || recorded.calls().len();
+        let at = |ms: u64| tokio::time::sleep(Duration::from_millis(ms));
+
+        at(1).await;
+        assert_eq!(applies(), 1, "the first apply fails");
+        at(1_990).await;
+        assert_eq!(applies(), 1, "no retry before 2 s");
+        at(20).await;
+        assert_eq!(applies(), 2, "the retry after 2 s");
+        at(3_970).await;
+        assert_eq!(applies(), 2, "the next wait is 4 s");
+        recorded.fail_applies(false);
+        at(20).await;
+        assert_eq!(applies(), 3, "the retry after 4 s succeeds");
+        at(30_000).await;
+        assert_eq!(applies(), 3, "no retry after a success");
+
+        recorded.fail_applies(true);
+        let mut moved = mesh();
+        moved.listen_port += 1;
+        desired_tx.send(Some(snapshot(moved))).unwrap();
+        at(1).await;
+        assert_eq!(applies(), 4, "a new snapshot is applied at once and fails");
+        at(1_990).await;
+        assert_eq!(applies(), 4);
+        at(20).await;
+        assert_eq!(applies(), 5, "the wait started again at 2 s");
+        task.abort();
+    }
+
+    /// A snapshot without a mesh ends the retries of a failed apply: the
+    /// device the failed apply may have changed is removed, and no retry is
+    /// left pending, so nothing is due again.
+    #[tokio::test(start_paused = true)]
+    async fn a_mesh_that_goes_away_ends_the_retries_of_its_apply() {
+        let driver = RecordingMeshDriver::new();
+        let recorded = driver.clone();
+        let manager = MeshManager::new(driver, test_key());
+        let mut state = ManagerState::default();
+        manager.sync(None, &mut state, false).await;
+        recorded.fail_applies(true);
+        manager
+            .sync(Some(&snapshot(mesh())), &mut state, false)
+            .await;
+        assert!(state.retry_at.is_some(), "the failed apply is retried");
+
+        manager.sync(None, &mut state, false).await;
+        assert_eq!(
+            recorded.calls(),
+            vec![MeshCall::Remove, MeshCall::Apply(mesh()), MeshCall::Remove]
+        );
+        assert_eq!((state.retry_at, state.retry_delay), (None, None));
+
+        manager.sync(None, &mut state, false).await;
+        assert_eq!(recorded.calls().len(), 3, "nothing left to remove");
+        assert_eq!((state.retry_at, state.retry_delay), (None, None));
+    }
+
+    /// A removal that fails is retried with the same growing wait as an
+    /// apply, never at once: after 2 s, then 4 s, then 8 s, and not again
+    /// once it succeeds. The failed apply before it does not set its wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_removal_is_retried_with_a_growing_wait() {
+        let (desired_tx, desired_rx) = watch::channel(Some(snapshot(mesh())));
+        let driver = RecordingMeshDriver::new();
+        let recorded = driver.clone();
+        recorded.fail_applies(true);
+        recorded.fail_removes(true);
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(
+            MeshManager::new(driver, test_key()).run(desired_rx, stop_future(stop_rx)),
+        );
+        let calls = || recorded.calls().len();
+        let at = |ms: u64| tokio::time::sleep(Duration::from_millis(ms));
+
+        at(1).await;
+        assert_eq!(calls(), 1, "the apply fails");
+        desired_tx.send(None).unwrap();
+        at(1).await;
+        assert_eq!(calls(), 2, "the removal fails");
+        at(1_990).await;
+        assert_eq!(calls(), 2, "no retry before 2 s");
+        at(20).await;
+        assert_eq!(calls(), 3, "the retry after 2 s");
+        at(3_970).await;
+        assert_eq!(calls(), 3, "the next wait is 4 s");
+        at(30).await;
+        assert_eq!(calls(), 4);
+        recorded.fail_removes(false);
+        at(8_000).await;
+        assert_eq!(calls(), 5, "the retry after 8 s succeeds");
+        at(40_000).await;
+        assert_eq!(calls(), 5, "no retry after a success");
+        assert!(
+            recorded.calls()[1..]
+                .iter()
+                .all(|call| *call == MeshCall::Remove)
+        );
+        task.abort();
+    }
+
+    /// The firewall watch holds the vote listener's address while a
+    /// successful apply of a mesh with `spec.votes` stands, and `None` once
+    /// an apply fails, without `spec.votes`, and once the mesh is removed.
+    #[tokio::test(start_paused = true)]
+    async fn the_firewall_watch_follows_the_loaded_rules() {
+        let with_votes = |votes: Option<SpecVotes>| {
+            let mut snapshot = snapshot(mesh());
+            snapshot.state.spec.votes = votes;
+            Some(snapshot)
+        };
+        let (desired_tx, desired_rx) = watch::channel(with_votes(Some(votes())));
+        let driver = RecordingMeshDriver::new();
+        let recorded = driver.clone();
+        let manager = MeshManager::new(driver, test_key());
+        let firewall = manager.firewall();
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(manager.run(desired_rx, stop_future(stop_rx)));
+        let listener: SocketAddr = "10.43.0.5:51821".parse().unwrap();
+        let at = |ms: u64| tokio::time::sleep(Duration::from_millis(ms));
+
+        at(1).await;
+        assert_eq!(*firewall.borrow(), Some(listener));
+
+        recorded.fail_applies(true);
+        let mut changed = votes();
+        changed.version += 1;
+        desired_tx.send(with_votes(Some(changed.clone()))).unwrap();
+        at(1).await;
+        assert_eq!(*firewall.borrow(), None, "a failed apply");
+        recorded.fail_applies(false);
+        at(2_010).await;
+        assert_eq!(*firewall.borrow(), Some(listener), "the retry succeeded");
+
+        desired_tx.send(with_votes(None)).unwrap();
+        at(1).await;
+        assert_eq!(*firewall.borrow(), None, "no spec.votes");
+
+        desired_tx.send(with_votes(Some(changed))).unwrap();
+        at(1).await;
+        assert_eq!(*firewall.borrow(), Some(listener));
+        desired_tx.send(None).unwrap();
+        at(1).await;
+        assert_eq!(*firewall.borrow(), None, "the mesh is removed");
+        task.abort();
     }
 
     #[tokio::test(start_paused = true)]
