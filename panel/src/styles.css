@@ -3143,11 +3143,12 @@
     font-variant-numeric: tabular-nums;
   }
 
-  /* A cell is as wide as its vCPUs: the li carries the share, the link inside is the Nodes page's cell. */
+  /* A cell is as wide as its vCPUs: the li carries the share, the link inside is the Nodes page's cell.
+     As on the Nodes strip, a cell is at least as wide as its name and the row wraps, so no name hides another. */
   .crail-cell {
     display: flex;
-    flex: var(--u, 1) 0 0;
-    min-width: 22px;
+    flex: var(--u, 1) 0 auto;
+    min-width: fit-content;
     max-width: calc(var(--u, 1) * 70px);
   }
 
@@ -3160,14 +3161,14 @@
     cursor: pointer;
   }
 
-  /* An instance whose app deploys, or that is down, says so with its edge and its words. */
+  /* An instance whose app deploys, or that is down, says so with its edge; its words (title, screen readers) say why.
+     The name keeps its kind colour: red 10 px text on the cell's tint would not reach 4.5:1. */
   .crail-cell .vcell[data-tone='shift'] {
     border-color: var(--shift);
   }
 
   .crail-cell .vcell[data-tone='fault'] {
     border-color: var(--fault);
-    color: var(--fault);
   }
 
   .vcell[data-hl] {
