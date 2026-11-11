@@ -2342,26 +2342,37 @@ mod tests {
         f.done();
     }
 
-    /// R that writes a row whose same-token `local` grant is held drops no
-    /// grant with a new token, so it emits no `app.left_stopped`: the
-    /// `local` grant is held again, eligible on the session whose `hello`
-    /// showed the lease.
+    /// What follows an R that wrote the row, over a held same-token `local`
+    /// grant that is not sent: that is no grant with a new token, so it is
+    /// not dropped and no `app.left_stopped` is emitted. The grant is held
+    /// by a first R, on a session whose `hello` showed the lease, without
+    /// majority support so it stays unsent; the hub's part of a policy
+    /// change that wrote the row then runs over it.
     #[tokio::test]
     async fn r_over_a_held_local_grant_emits_nothing() {
         let f = fixture("warm", "expiring", Some(D as i64), false).await;
-        created(&f).await;
         let on = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
         let hub = &f.state.hub;
-        hub.hold_local_end_on(&f.row().await, on.session.generation);
-        let writes = f.writes().await;
+        hub.set_voter_support(Arc::new(NoSupport));
         r(&f).await;
-        assert_eq!(f.writes().await, writes + 1, "R wrote the row");
-        assert!(left_stopped(&f).await.is_empty());
         let held = hub.0.held.lock().unwrap().entries[LEASE].clone();
         assert_eq!(
-            (held.kind, held.eligible_on),
-            (Kind::LocalEnd, Some(on.session.generation))
+            (held.kind, held.eligible_on, held.sent_on),
+            (Kind::LocalEnd, Some(on.session.generation), None)
         );
+        let ended = crate::leases::Ended {
+            lease: f.row().await,
+            wrote: true,
+            from_expiring: true,
+            hold: false,
+        };
+        hub.end_renewals_committed(&ended, &by(&actor())).await;
+        assert_eq!(
+            hub.0.held.lock().unwrap().entries.get(LEASE),
+            Some(&held),
+            "the local grant stays"
+        );
+        assert!(left_stopped(&f).await.is_empty());
         f.done();
     }
 }
