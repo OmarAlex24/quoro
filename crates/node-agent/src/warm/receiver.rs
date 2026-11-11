@@ -13,7 +13,8 @@
 //!   accepted for the volume (`stale_token`, recorded and reported);
 //! - no other stream of the volume is open and no copy of it is being
 //!   resolved (`busy`, below);
-//! - `base_seq` is null or names its complete copy (`base_mismatch`);
+//! - `base_seq` is null, names its complete copy, or, on a returning
+//!   source, a snapshot it kept as the volume's source (`base_mismatch`);
 //! - `snapshot_seq` is above `base_seq`, and for a full copy above its
 //!   complete copy (`not_newer`).
 //!
@@ -48,9 +49,13 @@
 //! **A returning source** (section 9) still holds the volume as its own when
 //! it finds itself the target. Each pass hands such a volume over before any
 //! stream of it is accepted ([`handover`]): its live file goes, kept first as
-//! a quarantined copy unless it shows no change against the base, and the
-//! next stream is a full copy. The first complete stream then releases the
-//! warm snapshots the node kept as the volume's source.
+//! a quarantined copy unless it shows no change against the base. Its base
+//! and the snapshot it was shipping stay as candidate copies (section 9
+//! step 3): a stream whose `base_seq` names one of them is staged from it,
+//! so the new source ships only what changed since; any other base is
+//! refused `base_mismatch`, and the source ships a full copy. The first
+//! complete stream then releases the warm snapshots the node kept as the
+//! volume's source.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -253,6 +258,9 @@ struct Accepted {
     _guard: OwnedMutexGuard<()>,
     record: WarmTargetRecord,
     size_gb: u32,
+    /// The snapshot a returning source kept that `base_seq` names, when it
+    /// is not the complete copy (section 9 step 3).
+    candidate: Option<KeptSnapshotRecord>,
 }
 
 /// Why writing a stream stopped.
@@ -792,10 +800,19 @@ impl<E: Engine + 'static> Inner<E> {
             self.record_stale(&file, header.fencing_token).await;
             return Err(Reject::Refuse(RefuseReason::StaleToken, seq));
         }
-        match header.base_seq {
-            Some(base) if Some(base) != record.complete_seq => {
+        let mut candidate = None;
+        if let Some(base) = header.base_seq
+            && Some(base) != record.complete_seq
+        {
+            candidate = self
+                .kept_candidate(&header.volume_id, base)
+                .await
+                .map_err(Reject::Failed)?;
+            if candidate.is_none() {
                 return Err(Reject::Refuse(RefuseReason::BaseMismatch, seq));
             }
+        }
+        match header.base_seq {
             Some(base) if header.snapshot_seq <= base => {
                 return Err(Reject::Refuse(RefuseReason::NotNewer, seq));
             }
@@ -818,6 +835,7 @@ impl<E: Engine + 'static> Inner<E> {
             _guard: guard,
             record,
             size_gb,
+            candidate,
         })
     }
 
@@ -837,15 +855,27 @@ impl<E: Engine + 'static> Inner<E> {
             _guard: guard,
             mut record,
             size_gb,
+            candidate,
         } = accepted;
         let id = VolumeId(header.volume_id.clone());
-        let from = if header.base_seq.is_some() {
-            StageFrom::Volume
-        } else {
-            StageFrom::Empty
+        let from = match (&candidate, header.base_seq) {
+            (Some(kept), _) => StageFrom::Snapshot(kept.snapshot.clone()),
+            (None, Some(_)) => StageFrom::Volume,
+            (None, None) => StageFrom::Empty,
         };
         let staging = match self.stage(&id, size_gb, &from).await {
             Ok(staging) => staging,
+            // The source would try the same base again: it ships a full copy
+            // instead. The snapshot stays until a complete stream lands.
+            Err(e) if candidate.is_some() => {
+                info!(
+                    volume_id = %header.volume_id,
+                    base_seq = ?header.base_seq,
+                    error = %e,
+                    "could not stage from a snapshot kept as the volume's source; the source ships a full copy"
+                );
+                return Outcome::Answer(refused(RefuseReason::BaseMismatch, record.complete_seq));
+            }
             Err(e) => {
                 let reason = format!("could not stage the copy: {e}");
                 self.set_error(&header.volume_id, Some(&reason)).await;
@@ -853,7 +883,7 @@ impl<E: Engine + 'static> Inner<E> {
             }
         };
         let cells = match self
-            .write_stream(header, &record, staging.get(), reader)
+            .write_stream(header, &record, candidate.as_ref(), staging.get(), reader)
             .await
         {
             Ok(cells) => cells,
@@ -1049,6 +1079,7 @@ impl<E: Engine + 'static> Inner<E> {
         &self,
         header: &StreamHeader,
         record: &WarmTargetRecord,
+        candidate: Option<&KeptSnapshotRecord>,
         staged: &StagedVolume,
         reader: &mut FrameReader<B>,
     ) -> Result<CellHashes, StreamFailure>
@@ -1069,19 +1100,21 @@ impl<E: Engine + 'static> Inner<E> {
         let mut cells = if full {
             CellHashes::zeroed(size).map_err(|e| bad(e.to_string()))?
         } else {
-            match record
-                .cells
-                .as_deref()
-                .map(|bytes| CellHashes::from_bytes(bytes, size))
-            {
+            let known = match candidate {
+                Some(kept) => kept.cells.as_deref(),
+                None => record.cells.as_deref(),
+            };
+            match known.map(|bytes| CellHashes::from_bytes(bytes, size)) {
                 Some(Ok(cells)) => cells,
-                // Lost or mismatched: the staging file is a clone of the
-                // complete copy, so hash it once and keep the result.
+                // Lost, mismatched or never taken: the staging file is a
+                // clone of the base, so hash it once. Those of the complete
+                // copy are kept.
                 _ => {
                     let cells = hash_file(Arc::clone(&file), size)
                         .await
-                        .map_err(|e| failed(format!("cannot hash the complete copy: {e}")))?;
-                    if let Some(complete) = record.complete_seq
+                        .map_err(|e| failed(format!("cannot hash the base copy: {e}")))?;
+                    if candidate.is_none()
+                        && let Some(complete) = record.complete_seq
                         && let Err(e) = self
                             .store
                             .set_warm_cells(&record.volume_id, complete, &cells.to_bytes())

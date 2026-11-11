@@ -235,6 +235,138 @@ async fn a_returning_source_with_no_change_since_the_base_hands_its_volume_over(
     assert!(h.status().error.is_none());
 }
 
+/// The new source's model of the copies the returning source kept: the data
+/// [`returning_source`] writes.
+fn returned_model() -> Model {
+    let mut model = Model::default();
+    model.write(0, &[7_u8; 4096]);
+    model.write(3 * CELL + 100, &pattern(100_000, 2));
+    model
+}
+
+/// A returning source handed over with its base (seq 1) and the snapshot it
+/// was shipping (seq 2) kept, both as [`returned_model`] has them.
+async fn handed_over_with_candidates(h: &Harness) -> (VolumeSnapshot, VolumeSnapshot) {
+    let mut listeners = BTreeMap::new();
+    returning_source(h).await;
+    let base = keep_snapshot(h, KeepPurpose::WarmBase, 1).await;
+    let shipping = keep_snapshot(h, KeepPurpose::WarmShipping, 2).await;
+    pass(h, &mut listeners).await;
+    assert_handed_over(h).await;
+    assert_eq!(kept_purposes(h).await, vec!["warm_base", "warm_shipping"]);
+    (base, shipping)
+}
+
+#[tokio::test]
+async fn a_returning_source_resyncs_from_the_base_or_the_snapshot_it_was_shipping() {
+    for base_seq in [1, 2] {
+        let h = Harness::new(if base_seq == 1 {
+            "resync-base"
+        } else {
+            "resync-shipping"
+        })
+        .await;
+        let (base, shipping) = handed_over_with_candidates(&h).await;
+        // The new source's writes since the copy it started from: only
+        // those cells are shipped.
+        let mut model = returned_model();
+        model.write(0, &[8_u8; 512]);
+        model.write(9 * CELL + 4096, &pattern(20_000, 6));
+        let changed = vec![(0, CELL), (9 * CELL, CELL)];
+        h.post(
+            stream(&header(5, 3, Some(base_seq)), &model, &changed),
+            End::Complete,
+        )
+        .await
+        .expect("a reply")
+        .assert_complete(3);
+        h.assert_copy(&model, Some(3), &model.touched).await;
+        // Both candidates go once a copy is complete.
+        assert!(kept_purposes(&h).await.is_empty(), "base_seq {base_seq}");
+        assert!(!base.location.exists() && !shipping.location.exists());
+        assert!(h.status().error.is_none(), "{:?}", h.status());
+    }
+}
+
+#[tokio::test]
+async fn a_stream_from_a_base_the_returning_source_does_not_hold_keeps_its_candidates() {
+    let h = Harness::new("resync-refused").await;
+    let (base, shipping) = handed_over_with_candidates(&h).await;
+    let mut model = returned_model();
+    model.write(9 * CELL, &pattern(4096, 6));
+    let changed = vec![(9 * CELL, CELL)];
+    let kept_as_is = || {
+        let h = &h;
+        let (base, shipping) = (base.location.clone(), shipping.location.clone());
+        async move {
+            assert_eq!(kept_purposes(h).await, vec!["warm_base", "warm_shipping"]);
+            assert!(base.exists() && shipping.exists());
+            h.assert_copy(&Model::default(), None, &BTreeSet::new())
+                .await;
+        }
+    };
+
+    // A base it never kept.
+    h.post(
+        stream(&header(5, 3, Some(7)), &model, &changed),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_refused("base_mismatch", None);
+    kept_as_is().await;
+
+    // The same seq with other data: only the root hash tells, and nothing
+    // is swapped in.
+    let mut other = Model::default();
+    other.write(0, &[7_u8; 4096]);
+    other.write(9 * CELL, &pattern(4096, 6));
+    h.post(
+        stream(&header(5, 3, Some(1)), &other, &changed),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_refused("root_mismatch", None);
+    kept_as_is().await;
+
+    // A candidate whose file is missing is no base.
+    let aside = base.location.with_extension("aside");
+    std::fs::rename(&base.location, &aside).expect("move the base aside");
+    h.post(
+        stream(&header(5, 3, Some(1)), &model, &changed),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_refused("base_mismatch", None);
+    std::fs::rename(&aside, &base.location).expect("put the base back");
+    kept_as_is().await;
+
+    // The engine cannot stage from it: the source ships a full copy next.
+    h.engine
+        .fail_next(FakeOp::StageVolume, EngineError::Io("injected".to_owned()));
+    h.post(
+        stream(&header(5, 3, Some(1)), &model, &changed),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_refused("base_mismatch", None);
+    kept_as_is().await;
+
+    // And the right data from the snapshot it was shipping completes.
+    h.post(
+        stream(&header(5, 3, Some(2)), &model, &changed),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_complete(3);
+    h.assert_copy(&model, Some(3), &model.touched).await;
+    assert!(kept_purposes(&h).await.is_empty());
+}
+
 #[tokio::test]
 async fn a_returning_source_with_writes_since_the_base_keeps_them_in_quarantine() {
     let h = Harness::new("handover-changed").await;

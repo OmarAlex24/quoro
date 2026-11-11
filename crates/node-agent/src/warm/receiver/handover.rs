@@ -37,8 +37,10 @@
 //! 4. **Then**, once the desired state still names the node as the target,
 //!    delete the live file and, after it is gone, in one transaction drop
 //!    the own row and leave the warm target row with no complete copy. The
-//!    volume is an ordinary warm copy from then on, and the next stream is a
-//!    full copy.
+//!    volume is an ordinary warm copy from then on. The base and the
+//!    snapshot the node was shipping stay as candidate copies: the next
+//!    stream starts from the one its `base_seq` names, and is a full copy
+//!    otherwise (section 9 step 3). The first complete stream releases both.
 //!
 //! **Crash safety.** The mark is written only once nothing in the live file
 //! is lost without it, and it records why the file may go: the `qrn_` id of
@@ -332,7 +334,7 @@ impl<E: Engine + 'static> Inner<E> {
         info!(
             volume_id,
             quarantine_id = ?quarantined,
-            "handed the node's own volume over: it is a warm copy now, and the next stream is a full copy"
+            "handed the node's own volume over: it is a warm copy now, and the next stream starts from a snapshot the node kept or is a full copy"
         );
         HandOver::Done(quarantined)
     }
@@ -686,6 +688,30 @@ impl<E: Engine + 'static> Inner<E> {
                 "could not delete an unrecorded quarantine clone; the next start-up sweep removes it"
             );
         }
+    }
+
+    /// The snapshot the node kept as the source of `volume_id`, its base or
+    /// the snapshot it was shipping, whose `snapshot_seq` is `seq` and whose
+    /// file is on disk: a candidate copy a stream may start from (section 9
+    /// step 3). The base comes first. A quarantined copy is never one, and
+    /// nor is a snapshot whose `seq` is not known.
+    pub(super) async fn kept_candidate(
+        &self,
+        volume_id: &str,
+        seq: u64,
+    ) -> Result<Option<KeptSnapshotRecord>, String> {
+        let kept = self
+            .store
+            .kept_snapshots_of(volume_id)
+            .await
+            .map_err(|e| format!("cannot read the kept snapshots: {e}"))?;
+        Ok(kept
+            .into_iter()
+            .filter(|kept| KeepPurpose::is_warm(&kept.purpose) && kept.seq == Some(seq))
+            .filter(|kept| {
+                std::fs::symlink_metadata(&kept.snapshot.location).is_ok_and(|meta| meta.is_file())
+            })
+            .max_by_key(|kept| kept.purpose == KeepPurpose::WarmBase.as_str()))
     }
 
     /// Releases the warm snapshots this node kept of `volume_id` as its
