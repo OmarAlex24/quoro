@@ -1723,4 +1723,125 @@ mod tests {
         grant_then_ping(&queued(&mut on), 4);
         f.done();
     }
+
+    /// What follows R keeps a grant with a new token held since R's
+    /// transaction read the row, for a newer token: R's commit drops only an
+    /// unsent one at a token no higher than the row it wrote. R writes the
+    /// row at token 3; before its hub part runs, a write gives the lease
+    /// token 4, marked, and its grant is held. R's hub part then leaves that
+    /// grant as it was, and holds no `local` grant over it.
+    #[tokio::test]
+    async fn r_keeps_a_grant_held_since_for_a_newer_token() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        created(&f).await;
+        let mut w = f.state.store.begin_write().await.unwrap();
+        sqlx::query("UPDATE apps SET ha_policy = 'none' WHERE id = ?")
+            .bind(APP)
+            .execute(&mut *w.tx)
+            .await
+            .unwrap();
+        let ended = crate::leases::leave_warm(&mut w.tx, APP, &actor())
+            .await
+            .unwrap()
+            .unwrap();
+        w.commit().await.unwrap();
+        assert!(ended.wrote && ended.hold);
+        assert_eq!(ended.lease.fencing_token, 3);
+        write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
+        let row = f.row().await;
+        let hub = &f.state.hub;
+        hub.hold_grant(&row);
+        let held = hub.0.held.lock().unwrap().entries[LEASE].clone();
+        assert_eq!((held.kind, held.token), (Kind::NewToken, 4));
+        hub.end_renewals_committed(&ended);
+        assert_eq!(
+            hub.0.held.lock().unwrap().entries.get(LEASE),
+            Some(&held),
+            "the grant for the newer token stays"
+        );
+        assert!(hub.row_grant_pending(&row));
+        f.done();
+    }
+
+    /// F1's drop when the row moves: a `local` grant held while its holder
+    /// is away (no session, so none is eligible) goes once the row moves, to
+    /// a new token or revoked. Before that it stays, waiting; after it, the
+    /// registry holds nothing for the lease and no grant is pending.
+    #[tokio::test]
+    async fn a_local_grant_with_its_holder_away_goes_once_the_row_moves() {
+        for moved in [
+            "UPDATE leases SET fencing_token = 4 WHERE id = ?",
+            "UPDATE leases SET revoked_at = '2026-11-10T10:00:00Z' WHERE id = ?",
+        ] {
+            let f = fixture("warm", "expiring", Some(D as i64), false).await;
+            r(&f).await;
+            let hub = &f.state.hub;
+            hub.attempt_held().await;
+            let held = hub.0.held.lock().unwrap().entries.get(LEASE).cloned();
+            let held = held.expect("the local grant is held");
+            assert_eq!(
+                (held.kind, held.eligible_on),
+                (Kind::LocalEnd, None),
+                "{moved}"
+            );
+            write_row(&f, moved).await;
+            hub.attempt_held().await;
+            assert!(
+                !hub.0.held.lock().unwrap().entries.contains_key(LEASE),
+                "{moved}"
+            );
+            assert!(!hub.grant_pending(LEASE), "{moved}");
+            f.done();
+        }
+    }
+
+    /// Evidence from an `uncertain` listing: a holder whose `hello` listed
+    /// the lease `uncertain`, `expiring` at the row's token, holds it there,
+    /// so R's `local` grant goes out on that session once R is acknowledged,
+    /// then its `ping`, whose `pong` clears the mark.
+    #[tokio::test]
+    async fn an_uncertain_listing_is_evidence_for_the_local_grant() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        let mut on = live(&f.state, &f, Some(("uncertain", LeaseMode::Expiring, 3))).await;
+        r(&f).await;
+        ack(&f.state, &f, &on).await;
+        f.state.hub.attempt_held().await;
+        let (_grant, ping) = grant_then_ping(&queued(&mut on), 3);
+        pong(&mut on.session, &ping).await;
+        assert_eq!(
+            state(&f).await,
+            ("local".to_string(), 3, Some(D as i64), false, false)
+        );
+        f.done();
+    }
+
+    /// A failover's hold that lands after R. The failover wrote token 4,
+    /// marked; R then wrote the row `local` before the failover held its
+    /// grant, so the grant with a new token is held over a row whose newest
+    /// write, R's, gave no new token. It stands for nothing: the next
+    /// attempt drops it, though no session of its holder may take it, and
+    /// `grant_pending` reads false, so a failover after a return to `warm`
+    /// does not answer `in_progress` for it.
+    #[tokio::test]
+    async fn a_new_token_grant_held_after_r_goes_with_its_holder_away() {
+        let f = fixture("warm", "expiring", Some(D as i64), true).await;
+        created(&f).await;
+        write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
+        let failover = f.row().await;
+        r(&f).await;
+        let hub = &f.state.hub;
+        hub.hold_grant(&failover);
+        let held = hub.0.held.lock().unwrap().entries[LEASE].clone();
+        assert_eq!(
+            (held.kind, held.token, held.eligible_on),
+            (Kind::NewToken, 4, None)
+        );
+        assert!(hub.grant_pending(LEASE));
+        hub.attempt_held().await;
+        assert!(!hub.0.held.lock().unwrap().entries.contains_key(LEASE));
+        assert!(!hub.grant_pending(LEASE));
+        assert!(!hub.row_grant_pending(&f.row().await));
+        assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
+        f.done();
+    }
 }

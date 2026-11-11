@@ -1239,6 +1239,49 @@ mod tests {
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
+    /// An attempt reads an entry, decides to drop it, and a registration of
+    /// the same row lands before the drop: the same-token `local` grant held
+    /// again, equal to the one read in every field but its registration. The
+    /// drop leaves the fresh registration held. Nor does it remove an entry
+    /// changed in place since the read (sent meanwhile); only the entry as
+    /// read goes.
+    #[tokio::test]
+    async fn a_stale_drop_never_removes_a_fresh_registration() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let lease = marked("lse_one", &node_id);
+        hub.hold_local_end_on(&lease, 1);
+        let stale = entry(hub, "lse_one");
+        hub.hold_local_end_on(&lease, 1);
+        let fresh = entry(hub, "lse_one");
+        hub.drop_held("lse_one", &stale);
+        assert_eq!(
+            hub.0.held.lock().unwrap().entries.get("lse_one"),
+            Some(&fresh),
+            "the fresh registration stays"
+        );
+
+        hub.0
+            .held
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut("lse_one")
+            .unwrap()
+            .sent_on = Some(1);
+        hub.drop_held("lse_one", &fresh);
+        assert_eq!(
+            entry(hub, "lse_one").sent_on,
+            Some(1),
+            "changed in place since the read"
+        );
+
+        let read = entry(hub, "lse_one");
+        hub.drop_held("lse_one", &read);
+        assert!(!hub.0.held.lock().unwrap().entries.contains_key("lse_one"));
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
     /// ADR 0299 and review finding B1: a `log_ack` counts only on a session
     /// whose start pass ran to its end.
     #[tokio::test]
