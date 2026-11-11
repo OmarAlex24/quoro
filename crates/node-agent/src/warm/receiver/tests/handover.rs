@@ -1012,6 +1012,10 @@ async fn a_marked_copy_whose_clone_is_missing_is_kept_and_the_file_compared_agai
     let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
     let lost = marked_copy(&h).await;
     assert_eq!(statuses.borrow_and_update().len(), 1);
+    // Only the file goes: the fake engine still names the clone. On a real
+    // node the engine would answer `NotFound` for it, and the hash would
+    // forget the record (section 9 step 2); the record stays here because
+    // the hash gate keeps the hash from running.
     std::fs::remove_file(&lost.path).expect("remove the clone");
     // The base on disk shows the volume directory to be the real one.
     assert!(base.location.exists());
@@ -1912,4 +1916,43 @@ async fn a_lost_clone_keeps_its_record_while_the_engine_cannot_tell_or_no_other_
     assert!(quarantines.hash_failed(&lost.quarantine_id));
     kept_as_is(&h).await;
     assert!(path.exists());
+}
+
+#[tokio::test]
+async fn a_clone_the_engine_still_names_or_that_appears_with_the_directory_keeps_its_record() {
+    let h = Harness::new("handover-clone-mount-race").await;
+    let path = returning_source(&h).await;
+    let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+    diverge(&path);
+    let quarantines = h.receiver.inner.quarantines.clone();
+    let gate = quarantines.inner.hash_gate.lock().await;
+    let lost = marked_copy(&h).await;
+    // The file is gone, but the engine still names the clone.
+    std::fs::remove_file(&lost.path).expect("remove the clone");
+    drop(gate);
+    wait_for("the hash to fail", || async {
+        quarantines.hash_failed(&lost.quarantine_id)
+    })
+    .await;
+    assert_eq!(quarantined(&h).await, vec![lost.clone()]);
+
+    // The first lookup misses the clone, as before a volume directory
+    // mounts; the base then answers, and so does the clone, as once it has.
+    h.engine
+        .fail_next(FakeOp::VolumeChangedRanges, EngineError::NotFound);
+    quarantines.hash(&lost);
+    wait_for("the second hash to end", || async {
+        !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert!(quarantines.hash_failed(&lost.quarantine_id));
+    assert_eq!(quarantined(&h).await, vec![lost.clone()]);
+    assert!(
+        h.store
+            .kept_snapshot(&lost.snapshot_id)
+            .await
+            .expect("store")
+            .is_some()
+    );
+    assert!(base.location.exists());
 }

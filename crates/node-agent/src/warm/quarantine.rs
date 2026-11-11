@@ -301,6 +301,8 @@ impl<E: Engine + 'static> Quarantines<E> {
         // stops the hash ([`Inner`]'s `Drop`).
         let weak: Weak<Inner<E>> = Arc::downgrade(&self.inner);
         let id = record.quarantine_id.clone();
+        let volume_id = record.volume_id.clone();
+        let snapshot_id = record.snapshot_id.clone();
         let path = record.path.clone();
         tokio::spawn(async move {
             let Some(inner) = weak.upgrade() else {
@@ -372,7 +374,12 @@ impl<E: Engine + 'static> Quarantines<E> {
                     match inner.forget_lost_clone(&id).await {
                         Ok(true) => {
                             inner.lock_retry().remove(&id);
-                            info!(quarantine_id = %id, "the clone of a quarantined copy is gone before it was hashed; its record is forgotten");
+                            warn!(
+                                quarantine_id = %id,
+                                volume_id = %volume_id,
+                                snapshot_id = %snapshot_id,
+                                "the clone of a quarantined copy is gone before it was hashed; its record and kept snapshot are forgotten"
+                            );
                             true
                         }
                         Ok(false) => {
@@ -409,9 +416,14 @@ impl<E: Engine + 'static> Quarantines<E> {
 impl<E: Engine> Inner<E> {
     /// Forgets the record of copy `id`, with its kept snapshot, when its
     /// clone is gone before it was hashed (section 9 step 2): the engine
-    /// answers `NotFound` for the clone, another file the node records for
-    /// the volume answers it, and the record has no SHA-256. Touches no
-    /// file. Returns whether the record went.
+    /// answers `NotFound` for the clone, another kept snapshot of the volume
+    /// answers it, and the record has no SHA-256. Touches no file. Returns
+    /// whether the record went.
+    ///
+    /// The clone is looked up again after the other file answered: a volume
+    /// directory that mounted between the two lookups shows the other file
+    /// and would hide the clone the first lookup missed. A copy with no other
+    /// kept snapshot is never forgotten.
     async fn forget_lost_clone(&self, id: &str) -> Result<bool, String> {
         let record = match self.store.volume_quarantine(id).await {
             Ok(Some(record)) if record.sha256.is_none() => record,
@@ -426,15 +438,8 @@ impl<E: Engine> Inner<E> {
             Ok(None) => return Ok(false),
             Err(e) => return Err(format!("cannot read the kept snapshot: {e}")),
         };
-        match self
-            .engine
-            .volume_changed_ranges(&RangesOf::Snapshot(kept.snapshot), None)
-            .await
-        {
-            Err(EngineError::NotFound) => {}
-            // The engine sees the clone, or cannot tell (a pool that does
-            // not mount answers `Unsupported`).
-            _ => return Ok(false),
+        if !self.clone_gone(&kept.snapshot, &record.path).await {
+            return Ok(false);
         }
         if !volume_file_present(
             self.engine.as_ref(),
@@ -446,10 +451,29 @@ impl<E: Engine> Inner<E> {
         {
             return Ok(false);
         }
+        // Again, now that the directory is shown to be the real one.
+        if !self.clone_gone(&kept.snapshot, &record.path).await {
+            return Ok(false);
+        }
         self.store
             .forget_unhashed_volume_quarantine(id, &record.snapshot_id)
             .await
             .map_err(|e| format!("cannot forget the record: {e}"))
+    }
+
+    /// Whether the clone is gone: the engine answers `NotFound` for it as a
+    /// snapshot of the volume, and its path is missing. Any other answer,
+    /// `Unsupported` from a pool that does not mount among them, keeps it.
+    async fn clone_gone(&self, clone: &quoro_engine::VolumeSnapshot, path: &Path) -> bool {
+        matches!(
+            self.engine
+                .volume_changed_ranges(&RangesOf::Snapshot(clone.clone()), None)
+                .await,
+            Err(EngineError::NotFound)
+        ) && matches!(
+            std::fs::symlink_metadata(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
     }
 
     /// Reads the records and publishes their entries when they changed.
