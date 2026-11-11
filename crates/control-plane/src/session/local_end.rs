@@ -48,9 +48,12 @@
 //!   ([`super::held`]'s `HeldGrant::pending`). "When the policy returns to
 //!   `warm`, the grant is dropped", as every unsent one is.
 //! - **The barrier.** The grant and a `ping` are queued together on the
-//!   session. The session then answers no renewal of the lease at that token
-//!   (ADR 0256; [`super::conversion`]), and no settle `ping` of the lease
-//!   settles any more. The `pong` of that `ping` with no refusal before it
+//!   session, and recorded there in the same hold of the sessions lock, only
+//!   once both are queued. The session then answers no renewal of the lease
+//!   at that token (ADR 0256; [`super::conversion`]), and every settle of
+//!   the lease pending on the session is cleared, whether planned from its
+//!   `hello` or waiting for its `pong` ("Settling a lease"); the settle's
+//!   row write also refuses a settling `ping` at or below the grant's token. The `pong` of that `ping` with no refusal before it
 //!   writes the row `local` at the token and clears the mark, as a `local`
 //!   report does, if the row's newest write is still the one recorded with
 //!   the `ping` and every other check holds again. It also passes ADR 0257's
@@ -601,15 +604,25 @@ impl NodeHub {
         Ok(Attempt::Sent)
     }
 
-    /// Records on `generation` the same-token `local` grant `grant_id` of
-    /// `barrier`'s lease and its barrier `ping` (ADR 0256: no renewal of the
-    /// lease at that token is answered on the session from now on), then
-    /// queues `frames` on the session's channel, unless empty (the caller
-    /// queues them on its own outbox). `regrant` says whether a
-    /// `bad_message` refusal of the grant gives the lease back; `fresh`,
-    /// whether the grant is sent after the session start, so a barrier that
-    /// passed before it no longer counts. Returns whether `generation` is
-    /// the node's session.
+    /// Queues `frames` on `generation`'s channel, the same-token `local`
+    /// grant `grant_id` of `barrier`'s lease and its barrier `ping`, and
+    /// records both on the session, in one hold of the sessions lock that
+    /// finds `generation` still the node's session. `frames` is empty when
+    /// the caller pushes them to the session's own outbox right after this
+    /// returns, with no await between ([`Session::queue_local_grant`]).
+    ///
+    /// The record is made only once every frame is queued: a refused send
+    /// means the session's receiver is gone, and nothing queued on it
+    /// reaches the wire. It sets the session's `local_sent` (ADR 0256: no
+    /// renewal of the lease at that token is answered on the session from
+    /// then on) and clears every settle of the lease pending on the session
+    /// ("Settling a lease": "Sending the same-token `local` grant clears any
+    /// pending settle for that lease"). Every reader of these takes this
+    /// lock, so none sees the frames queued without the record. `regrant`
+    /// says whether a `bad_message` refusal of the grant gives the lease
+    /// back; `fresh`, whether the grant is sent after the session start, so
+    /// a barrier that passed before it no longer counts. Returns whether the
+    /// grant was queued and recorded.
     #[expect(clippy::too_many_arguments, reason = "one record of one send")]
     pub(super) fn queue_local_end(
         &self,
@@ -622,9 +635,6 @@ impl NodeHub {
         ping_id: &str,
         frames: &[String],
     ) -> bool {
-        if !self.note_local_grant_sent(node_id, generation, &barrier.lease_id, barrier.token) {
-            return false;
-        }
         let mut sessions = self.0.sessions.lock().expect("session lock");
         let Some(handle) = sessions
             .get_mut(node_id)
@@ -632,6 +642,18 @@ impl NodeHub {
         else {
             return false;
         };
+        if !frames
+            .iter()
+            .all(|frame| handle.tx.send(frame.clone()).is_ok())
+        {
+            return false;
+        }
+        let sent = handle
+            .local_sent
+            .entry(barrier.lease_id.clone())
+            .or_insert(0);
+        *sent = (*sent).max(barrier.token);
+        handle.settles.forget(&barrier.lease_id);
         if fresh {
             // A grant sent after the session start has its own barrier: one
             // that passed before it, by a `pong` or the `hello`'s listing,
@@ -660,9 +682,7 @@ impl NodeHub {
             .local_end
             .pings
             .insert(ping_id.to_string(), barrier.clone());
-        frames
-            .iter()
-            .all(|frame| handle.tx.send(frame.clone()).is_ok())
+        true
     }
 
     /// A refusal answered the `local` grant `re` on `generation`: its
@@ -800,18 +820,20 @@ impl Session {
         Ok(Some(lease))
     }
 
-    /// Queues, after the same-token `local` grant `grant_id` of `lease_id`
-    /// at `token` already on `outbox`, its barrier `ping`, and records both
-    /// on the session (ADR 0257). `regrant` says whether a refusal of the
-    /// grant gives the lease back.
-    pub(super) async fn queue_barrier(
+    /// The session start's same-token `local` grant of `lease` at `token`
+    /// and its barrier `ping` (ADR 0257), pushed to `outbox` only once
+    /// [`NodeHub::queue_local_end`] recorded them on this session, with no
+    /// await between, so the record and the frames go together: a session
+    /// that is no longer the node's pushes neither. `regrant` says whether a
+    /// refusal of the grant gives the lease back.
+    pub(super) async fn queue_local_grant(
         &self,
-        lease_id: &str,
+        lease: &Lease,
         token: u64,
-        grant_id: &str,
         regrant: bool,
         outbox: &mut Vec<String>,
     ) {
+        let lease_id = lease.id.as_str();
         let seq = match self.hub.0.store.pool().acquire().await {
             Ok(mut conn) => leases::newest_write_seq(&mut conn, lease_id)
                 .await
@@ -824,8 +846,9 @@ impl Session {
                 None
             }
         };
+        let grant_id = new_msg_id();
         let ping_id = new_msg_id();
-        self.hub.queue_local_end(
+        if self.hub.queue_local_end(
             &self.node_id,
             self.generation,
             &Barrier {
@@ -833,25 +856,31 @@ impl Session {
                 token,
                 seq,
             },
-            grant_id,
+            &grant_id,
             regrant,
             false,
             &ping_id,
             &[],
-        );
-        outbox.push(ControlMessage::Ping.to_frame(&ping_id, None).to_text());
+        ) {
+            outbox.push(
+                ControlMessage::LeaseGrant(lease.grant())
+                    .to_frame(&grant_id, None)
+                    .to_text(),
+            );
+            outbox.push(ControlMessage::Ping.to_frame(&ping_id, None).to_text());
+        }
     }
 
     /// A `pong` that is no settle's: when it answers a barrier `ping` with no
-    /// refusal of its grant before it, the barrier passes, the session's
-    /// settle state of the lease is dropped, and the row is written `local`
-    /// at the token with the mark cleared ("The mark", the `pong` bullet), if
-    /// every check holds again ([`Session::write_pong`]).
+    /// refusal of its grant before it, the barrier passes, and the row is
+    /// written `local` at the token with the mark cleared ("The mark", the
+    /// `pong` bullet), if every check holds again ([`Session::write_pong`]).
+    /// The session's settles of the lease went when the grant was queued
+    /// ([`NodeHub::queue_local_end`]).
     pub(super) async fn on_barrier_pong(&mut self, re: &str) {
         let Some(barrier) = self.hub.take_barrier(&self.node_id, self.generation, re) else {
             return;
         };
-        self.settles.forget(&barrier.lease_id);
         match self.write_pong(&barrier).await {
             Ok(Some(lease)) => {
                 tracing::info!(

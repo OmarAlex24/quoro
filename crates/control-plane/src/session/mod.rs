@@ -493,6 +493,11 @@ struct SessionHandle {
     /// conversion grant follows (section 8.4, "From R until the holder has
     /// taken the grant", ADR 0256; [`conversion`]).
     local_sent: HashMap<String, u64>,
+    /// The leases this session settles from its `hello` or at a `pong`
+    /// (section 8.4, "Settling a lease"; [`conversion`]). Kept here, under
+    /// this lock, so the same-token `local` grant clears them in the hold
+    /// that records it ([`NodeHub::queue_local_end`]).
+    settles: conversion::Settles,
     /// The `local` grants that end renewals, their barrier `ping`s, and
     /// what the session's `hello` and renewals showed ([`local_end`]).
     local_end: local_end::SessionState,
@@ -1927,6 +1932,7 @@ impl NodeHub {
                 start_done: false,
                 conversions: HashMap::new(),
                 local_sent: HashMap::new(),
+                settles: conversion::Settles::default(),
                 local_end: local_end::SessionState::default(),
             },
         );
@@ -2753,9 +2759,10 @@ struct Session {
     /// When the next `support_request` is due, every `S / 3` (section 5.27);
     /// `None` while none goes out.
     support_due: Option<Instant>,
-    /// The leases this session settles (section 8.4, "Settling a lease";
+    /// The longest `duration_ms` this session granted for each lease, for
+    /// the settle's row write (section 8.4, "Settling a lease";
     /// [`conversion`]).
-    settles: conversion::Settles,
+    granted: HashMap<String, u64>,
 }
 
 impl Session {
@@ -2785,7 +2792,7 @@ impl Session {
             voter_snapshots: VecDeque::new(),
             acked_votes_version: None,
             support_due: None,
-            settles: conversion::Settles::default(),
+            granted: HashMap::new(),
         }
     }
 }
@@ -4754,7 +4761,8 @@ impl Session {
                         && (lease.unsettled || (lease.mode == "local" && *claimed == token))
                         && warm.contains(&lease.resource_id)
                     {
-                        self.settles.report(&lease.id, *claimed);
+                        self.hub
+                            .report_settle(&self.node_id, self.generation, &lease.id, *claimed);
                         continue;
                     }
                     // "Grants of a marked row": every grant of a marked row
@@ -4807,21 +4815,14 @@ impl Session {
                         }
                         continue;
                     }
-                    let id = new_msg_id();
                     let regrant = reported.is_some_and(|(state, claimed, _)| {
                         claimed == token && (state == "held" || state == "uncertain")
                     });
-                    outbox.push(
-                        ControlMessage::LeaseGrant(lease.grant())
-                            .to_frame(&id, None)
-                            .to_text(),
-                    );
                     // ADR 0257: a `ping` follows every same-token `local`
                     // grant, and no conversion grant goes out before its
                     // `pong`. A refusal of a grant the `hello` listed `held`
                     // or `uncertain` at that token gives the lease back.
-                    self.queue_barrier(&lease.id, token, &id, regrant, outbox)
-                        .await;
+                    self.queue_local_grant(&lease, token, regrant, outbox).await;
                 }
             }
             Err(e) => {
