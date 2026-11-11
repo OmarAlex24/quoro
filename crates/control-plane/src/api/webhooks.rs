@@ -84,6 +84,8 @@ pub enum EventType {
     AppSwitchedOver,
     #[serde(rename = "app.switchover_failed")]
     AppSwitchoverFailed,
+    #[serde(rename = "app.left_stopped")]
+    AppLeftStopped,
     #[serde(rename = "deployment.started")]
     DeploymentStarted,
     #[serde(rename = "deployment.succeeded")]
@@ -167,6 +169,7 @@ impl EventType {
             Self::AppFailedOver => "app.failed_over",
             Self::AppSwitchedOver => "app.switched_over",
             Self::AppSwitchoverFailed => "app.switchover_failed",
+            Self::AppLeftStopped => "app.left_stopped",
             Self::DeploymentStarted => "deployment.started",
             Self::DeploymentSucceeded => "deployment.succeeded",
             Self::DeploymentFailed => "deployment.failed",
@@ -207,7 +210,7 @@ impl EventType {
     }
 
     /// Every event type of the contract, in contract order.
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 50] = [
         Self::NodeEnrolled,
         Self::NodeConnected,
         Self::NodeDisconnected,
@@ -230,6 +233,7 @@ impl EventType {
         Self::AppFailedOver,
         Self::AppSwitchedOver,
         Self::AppSwitchoverFailed,
+        Self::AppLeftStopped,
         Self::DeploymentStarted,
         Self::DeploymentSucceeded,
         Self::DeploymentFailed,

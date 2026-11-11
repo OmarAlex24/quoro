@@ -581,6 +581,7 @@ fn event_type() -> Value {
             "app.failed_over",
             "app.switched_over",
             "app.switchover_failed",
+            "app.left_stopped",
             "deployment.started",
             "deployment.succeeded",
             "deployment.failed",

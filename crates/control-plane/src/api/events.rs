@@ -59,6 +59,7 @@ pub const EVENT_TYPES: [&str; 49] = [
     "app.failed_over",
     "app.switched_over",
     "app.switchover_failed",
+    "app.left_stopped",
     "deployment.started",
     "deployment.succeeded",
     "deployment.failed",
