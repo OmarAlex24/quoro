@@ -6624,10 +6624,11 @@ paths:
         node with the `node` role: its capacity minus what is allocated,
         within the app's `placement.node_ids`. A warm app can go only to its
         warm node. Nothing is reserved and no event is emitted. The panel's
-        HA view shows the answer. The MCP tool `get_capacity` under the same
-        scope (ADR 0178) is added with the implementation. `404` when the
-        node does not exist or was removed.
+        HA view shows the answer. Exposed as the MCP tool `get_capacity`
+        under the same scope (ADR 0178). `404` when the node does not exist
+        or was removed.
       x-quoro-scope: cluster:read
+      x-quoro-mcp-tool: get_capacity
       parameters:
         - $ref: '#/components/parameters/LostNodeId'
       responses:

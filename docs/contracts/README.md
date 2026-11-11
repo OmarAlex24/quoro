@@ -309,6 +309,7 @@ M3 exposes these tools (D-0033: read plus restart and redeploy; delete exists so
 | Tool | Endpoint | Scope |
 | --- | --- | --- |
 | `get_cluster` | `GET /api/v1/cluster` | `cluster:read` |
+| `get_capacity` | `GET /api/v1/cluster/capacity` | `cluster:read` |
 | `list_nodes` | `GET /api/v1/nodes` | `node:read` |
 | `get_node` | `GET /api/v1/nodes/{node_id}` | `node:read` |
 | `list_projects` | `GET /api/v1/projects` | `project:read` |
@@ -334,7 +335,7 @@ M4 adds no MCP tool. Builds, metrics and console sessions are reachable by agent
 
 M5a adds no MCP tool either. Volumes, backups and restores are reachable by agents through the HTTP API with a grant (a volume delete and a restore only through a JIT approval); backup repositories, their recovery key and the off-site audit export are human-only. Replicas are a field of `updateApp`, with no tool of their own. Vulnerability reports are read through the HTTP API (`app:read`), and an agent woken by `app.vulnerable` rebuilds through `startBuild` with `refresh_base` (`app:deploy`), also with no tool of their own (ADR 0155 defers automatic rebuilds to M5b). A later tool is a contract change of its own.
 
-M5b's lease and witness contract adds no MCP tool: the roles operation and declaring a node lost are human-only, and an agent reads the voters through `get_cluster` and an app's lease through `get_app`.
+M5b's lease and witness contract adds no MCP tool: the roles operation and declaring a node lost are human-only, and an agent reads the voters through `get_cluster` and an app's lease through `get_app`. The N+1 indicator is the one M5b tool: `get_capacity`, a read under `cluster:read`, added with its implementation (ADR 0178, ADR 0217).
 
 M5b's promotion and custody contract adds no MCP tool: promotion is a CLI step on the candidate, and rotating the signing key is human-only. An agent reads a node's follow lag and custody state through `get_node`.
 

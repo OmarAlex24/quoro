@@ -60,6 +60,42 @@ describe('the mock N+1 answer', () => {
     ]);
   });
 
+  it('an instance on a node that is not connected keeps nothing running', () => {
+    const all = nodes();
+    const lab3 = all.find((node) => node.name === 'lab-3')!;
+    const answer = simulateLoss({
+      lostId: lab3.id,
+      nodes: all.map((node) => (node.name === 'lab-4' ? { ...node, status: 'disconnected' as const } : node)),
+      apps: db.apps,
+      vms: db.vms,
+      volumes: db.volumes,
+      backups: db.backups,
+      now: '2026-11-07T00:00:00Z',
+    });
+    expect(answer.apps.filter((app) => app.action === 'keep')).toEqual([]);
+    const replicas = answer.apps.filter((app) => ['api', 'web'].includes(nameOf(app.app_id)!));
+    expect(replicas.map((app) => [app.action, app.reason])).toEqual([
+      ['start', 'no_capacity'],
+      ['start', 'no_capacity'],
+    ]);
+    expect(answer.fits).toBe(false);
+  });
+
+  it('an app whose instances are all stopped is not listed', () => {
+    const lab3 = nodes().find((node) => node.name === 'lab-3')!;
+    const web = db.apps.find((app) => app.name === 'web')!;
+    const answer = simulateLoss({
+      lostId: lab3.id,
+      nodes: nodes(),
+      apps: db.apps,
+      vms: db.vms.map((vm) => (vm.app_id === web.id ? { ...vm, desired_status: 'stopped' as const } : vm)),
+      volumes: db.volumes,
+      backups: db.backups,
+      now: '2026-11-07T00:00:00Z',
+    });
+    expect(answer.apps.some((app) => app.app_id === web.id)).toBe(false);
+  });
+
   it('losing lab-4 does not fit: the apps pinned to it have nowhere to go', () => {
     const answer = lose('lab-4');
     expect(answer.fits).toBe(false);

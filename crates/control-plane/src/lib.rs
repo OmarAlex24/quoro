@@ -17,6 +17,9 @@ pub mod authority;
 pub mod authz;
 pub mod backups;
 pub mod build;
+/// The N+1 indicator: simulating the loss of a node (`getClusterCapacity`,
+/// ADR 0178).
+pub(crate) mod capacity;
 pub mod changelog;
 pub mod crypto;
 /// Key custody: binding each node's custody key and sealing the cluster keys

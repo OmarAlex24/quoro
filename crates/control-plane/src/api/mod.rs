@@ -49,6 +49,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/auth/agent-token", post(agents::create_agent_token))
         .route("/api/v1/cluster", get(cluster::get_cluster))
         .route(
+            "/api/v1/cluster/capacity",
+            get(cluster::get_cluster_capacity),
+        )
+        .route(
             "/api/v1/agents",
             get(agents::list_agents).post(agents::create_agent),
         )

@@ -42,8 +42,9 @@ interface Need {
 
 /**
  * Simulate the loss of `lostId`: every app with an instance meant to run
- * there, or a volume there. A stateless app that keeps another instance
- * loses one replica; one whose only instance was there needs a new one; a
+ * there (`desired_status` `running`), or a volume there. A stateless app that
+ * keeps another instance on a remaining connected node loses one replica; an
+ * instance on a node that is not connected does not count; one whose only instance was there needs a new one; a
  * `warm` app starts on its warm node; a stateful `none` or `cold` app needs a
  * restore of its latest succeeded backup. They are placed greedily, by memory,
  * then vCPUs, then disk, largest first, against each remaining connected node
@@ -87,16 +88,18 @@ export function simulateLoss({
   const needs: Need[] = [];
 
   for (const app of apps) {
-    const instances = vms.filter((vm) => vm.app_id === app.id && vm.observed_status !== 'deleted');
+    const instances = vms.filter(
+      (vm) => vm.app_id === app.id && vm.desired_status === 'running' && vm.observed_status !== 'deleted',
+    );
     const onLost = instances.some((vm) => vm.node_id === lostId);
     const volumeThere = volumes.some(
       (volume) => volume.app_id === app.id && volume.node_id === lostId && ACTIVE_VOLUME.has(volume.state),
     );
     if (!onLost && !volumeThere) continue;
 
-    // An app whose data is not on the lost node, with an instance elsewhere,
-    // only loses a replica.
-    const elsewhere = instances.find((vm) => vm.node_id !== lostId);
+    // An app whose data is not on the lost node, with an instance on a
+    // remaining connected node, only loses a replica.
+    const elsewhere = instances.find((vm) => free.has(vm.node_id));
     if (!app.stateful || !volumeThere) {
       if (elsewhere) {
         kept.push({ app_id: app.id, policy: app.ha_policy, action: 'keep', node_id: elsewhere.node_id, reason: null });

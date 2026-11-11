@@ -54,6 +54,15 @@ const SPECS: &[ToolSpec] = &[
         input_schema: schema_get_cluster,
     },
     ToolSpec {
+        name: "get_capacity",
+        operation_id: "getClusterCapacity",
+        scope: "cluster:read",
+        mutating: false,
+        destructive: false,
+        title: "Simulate the loss of a node (the N+1 indicator)",
+        input_schema: schema_get_capacity,
+    },
+    ToolSpec {
         name: "list_nodes",
         operation_id: "listNodes",
         scope: "node:read",
@@ -430,6 +439,20 @@ fn target() -> Value {
 
 fn schema_get_cluster() -> Value {
     schema(vec![], &[])
+}
+
+fn schema_get_capacity() -> Value {
+    schema(
+        vec![(
+            "lost_node_id",
+            json!({
+                "type": "string",
+                "pattern": "^nod_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "The node whose loss the N+1 indicator simulates (`nod_...`)."
+            }),
+        )],
+        &["lost_node_id"],
+    )
 }
 
 fn schema_list_nodes() -> Value {
@@ -907,6 +930,10 @@ async fn dispatch(
 ) -> Result<Value, ApiError> {
     match name {
         "get_cluster" => to_value(service::cluster::get_cluster(state, ctx).await),
+        "get_capacity" => {
+            let lost_node_id = id(arguments, "lost_node_id");
+            to_value(service::cluster::get_cluster_capacity(state, ctx, Some(lost_node_id)).await)
+        }
         "list_nodes" => {
             let page = query::<api::nodes::PageParams>(arguments, &[])?;
             to_value(service::nodes::list_nodes(state, ctx, &page).await)
@@ -1128,6 +1155,7 @@ mod tests {
     fn specs_cover_the_readme_table() {
         let expected = [
             "get_cluster",
+            "get_capacity",
             "list_nodes",
             "get_node",
             "list_projects",
