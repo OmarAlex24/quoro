@@ -1134,7 +1134,7 @@ async fn node_entries_rebuild_every_column_of_the_row() {
     assert!(row.5.is_some(), "a changed custody key: {row:?}");
     assert_eq!(row.6.as_deref(), Some(signing_key_id.as_str()));
 
-    let rebuilt = replay::rebuild(&server, &["node"], &[]).await;
+    let rebuilt = replay::rebuild(&server, &["node"]).await;
     let columns = replay::column_names(&server.state.store, "nodes").await;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes")
         .fetch_one(server.state.store.pool())

@@ -195,21 +195,24 @@ async fn agent_lifecycle_keys_and_tokens() {
         .await
         .unwrap();
     assert_eq!(stored.0, sha256_hex(secret.as_bytes()));
-    // Neither the change log nor the audit record carries the secret.
-    let payloads: Vec<(String,)> =
-        sqlx::query_as("SELECT payload FROM change_log WHERE entity_type = 'agent_key'")
-            .fetch_all(server.state.store.pool())
-            .await
-            .unwrap();
-    for (payload,) in payloads {
+    // Neither the change log nor the audit record carries the secret. The
+    // hash travels in the key's `create` entry only (`node-agent-protocol.md`
+    // section 7.1, ADR 0317).
+    let payloads: Vec<(String, String)> = sqlx::query_as(
+        "SELECT op, payload FROM change_log WHERE entity_type = 'agent_key' ORDER BY seq",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(payloads.len(), 1, "{payloads:?}");
+    for (op, payload) in payloads {
         assert!(
             !payload.contains(secret),
             "change log leaked the key: {payload}"
         );
-        assert!(
-            !payload.contains("key_hash"),
-            "change log leaked the hash: {payload}"
-        );
+        assert_eq!(op, "create");
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["key_hash"], stored.0.as_str(), "{payload}");
     }
     let params: Vec<(String,)> = sqlx::query_as(
         "SELECT params FROM audit_log WHERE operation = 'POST /api/v1/agents/{agent_id}/keys'",
@@ -221,6 +224,10 @@ async fn agent_lifecycle_keys_and_tokens() {
         assert!(
             !params.contains(secret),
             "audit log leaked the key: {params}"
+        );
+        assert!(
+            !params.contains(&stored.0),
+            "audit log carries the hash: {params}"
         );
     }
 
@@ -604,4 +611,119 @@ async fn agent_calls_are_human_only_and_scope_checked() {
         .unwrap();
     assert_eq!(me["type"], "user");
     assert!(me["agent"].is_null());
+}
+
+/// Section 7.3 step 4 and ADR 0317: replaying the `agent_key` entries into an
+/// empty database rebuilds every column of every key, `key_hash` included,
+/// with no placeholder. A mint and a revoke write updates that merge over a
+/// create that carries the hash. Each rebuilt hash is the SHA-256 of the
+/// secret the API handed out, so a promoted primary still accepts the key.
+#[tokio::test]
+async fn the_change_log_rebuilds_every_agent_key_column_and_the_hash_of_its_secret() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let owner_id = owner_id(&owner, &server).await;
+    let agent = create_agent(&owner, &server, "watcher", &owner_id).await;
+    let agent_id = agent["id"].as_str().unwrap();
+    let used = create_key(&owner, &server, agent_id).await;
+    let revoked = create_key(&owner, &server, agent_id).await;
+    let untouched = create_key(&owner, &server, agent_id).await;
+    let res = mint(&server, used["key"].as_str().unwrap(), Some("replay test")).await;
+    assert_eq!(res.status(), 200, "mint: {}", res.text().await.unwrap());
+    let res = owner
+        .delete(server.url(&format!(
+            "/api/v1/agents/{agent_id}/keys/{}",
+            revoked["id"].as_str().unwrap()
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204, "revoke");
+    // Only a create carries the hash: the mint and the revoke updates leave
+    // it out and merge over it.
+    let updates: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload FROM change_log WHERE entity_type = 'agent_key' AND op = 'update'",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    assert!(updates.len() >= 2, "{updates:?}");
+    for (payload,) in &updates {
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        assert!(payload.get("key_hash").is_none(), "{payload}");
+    }
+
+    let rebuilt = common::replay::rebuild(&server, &["agent_key"]).await;
+    let columns = common::replay::column_names(&server.state.store, "agent_keys").await;
+    assert!(columns.iter().any(|c| c == "key_hash"), "{columns:?}");
+    let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+    common::replay::assert_rebuilt(&server, &rebuilt, "agent_keys", &columns, 3).await;
+
+    for created in [&used, &revoked, &untouched] {
+        let (hash, last_used_at, revoked_at): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT key_hash, last_used_at, revoked_at FROM agent_keys WHERE id = ?",
+            )
+            .bind(created["id"].as_str().unwrap())
+            .fetch_one(rebuilt.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            hash,
+            sha256_hex(created["key"].as_str().unwrap().as_bytes()),
+            "the rebuilt hash of {} matches its secret",
+            created["id"]
+        );
+        assert_eq!(last_used_at.is_some(), created["id"] == used["id"]);
+        assert_eq!(revoked_at.is_some(), created["id"] == revoked["id"]);
+    }
+}
+
+/// Section 7.1: session and access-token hashes stay on the primary
+/// (`sessions` and `access_tokens` are local). After a login and an agent
+/// token exchange, no change-log entry's payload carries any of them.
+#[tokio::test]
+async fn session_and_access_token_hashes_stay_out_of_the_change_log() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let owner_id = owner_id(&owner, &server).await;
+    let client = server.client();
+    server
+        .login(&client, common::OWNER_EMAIL, common::OWNER_PASSWORD)
+        .await;
+    let agent = create_agent(&client, &server, "watcher", &owner_id).await;
+    let key = create_key(&client, &server, agent["id"].as_str().unwrap()).await;
+    let res = mint(&server, key["key"].as_str().unwrap(), Some("scan test")).await;
+    assert_eq!(res.status(), 200, "mint: {}", res.text().await.unwrap());
+    let token: Value = res.json().await.unwrap();
+
+    let pool = server.state.store.pool();
+    let sessions: Vec<(String,)> = sqlx::query_as("SELECT token_hash FROM sessions")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert!(sessions.len() >= 2, "a session for each login");
+    let access: Vec<(String,)> = sqlx::query_as("SELECT token_hash FROM access_tokens")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        access,
+        vec![(sha256_hex(
+            token["access_token"].as_str().unwrap().as_bytes()
+        ),)]
+    );
+    let payloads: Vec<(i64, String)> = sqlx::query_as("SELECT seq, payload FROM change_log")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert!(!payloads.is_empty());
+    for (hash,) in sessions.iter().chain(&access) {
+        for (seq, payload) in &payloads {
+            assert!(
+                !payload.contains(hash.as_str()),
+                "change-log entry {seq} carries a local hash"
+            );
+        }
+    }
 }

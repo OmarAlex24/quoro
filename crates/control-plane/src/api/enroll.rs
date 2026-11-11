@@ -291,9 +291,11 @@ async fn issue_token(
     .execute(&mut *w.tx)
     .await?;
 
-    // The change log carries the token row without `token_hash`: the log
-    // reaches every following node, and a hash of a usable secret has no
-    // business there.
+    // The create carries the whole row, `token_hash` included
+    // (`node-agent-protocol.md` section 7.1, ADR 0317). A SHA-256 of a random
+    // 32-byte secret gives a following node no usable credential, and a
+    // promoted primary that rebuilds the row from the log must still accept
+    // an unused token.
     let change_seq = changelog::append(
         &mut w.tx,
         &ctx.identity.actor(),
@@ -302,6 +304,7 @@ async fn issue_token(
         Op::Create,
         json!({
             "id": id,
+            "token_hash": token_hash,
             "created_by": ctx.identity.id(),
             "expires_at": expires_at,
             "used_at": null,
@@ -696,7 +699,8 @@ async fn enroll(
         if used.rows_affected() != 1 {
             return Err(ApiError::conflict("the join token was already used"));
         }
-        // Same rule as the insert: the token row travels without its hash.
+        // The update leaves `token_hash` out: a rebuild merges it over the
+        // row the create wrote, which already holds the hash.
         changelog::append(
             &mut w.tx,
             &actor,

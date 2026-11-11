@@ -2250,7 +2250,7 @@ async fn node_tunnel_entries_rebuild_their_rows() {
         .unwrap();
     assert_eq!(port, 9090);
 
-    let rebuilt = replay::rebuild(&server, &["node_tunnel"], &[]).await;
+    let rebuilt = replay::rebuild(&server, &["node_tunnel"]).await;
     let columns = replay::column_names(&server.state.store, "node_tunnels").await;
     assert!(columns.iter().any(|c| c == "created_at"), "{columns:?}");
     let columns: Vec<&str> = columns.iter().map(String::as_str).collect();

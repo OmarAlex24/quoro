@@ -15,7 +15,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use quoro_control_plane::store::Store;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use sqlx::Row as _;
 
 /// The table each `entity_type` names (`db-schema.sql` and its migrations).
@@ -55,29 +54,6 @@ fn table_of(entity_type: &str) -> &'static str {
         other => panic!("no table for entity_type {other}"),
     }
 }
-
-/// A column a `create` payload lacks for a reason outside the test, which
-/// the rebuild fills with a placeholder so the row can be inserted. The
-/// placeholder is the SHA-256 of `rebuilt:<entity_id>`, so it is unique and
-/// passes the 64-hex CHECK of the hash columns. A test never compares it.
-#[derive(Clone, Copy)]
-pub struct Placeholder {
-    pub table: &'static str,
-    pub column: &'static str,
-}
-
-/// `api_tokens.token_hash` and `node_join_tokens.token_hash` are left out
-/// of the log on purpose, pending a maintainer decision (#751).
-pub const TOKEN_HASHES: &[Placeholder] = &[
-    Placeholder {
-        table: "api_tokens",
-        column: "token_hash",
-    },
-    Placeholder {
-        table: "node_join_tokens",
-        column: "token_hash",
-    },
-];
 
 struct Column {
     name: String,
@@ -198,13 +174,10 @@ fn key_filter(key: &[&str], entity_id: &str) -> (String, Vec<Bound>) {
 }
 
 /// Rebuilds the tables of `entity_types` from `server`'s change log into a
-/// new in-memory database of the same schema, filling `placeholders` when a
-/// `create` lacks them.
-pub async fn rebuild(
-    server: &Server,
-    entity_types: &[&str],
-    placeholders: &[Placeholder],
-) -> Store {
+/// new in-memory database of the same schema. A `create` inserts only what
+/// its payload carries, so a NOT NULL column the log leaves out fails the
+/// rebuild.
+pub async fn rebuild(server: &Server, entity_types: &[&str]) -> Store {
     let store = Store::open_in_memory().await.unwrap();
     // One connection: the pragma holds for every statement below.
     sqlx::query("PRAGMA foreign_keys = OFF")
@@ -245,15 +218,6 @@ pub async fn rebuild(
                     if let Some(value) = fields.get(&column.name) {
                         names.push(format!("\"{}\"", column.name));
                         values.push(bind_value(table, column, value));
-                    } else if placeholders
-                        .iter()
-                        .any(|p| p.table == table && p.column == column.name)
-                    {
-                        names.push(format!("\"{}\"", column.name));
-                        let hash = Sha256::digest(format!("rebuilt:{entity_id}").as_bytes());
-                        values.push(Bound::Text(
-                            hash.iter().map(|b| format!("{b:02x}")).collect(),
-                        ));
                     }
                 }
                 let sql = format!(

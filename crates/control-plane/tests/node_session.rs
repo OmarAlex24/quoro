@@ -635,12 +635,7 @@ async fn enrollment_entries_rebuild_the_node_token_and_credential_rows() {
     common::settle_voters(&server).await;
     enrolled(&server, &owner, NODE_NAME).await;
 
-    let rebuilt = replay::rebuild(
-        &server,
-        &["node", "node_join_token", "node_credential"],
-        replay::TOKEN_HASHES,
-    )
-    .await;
+    let rebuilt = replay::rebuild(&server, &["node", "node_join_token", "node_credential"]).await;
     replay::assert_rebuilt(
         &server,
         &rebuilt,
@@ -662,7 +657,14 @@ async fn enrollment_entries_rebuild_the_node_token_and_credential_rows() {
         &server,
         &rebuilt,
         "node_join_tokens",
-        &["id", "created_by", "expires_at", "used_at", "node_id"],
+        &[
+            "id",
+            "token_hash",
+            "created_by",
+            "expires_at",
+            "used_at",
+            "node_id",
+        ],
         1,
     )
     .await;
@@ -674,6 +676,57 @@ async fn enrollment_entries_rebuild_the_node_token_and_credential_rows() {
         2,
     )
     .await;
+}
+
+/// Section 7.3 step 4 and ADR 0317: replaying the `node_join_token` entries
+/// into an empty database rebuilds every column of every join token,
+/// `token_hash` included, with no placeholder. One token is used by an
+/// enrollment, whose update merges over a create that carries the hash; the
+/// other stays unused. Each rebuilt hash is the SHA-256 of the secret the API
+/// handed out, so a promoted primary still accepts the unused token.
+#[tokio::test]
+async fn the_change_log_rebuilds_every_join_token_column_and_the_hash_of_its_secret() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let used = create_token(&server, &owner).await;
+    let unused = create_token(&server, &owner).await;
+    let (status, body) = enroll(&server, used["token"].as_str().unwrap(), NODE_NAME).await;
+    assert_eq!(status, 201, "enroll: {body}");
+    // Only a create carries the hash: the enrollment's update leaves it out
+    // and merges over it.
+    let updates: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload FROM change_log WHERE entity_type = 'node_join_token' AND op = 'update'",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    assert!(!updates.is_empty(), "the enrollment writes an update");
+    for (payload,) in &updates {
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        assert!(payload.get("token_hash").is_none(), "{payload}");
+    }
+
+    let rebuilt = replay::rebuild(&server, &["node_join_token"]).await;
+    let columns = replay::column_names(&server.state.store, "node_join_tokens").await;
+    assert!(columns.iter().any(|c| c == "token_hash"), "{columns:?}");
+    let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+    replay::assert_rebuilt(&server, &rebuilt, "node_join_tokens", &columns, 2).await;
+
+    for (created, used_by) in [(&used, Some(&body["node_id"])), (&unused, None)] {
+        let (hash, node_id): (String, Option<String>) =
+            sqlx::query_as("SELECT token_hash, node_id FROM node_join_tokens WHERE id = ?")
+                .bind(created["id"].as_str().unwrap())
+                .fetch_one(rebuilt.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            hash,
+            quoro_control_plane::store::sha256_hex(created["token"].as_str().unwrap().as_bytes()),
+            "the rebuilt hash of {} matches its secret",
+            created["id"]
+        );
+        assert_eq!(node_id.as_deref(), used_by.and_then(Value::as_str));
+    }
 }
 
 #[tokio::test]
