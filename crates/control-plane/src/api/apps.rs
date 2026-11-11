@@ -1729,11 +1729,13 @@ pub async fn update_app(
 
     match update_app_tx(&state, &ctx, &app_id, &body, &params).await {
         Ok((mut app, vm_ids, warm_wake, ended)) => {
-            // Section 8.4, "Ending the renewals" step 2: after any policy
-            // change off `warm`, the `local` grant that ends the renewals goes
-            // out once the row's newest write is replicated and supported. A
-            // held grant with a new token that R left standing for nothing
-            // goes first.
+            // Section 8.4, "Ending the renewals" step 2: once R is
+            // replicated, while the policy is still off `warm` and while the
+            // primary holds majority support, the holder gets the
+            // same-token `local` grant. This change left the policy off
+            // `warm`, so the grant is held whether or not R wrote the row
+            // this time. A held grant with a new token that R left standing
+            // for nothing goes first.
             if let Some(ended) = ended {
                 state.hub.end_renewals_committed(&ended);
             }

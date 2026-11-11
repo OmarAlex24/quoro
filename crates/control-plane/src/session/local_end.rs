@@ -275,7 +275,7 @@ impl NodeHub {
                     let mut held = HeldGrant::of(lease, eligible);
                     held.kind = Kind::LocalEnd;
                     held.support_ms = DEFAULT_DURATION_MS;
-                    (true, registry.entries.insert(lease.id.clone(), held))
+                    (true, registry.insert(lease.id.clone(), held))
                 }
             }
         };
@@ -1588,14 +1588,17 @@ mod tests {
         f.done();
     }
 
-    /// "Ending the renewals" step 2 ("after any policy change off `warm`")
-    /// and ADR 0257. The grant (G1) and its `ping` (P1) went out; before
-    /// P1's `pong`, the policy goes back on `warm`, which sends nothing, and
-    /// off it again, where R writes nothing: the row still reads `local` with
-    /// the mark and its newest write gave no new token. A second grant (G2)
-    /// goes out with its own `ping` (P2). P1's `pong` writes nothing and
-    /// passes no barrier; P2's writes the row `local`, unmarked, and passes
-    /// it.
+    /// "Ending the renewals" step 2 ("once R is replicated (below), while
+    /// the policy is still off `warm` and while it holds majority support
+    /// (section 8.8), sends the holder the same-token `local` grant") and
+    /// ADR 0257: a change off `warm` leaves the policy off `warm`, so the
+    /// grant is owed again whether or not R wrote the row. The grant (G1)
+    /// and its `ping` (P1) went out; before P1's `pong`, the policy goes
+    /// back on `warm`, which sends nothing, and off it again, where R writes
+    /// nothing: the row still reads `local` with the mark and its newest
+    /// write gave no new token. A second grant (G2) goes out with its own
+    /// `ping` (P2). P1's `pong` writes nothing and passes no barrier; P2's
+    /// writes the row `local`, unmarked, and passes it.
     #[tokio::test]
     async fn a_warm_round_trip_before_the_pong_sends_a_second_local_grant() {
         let (f, mut on, _g1, p1) = sent("warm", false).await;

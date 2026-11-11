@@ -1223,13 +1223,16 @@ pub(crate) struct Ended {
 
 /// R, then what follows it, in the transaction of a policy change off `warm`
 /// (section 8.4, "Ending the renewals" steps 1 and 2): `None` when the app
-/// has no unrevoked lease. Step 2 sends the same-token `local` grant "after
-/// any policy change off `warm`", not only after one that writes the row:
-/// a row R finds already `local` with the mark, as a return to `warm` and
-/// back before any settle leaves it, still gets it. A row whose newest
-/// write gave it a new token gets none: that write's grant ("Grants of a
-/// marked row") is the one the row waits for, and it goes out through its
-/// own path, gated.
+/// has no unrevoked lease. When the policy leaves `warm`, step 2 has the
+/// primary, "once R is replicated (below), while the policy is still off
+/// `warm` and while it holds majority support (section 8.8)", send "the
+/// holder the same-token `local` grant". Every change off `warm` leaves the
+/// policy off `warm`, so the grant is owed whether or not R wrote the row
+/// this time: a row R finds already `local` with the mark, as a return to
+/// `warm` and back before any settle leaves it, still gets it. A row whose
+/// newest write gave it a new token gets none: that write's grant ("Grants
+/// of a marked row") is the one the row waits for, and it goes out through
+/// its own path, gated.
 ///
 /// # Errors
 ///
