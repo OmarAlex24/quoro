@@ -13,46 +13,53 @@ import { isConverging, lampState } from '../lib/lamp';
 import { nodeReadout } from '../lib/nodes';
 import { problemView, type ProblemView } from '../lib/problem';
 import { PROJECT_LIST_PARAMS } from '../lib/projects';
-import { VM_TABS, type VmTab } from '../lib/routes';
 import { memoryWords, vmSize } from '../lib/services';
-import { usePaneEnter } from '../lib/use-tab-motion';
+import { useSheetMotion, type SheetMotion } from '../lib/use-sheet-motion';
 import { useSession } from '../session';
 import { GlyphTile } from './glyph-tile';
 import { ImageRef } from './image-ref';
 import { LampDot } from './lamp';
-import { CloseButton, SheetTabs } from './service-sheet';
-import { Group, Rows } from './sheet-settings';
+import { CloseButton } from './service-sheet';
+import { Rows } from './sheet-settings';
 import { Button } from './ui/button';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { DeleteVmDialog, useVmAction, VmActionsMenu, vmActionNotice } from './vm-actions';
 import { SkeletonCards } from './skeleton';
 
-const TAB_WORDS: Record<VmTab, string> = {
-  overview: 'Overview',
-  settings: 'Settings',
+const OBSERVED_WORDS: Record<Vm['observed_status'], string> = {
+  creating: 'Creating',
+  stopped: 'Stopped',
+  starting: 'Starting',
+  running: 'Running',
+  stopping: 'Stopping',
+  crashed: 'Crashed',
+  deleted: 'Deleted',
+  unknown: 'Unknown',
 };
 
 const code = (value: string) => <span className="type-code text-[11.5px]">{value}</span>;
 
 /**
  * A VM opened from its project's canvas or the VM table: the same sheet as an
- * app's, with the VM's lamp and two tabs. Overview says what the VM is and
- * where it runs; Settings holds the console and delete. Start and stop sit in
- * the ⋯ menu and the console in the header, as the VM bay had them. Quoro
- * keeps no metrics for a single VM, so there is no Metrics tab.
+ * app's, as one pane. The console and start or stop come first, then the
+ * VM's size and node as figures and what else it is in rows. Start, stop and
+ * delete also sit in the ⋯ menu. Quoro keeps no metrics for a single VM, so
+ * there are no charts.
  */
 export function VmSheet({
   projectId,
   vmId,
-  tab,
   onClose,
+  motion,
 }: {
   projectId: string;
   vmId: string;
-  tab: VmTab;
   onClose: () => void;
+  /** How it slides in and out, as the app sheet does. */
+  motion?: SheetMotion;
 }) {
   const contentRef = useRef<HTMLDivElement>(null);
+  useSheetMotion(contentRef, motion);
   const vmQuery = useGetVm(vmId, {
     query: {
       retry: false,
@@ -70,6 +77,8 @@ export function VmSheet({
         ref={contentRef}
         className="sheet svc-sheet"
         aria-describedby={undefined}
+        inert={motion?.leaving || undefined}
+        data-leaving={motion?.leaving ? '' : undefined}
         // The canvas stays usable behind the sheet, as with an app.
         onInteractOutside={(event) => event.preventDefault()}
         onOpenAutoFocus={(event) => {
@@ -82,7 +91,7 @@ export function VmSheet({
         }}
       >
         {vm ? (
-          <VmSheetBody key={vm.id} vm={vm} projectId={projectId} tab={tab} />
+          <VmSheetBody key={vm.id} vm={vm} projectId={projectId} />
         ) : (
           <>
             <div className="sh-head">
@@ -108,13 +117,12 @@ export function VmSheet({
   );
 }
 
-function VmSheetBody({ vm, projectId, tab }: { vm: Vm; projectId: string; tab: VmTab }) {
+function VmSheetBody({ vm, projectId }: { vm: Vm; projectId: string }) {
   const { me, canWrite } = useSession();
   const navigate = useNavigate();
   const [problem, setProblem] = useState<ProblemView | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
-  const bodyRef = usePaneEnter<HTMLDivElement>(tab);
 
   const nodesQuery = useListNodes(undefined, { query: { staleTime: 10_000 } });
   const projectsQuery = useListProjects(PROJECT_LIST_PARAMS);
@@ -145,7 +153,9 @@ function VmSheetBody({ vm, projectId, tab }: { vm: Vm; projectId: string; tab: V
 
   const lamp = lampState(vm);
   const showConsole = canViewConsole(me);
-  const nodeWords = node ? `${node.name} · ${nodeReadout(node.status).words.toLowerCase()}` : 'An unknown node';
+  const wantsRunning = vm.desired_status === 'running';
+  const nodeState = node ? nodeReadout(node.status).words.toLowerCase() : null;
+  const [memory, memoryUnit] = memoryWords(vm.memory_mb).split(' ');
 
   return (
     <>
@@ -154,14 +164,6 @@ function VmSheetBody({ vm, projectId, tab }: { vm: Vm; projectId: string; tab: V
           <GlyphTile kind="vm" size="lg" label />
           <DialogPrimitive.Title className="sh-name">{vm.name}</DialogPrimitive.Title>
           <span className="flex-1" />
-          {showConsole ? (
-            <Button size="sm" asChild className="max-[479.98px]:hidden">
-              <Link to="/vms/$vmId/console" params={{ vmId: vm.id }}>
-                <SquareTerminal className="size-3.5" strokeWidth={1.7} aria-hidden="true" />
-                Console
-              </Link>
-            </Button>
-          ) : null}
           {canWrite ? (
             <VmActionsMenu
               vm={vm}
@@ -179,111 +181,102 @@ function VmSheetBody({ vm, projectId, tab }: { vm: Vm; projectId: string; tab: V
             {lamp.statusText}
           </span>
           <span>{vmSize(vm)}</span>
-          {node ? <span>{node.name}</span> : null}
         </div>
       </div>
+      <div className="sh-rule" aria-hidden="true" />
 
-      <SheetTabs label={`${vm.name} sections`} tab={tab}>
-        {VM_TABS.map((key) => (
-          <Link
-            key={key}
-            to="/projects/$projectId"
-            params={{ projectId }}
-            search={{ vm: vm.id, tab: key }}
-            className={key === tab ? 'on' : undefined}
-            aria-current={key === tab ? 'page' : undefined}
-          >
-            {TAB_WORDS[key]}
-          </Link>
-        ))}
-      </SheetTabs>
-
-      <div ref={bodyRef} className="sh-body">
+      <div className="sh-body">
         {notice ? <NoticeLine>{notice}</NoticeLine> : null}
         {problem ? <ProblemBanner view={problem} /> : null}
+        {lamp.text !== lamp.statusText ? (
+          <p className={lamp.coreTone === 'fault' ? 'vm-caption vm-caption-fault' : 'vm-caption'}>
+            <LampDot ring={lamp.ringTone} core={lamp.coreTone} pulse={lamp.pulse} size={12} />
+            {lamp.text}
+          </p>
+        ) : null}
 
-        {tab === 'overview' ? (
-          <>
-            {lamp.text !== lamp.statusText ? (
-              <p className={lamp.coreTone === 'fault' ? 'vm-caption vm-caption-fault' : 'vm-caption'}>
-                <LampDot ring={lamp.ringTone} core={lamp.coreTone} pulse={lamp.pulse} size={12} />
-                {lamp.text}
-              </p>
+        {showConsole || canWrite ? (
+          <div className="flex flex-wrap items-center gap-2">
+            {showConsole ? (
+              <Button size="sm" asChild>
+                <Link to="/vms/$vmId/console" params={{ vmId: vm.id }}>
+                  <SquareTerminal className="size-3.5" strokeWidth={1.7} aria-hidden="true" />
+                  Open console
+                </Link>
+              </Button>
             ) : null}
-            <Group title="General">
-              <Rows
-                rows={[
-                  ['Image', <ImageRef image={vm.image} />],
-                  ['Size', `${vm.vcpus} vCPU, ${memoryWords(vm.memory_mb)}, ${vm.disk_gb} GiB disk`],
-                  ['Address', vm.ip ? code(vm.ip) : 'None yet'],
-                  ['Node', nodeWords],
-                  [
-                    'Project',
-                    <Link to="/projects/$projectId" params={{ projectId: vm.project_id }} className="vmt-link">
-                      {project?.name ?? 'This project'}
-                    </Link>,
-                  ],
-                  vm.app_id
-                    ? [
-                        'App',
-                        <Link
-                          to="/projects/$projectId"
-                          params={{ projectId: vm.project_id }}
-                          search={{ app: vm.app_id, tab: 'deployments' }}
-                          className="vmt-link"
-                        >
-                          {appQuery.data ? `Instance of ${appQuery.data.name}` : 'Instance of an app'}
-                        </Link>,
-                      ]
-                    : ['App', 'None: a standalone VM'],
-                  ['Restarts', `${vm.restart_count}`],
-                  vm.last_exit_code !== null && vm.last_exit_code !== undefined
-                    ? ['Last exit code', code(String(vm.last_exit_code))]
-                    : null,
-                  ['Created', new Date(vm.created_at).toLocaleString()],
-                  ['Id', <span className="break-all">{code(vm.id)}</span>],
-                ]}
-              />
-            </Group>
-          </>
-        ) : (
-          <>
-            <Group
-              title="Console"
-              lede="The VM's serial console, read-only: recent boot output and then live kernel and init lines."
-            >
-              {showConsole ? (
-                <div>
-                  <Button asChild>
-                    <Link to="/vms/$vmId/console" params={{ vmId: vm.id }}>
-                      <SquareTerminal className="size-4" strokeWidth={1.7} aria-hidden="true" />
-                      Open the console
-                    </Link>
-                  </Button>
-                </div>
-              ) : (
-                <p className="text-[13px] text-ink-2">
-                  This session can't view a serial console. A viewer needs a grant that covers vm:console.
-                </p>
-              )}
-            </Group>
             {canWrite ? (
-              <Group title="Danger zone">
-                <div className="box box-danger flex flex-wrap items-center gap-x-4 gap-y-3 px-4 py-4">
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[13.5px] font-medium text-ink">Delete this VM</p>
-                    <p className="mt-0.5 text-[12.5px] leading-snug text-ink-2">
-                      Its disk is removed with it. This cannot be undone.
-                    </p>
-                  </div>
-                  <Button variant="danger" disabled={action.isPending} onClick={() => setConfirming(true)}>
-                    Delete
-                  </Button>
-                </div>
-              </Group>
+              <Button size="sm" variant="ghost" disabled={action.isPending} onClick={() => run(wantsRunning ? 'stop' : 'start')}>
+                {wantsRunning ? 'Stop' : 'Start'}
+              </Button>
             ) : null}
-          </>
-        )}
+          </div>
+        ) : null}
+
+        <dl className="stats">
+          <div>
+            <dt>vCPU</dt>
+            <dd>{vm.vcpus}</dd>
+          </div>
+          <div>
+            <dt>Memory</dt>
+            <dd>
+              {memory}
+              <em>{memoryUnit}</em>
+            </dd>
+          </div>
+          <div>
+            <dt>Disk</dt>
+            <dd>
+              {vm.disk_gb}
+              <em>GiB</em>
+            </dd>
+          </div>
+          <div>
+            <dt>Node</dt>
+            <dd title={node?.name}>{node?.name ?? 'Unknown'}</dd>
+          </div>
+        </dl>
+
+        <Rows
+          rows={[
+            ['Address', vm.ip ? code(vm.ip) : 'None yet'],
+            ['Observed status', OBSERVED_WORDS[vm.observed_status]],
+            ['Restarts', `${vm.restart_count}`],
+            [
+              'Console',
+              showConsole
+                ? 'Read-only serial output'
+                : "This session can't view a serial console. A viewer needs a grant that covers vm:console.",
+            ],
+            ['Image', <ImageRef image={vm.image} />],
+            nodeState ? ['Node state', nodeState.charAt(0).toUpperCase() + nodeState.slice(1)] : null,
+            [
+              'Project',
+              <Link to="/projects/$projectId" params={{ projectId: vm.project_id }} className="vmt-link">
+                {project?.name ?? 'This project'}
+              </Link>,
+            ],
+            vm.app_id
+              ? [
+                  'App',
+                  <Link
+                    to="/projects/$projectId"
+                    params={{ projectId: vm.project_id }}
+                    search={{ app: vm.app_id, tab: 'deployments' }}
+                    className="vmt-link"
+                  >
+                    {appQuery.data ? `Instance of ${appQuery.data.name}` : 'Instance of an app'}
+                  </Link>,
+                ]
+              : ['App', 'None: a standalone VM'],
+            vm.last_exit_code !== null && vm.last_exit_code !== undefined
+              ? ['Last exit code', code(String(vm.last_exit_code))]
+              : null,
+            ['Created', new Date(vm.created_at).toLocaleString()],
+            ['Id', <span className="break-all">{code(vm.id)}</span>],
+          ]}
+        />
       </div>
 
       <DeleteVmDialog

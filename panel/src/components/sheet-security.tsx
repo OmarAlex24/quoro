@@ -7,6 +7,7 @@ import { getAppVulnerabilities, useGetAppVulnerabilities } from '../api/generate
 import { relativeTime } from '../lib/app-status';
 import { problemView, type ProblemView } from '../lib/problem';
 import {
+  checkedAgainstSentence,
   dataAgeSentence,
   groupFindings,
   inventorySentence,
@@ -71,24 +72,50 @@ export function SecurityTab({ app, canWrite, onRebuilt }: { app: AppDetail; canW
   const groups = groupFindings(items);
   const hasSource = app.source !== null && app.source !== undefined;
 
+  const rebuild =
+    hasSource && open > 0 ? (
+      <RebuildWithRefreshedBase
+        appId={app.id}
+        disabled={!canWrite}
+        disabledReason={canWrite ? null : 'Your role can read vulnerabilities but not start builds.'}
+        onStarted={onRebuilt}
+      />
+    ) : null;
+  const inventoried = report.inventory.status === 'inventoried';
+
   return (
     <>
-      <div className="sec-head">
-        <div className="box-t">
-          <b className="sec-title">
-            {checked ? `${open} open ${open === 1 ? 'finding' : 'findings'}` : 'Not checked yet'}
-          </b>
-          <small>{inventorySentence(report.inventory)}</small>
+      {inventoried ? (
+        <>
+          <dl className="stats stats-3">
+            <div>
+              <dt>Open findings</dt>
+              <dd>{open}</dd>
+            </div>
+            <div>
+              <dt>Packages checked</dt>
+              <dd>{report.inventory.package_count ?? 0}</dd>
+            </div>
+            <div>
+              <dt>Base</dt>
+              <dd className="stats-word" title={report.inventory.os}>
+                {report.inventory.os ?? 'Not reported'}
+              </dd>
+            </div>
+          </dl>
+          {rebuild ? <div>{rebuild}</div> : null}
+        </>
+      ) : (
+        <div className="sec-head">
+          <div className="box-t">
+            <b className="sec-title">
+              {checked ? `${open} open ${open === 1 ? 'finding' : 'findings'}` : 'Not checked yet'}
+            </b>
+            <small>{inventorySentence(report.inventory)}</small>
+          </div>
+          {rebuild}
         </div>
-        {hasSource && open > 0 ? (
-          <RebuildWithRefreshedBase
-            appId={app.id}
-            disabled={!canWrite}
-            disabledReason={canWrite ? null : 'Your role can read vulnerabilities but not start builds.'}
-            onStarted={onRebuilt}
-          />
-        ) : null}
-      </div>
+      )}
 
       {checked ? (
         <div className="sec-filters">
@@ -138,7 +165,9 @@ export function SecurityTab({ app, canWrite, onRebuilt }: { app: AppDetail; canW
                 ? 'No findings, open or resolved, for this image'
                 : 'No known vulnerabilities in this image'
           }
-        />
+        >
+          {filtered ? null : cleanSentence(checkedAgainstSentence(report.inventory, report.data))}
+        </EmptyState>
       ) : null}
 
       {groups.map((group) => (
@@ -199,6 +228,10 @@ export function SecurityTab({ app, canWrite, onRebuilt }: { app: AppDetail; canW
     </>
   );
 }
+
+/** The empty state's words: what the image was checked against, and where a new finding would show. */
+const cleanSentence = (checkedAgainst: string | null): string =>
+  [checkedAgainst, 'New findings show a count on this tab.'].filter(Boolean).join(' ');
 
 /** Open findings, or every finding with the resolved ones after them. */
 function OpenOrAll({ includeResolved, onChange }: { includeResolved: boolean; onChange: (next: boolean) => void }) {

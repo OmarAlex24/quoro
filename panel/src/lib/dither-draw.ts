@@ -544,7 +544,13 @@ export function drawMetricArea(
     0,
   );
 
-  if (plot.limit) {
+  if (plot.limit && !labels) {
+    // A chart without labels (the service sheet's) marks the limit with a
+    // dashed rule alone; its figure is in the heading above.
+    ctx.fillStyle = faint;
+    const y = Math.round(plot.limit.y);
+    for (let x = box.left; x < box.right; x += 6) ctx.fillRect(x, y, Math.min(3, box.right - x), 1);
+  } else if (plot.limit) {
     ctx.fillStyle = faint;
     ctx.fillRect(box.left, Math.round(plot.limit.y), width, 1);
     ctx.textAlign = 'right';

@@ -49,6 +49,11 @@ export interface DitherAreaProps<T extends { time: string }> {
   reading?: ReactNode;
   /** The area's first tone (compact charts only): the accent, or run green. */
   tone?: 'accent' | 'run';
+  /**
+   * The time under a compact chart in words, `−10 min`, `−5 min`, `now`, as
+   * the service sheet draws it. The node cards leave it out.
+   */
+  timeAxis?: boolean;
   className?: string;
 }
 
@@ -79,6 +84,7 @@ export function DitherArea<T extends { time: string }>({
   compact = false,
   reading: newestReading,
   tone = 'accent',
+  timeAxis = false,
   className,
 }: DitherAreaProps<T>) {
   const pad = compact ? COMPACT_PAD : undefined;
@@ -255,6 +261,13 @@ export function DitherArea<T extends { time: string }>({
           </span>
         ) : null}
       </div>
+      {timeAxis ? (
+        <div className="chart-ax" aria-hidden="true">
+          <span>−10 min</span>
+          <span>−5 min</span>
+          <span>now</span>
+        </div>
+      ) : null}
       <p id={`${id}-summary`} className="sr-only">
         {summary}
       </p>

@@ -465,6 +465,34 @@ export function remainingSeconds(timeline: RunTimeline, estimate: Estimate | nul
   return rest;
 }
 
+/* ---------- the rollout, apart from the build before it ---------- */
+
+export interface RolloutView {
+  /** The steps the run box draws as cells and on its tape. */
+  readonly steps: readonly StepSpan[];
+  /** The queue and build said in words once the build succeeded: `rollout after 5s queued and a 1m 05s build`. */
+  readonly before: string | null;
+}
+
+/**
+ * What the run box draws. Once a run's build has succeeded, its cells and
+ * tape are the rollout's four steps and the queue and build become words
+ * beside them, as the proposal draws a Git app's deploy. While the build is
+ * queued or running, or when it failed or was cancelled, all six steps stay,
+ * since the build is where the run is.
+ */
+export function rolloutView(timeline: RunTimeline): RolloutView {
+  const build = timeline.steps.find((step) => step.step === 'build');
+  if (timeline.kind !== 'git' || build === undefined || build.state !== 'done') {
+    return { steps: timeline.steps, before: null };
+  }
+  const queue = timeline.steps.find((step) => step.step === 'queue');
+  const steps = timeline.steps.filter((step) => step.step !== 'queue' && step.step !== 'build');
+  const built = build.seconds === null ? 'a build' : `a ${formatSpan(build.seconds)} build`;
+  const queued = queue?.seconds !== null && queue?.seconds !== undefined ? `${formatSpan(queue.seconds)} queued and ` : '';
+  return { steps, before: `rollout after ${queued}${built}` };
+}
+
 /* ---------- the mini tape of a history row ---------- */
 
 export type MiniTone = 'done' | 'live' | 'failed' | 'stopped' | 'rest';

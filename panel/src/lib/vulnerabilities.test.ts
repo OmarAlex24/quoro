@@ -7,6 +7,7 @@ import type {
   VulnerabilitySeverity,
 } from '../api/generated/model';
 import {
+  checkedAgainstSentence,
   dataAgeSentence,
   guestKernelFindings,
   guestKernelIsClear,
@@ -327,5 +328,37 @@ describe('nodeSecurityCount', () => {
     expect(nodeSecurityCount({})).toBeNull();
     expect(nodeSecurityCount(undefined)).toBeNull();
     expect(nodeSecurityCount({ host_kernels: [] })).toBe(0);
+  });
+});
+
+describe('checkedAgainstSentence', () => {
+  const now = Date.parse('2026-01-01T05:00:00Z');
+  const source = (ecosystem: string, modified: string | null = '2026-01-01T00:00:00Z'): VulnerabilityDataSource => ({
+    ecosystem,
+    source: 'download',
+    data_modified_at: modified,
+    refreshed_at: modified,
+    last_error: null,
+  });
+
+  it('names the data the image was checked against and its age', () => {
+    expect(
+      checkedAgainstSentence({ status: 'inventoried', ecosystems: ['Debian:13'] }, [source('Debian:13'), source('npm')], now),
+    ).toBe('Checked against Debian 13 data from 5 h ago.');
+  });
+
+  it('lists every ecosystem the image covers', () => {
+    expect(
+      checkedAgainstSentence(
+        { status: 'inventoried', ecosystems: ['Debian:13', 'npm'] },
+        [source('Debian:13'), source('npm', '2025-12-31T05:00:00Z')],
+        now,
+      ),
+    ).toBe('Checked against Debian 13 data from 5 h ago and npm data from 1 d ago.');
+  });
+
+  it('says nothing without data that covers the image', () => {
+    expect(checkedAgainstSentence({ status: 'inventoried', ecosystems: ['PyPI'] }, [source('Debian:13')], now)).toBeNull();
+    expect(checkedAgainstSentence({ status: 'inventoried', ecosystems: ['Debian:13'] }, [source('Debian:13', null)], now)).toBeNull();
   });
 });

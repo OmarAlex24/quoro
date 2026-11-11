@@ -29,7 +29,7 @@ export function GlyphTile({
   className,
 }: {
   kind: GlyphKind;
-  size?: 'md' | 'lg';
+  size?: 'sm' | 'md' | 'lg';
   /** Spoken name; without one the tile is decoration next to written words. */
   label?: boolean;
   className?: string;
@@ -37,7 +37,7 @@ export function GlyphTile({
   const Icon = ICONS[kind];
   return (
     <span
-      className={cn('glyph', `glyph-${kind}`, size === 'lg' && 'glyph-lg', className)}
+      className={cn('glyph', `glyph-${kind}`, size === 'lg' && 'glyph-lg', size === 'sm' && 'glyph-sm', className)}
       {...(label ? { role: 'img', 'aria-label': WORDS[kind] } : { 'aria-hidden': true })}
     >
       <Icon strokeWidth={1.7} aria-hidden="true" />

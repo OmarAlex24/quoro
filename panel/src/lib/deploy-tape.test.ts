@@ -24,6 +24,7 @@ import {
   runPhase,
   runSentence,
   runTag,
+  rolloutView,
   runTimeline,
   type RunTimeline,
 } from './deploy-tape';
@@ -726,5 +727,38 @@ describe('formats and words', () => {
     );
     expect(runTag(failed, null)).toEqual({ word: 'Failed', tone: 'fault' });
     expect(runSentence(failed)).toBe('Failed at pull');
+  });
+});
+
+describe('rolloutView', () => {
+  it('draws a Git run past its build as the rollout, with the queue and build in words', () => {
+    const run = joinRuns([build()], [deployment({ trigger: 'build', created_at: at(76), finished_at: at(128) })])[0]!;
+    const view = rolloutView(runTimeline(run, fullEntries, ms(500)));
+    expect(view.steps.map((step) => step.step)).toEqual(['pull', 'rootfs', 'boot', 'health']);
+    expect(view.before).toBe('rollout after 6s queued and a 1m 08s build');
+  });
+
+  it('keeps all six steps while the build runs', () => {
+    const run = joinRuns([build({ status: 'building', finished_at: null, deployment_id: null })], [])[0]!;
+    const view = rolloutView(runTimeline(run, undefined, ms(42)));
+    expect(view.steps).toHaveLength(6);
+    expect(view.before).toBeNull();
+  });
+
+  it('keeps all six steps when the build failed', () => {
+    const run = joinRuns(
+      [build({ status: 'failed', failed_phase: 'building', finished_at: at(39), deployment_id: null })],
+      [],
+    )[0]!;
+    const view = rolloutView(runTimeline(run, undefined, ms(500)));
+    expect(view.steps).toHaveLength(6);
+    expect(view.before).toBeNull();
+  });
+
+  it('leaves an image deploy as it is', () => {
+    const run = joinRuns([], [deployment()])[0]!;
+    const view = rolloutView(runTimeline(run, undefined, ms(500)));
+    expect(view.steps.map((step) => step.step)).toEqual(['pull', 'rootfs', 'boot', 'health']);
+    expect(view.before).toBeNull();
   });
 });
