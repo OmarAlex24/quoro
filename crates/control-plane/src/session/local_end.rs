@@ -192,8 +192,15 @@ impl NodeHub {
     /// write gives no new token any more, so a grant with a new token held
     /// for it and not sent yet stands for nothing: it goes now, whether or
     /// not its holder is connected, so it no longer reads as pending. A grant
-    /// held since for a newer token stays. Then the same-token `local` grant
-    /// is held when [`leases::leave_warm`] found the row needs it.
+    /// held since for a newer token stays. So does one whose step-4 revoke is
+    /// held back for support: section 5.1 revokes the lease its holder listed
+    /// at a lower token in the other mode, whatever R writes, so the entry
+    /// keeps that revoke until support returns and it goes out, and the next
+    /// attempt then drops the entry ([`NodeHub::attempt_held`]). No `local`
+    /// grant is held over it, and none could go out meanwhile: that holder's
+    /// session has no evidence at the row's token. Then the same-token
+    /// `local` grant is held when [`leases::leave_warm`] found the row needs
+    /// it.
     pub(crate) fn end_renewals_committed(&self, ended: &leases::Ended) {
         let lease = &ended.lease;
         if ended.wrote {
@@ -202,6 +209,7 @@ impl NodeHub {
                 let stale = registry.entries.get(&lease.id).is_some_and(|held| {
                     held.kind == Kind::NewToken
                         && held.sent_on.is_none()
+                        && held.revoke_first.is_none()
                         && held.token <= lease.fencing_token
                 });
                 if stale {
