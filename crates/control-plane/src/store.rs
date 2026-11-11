@@ -74,22 +74,26 @@ pub const DEMOTION_RETRY_FIRST: Duration = Duration::from_secs(5);
 pub const DEMOTION_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// How far the demotion got with `meta.demoted_by_term`. The demoted flag
-/// is set before any of it: [`Store::demote`] sets the flag first, keeps
-/// `node_term`, and only then takes the writer gate to write `meta`. The
-/// rest is read and written with the gate held, but the retry task reads
-/// `recorded` to stop.
+/// is set before any of it: [`Store::demote`] sets the flag first and keeps
+/// `node_term`, and only then does its task take the writer gate to write
+/// `meta`. The rest is read and written with the gate held, but the retry
+/// task reads `recorded` to stop.
 struct DemotionRecord {
     /// Whether `meta.demoted_by_term` is recorded.
     recorded: AtomicBool,
     /// The first `node_term` a `stale_term` carried, kept before the gate is
     /// taken. Every attempt, a later `stale_term`'s, the retry task's and the
-    /// one at shutdown, passes this one, so an attempt that never got far
-    /// enough to choose a term still records the node's term. A `stale_term`
-    /// without a term keeps nothing, so a later one with a term is kept.
+    /// one at shutdown, passes this one to [`demotion_term`], but only while
+    /// no attempt has chosen a term yet: a chosen `term` (below) beats it.
+    /// So an attempt that failed before it chose a term, on a busy
+    /// `BEGIN IMMEDIATE`, still leaves the node's term to the next one. A
+    /// `stale_term` without a term keeps nothing, so a later one with a term
+    /// is kept.
     node_term: std::sync::Mutex<Option<u64>>,
     /// The term the first attempt that could compute one chose. Every later
-    /// attempt, the retry task's and a later `stale_term`'s, records this one,
-    /// so the two never record different terms.
+    /// attempt, the retry task's, a later `stale_term`'s and the one at
+    /// shutdown, records this one, whatever `node_term` it passes, so no two
+    /// attempts record different terms.
     term: std::sync::Mutex<Option<u64>>,
     /// Whether the retry task was started; one is enough.
     retrying: AtomicBool,
@@ -117,13 +121,46 @@ impl Default for DemotionRecord {
 pub const DEMOTED_REFUSAL: &str =
     "this primary is demoted: a higher term exists, and it writes nothing more";
 
-/// What [`Store::demote`] did.
+/// What the `meta` write of [`Store::demote`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Demotion {
     /// `meta.demoted_by_term` holds this term, so a restart stays demoted.
     Recorded(u64),
     /// The `meta` write failed: this process is demoted, a restart is not.
     NotRecorded,
+}
+
+/// The `meta` write of a demotion, on its own task ([`Store::demote`]).
+/// Awaiting it gives what the write did: `None` when the demotion was already
+/// recorded. Dropping it leaves the write running.
+pub struct DemotionTask(tokio::task::JoinHandle<Option<Demotion>>);
+
+impl DemotionTask {
+    /// Runs `write` on its own task.
+    pub(crate) fn spawn(
+        write: impl std::future::Future<Output = Option<Demotion>> + Send + 'static,
+    ) -> Self {
+        Self(tokio::spawn(write))
+    }
+}
+
+impl std::future::Future for DemotionTask {
+    type Output = Option<Demotion>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx).map(|joined| {
+            joined.unwrap_or_else(|error| {
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+                // Cancelled with the runtime: nothing more to report.
+                None
+            })
+        })
+    }
 }
 
 /// A test seam that holds the next demotion with the demoted flag set and the
@@ -403,11 +440,11 @@ impl Store {
     /// connection committed in between: SQLite answers `SQLITE_BUSY_SNAPSHOT`
     /// at once, without waiting.
     ///
-    /// Once the primary is demoted it refuses, after it acquired the gate,
-    /// and opens no transaction (section 7.4: a demoted primary writes
-    /// nothing more). A writer queued on the gate when the demotion started
-    /// is refused too, because the flag is set before the demotion even
-    /// waits for the gate; one that holds the gate then is refused at
+    /// Once the primary is demoted it refuses and opens no transaction
+    /// (section 7.4: a demoted primary writes nothing more). A writer waiting
+    /// on the gate stops waiting the moment the flag is set, and is refused
+    /// without the gate, so no session or loop waits on the gate after the
+    /// demotion. One that holds the gate then is refused at
     /// [`WriteTx::commit`].
     ///
     /// # Errors
@@ -415,7 +452,18 @@ impl Store {
     /// [`DEMOTED_REFUSAL`] once the primary is demoted, or the database error
     /// from `BEGIN IMMEDIATE`.
     pub async fn begin_write(&self) -> Result<WriteTx, sqlx::Error> {
-        let gate = Arc::clone(&self.writer).lock_owned().await;
+        let mut demoted = self.demoted.subscribe();
+        let gate = tokio::select! {
+            biased;
+            gate = Arc::clone(&self.writer).lock_owned() => gate,
+            () = async {
+                // The sender lives as long as the store: a closed watch
+                // never refuses.
+                if demoted.wait_for(|demoted| *demoted).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            } => return Err(sqlx::Error::Protocol(DEMOTED_REFUSAL.to_string())),
+        };
         if self.is_demoted() {
             return Err(sqlx::Error::Protocol(DEMOTED_REFUSAL.to_string()));
         }
@@ -494,17 +542,20 @@ impl Store {
 
     /// Demotes this primary: a machine answered it with `stale_term`, so a
     /// higher term exists (`node-agent-protocol.md` sections 7.4 and 8.8, ADR
-    /// 0230). Returns `None` when it was already demoted and its term is
-    /// recorded: the first recorded term stays.
+    /// 0230).
     ///
-    /// It sets the demoted flag first, before it waits for anything, so from
+    /// It sets the demoted flag and keeps the first `node_term` it is given
+    /// ([`DemotionRecord`]) at once, without waiting for anything, so from
     /// the moment the `stale_term` arrives nothing more commits and every
-    /// session sends only `not_primary`: a writer queued on the gate is
+    /// session sends only `not_primary`: a writer waiting on the gate is
     /// refused at [`Store::begin_write`], and one holding it at
-    /// [`WriteTx::commit`]. It keeps the first `node_term` it is given
-    /// ([`DemotionRecord`]), then takes the writer gate and, in one
-    /// transaction, records `meta.demoted_by_term`: that `node_term` when it
-    /// is usable, else `meta.term + 1` ([`demotion_term`]). The contract
+    /// [`WriteTx::commit`]. The rest runs on its own task, which it returns,
+    /// so the caller, a node session among them, waits for neither the gate
+    /// nor SQLite. That task takes the writer gate and, in one transaction,
+    /// records `meta.demoted_by_term`: the term an earlier attempt chose,
+    /// else the kept `node_term` when it is usable, else `meta.term + 1`
+    /// ([`demotion_term`]). Awaited, it gives `None` when the demotion was
+    /// already recorded: the first recorded term stays. The contract
     /// gives no rule for a `stale_term` without a usable term; that case is
     /// logged at `error` and the primary is demoted all the same, as section
     /// 8.8 sets no condition. Until the `meta` write commits the process is
@@ -525,9 +576,16 @@ impl Store {
     /// again above the error's term instead (`backup-format.md` section 8.2,
     /// ADR 0261). That restore path does not exist yet, so every primary
     /// demotes here.
-    pub async fn demote(&self, node_term: Option<u64>) -> Option<Demotion> {
+    pub fn demote(&self, node_term: Option<u64>) -> DemotionTask {
         self.demoted.send_replace(true);
         self.keep_node_term(node_term);
+        let store = self.clone();
+        DemotionTask::spawn(async move { store.record_demotion_under_gate().await })
+    }
+
+    /// The part of [`Store::demote`] that waits: the `meta` write under the
+    /// writer gate, and the retry task when it fails.
+    async fn record_demotion_under_gate(&self) -> Option<Demotion> {
         let gate = Arc::clone(&self.writer).lock_owned().await;
         if self.demotion.recorded.load(Ordering::SeqCst) {
             return None;
@@ -546,7 +604,7 @@ impl Store {
             Err(error) => {
                 tracing::error!(
                     %error,
-                    ?node_term,
+                    node_term = ?self.kept_node_term(),
                     "cannot record meta.demoted_by_term: this process is demoted, but a restart would not stay demoted until a retry records it"
                 );
                 Demotion::NotRecorded
@@ -659,9 +717,10 @@ impl Store {
 
     /// One last attempt at an unrecorded demotion, for a clean shutdown: the
     /// retry task stops with the process. Does nothing when the primary is not
-    /// demoted or its demotion is recorded. It passes the `node_term` the
+    /// demoted or its demotion is recorded. It records the term an earlier
+    /// attempt chose, if one did; otherwise it passes the `node_term` the
     /// first `stale_term` carried, so a first attempt that failed before it
-    /// chose a term still records the node's term, not `meta.term + 1`.
+    /// chose a term still leads to the node's term, not `meta.term + 1`.
     pub async fn record_demotion_before_exit(&self) {
         if !self.is_demoted() {
             return;

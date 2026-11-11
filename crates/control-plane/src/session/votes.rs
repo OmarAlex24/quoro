@@ -302,13 +302,15 @@ impl Session {
 
     /// The node answered `stale_term`: a higher term exists. The primary
     /// stops granting and renewing `expiring` leases at once, then demotes
-    /// itself ([`NodeHub::stale_term`], section 7.4, ADR 0230).
-    pub(super) async fn on_stale_term(&self, node_term: Option<u64>) {
+    /// itself ([`NodeHub::stale_term`], section 7.4, ADR 0230). The flag is
+    /// set when this returns; the session does not wait for the `meta`
+    /// write, so it ends within its cap.
+    pub(super) fn on_stale_term(&self, node_term: Option<u64>) {
         tracing::error!(
             node_id = %self.node_id,
             ?node_term,
             "a node answered stale_term: a higher term exists; this primary grants and renews no expiring lease and demotes itself"
         );
-        self.hub.stale_term(node_term).await;
+        drop(self.hub.stale_term(node_term));
     }
 }

@@ -618,6 +618,9 @@ struct HubInner {
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
     /// Test seam: failures to inject, each once ([`NodeHub::inject_fault`]).
     faults: Mutex<Vec<Fault>>,
+    /// Test seam: the node ids whose session task has returned, in order,
+    /// the newest [`SESSION_ENDS_KEPT`] only ([`NodeHub::session_tasks_ended`]).
+    session_tasks_ended: watch::Sender<Vec<String>>,
     /// Woken by every change notification, so the domains' serving status
     /// is recomputed after the desired states it follows (ADR 0167).
     serving_inputs: Notify,
@@ -754,6 +757,7 @@ impl NodeHub {
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             faults: Mutex::new(Vec::new()),
+            session_tasks_ended: watch::channel(Vec::new()).0,
             serving_inputs: Notify::new(),
             revoke_answers: Notify::new(),
         }))
@@ -1390,6 +1394,15 @@ impl NodeHub {
         dns_challenge(self, node_id, challenge, acme_routes).await
     }
 
+    /// Test seam: a watch of the node ids whose session task has returned,
+    /// in order, after its last send: unlike the detach, which comes before
+    /// the close frame, this is the task's real end.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn session_tasks_ended(&self) -> watch::Receiver<Vec<String>> {
+        self.0.session_tasks_ended.subscribe()
+    }
+
     /// Test seam: queues `message` on `node_id`'s session as
     /// [`NodeHub::send_control`] does, for a test that a demotion drops what
     /// was queued.
@@ -1829,20 +1842,30 @@ impl NodeHub {
     /// then on it commits nothing, then records the term in `meta`. Every
     /// node session ends with a fatal `not_primary` as soon as it sees the
     /// demoted flag, and the demotion guard ([`crate::demotion`]) answers
-    /// every later request with `503`.
-    /// A second `stale_term` changes nothing.
-    pub async fn stale_term(&self, node_term: Option<u64>) {
+    /// every later request with `503`. A second `stale_term` changes
+    /// nothing.
+    ///
+    /// The flag is set before this returns; the `meta` write runs on its
+    /// own task, returned here. A node session drops it, so it ends within
+    /// its cap whatever the gate or SQLite wait for; a caller that needs the
+    /// outcome awaits it.
+    pub fn stale_term(&self, node_term: Option<u64>) -> crate::store::DemotionTask {
         self.0.support.stale_term();
-        match self.0.store.demote(node_term).await {
-            Some(crate::store::Demotion::Recorded(term)) => tracing::error!(
-                demoted_by_term = term,
-                "this primary is demoted: it ends every node session with not_primary and answers every request with 503"
-            ),
-            Some(crate::store::Demotion::NotRecorded) => tracing::error!(
-                "this primary is demoted until it restarts: it ends every node session with not_primary and answers every request with 503"
-            ),
-            None => tracing::debug!(?node_term, "already demoted; the first term stays"),
-        }
+        let demotion = self.0.store.demote(node_term);
+        crate::store::DemotionTask::spawn(async move {
+            let outcome = demotion.await;
+            match outcome {
+                Some(crate::store::Demotion::Recorded(term)) => tracing::error!(
+                    demoted_by_term = term,
+                    "this primary is demoted: it ends every node session with not_primary and answers every request with 503"
+                ),
+                Some(crate::store::Demotion::NotRecorded) => tracing::error!(
+                    "this primary is demoted until it restarts: it ends every node session with not_primary and answers every request with 503"
+                ),
+                None => tracing::debug!(?node_term, "already demoted; the first term stays"),
+            }
+            outcome
+        })
     }
 
     /// Ends every live session, for a clean shutdown.
@@ -2959,7 +2982,17 @@ async fn run_session(
     // After a demotion it shares the cap of `not_primary`.
     let until = demoted_until.unwrap_or_else(|| Instant::now() + DEMOTED_SEND_TIMEOUT);
     let _ = tokio::time::timeout_at(until, socket.send(Message::Close(None))).await;
+    let node_id = session.node_id;
+    session.hub.0.session_tasks_ended.send_modify(|ended| {
+        ended.push(node_id);
+        let excess = ended.len().saturating_sub(SESSION_ENDS_KEPT);
+        ended.drain(..excess);
+    });
 }
+
+/// How many session ends the test seam [`NodeHub::session_tasks_ended`]
+/// keeps, so a long-running primary does not grow it without bound.
+const SESSION_ENDS_KEPT: usize = 64;
 
 /// Ends `generation`'s session: fails its pending commands and streams and,
 /// when `record_disconnect`, records the disconnect, with the
@@ -3357,7 +3390,7 @@ impl Session {
                 // means a higher term exists. The primary demotes itself and
                 // ends this session like every other one (section 7.4).
                 if error.code == quoro_proto::ErrorCode::StaleTerm {
-                    self.on_stale_term(error.term).await;
+                    self.on_stale_term(error.term);
                     outbox.push(not_primary_frame());
                     return true;
                 }

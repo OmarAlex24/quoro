@@ -41,6 +41,21 @@ async fn meta(server: &Server, key: &str) -> Option<String> {
         .unwrap()
 }
 
+/// `meta.demoted_by_term` once it is recorded: the demotion writes it on
+/// its own task, after the sessions may have ended.
+async fn recorded_term(server: &Server) -> String {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(term) = meta(server, "demoted_by_term").await {
+                return term;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("meta.demoted_by_term is recorded within 10 s")
+}
+
 /// Asserts the `503` `not_primary` problem with its request id.
 async fn assert_not_primary(res: reqwest::Response, what: &str) {
     assert_eq!(res.status(), 503, "{what}");
@@ -156,7 +171,7 @@ async fn a_stale_term_demotes_the_primary_and_ends_every_session() {
     on_a.send(stale_term(Some(5)), Some(&welcome)).await;
     ended_with_not_primary(&mut on_a).await;
     ended_with_not_primary(&mut on_b).await;
-    assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
+    assert_eq!(recorded_term(&server).await, "5");
     assert!(server.state.store.is_demoted());
 
     // A new session upgrade is refused before authentication, with a
@@ -521,9 +536,9 @@ async fn a_second_stale_term_changes_nothing() {
     assert_eq!(meta(&server, "demoted_by_term").await.unwrap(), first);
 }
 
-/// A write queued on the writer gate while the demotion holds it never
+/// A write that waits on the writer gate while the demotion holds it never
 /// commits: the flag is set before the demotion takes the gate, and before
-/// its `meta` write.
+/// its `meta` write, and the write is refused without the gate.
 #[tokio::test]
 async fn a_write_queued_on_the_gate_does_not_commit_after_the_demotion() {
     let server = start_with_patient_node_session().await;
@@ -537,13 +552,10 @@ async fn a_write_queued_on_the_gate_does_not_commit_after_the_demotion() {
     assert!(store.is_demoted());
     assert_eq!(meta(&server, "demoted_by_term").await, None);
 
-    // This runtime has one thread: once the task said it is writing, it ran
-    // on until it waits on the gate.
-    let (writing, started) = tokio::sync::oneshot::channel();
+    // The write is refused while the demotion still holds the gate.
     let queued = {
         let store = store.clone();
         tokio::spawn(async move {
-            let _ = writing.send(());
             let mut w = store.begin_write().await?;
             sqlx::query("INSERT INTO meta (key, value) VALUES ('queued_write', 'committed')")
                 .execute(&mut *w.tx)
@@ -551,19 +563,14 @@ async fn a_write_queued_on_the_gate_does_not_commit_after_the_demotion() {
             w.commit().await
         })
     };
-    started.await.unwrap();
-    tokio::task::yield_now().await;
-    assert!(
-        !queued.is_finished(),
-        "the queued write waits on the gate the demotion holds"
-    );
-    hold.release();
-    demoting.await.unwrap();
-    let refused = queued
+    let refused = timeout(Duration::from_secs(2), queued)
         .await
+        .expect("the write does not wait on the gate the demotion holds")
         .unwrap()
         .expect_err("the queued write is refused");
     assert!(refused.to_string().contains(DEMOTED_REFUSAL), "{refused}");
+    hold.release();
+    demoting.await.unwrap();
     assert_eq!(meta(&server, "queued_write").await, None);
     assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
 }
@@ -592,7 +599,8 @@ async fn release_write_lock(mut lock: sqlx::SqliteConnection) {
 
 /// When the `stale_term` arrives, a writer that holds the gate with an open
 /// transaction and a writer queued on the gate both commit nothing: the
-/// open one is refused at `commit`, the queued one at `begin_write`.
+/// queued one is refused at `begin_write` at once, while the open one still
+/// holds the gate, and the open one is refused at `commit`.
 #[tokio::test]
 async fn an_open_and_a_queued_write_commit_nothing_after_a_stale_term() {
     let server = start_with_patient_node_session().await;
@@ -630,15 +638,16 @@ async fn an_open_and_a_queued_write_commit_nothing_after_a_stale_term() {
         }
         tokio::task::yield_now().await;
     }
+    let refused = timeout(Duration::from_secs(2), queued)
+        .await
+        .expect("the queued write stops waiting on the gate at the stale_term")
+        .unwrap()
+        .expect_err("the queued write is refused at begin_write");
+    assert!(refused.to_string().contains(DEMOTED_REFUSAL), "{refused}");
     let refused = open
         .commit()
         .await
         .expect_err("the open write is refused at commit");
-    assert!(refused.to_string().contains(DEMOTED_REFUSAL), "{refused}");
-    let refused = queued
-        .await
-        .unwrap()
-        .expect_err("the queued write is refused at begin_write");
     assert!(refused.to_string().contains(DEMOTED_REFUSAL), "{refused}");
     demoting.await.unwrap();
     assert_eq!(meta(&server, "open_write").await, None);
@@ -647,10 +656,12 @@ async fn an_open_and_a_queued_write_commit_nothing_after_a_stale_term() {
 }
 
 /// While the `meta` write waits on a SQLite lock another connection holds,
-/// a frame produced for another node's session never reaches that node: it
-/// sees `not_primary` and nothing else, before `meta` is written.
+/// every session ends within the cap with `not_primary`, the one that
+/// carried the `stale_term` included, and a frame produced for another
+/// node's session never reaches that node. `meta` is recorded once the lock
+/// is released.
 #[tokio::test]
-async fn a_frame_for_another_session_never_reaches_its_node_while_meta_waits() {
+async fn every_session_ends_within_the_cap_while_meta_waits() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let a = enroll(&server, &owner, "node-a", &["node"]).await;
@@ -661,11 +672,12 @@ async fn a_frame_for_another_session_never_reaches_its_node_while_meta_waits() {
     on_b.settle().await;
 
     let lock = hold_write_lock(&server).await;
+    let sent_at = tokio::time::Instant::now();
     on_a.send(stale_term(Some(5)), None).await;
     // Well inside the 5 s the `meta` write waits on the lock. Not asserted
     // here: a flag set only after the `meta` write lets the frames below
     // through, which the assertions on what node B saw catch.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let deadline = sent_at + Duration::from_secs(4);
     while !server.state.store.is_demoted() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -689,8 +701,6 @@ async fn a_frame_for_another_session_never_reaches_its_node_while_meta_waits() {
             Some(Ok(_)) => {}
         }
     }
-    // Node B's session ended while the `meta` write still waited.
-    assert_eq!(meta(&server, "demoted_by_term").await, None);
     assert!(
         frames.iter().all(|frame| frame["type"] != "ping"),
         "a frame produced after the stale_term reached node B: {frames:?}"
@@ -698,10 +708,17 @@ async fn a_frame_for_another_session_never_reaches_its_node_while_meta_waits() {
     let last = frames.last().expect("not_primary");
     assert_eq!(last["type"], "error", "{frames:?}");
     assert_eq!(last["body"]["code"], "not_primary", "{frames:?}");
+    // Node A's session does not wait for the `meta` write either: it ends
+    // well before the 5 s that write may wait on the lock.
+    timeout(Duration::from_secs(3), ended_with_not_primary(&mut on_a))
+        .await
+        .expect("node A's session ends without waiting for the meta write");
+    assert!(sent_at.elapsed() < Duration::from_secs(4));
+    // Both ended while the `meta` write still waited.
+    assert_eq!(meta(&server, "demoted_by_term").await, None);
 
     release_write_lock(lock).await;
-    ended_with_not_primary(&mut on_a).await;
-    assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
+    assert_eq!(recorded_term(&server).await, "5");
 }
 
 /// A first attempt at the `meta` write that fails before it chose a term, on
@@ -723,33 +740,49 @@ async fn a_shutdown_after_a_busy_first_attempt_records_the_nodes_term() {
     assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
 }
 
+/// A node whose session is parked on a send of a frame the socket cannot
+/// take: it stopped reading, and its socket holds far more than the
+/// loopback buffers do.
+async fn stopped_reader(server: &Server) -> (Node, Machine) {
+    let owner = server.owner().await;
+    let a = enroll(server, &owner, "node-a", &["node"]).await;
+    let mut on_a = Machine::connect(server, &a).await;
+    on_a.settle().await;
+    for _ in 0..64 {
+        assert!(
+            server
+                .state
+                .hub
+                .queue_control_for_test(&a.node_id, &filler())
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    (a, on_a)
+}
+
+const FILLER_BYTES: usize = 900 * 1024;
+
+fn filler() -> ControlMessage {
+    ControlMessage::Error(ProtocolError {
+        code: ErrorCode::BadMessage,
+        message: "x".repeat(FILLER_BYTES),
+        fatal: false,
+        term: None,
+    })
+}
+
 /// A node that stopped reading before the demotion, with its session parked
-/// on a send of a frame the socket cannot take: the session still ends
-/// within the 5 s cap of the demotion.
+/// on a send: the session task still ends within one 5 s cap of the
+/// demotion, its last sends, `not_primary` and the close frame, sharing it.
 #[tokio::test]
 async fn a_node_that_stopped_reading_does_not_hold_its_session_past_the_cap() {
     let server = start_with_patient_node_session().await;
-    let owner = server.owner().await;
-    let a = enroll(&server, &owner, "node-a", &["node"]).await;
-    let mut on_a = Machine::connect(&server, &a).await;
-    on_a.settle().await;
-
-    // The node reads nothing more. Far more than the loopback socket
-    // buffers hold: the session's send of one of them blocks.
-    let filler = ControlMessage::Error(ProtocolError {
-        code: ErrorCode::BadMessage,
-        message: "x".repeat(900 * 1024),
-        fatal: false,
-        term: None,
-    });
-    for _ in 0..64 {
-        assert!(server.state.hub.queue_control_for_test(&a.node_id, &filler));
-    }
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (a, on_a) = stopped_reader(&server).await;
+    let mut ended = server.state.hub.session_tasks_ended();
 
     let demoted_at = tokio::time::Instant::now();
-    server.state.hub.stale_term(Some(5)).await;
-    // The session detaches once its last sends gave up: the hub then takes
+    drop(server.state.hub.stale_term(Some(5)));
+    // The session detaches once `not_primary` gave up: the hub then takes
     // no frame for the node.
     timeout(Duration::from_secs(15), async {
         while server
@@ -761,12 +794,77 @@ async fn a_node_that_stopped_reading_does_not_hold_its_session_past_the_cap() {
         }
     })
     .await
-    .expect("the session ends after the demotion");
+    .expect("the session detaches after the demotion");
+    // The task itself returns after the close frame, within the same cap.
+    timeout(
+        Duration::from_secs(15),
+        ended.wait_for(|ended| ended.contains(&a.node_id)),
+    )
+    .await
+    .expect("the session task ends after the demotion")
+    .unwrap();
     let took = demoted_at.elapsed();
-    // At about the cap: sooner would mean the socket never filled.
+    // At about the cap: sooner would mean the socket never filled, and a
+    // second cap for the close frame would take it to about 10 s.
     assert!(took >= Duration::from_secs(4), "{took:?}");
-    assert!(took < Duration::from_secs(8), "{took:?}");
+    assert!(took < Duration::from_secs(7), "{took:?}");
     drop(on_a);
+}
+
+/// A node that stopped reading before the demotion and reads again inside
+/// the cap gets whole frames only, with `not_primary` the last text frame:
+/// the frame whose send was parked at the demotion goes out whole, and
+/// nothing queued after it does.
+#[tokio::test]
+async fn a_node_that_reads_again_inside_the_cap_sees_whole_frames_then_not_primary() {
+    let server = start_with_patient_node_session().await;
+    let (a, mut on_a) = stopped_reader(&server).await;
+    drop(server.state.hub.stale_term(Some(5)));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Queued after the demotion: never sent.
+    let _ = server
+        .state
+        .hub
+        .queue_control_for_test(&a.node_id, &ControlMessage::Ping);
+
+    let mut frames = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(10), on_a.socket.next())
+            .await
+            .expect("the session closes within 10 s")
+        {
+            None | Some(Ok(WsMessage::Close(_))) => break,
+            Some(Err(e)) => panic!("the node read a broken frame: {e}"),
+            Some(Ok(WsMessage::Text(text))) => {
+                frames.push(serde_json::from_str::<Value>(text.as_str()).unwrap());
+            }
+            Some(Ok(_)) => {}
+        }
+    }
+    let (last, before) = frames.split_last().expect("not_primary");
+    assert_eq!(last["type"], "error");
+    assert_eq!(last["body"]["code"], "not_primary", "{last}");
+    assert_eq!(last["body"]["fatal"], true, "{last}");
+    assert!(
+        before.iter().all(|frame| frame["type"] != "ping"),
+        "a frame queued after the demotion reached the node"
+    );
+    let fillers: Vec<&Value> = before
+        .iter()
+        .filter(|frame| frame["type"] == "error")
+        .collect();
+    assert!(!fillers.is_empty(), "the socket held frames from before");
+    assert!(
+        fillers.len() < 64,
+        "the frames queued behind the parked one are dropped"
+    );
+    for frame in fillers {
+        assert_eq!(frame["body"]["code"], "bad_message");
+        assert_eq!(
+            frame["body"]["message"].as_str().map(str::len),
+            Some(FILLER_BYTES)
+        );
+    }
 }
 
 /// A `meta` write that fails still demotes this process: the flag is set,
