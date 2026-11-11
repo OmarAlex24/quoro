@@ -120,7 +120,12 @@ export const readingOrder = (positions: Positions, keys: readonly string[]): str
 
 /* ---------- storage ---------- */
 
-export const positionsKey = (projectId: string): string => `quoro.canvas.${projectId}`;
+/**
+ * Where a project's positions are saved. The version moves when the cards
+ * change size, so a layout dragged for smaller cards is not read back over
+ * the taller ones (v2: the cards gained their figures, #783).
+ */
+export const positionsKey = (projectId: string): string => `quoro.canvas.v2.${projectId}`;
 
 const isPoint = (value: unknown): value is Point =>
   typeof value === 'object' &&

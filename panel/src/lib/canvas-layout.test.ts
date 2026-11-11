@@ -129,6 +129,7 @@ describe('position storage', () => {
     const storage = memory();
     writePositions(storage, 'prj_1', { 'app:a': { x: 10.4, y: 20 } }, ['app:a']);
     expect(storage.data.get(positionsKey('prj_1'))).toBe('{"app:a":{"x":10,"y":20}}');
+    expect(positionsKey('prj_1')).toBe('quoro.canvas.v2.prj_1');
     expect(readPositions(storage, 'prj_1')).toEqual({ 'app:a': { x: 10, y: 20 } });
     expect(readPositions(storage, 'prj_2')).toEqual({});
   });

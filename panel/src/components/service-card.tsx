@@ -46,8 +46,15 @@ const FOOT_ICONS: Record<FootKey, LucideIcon> = {
   host: Server,
 };
 
-/** How often a card reads its app's metrics: once per sample (`AppMetrics.interval_s` is 5 s). */
-const METRICS_EVERY_MS = 5_000;
+/**
+ * How often a card reads its app's metrics: every other sample
+ * (`AppMetrics.interval_s` is 5 s). A canvas holds many cards, each its own
+ * request, so the cards read at half the stream's pace.
+ */
+const METRICS_EVERY_MS = 10_000;
+
+/** An app with nothing running has no new sample to read: its card reads once and stops. */
+const metricsIdle = (status: App['status']): boolean => status === 'down' || status === 'stopped';
 
 /**
  * The card face both kinds share: a kind tile and the name, one line of
@@ -163,6 +170,7 @@ export function AppCard({
   nodeNames,
   selected = false,
   highlighted = false,
+  dimmed = false,
   onDeployed,
 }: {
   app: App;
@@ -179,6 +187,8 @@ export function AppCard({
   selected?: boolean;
   /** Pointed at from the project rail. */
   highlighted?: boolean;
+  /** Stepped back while another service's sheet is open: its figures stop reading until it is back. */
+  dimmed?: boolean;
   /** A redeploy this card watched roll out has succeeded. */
   onDeployed?: (name: string) => void;
 }) {
@@ -221,7 +231,7 @@ export function AppCard({
       lamp={<LampDot ring={lamp.tone} core={lamp.tone} pulse={lamp.pulse} size={15} />}
       word={progress && lamp.statusText === 'Deploying' ? progress.word : lamp.statusText}
       since={deployments ? deployAge(app, deployments, now) : null}
-      body={progress ? <PhaseTape progress={progress} /> : <AppFigures appId={app.id} chips={chips} />}
+      body={progress ? <PhaseTape progress={progress} /> : <AppFigures appId={app.id} chips={chips} poll={!dimmed && !metricsIdle(app.status)} />}
       foot={foot}
       deploying={lamp.pulse}
       confirmed={confirmed}
@@ -284,8 +294,8 @@ function PhaseTape({ progress }: { progress: DeployProgress }) {
  * figures, a small CPU trace and a memory meter, each redrawn as a sample
  * lands, without a tween. Then the nodes its instances run on.
  */
-function AppFigures({ appId, chips }: { appId: string; chips: readonly NodeChip[] }) {
-  const metrics = useGetAppMetrics(appId, { query: { refetchInterval: METRICS_EVERY_MS, retry: false } });
+function AppFigures({ appId, chips, poll }: { appId: string; chips: readonly NodeChip[]; poll: boolean }) {
+  const metrics = useGetAppMetrics(appId, { query: { refetchInterval: poll ? METRICS_EVERY_MS : false, retry: false } });
   const figures = useMemo(() => cardFigures(metrics.data?.instances ?? []), [metrics.data]);
   const intervalMs = (metrics.data?.interval_s ?? 5) * 1_000;
   return (
@@ -347,7 +357,7 @@ function CpuTrace({ trace, intervalMs }: { trace: ReadonlyArray<{ time: string; 
   );
   const label =
     series.values.length > 0
-      ? seriesSummary({ label: 'CPU, last 10 minutes', values: series.values, format: (value) => formatPercent(value / 100) })
+      ? seriesSummary({ label: 'CPU', values: series.values, format: (value) => formatPercent(value / 100) })
       : 'CPU: no sample yet';
   return <DitherCanvas paint={paint} label={label} className="svc-trace" />;
 }

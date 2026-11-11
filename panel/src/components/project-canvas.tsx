@@ -182,7 +182,15 @@ export function ProjectCanvas({
   const [hl, setHl] = useState<string | null>(null);
   const highlight = useMemo(() => ({ key: hl, set: setHl }), [hl]);
   const [said, setSaid] = useState('');
-  const onDeployed = useCallback((name: string) => setSaid(`${name} deployed`), []);
+  // Cleared first, then set a moment later, so a second success of the same
+  // app changes the live region and is announced again.
+  const sayTimer = useRef<number | undefined>(undefined);
+  const onDeployed = useCallback((name: string) => {
+    window.clearTimeout(sayTimer.current);
+    setSaid('');
+    sayTimer.current = window.setTimeout(() => setSaid(`${name} deployed`), 120);
+  }, []);
+  useEffect(() => () => window.clearTimeout(sayTimer.current), []);
 
   const nodeNames = useMemo(() => Object.fromEntries(nodes.map((node) => [node.id, node.name])), [nodes]);
   const services = useMemo(() => projectServices(projectId, apps, vms), [projectId, apps, vms]);
@@ -266,7 +274,9 @@ export function ProjectCanvas({
     }
     const all = bounds(positions, sizes);
     if (!all) return;
-    const view = fitView(all, { w: element.clientWidth, h: element.clientHeight });
+    // Fit into the room left of the rail, centred there, so no card lands under it.
+    const railSpace = narrowRail ? RAIL_SPACE.narrow : RAIL_SPACE.wide;
+    const view = fitView(all, { w: Math.max(CARD_W + 32, element.clientWidth - railSpace), h: element.clientHeight });
     if (view.zoom === zoom) {
       setUserZoom(view.zoom);
       element.scrollLeft = view.left;
@@ -275,7 +285,7 @@ export function ProjectCanvas({
     }
     pendingScroll.current = { left: view.left, top: view.top };
     setUserZoom(view.zoom);
-  }, [positions, zoom]);
+  }, [positions, zoom, narrowRail]);
 
   /* ---------- auras ---------- */
 
@@ -425,6 +435,7 @@ export function ProjectCanvas({
       <AppCard
         selected={selected === service.key}
         highlighted={hl === service.key}
+        dimmed={Boolean(selected) && selected !== service.key}
         app={service.app}
         builds={builds[service.app.id]}
         run={runOf(service.app.id)}
