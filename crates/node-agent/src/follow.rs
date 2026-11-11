@@ -573,6 +573,50 @@ pub(crate) mod testing {
         unhashed.as_object_mut().unwrap().remove("hash");
         entry["hash"] = json!(entry_hash(jcs::canonicalize(&unhashed).unwrap().as_bytes()));
     }
+
+    /// A change-log entry without `hash`, in RFC 8785 form, written out: two
+    /// floats whose text an approximate parser reads back as other numbers
+    /// (ADR 0315). The primary's tests hold the same text (`FLOAT_ENTRY` in
+    /// `quoro-control-plane`'s `changelog::tests`), so a node and the primary
+    /// re-hash one entry. Its hash is the SHA-256 of this text.
+    pub(crate) const FLOAT_ENTRY: &str = r#"{"actor_id":"test","actor_type":"system","entity_id":"vm_1","entity_type":"vm","op":"update","payload":{"x":1548.2162860866163,"y":18983552425072.563},"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","seq":1,"term":1,"time":"2026-11-10T10:15:31.000Z"}"#;
+
+    /// An entry a development build since #723 wrote before floats parsed
+    /// exactly (ADR 0315), without `hash`, with the payload text it stored:
+    /// the RFC 8785 text of the double a request's `1548.2162860866162` read
+    /// as.
+    pub(crate) const STALE_STORED: &str = r#"{"actor_id":"test","actor_type":"system","entity_id":"vm_1","entity_type":"vm","op":"update","payload":{"x":1548.2162860866163},"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","seq":1,"term":1,"time":"2026-11-10T10:15:31.000Z"}"#;
+
+    /// [`STALE_STORED`] as that build hashed it: with the payload as its
+    /// parser read the stored text back, the neighbouring double.
+    pub(crate) const STALE_HASHED: &str = r#"{"actor_id":"test","actor_type":"system","entity_id":"vm_1","entity_type":"vm","op":"update","payload":{"x":1548.2162860866165},"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","seq":1,"term":1,"time":"2026-11-10T10:15:31.000Z"}"#;
+
+    /// Lowercase hex SHA-256 of `text`.
+    pub(crate) fn sha256(text: &str) -> String {
+        use sha2::{Digest as _, Sha256};
+        crate::util::hex(&Sha256::digest(text.as_bytes()))
+    }
+
+    /// The entry `unhashed`, read from its stored text as the primary reads
+    /// it, with `hash`, sent alone in a `log_entries` frame as the primary
+    /// writes it, and parsed back from that frame's text as the node parses
+    /// it.
+    pub(crate) fn received(unhashed: &str, hash: &str) -> LogEntries {
+        use quoro_proto::wire::{ControlMessage, RawFrame};
+        let mut entry: Value = serde_json::from_str(unhashed).unwrap();
+        entry["hash"] = json!(hash);
+        let text = ControlMessage::LogEntries(LogEntries {
+            from_seq: entry["seq"].as_u64().unwrap(),
+            entries: vec![entry],
+            head_seq: Some(1),
+        })
+        .to_frame("msg_01JC9ZN1Q6C8D0F2H4K6N8Q0S2", None)
+        .to_text();
+        match ControlMessage::from_raw(&RawFrame::parse(&text).unwrap()).unwrap() {
+            ControlMessage::LogEntries(body) => body,
+            other => panic!("not log_entries: {}", other.kind()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -800,6 +844,25 @@ mod tests {
                 index: 1,
                 field: "hash"
             })
+        );
+    }
+
+    /// ADR 0315: the primary sends an entry a development build since #723
+    /// hashed over a float's best-effort read-back as it stored it. Read
+    /// exactly, it does not hash to its hash, so a node that does not hold
+    /// it refuses the message (`bad_message`) and stores nothing. The same
+    /// message, read with the best-effort parser, verified.
+    #[test]
+    fn an_entry_hashed_over_a_best_effort_read_back_is_refused() {
+        use super::testing::{STALE_HASHED, STALE_STORED, received, sha256};
+        assert_ne!(
+            "1548.2162860866163".parse::<f64>().unwrap(),
+            "1548.2162860866165".parse::<f64>().unwrap()
+        );
+        let body = received(STALE_STORED, &sha256(STALE_HASHED));
+        assert_eq!(
+            verify_batch(0, ZERO_HASH, &body),
+            Err(Rejection::Hash { seq: 1 })
         );
     }
 

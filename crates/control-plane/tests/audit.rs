@@ -623,14 +623,16 @@ async fn an_agent_key_call_above_the_limit_is_recorded_for_its_agent() {
 }
 
 #[tokio::test]
-async fn a_float_a_node_reads_as_another_number_is_audited_with_a_digest() {
+async fn a_float_is_audited_in_params_and_its_record_verifies() {
     let server = common::start().await;
     let owner = server.owner().await;
 
     // A human's approval request: refused after authorization, so the error
-    // is audited with the body's parameters. One of them is a float a node
-    // would read back as another number (`audit-log-format.md` section 4.1).
-    let body = r#"{"scope":"app:delete","target":{"type":"app","id":"app_01JC9Z6Q5W8N3K4T7R2M1XHB0F"},"operation":"DELETE /api/v1/apps/{app_id}","params":{"x":18983552425072.563},"justification":"j"}"#;
+    // is audited with the body's parameters. Two of them are floats whose
+    // RFC 8785 text an approximate parser reads back as another number;
+    // the primary parses floats exactly (`audit-log-format.md` section 4.1,
+    // ADR 0315), so they are kept.
+    let body = r#"{"scope":"app:delete","target":{"type":"app","id":"app_01JC9Z6Q5W8N3K4T7R2M1XHB0F"},"operation":"DELETE /api/v1/apps/{app_id}","params":{"x":1548.2162860866162,"y":18983552425072.563},"justification":"j"}"#;
     let before = audit_count(&server).await;
     let res = owner
         .post(server.url("/api/v1/approvals"))
@@ -643,21 +645,22 @@ async fn a_float_a_node_reads_as_another_number_is_audited_with_a_digest() {
     assert_eq!((status, code.as_str()), (422, "validation_failed"));
     assert_eq!(audit_count(&server).await, before + 1);
 
-    // The record keeps the digest of the parameters' RFC 8785 text, the
-    // float as the primary read it.
     let record = newest(&server, &owner).await;
     assert_eq!(record["operation"], "POST /api/v1/approvals", "{record}");
-    assert_eq!(record["params"], json!({}), "{record}");
-    let text = r#"{"incident_id":null,"justification":"j","operation":"DELETE /api/v1/apps/{app_id}","params":{"x":18983552425072.563},"scope":"app:delete","target":{"id":"app_01JC9Z6Q5W8N3K4T7R2M1XHB0F","type":"app"}}"#;
-    assert_eq!(record["params_sha256"], json!(sha256(text)), "{record}");
-    assert_eq!(record["params_bytes"], json!(text.len()), "{record}");
+    assert!(record["params_sha256"].is_null(), "{record}");
     let seq = record["seq"].as_i64().unwrap();
+    let (stored,): (String,) = sqlx::query_as("SELECT params FROM audit_log WHERE seq = ?")
+        .bind(seq)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
     assert_eq!(
-        list(&owner, &server.url(&format!("/api/v1/audit/{seq}"))).await,
-        record
+        stored,
+        r#"{"incident_id":null,"justification":"j","operation":"DELETE /api/v1/apps/{app_id}","params":{"x":1548.2162860866163,"y":18983552425072.563},"scope":"app:delete","target":{"id":"app_01JC9Z6Q5W8N3K4T7R2M1XHB0F","type":"app"}}"#
     );
 
-    // Its change-log entry was written, and the chain verifies.
+    // Its change-log entry was written, and the chain verifies from the
+    // stored text.
     let (entries,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM change_log WHERE entity_type = 'audit' AND entity_id = ?",
     )
@@ -677,6 +680,44 @@ async fn a_float_a_node_reads_as_another_number_is_audited_with_a_digest() {
         .unwrap();
     assert_eq!(verified["ok"], true, "{verified}");
     assert_eq!(verified["checked"].as_i64(), Some(seq));
+}
+
+#[tokio::test]
+async fn a_whole_number_float_above_2_53_is_audited_with_a_digest() {
+    let server = common::start().await;
+    let owner = server.owner().await;
+
+    // `1e16` is a float whose RFC 8785 text, `10000000000000000`, reads
+    // back as an integer above 2^53, so the parameters stay a digest
+    // (`audit-log-format.md` section 4.1). The text the digest covers holds
+    // the other float as the primary read it.
+    let body = r#"{"scope":"app:delete","target":{"type":"app","id":"app_01JC9Z6Q5W8N3K4T7R2M1XHB0F"},"operation":"DELETE /api/v1/apps/{app_id}","params":{"n":1e16,"x":1548.2162860866162},"justification":"j"}"#;
+    let res = owner
+        .post(server.url("/api/v1/approvals"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let (status, code, _) = common::problem(res).await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
+
+    let record = newest(&server, &owner).await;
+    assert_eq!(record["operation"], "POST /api/v1/approvals", "{record}");
+    assert_eq!(record["params"], json!({}), "{record}");
+    let text = r#"{"incident_id":null,"justification":"j","operation":"DELETE /api/v1/apps/{app_id}","params":{"n":10000000000000000,"x":1548.2162860866163},"scope":"app:delete","target":{"id":"app_01JC9Z6Q5W8N3K4T7R2M1XHB0F","type":"app"}}"#;
+    assert_eq!(record["params_sha256"], json!(sha256(text)), "{record}");
+    assert_eq!(record["params_bytes"], json!(text.len()), "{record}");
+    let verified: Value = owner
+        .post(server.url("/api/v1/audit/verify"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(verified["ok"], true, "{verified}");
 }
 
 #[tokio::test]

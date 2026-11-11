@@ -136,10 +136,11 @@ impl std::error::Error for AppendError {}
 ///
 /// The entry is built from the payload exactly as it reads back from the
 /// canonical text stored for it, the way `StoredEntry::unhashed` and
-/// [`verify`] rebuild it, and hashed in that form. For the payloads Quoro
-/// writes, whose only floats are scores with one decimal, the read-back form
-/// is the original canonical form, so their hash is the one an entry had
-/// before this check (ADR 0302).
+/// [`verify`] rebuild it, and hashed in that form. Floats parse exactly
+/// (`serde_json`'s `float_roundtrip`, ADR 0315): each reads back as the
+/// double nearest to its text, which is the double it was written from, so
+/// the read-back form of every payload is the original canonical form, and
+/// its hash is the one an entry had before this check (ADR 0302).
 ///
 /// An entry a node could not receive alone and verify is refused before
 /// anything is written (`node-agent-protocol.md` section 7.1, "Entries a
@@ -295,10 +296,12 @@ pub(crate) fn alone_frame_bytes(seq: u64, entry: &Value) -> usize {
 /// only an entry a node can verify (`node-agent-protocol.md` section 7.1,
 /// "Entries a node can receive", ADR 0302).
 ///
-/// The primary hashes the entry as it reads back from its stored text, but a
-/// node parses it a second time, from the frame text. `serde_json` parses
-/// floats without `float_roundtrip`, so a float can come back from that text
-/// as another number.
+/// The primary hashes the entry as it reads back from its stored text, and a
+/// node parses it a second time, from the frame text. Both parse floats
+/// exactly (`serde_json`'s `float_roundtrip`, ADR 0315), so a float reads
+/// back from either text as the same double, and the check holds for every
+/// float. It still guards the frame: what the primary writes there is what a
+/// node with the same parser verifies.
 ///
 /// # Errors
 ///
@@ -516,6 +519,15 @@ pub(crate) async fn hash_at(
 
 /// Re-hashes the whole change log from `seq` 1 and returns the first `seq`
 /// whose `prev_hash` or `hash` does not match, or `None` when it is intact.
+///
+/// The primary does not run it at start, nor when it follows, exports or
+/// backs up. An entry it names may be one a development build since #723
+/// hashed over a float's best-effort read-back, before floats parsed exactly
+/// (ADR 0315): its stored text now reads back as the double it was written
+/// from, so it no longer hashes to its `hash`. [`StoredEntry::wire_entry`]
+/// still builds it with its stored `hash`, and follow sends it as stored. A
+/// node that does not hold it yet refuses it, upgraded or not, and stays at
+/// its last acknowledgement.
 ///
 /// # Errors
 ///
@@ -774,31 +786,58 @@ mod tests {
         assert_eq!(log_state(&mut w.tx).await, before);
     }
 
-    #[tokio::test]
-    async fn a_float_a_node_parses_back_as_another_number_is_refused() {
-        // Found by a search over 17-digit floats: serde_json, without
-        // float_roundtrip, reads the stored text back as one number, and a
-        // node reads that number's text in the frame back as another.
-        let payload = json!({"x": 18_983_552_425_072.563});
-        assert_eq!(
-            jcs::canonicalize(&payload).unwrap(),
-            "{\"x\":18983552425072.563}"
-        );
-        let read_back: Value = serde_json::from_str("{\"x\":18983552425072.563}").unwrap();
-        let on_the_node: Value =
-            serde_json::from_str(&serde_json::to_string(&read_back).unwrap()).unwrap();
-        assert_ne!(
-            read_back, on_the_node,
-            "this float now parses back the same: pick another for this test"
-        );
-        // Both forms have a canonical form, so only the node's hash differs.
-        assert!(jcs::canonicalize(&read_back).is_ok());
-        assert!(jcs::canonicalize(&on_the_node).is_ok());
+    /// The payload of [`FLOAT_ENTRY`]: two floats in their RFC 8785 text,
+    /// each of which read back as another number before floats parsed
+    /// exactly (ADR 0315).
+    const FLOAT_PAYLOAD: &str = r#"{"x":1548.2162860866163,"y":18983552425072.563}"#;
 
+    /// A change-log entry without `hash`, holding [`FLOAT_PAYLOAD`], in RFC
+    /// 8785 form, written out. Its hash is the SHA-256 of this text. The node
+    /// agent's tests hold the same text (`follow::tests`), so the primary and
+    /// a node re-hash one entry.
+    const FLOAT_ENTRY: &str = r#"{"actor_id":"test","actor_type":"system","entity_id":"vm_1","entity_type":"vm","op":"update","payload":{"x":1548.2162860866163,"y":18983552425072.563},"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","seq":1,"term":1,"time":"2026-11-10T10:15:31.000Z"}"#;
+
+    /// [`FLOAT_ENTRY`] as the primary stores it, without its hash.
+    fn float_entry() -> StoredEntry {
+        StoredEntry {
+            seq: 1,
+            term: 1,
+            time: "2026-11-10T10:15:31.000Z".to_string(),
+            actor_type: "system".to_string(),
+            actor_id: "test".to_string(),
+            entity_type: "vm".to_string(),
+            entity_id: "vm_1".to_string(),
+            op: "update".to_string(),
+            payload: FLOAT_PAYLOAD.to_string(),
+            prev_hash: GENESIS_HASH.to_string(),
+            hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_float_entry_hashes_over_its_stored_text_and_a_node_verifies_it() {
+        // Read from its stored text, the entry hashes to the SHA-256 of that
+        // text, and a node that parses the frame carrying it alone finds the
+        // same hash (`receivable_hash`).
+        let mut entry = float_entry();
+        let hash = entry.receivable_hash().unwrap();
+        assert_eq!(hash, sha256_hex(FLOAT_ENTRY.as_bytes()));
+        entry.hash = hash.clone();
+        let wire = entry.wire_entry().unwrap();
+        assert_eq!(wire["hash"], json!(hash));
+        let frame = alone_frame(1, &wire);
+        assert_eq!(node_verifies(&frame, &hash), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_float_payload_is_written_and_re_hashes_from_its_stored_text() {
+        // The payload as the primary reads it from a request body.
+        let payload: Value =
+            serde_json::from_str(r#"{"x": 1548.2162860866162, "y": 18983552425072.563}"#).unwrap();
         let store = Store::open_in_memory().await.unwrap();
         let mut w = store.begin_write().await.unwrap();
-        let before = log_state(&mut w.tx).await;
-        let refused = append(
+        let start = log_state(&mut w.tx).await.0;
+        let seq = append(
             &mut w.tx,
             &Actor::system("test"),
             "vm",
@@ -806,12 +845,103 @@ mod tests {
             Op::Update,
             payload,
         )
-        .await;
-        assert!(
-            matches!(&refused, Err(AppendError::Unverifiable(reason)) if reason.contains("does not hash")),
-            "{refused:?}"
+        .await
+        .unwrap();
+        w.commit().await.unwrap();
+        let mut conn = store.pool().acquire().await.unwrap();
+        let (_, rows) = read_after(&mut conn, start, 500).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.seq, seq);
+        assert_eq!(row.payload, FLOAT_PAYLOAD);
+        // The hash is the SHA-256 of the entry's RFC 8785 text, written out
+        // around the stored payload text.
+        let text = format!(
+            r#"{{"actor_id":"test","actor_type":"system","entity_id":"vm_1","entity_type":"vm","op":"update","payload":{FLOAT_PAYLOAD},"prev_hash":"{}","seq":{seq},"term":1,"time":"{}"}}"#,
+            row.prev_hash, row.time
         );
-        assert_eq!(log_state(&mut w.tx).await, before);
+        assert_eq!(row.hash, sha256_hex(text.as_bytes()));
+        assert_eq!(verify(&mut conn).await.unwrap(), None);
+    }
+
+    /// The payload of an entry a development build since #723 wrote, before
+    /// floats parsed exactly (ADR 0315): the RFC 8785 text of the double the
+    /// request's `1548.2162860866162` read as.
+    const STALE_PAYLOAD: &str = r#"{"x":1548.2162860866163}"#;
+
+    /// The entry at `seq` after `prev_hash` holding [`STALE_PAYLOAD`], hashed
+    /// as that build hashed it: over the payload as its parser read the
+    /// stored text back, the neighbouring double, written
+    /// `1548.2162860866165`.
+    fn stale_entry(seq: i64, prev_hash: &str) -> StoredEntry {
+        let time = "2026-11-10T10:15:31.000Z";
+        let hashed = format!(
+            r#"{{"actor_id":"test","actor_type":"system","entity_id":"vm_1","entity_type":"vm","op":"update","payload":{{"x":1548.2162860866165}},"prev_hash":"{prev_hash}","seq":{seq},"term":1,"time":"{time}"}}"#
+        );
+        StoredEntry {
+            seq,
+            term: 1,
+            time: time.to_string(),
+            actor_type: "system".to_string(),
+            actor_id: "test".to_string(),
+            entity_type: "vm".to_string(),
+            entity_id: "vm_1".to_string(),
+            op: "update".to_string(),
+            payload: STALE_PAYLOAD.to_string(),
+            prev_hash: prev_hash.to_string(),
+            hash: sha256_hex(hashed.as_bytes()),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_entry_hashed_over_a_best_effort_read_back_is_kept_and_sent_as_stored() {
+        // The two texts are two doubles, so the stored text does not read
+        // back as the number that build hashed.
+        assert_ne!(
+            "1548.2162860866163".parse::<f64>().unwrap(),
+            "1548.2162860866165".parse::<f64>().unwrap()
+        );
+        let store = Store::open_in_memory().await.unwrap();
+        let actor = Actor::system("test");
+        let mut w = store.begin_write().await.unwrap();
+        append(&mut w.tx, &actor, "vm", "vm_0", Op::Create, json!({}))
+            .await
+            .unwrap();
+        let (seq, prev): (i64, String) =
+            sqlx::query_as("SELECT seq, hash FROM change_log ORDER BY seq DESC LIMIT 1")
+                .fetch_one(&mut *w.tx)
+                .await
+                .unwrap();
+        let stale = stale_entry(seq + 1, &prev);
+        insert(&mut w.tx, &stale).await.unwrap();
+        // The log goes on after it: the next entry links to its stored hash.
+        let next = append(&mut w.tx, &actor, "vm", "vm_2", Op::Create, json!({}))
+            .await
+            .unwrap();
+        w.commit().await.unwrap();
+
+        let mut conn = store.pool().acquire().await.unwrap();
+        let (_, rows) = read_after(&mut conn, seq, 500).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], stale);
+        assert_eq!(
+            (rows[1].seq, rows[1].prev_hash.as_str()),
+            (next, stale.hash.as_str())
+        );
+        // Read with floats parsed exactly, it no longer hashes to its hash: a
+        // full re-hash names its seq.
+        assert_eq!(verify(&mut conn).await.unwrap(), Some(stale.seq));
+        // Follow builds it with its stored hash, as stored, and does not
+        // refuse it.
+        let wire = rows[0].wire_entry().unwrap();
+        assert_eq!(wire["hash"], json!(stale.hash));
+        assert_eq!(
+            wire["payload"]["x"].as_f64(),
+            Some("1548.2162860866163".parse::<f64>().unwrap())
+        );
+        // A node that parses it finds another hash.
+        let frame = alone_frame(u64::try_from(stale.seq).unwrap(), &wire);
+        assert!(node_verifies(&frame, &stale.hash).is_err());
     }
 
     #[tokio::test]

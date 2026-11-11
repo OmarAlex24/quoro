@@ -236,6 +236,31 @@ mod tests {
     }
 
     #[test]
+    fn a_float_s_canonical_text_reads_back_as_the_same_double() {
+        // `serde_json` parses floats exactly (`float_roundtrip`, ADR 0315):
+        // each text reads as the double nearest to it, so the canonical text
+        // of a parsed float reads back as that double, and a record hashed
+        // over that text re-hashes from it. An approximate parser reads each
+        // of these texts back as a neighbouring double.
+        for (body, text) in [
+            ("1548.2162860866162", "1548.2162860866163"),
+            ("18983552425072.563", "18983552425072.563"),
+            ("72096104873994100000", "72096104873994100000"),
+        ] {
+            let parsed: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                parsed.as_f64(),
+                Some(body.parse::<f64>().unwrap()),
+                "{body}"
+            );
+            assert_eq!(canonicalize(&parsed).unwrap(), text, "{body}");
+            let read_back: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(read_back, parsed, "{body}");
+            assert_eq!(canonicalize(&read_back).unwrap(), text, "{body}");
+        }
+    }
+
+    #[test]
     fn refuses_numbers_with_an_exponent_form() {
         assert!(canonicalize(&json!(1e21)).is_err());
         assert!(canonicalize(&json!(1e-7)).is_err());

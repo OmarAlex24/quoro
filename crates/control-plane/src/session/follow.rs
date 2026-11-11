@@ -122,6 +122,14 @@ pub(super) enum Batch {
 /// the primary sends every entry `append` accepts (section 7.1, "Entries a
 /// node can receive", ADR 0302). Otherwise, and for a first entry without an
 /// RFC 8785 form, the batch is blocked on it.
+///
+/// The batch never re-hashes an entry. One whose stored text no longer
+/// hashes to its `hash`, as one a development build since #723 hashed over a
+/// float's best-effort read-back (ADR 0315), is sent as stored and not
+/// blocked: a node that does not hold it yet answers `bad_message`, and
+/// follow sends it again after [`LOG_RETRY_DELAY`]. That node stays at its
+/// last acknowledgement for good: an upgraded, newly enrolled or refollowing
+/// node verifies the entry the same way.
 pub(super) fn build_batch(rows: &[StoredEntry], room: usize) -> Batch {
     let mut entries = Vec::new();
     let mut used = 0usize;

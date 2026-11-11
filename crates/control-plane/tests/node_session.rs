@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::log::{check_entries, genesis, log_hash_at, log_head};
+use common::log::{check_entries, genesis, log_hash_at, log_head, sha256_hex};
 use common::replay;
 use common::{
     Server, TLS_FINGERPRINT, problem, restart_with_resolver, start, start_with_patient_node_session,
@@ -2149,6 +2149,137 @@ async fn a_bad_message_answer_is_sent_again_from_the_last_ack_after_a_delay() {
     assert_ne!(again["id"], refused["id"]);
     assert_eq!(again["body"]["from_seq"], last + 1);
     check_entries(&again["body"], &hash);
+}
+
+/// Appends, in one write, a change-log entry that a development build since
+/// #723 wrote before floats parsed exactly (ADR 0315): its stored payload
+/// text is `{"x":1548.2162860866163}`, and its hash covers the payload as
+/// that build read the text back, `{"x":1548.2162860866165}`, another
+/// double. Returns its `seq` and `hash`.
+async fn append_stale_entry(server: &Server) -> (u64, String) {
+    assert_ne!(
+        "1548.2162860866163".parse::<f64>().unwrap(),
+        "1548.2162860866165".parse::<f64>().unwrap()
+    );
+    let mut w = server.state.store.begin_write().await.unwrap();
+    let (last, prev): (i64, String) =
+        sqlx::query_as("SELECT seq, hash FROM change_log ORDER BY seq DESC LIMIT 1")
+            .fetch_one(&mut *w.tx)
+            .await
+            .unwrap();
+    let seq = last + 1;
+    let time = "2026-11-10T10:15:31.000Z";
+    let hashed = format!(
+        r#"{{"actor_id":"test","actor_type":"system","entity_id":"stale-0","entity_type":"probe","op":"create","payload":{{"x":1548.2162860866165}},"prev_hash":"{prev}","seq":{seq},"term":1,"time":"{time}"}}"#
+    );
+    let hash = sha256_hex(hashed.as_bytes());
+    sqlx::query(
+        "INSERT INTO change_log (seq, term, time, actor_type, actor_id, entity_type, entity_id, \
+         op, payload, prev_hash, hash) \
+         VALUES (?, 1, ?, 'system', 'test', 'probe', 'stale-0', 'create', ?, ?, ?)",
+    )
+    .bind(seq)
+    .bind(time)
+    .bind(r#"{"x":1548.2162860866163}"#)
+    .bind(&prev)
+    .bind(&hash)
+    .execute(&mut *w.tx)
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+    (u64::try_from(seq).unwrap(), hash)
+}
+
+/// ADR 0315: a primary whose log holds an entry that no longer verifies
+/// starts, since nothing re-hashes the log at start, and a node that already
+/// holds the entry is not diverged and follows on from it.
+#[tokio::test]
+async fn an_entry_that_no_longer_verifies_stops_neither_the_primary_nor_a_node_past_it() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    let (seq, hash) = append_stale_entry(&server).await;
+
+    // The primary's start-up over this log: `AppState::open` on the open
+    // store, which is where a start-time check of the log would run.
+    quoro_control_plane::AppState::open(
+        server.state.store.clone(),
+        (*server.state.config).clone(),
+        std::sync::Arc::new(quoro_control_plane::ReferenceAsDigest),
+        std::sync::Arc::clone(&server.state.data_key),
+    )
+    .await
+    .unwrap();
+    append_entries(&server, "after", 1).await;
+
+    // A node that stored the entry when an earlier build sent it reports
+    // its hash, and follows on from it.
+    let (_socket, frames) = follow_from(&server, &node, hello_at(&node.node_id, seq, &hash)).await;
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    let body = &frames.last().unwrap()["body"];
+    assert_eq!(body["from_seq"], seq + 1, "{body}");
+    let (last, _) = check_entries(body, &hash);
+    assert!(last > seq, "{body}");
+    assert!(
+        body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["entity_id"] == "after-0"),
+        "{body}"
+    );
+}
+
+/// ADR 0315: follow sends an entry that no longer verifies as it is stored.
+/// A node that does not hold it yet re-hashes it from the frame, finds
+/// another hash and answers `bad_message`, and the primary sends it again
+/// from the node's last ack after the retry delay, every time: that node
+/// stays at its last acknowledgement.
+#[tokio::test]
+async fn a_node_behind_an_entry_that_no_longer_verifies_is_sent_it_again() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    let (seq, hash) = append_stale_entry(&server).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let mut sent = frames.last().unwrap().clone();
+    for round in 0..2 {
+        assert_eq!(sent["body"]["from_seq"], 1, "{sent}");
+        let entries = sent["body"]["entries"].as_array().unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry["seq"] == seq)
+            .expect("the entry is sent, not withheld");
+        assert_eq!(entry["hash"], hash.as_str(), "{entry}");
+        assert_eq!(
+            entry["payload"]["x"].as_f64(),
+            Some("1548.2162860866163".parse::<f64>().unwrap())
+        );
+        let mut unhashed = entry.as_object().unwrap().clone();
+        unhashed.remove("hash");
+        let canonical = quoro_proto::jcs::canonicalize(&Value::Object(unhashed)).unwrap();
+        assert_ne!(
+            sha256_hex(canonical.as_bytes()),
+            hash,
+            "a node finds another hash"
+        );
+
+        let error = NodeMessage::Error(ProtocolError {
+            code: ErrorCode::BadMessage,
+            message: format!("log_entries does not verify: seq {seq} does not hash to its hash"),
+            fatal: false,
+            term: None,
+        })
+        .to_frame(&format!("msg_refusal{round:019}"), sent["id"].as_str())
+        .to_text();
+        let refused_at = Instant::now();
+        send_text(&mut socket, error).await;
+        let again = recv_type(&mut socket, "log_entries").await;
+        assert!(refused_at.elapsed() >= Duration::from_millis(2_900));
+        assert_ne!(again["id"], sent["id"]);
+        sent = again;
+    }
 }
 
 #[tokio::test]
