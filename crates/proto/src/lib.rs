@@ -113,6 +113,10 @@ pub enum ErrorCode {
     /// the primary bound to the machine (non-fatal, section 7.2). The session
     /// goes on; the primary makes no seal to the new key.
     CustodyKeyChanged,
+    /// From M5b: a `switchover_freeze` could not ship its final snapshot, or
+    /// the target refused it; the node resumed the VM (non-fatal, carried in
+    /// a `command_result`, section 6.13).
+    ReplicationFailed,
 }
 
 /// The `data.reason` enum of the `node.fenced` event (section 8.5,
@@ -183,6 +187,11 @@ pub struct CommandResult {
     /// Samples answering `command` kind `metrics_query` (section 5.17).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<metrics::MetricsReport>,
+    /// From M5b: present only in an `ok` answer to `command` kind
+    /// `switchover_freeze`: the final snapshot the target confirmed (section
+    /// 5.17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_seq: Option<u64>,
 }
 
 /// The `error` object of a `command_result` (section 5.9).

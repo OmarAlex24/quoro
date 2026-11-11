@@ -1247,6 +1247,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 }),
                 lines: None,
                 metrics: None,
+                snapshot_seq: None,
             };
         }
         let running: Vec<&str> = lease_ids
@@ -1291,6 +1292,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                         error: None,
                         lines: None,
                         metrics: None,
+                        snapshot_seq: None,
                     }
                 } else {
                     CommandResult {
@@ -1309,6 +1311,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                         error: None,
                         lines: None,
                         metrics: None,
+                        snapshot_seq: None,
                     }
                 }
             }
@@ -1386,6 +1389,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 error: None,
                 lines: None,
                 metrics: None,
+                snapshot_seq: None,
             };
             self.answered.insert(envelope.id, result.clone());
             let _ = reply.send(Ok(result));
@@ -1417,6 +1421,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     error: None,
                     lines: None,
                     metrics: None,
+                    snapshot_seq: None,
                 };
                 self.answered.insert(envelope.id, result.clone());
                 let _ = reply.send(Ok(result));
@@ -1527,6 +1532,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     error: None,
                     lines: None,
                     metrics: None,
+                    snapshot_seq: None,
                 }));
             }
             return;
@@ -1946,6 +1952,7 @@ fn not_fenced(detail: &str) -> CommandResult {
         error: None,
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     }
 }
 
@@ -2035,6 +2042,7 @@ fn revoke_result(lease_id: &LeaseId, outcome: &FenceOutcome) -> CommandResult {
             error: None,
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         };
     }
     let (_, failed) = fence_failures(outcome);
@@ -2048,6 +2056,7 @@ fn revoke_result(lease_id: &LeaseId, outcome: &FenceOutcome) -> CommandResult {
         }),
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     }
 }
 

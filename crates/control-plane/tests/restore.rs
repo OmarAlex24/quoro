@@ -436,6 +436,7 @@ fn ok_result() -> NodeMessage {
         error: None,
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     })
 }
 
@@ -1847,6 +1848,7 @@ async fn fail_fence(setup: &mut Setup, moving: &Moving) {
             }),
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         }),
         Some(&moving.revoke_id),
     )
@@ -1986,6 +1988,7 @@ async fn a_fence_that_fails_again_after_an_acknowledgement_needs_a_new_one() {
             }),
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         }),
         Some(revoke["id"].as_str().unwrap()),
     )

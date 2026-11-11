@@ -232,6 +232,7 @@ fn ok_result() -> NodeMessage {
         error: None,
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     })
 }
 
@@ -245,6 +246,7 @@ fn fence_failed_result() -> NodeMessage {
         }),
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     })
 }
 

@@ -246,6 +246,7 @@ fn ok_result() -> NodeMessage {
         error: None,
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     })
 }
 
@@ -862,6 +863,7 @@ async fn a_new_volume_is_refused_while_a_failed_fence_is_unrecorded() {
             }),
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         }),
         Some(&revoke_id),
     )
