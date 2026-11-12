@@ -31,12 +31,13 @@ use crate::identity::IdentityHandle;
 use crate::ingress::{CertificateEvents, DnsBridge, IngressSupervisor};
 use crate::interactive::Interactive;
 use crate::lease::{FenceTimers, HostClock, LeaseConfig, SystemHostClock};
-use crate::mesh::{MeshKey, MeshManager, PlatformMeshDriver};
+use crate::mesh::{MeshDriver, MeshKey, MeshManager, PlatformMeshDriver};
 use crate::metrics::{MetricsRing, MetricsSampler};
 use crate::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
 use crate::session::{Session, SessionSetup, wait_stop};
 use crate::store::NodeStore;
 use crate::transcript::{self, TranscriptLimits};
+use crate::vote_listener::{VoteListener, VoteListenerOptions};
 use crate::warm::receiver::{ReceiverOptions, WarmReceiver};
 use crate::warm::sender::{SenderOptions, WarmSender};
 use crate::warm::{StatusBoard, VolumeLocks};
@@ -62,6 +63,23 @@ pub async fn run<E: Engine + 'static>(
     config: AgentConfig,
     engine: E,
     facts: NodeFacts,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), AgentError> {
+    run_with_mesh(config, engine, facts, PlatformMeshDriver::new(), shutdown).await
+}
+
+/// [`run`], with `mesh_driver` applying the mesh instead of this platform's
+/// driver. Tests pass a recording driver, so that the agent neither needs nor
+/// touches the host's WireGuard and nftables.
+///
+/// # Errors
+///
+/// As [`run`].
+pub async fn run_with_mesh<E: Engine + 'static, D: MeshDriver + 'static>(
+    config: AgentConfig,
+    engine: E,
+    facts: NodeFacts,
+    mesh_driver: D,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), AgentError> {
     let identity = IdentityHandle::load(&config.data_dir)?;
@@ -134,6 +152,23 @@ pub async fn run<E: Engine + 'static>(
     let node_id = identity.get().node_id;
     let cluster_id = identity.get().cluster_id;
     let (desired, desired_rx) = watch::channel(current.clone());
+    let mesh_public_key = mesh_key.public_key_base64();
+    let mesh_manager = MeshManager::new(mesh_driver, mesh_key);
+    // The vote listener (section 8.9) belongs to the process, not to a
+    // session: it answers with no session up, while a promotion freezes the
+    // agent, and on a witness-only machine. It follows the same verified
+    // desired state as the other loops, listens only while the mesh firewall
+    // for its address is loaded, and starts after the stored support was
+    // brought onto this boot above.
+    let vote_listener = VoteListener::new(
+        store.clone(),
+        node_id.clone(),
+        cluster_id.clone(),
+        Arc::clone(&host_clock),
+        desired.subscribe(),
+        mesh_manager.firewall(),
+        VoteListenerOptions::default(),
+    );
 
     // Section 8.3: `local` leases are held on this node alone, so they survive
     // a lost session. `expiring` leases renew through the session and fence
@@ -259,17 +294,14 @@ pub async fn run<E: Engine + 'static>(
     let reconcile_task =
         tokio::spawn(reconciler.run(desired_rx.clone(), wait_stop(stop_rx.clone())));
     let build_task = tokio::spawn(manager.run(desired_rx, wait_stop(stop_rx.clone())));
-    let mesh_public_key = mesh_key.public_key_base64();
-    let mesh_task = tokio::spawn(
-        MeshManager::new(PlatformMeshDriver::new(), mesh_key)
-            .run(desired.subscribe(), wait_stop(stop_rx.clone())),
-    );
+    let mesh_task = tokio::spawn(mesh_manager.run(desired.subscribe(), wait_stop(stop_rx.clone())));
     let edge_task =
         tokio::spawn(Arc::clone(&edge).run(desired.subscribe(), wait_stop(stop_rx.clone())));
     let backup_task =
         tokio::spawn(backup_manager.run(desired.subscribe(), wait_stop(stop_rx.clone())));
     let warm_task = tokio::spawn(warm_receiver.run(wait_stop(stop_rx.clone())));
     let warm_sender_task = tokio::spawn(warm_sender.run(wait_stop(stop_rx.clone())));
+    let vote_task = tokio::spawn(vote_listener.run(wait_stop(stop_rx.clone())));
 
     // Terminal transcripts are pruned at agent start and then hourly; each
     // terminal session also prunes once it ends (section 3.3).
@@ -335,6 +367,7 @@ pub async fn run<E: Engine + 'static>(
     let _ = backup_task.await;
     let _ = warm_task.await;
     let _ = warm_sender_task.await;
+    let _ = vote_task.await;
     ingress.shutdown().await;
     shutdown_task.abort();
     outcome

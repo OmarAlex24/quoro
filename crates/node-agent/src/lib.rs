@@ -35,6 +35,7 @@ pub mod tls;
 pub mod transcript;
 mod util;
 pub mod vote;
+pub mod vote_listener;
 pub mod warm;
 
 use std::fmt;
@@ -42,7 +43,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub use agent::run;
+pub use agent::{run, run_with_mesh};
 pub use backup::S3Repository;
 pub use backup::manager::BackupManager;
 pub use build::manager::{BuildManager, BuildsHandle};

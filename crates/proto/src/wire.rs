@@ -1594,6 +1594,87 @@ pub struct SupportGrant {
 /// The floor of `support_request.support_ms` (sections 5.27 and 8.8).
 pub const MIN_SUPPORT_MS: u64 = 3_000;
 
+/// The path of a promotion vote on a voter's vote listener (section 8.9).
+pub const VOTE_PATH: &str = "/v1/vote";
+
+/// Body of `POST /v1/vote` (section 8.9): a candidate asks a voter for term
+/// `T` over the mesh (ADR 0182).
+///
+/// Unknown fields are ignored, as in every other body of the protocol
+/// (section 3.4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteRequest {
+    /// The cluster.
+    pub cluster_id: String,
+    /// The term asked for, `T`.
+    pub term: u64,
+    /// The candidate: the node whose mesh address sent the request.
+    pub candidate_node_id: String,
+    /// The voter-set version the candidate counts against (section 8.10).
+    pub voters_version: u64,
+    /// `true`: answer as for a real vote and change nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<bool>,
+}
+
+impl VoteRequest {
+    /// Whether the request only checks, and changes nothing.
+    #[must_use]
+    pub fn is_check(&self) -> bool {
+        self.check == Some(true)
+    }
+}
+
+/// `vote` of a [`VoteAnswer`] (section 8.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoteOutcome {
+    Granted,
+    Refused,
+}
+
+/// `reason` of a refused [`VoteAnswer`] (section 8.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoteRefusal {
+    /// The term asked for is not above the voter's term, and the voter did
+    /// not already grant that term to this candidate.
+    StaleTerm,
+    /// The voter's promise to the primary it supports has not run out.
+    SupportHeld,
+    /// The request's `voters_version` differs from the voter's.
+    VotersChanged,
+    /// Another cluster, a source that is not a voter with the `node` role,
+    /// a `candidate_node_id` that is not the node the request comes from, or
+    /// a caller on the voter's own host whose socket is not root's.
+    NotAllowed,
+}
+
+/// The `200` answer to `POST /v1/vote` (section 8.9).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteAnswer {
+    /// The voter.
+    pub node_id: String,
+    /// The voter's current term after this request.
+    pub term: u64,
+    /// `granted` or `refused`; with `check`, what a real vote would answer.
+    pub vote: VoteOutcome,
+    /// With `refused`: why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<VoteRefusal>,
+    /// With `support_held`: time until the promise runs out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    /// With `granted`: `max(0, lease horizon - now)` on the voter's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_wait_ms: Option<u64>,
+    /// The voter's voter-set version.
+    pub voters_version: u64,
+    /// With `voters_changed`: the node ids of the voter's voter set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voters: Option<Vec<String>>,
+}
+
 /// A control-plane-to-node message with a typed body.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ControlMessage {
@@ -2149,6 +2230,77 @@ mod tests {
         let voter: SpecVoter =
             serde_json::from_value(json!({"node_id": "nod_1", "roles": ["witness"]})).unwrap();
         assert_eq!(voter.mesh_address, None);
+    }
+
+    /// Section 8.9: the answer of the section's example reads and writes
+    /// back byte for byte, with no absent optional field written.
+    #[test]
+    fn a_vote_answer_round_trips_the_section_example() {
+        let example = json!({
+            "node_id": "nod_01JCA0A1B2C3D4E5F6G7H8J9KM",
+            "term": 2,
+            "vote": "granted",
+            "lease_wait_ms": 16480,
+            "voters_version": 3120
+        });
+        let answer: VoteAnswer = serde_json::from_value(example.clone()).unwrap();
+        assert_eq!(answer.vote, VoteOutcome::Granted);
+        assert_eq!(answer.lease_wait_ms, Some(16_480));
+        assert_eq!(
+            (answer.reason, answer.retry_after_ms, answer.voters.as_ref()),
+            (None, None, None)
+        );
+        assert_eq!(serde_json::to_value(&answer).unwrap(), example);
+
+        let refused = json!({
+            "node_id": "nod_1",
+            "term": 4,
+            "vote": "refused",
+            "reason": "voters_changed",
+            "voters_version": 3121,
+            "voters": ["nod_1", "nod_2", "nod_3"]
+        });
+        let answer: VoteAnswer = serde_json::from_value(refused.clone()).unwrap();
+        assert_eq!(answer.reason, Some(VoteRefusal::VotersChanged));
+        assert_eq!(serde_json::to_value(&answer).unwrap(), refused);
+        for (reason, text) in [
+            (VoteRefusal::StaleTerm, "stale_term"),
+            (VoteRefusal::SupportHeld, "support_held"),
+            (VoteRefusal::VotersChanged, "voters_changed"),
+            (VoteRefusal::NotAllowed, "not_allowed"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(text));
+        }
+    }
+
+    /// Section 8.9: a request without `check` writes none, `check` reads
+    /// back, and an unknown field is ignored (section 3.4).
+    #[test]
+    fn a_vote_request_round_trips_and_ignores_unknown_fields() {
+        let real = json!({
+            "cluster_id": "cls_1",
+            "term": 2,
+            "candidate_node_id": "nod_01JC9Z0000000000000000000Q",
+            "voters_version": 3120
+        });
+        let request: VoteRequest = serde_json::from_value(real.clone()).unwrap();
+        assert!(!request.is_check());
+        assert_eq!(serde_json::to_value(&request).unwrap(), real);
+
+        let mut checked = real.clone();
+        checked["check"] = json!(true);
+        let request: VoteRequest = serde_json::from_value(checked.clone()).unwrap();
+        assert!(request.is_check());
+        assert_eq!(serde_json::to_value(&request).unwrap(), checked);
+
+        let mut newer = real.clone();
+        newer["reason_for_promotion"] = json!("a later field");
+        let request: VoteRequest = serde_json::from_value(newer).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), real);
+
+        let mut missing = real;
+        missing.as_object_mut().unwrap().remove("voters_version");
+        assert!(serde_json::from_value::<VoteRequest>(missing).is_err());
     }
 
     /// Sections 5.3 and 5.11: `status_report.quarantines` and

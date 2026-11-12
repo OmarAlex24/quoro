@@ -978,7 +978,9 @@ impl NodeStore {
     }
 
     /// Reads a voter's term, vote and support, lets `decide` choose what to
-    /// write, and writes it, in one transaction (sections 8.8 and 8.9).
+    /// write, and writes it, in one transaction (sections 8.8 and 8.9): the
+    /// highest term, the support of a `support_grant` and the vote of a
+    /// granted promotion vote.
     ///
     /// The transaction starts with `BEGIN IMMEDIATE`, so it holds SQLite's
     /// write lock from its first read: a vote written by another task either
@@ -1030,6 +1032,19 @@ impl NodeStore {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             )
             .bind(SUPPORT)
+            .bind(text)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        }
+        if let Some(vote) = &write.vote {
+            let text = serde_json::to_string(vote)
+                .map_err(|e| AgentError::Store(format!("could not encode the vote: {e}")))?;
+            sqlx::query(
+                "INSERT INTO node_meta (key, value) VALUES (?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(VOTE)
             .bind(text)
             .execute(&mut *tx)
             .await
