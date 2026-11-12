@@ -671,8 +671,8 @@ pub struct ListenerLink {
 impl ListenerLink {
     /// A link that follows `firewall` with no manager behind it, for tests
     /// that drive the listener alone. The receiver reads what the listener
-    /// reports.
-    #[cfg(test)]
+    /// reports. Only the vote listener's tests use it, and they run on Linux.
+    #[cfg(all(test, target_os = "linux"))]
     #[must_use]
     pub(crate) fn detached(
         firewall: watch::Receiver<Option<SocketAddr>>,
