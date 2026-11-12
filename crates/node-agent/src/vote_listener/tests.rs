@@ -550,6 +550,7 @@ async fn the_listener_listens_only_while_votes_are_open() {
     let reply = parse_reply(&raw).expect("an answer");
     assert_eq!(reply.status, 503, "{reply:?}");
     assert_error_body(&reply);
+    assert_eq!(reply.body["error"], "votes are not open", "{reply:?}");
     assert_eq!(h.store.vote().await.unwrap(), None, "no vote taken");
     assert_eq!(h.store.highest_term().await.unwrap(), None);
 

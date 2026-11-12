@@ -568,9 +568,10 @@ impl Inner {
                     &vote,
                     &self.node_id,
                     &self.cluster_id,
-                    // Read again inside the transaction: a state that
-                    // closed votes since the check above serves none.
-                    || self.votes().filter(SpecVotes::open),
+                    // Read again inside the transaction, which answers a
+                    // state that closed votes since the check above with
+                    // `503` and decides nothing ([`answer_vote`]).
+                    || self.votes(),
                     source,
                     &received,
                 )
