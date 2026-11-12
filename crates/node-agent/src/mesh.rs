@@ -774,8 +774,9 @@ impl<D: MeshDriver> MeshManager<D> {
     /// A failed apply is retried without waiting for a snapshot or the
     /// period: after [`RETRY_FIRST`], then after twice the last wait, up to
     /// [`REAPPLY`] ([`retry_delay`]). A successful apply resets the wait. An
-    /// apply whose firewall does not load leaves WireGuard with no peers, so
-    /// the retry is what brings the peers back within seconds. A machine
+    /// apply that fails before its firewall loads, in the link step or in the
+    /// firewall itself, leaves WireGuard with no peers, so the retry is what
+    /// brings the peers back within seconds. A machine
     /// without `nft` installed keeps an empty mesh and retries; the failure is
     /// logged at `error` at most once per [`REAPPLY`], with how many were held
     /// back since, and at `debug` otherwise. A snapshot without a mesh ends
@@ -1084,17 +1085,10 @@ mod linux {
         votes: Option<&SpecVotes>,
         previous: Option<&SpecMesh>,
     ) -> Result<(), String> {
-        let ip = find_tool("ip", "iproute2")?;
-        let own = parse_cidr(&mesh.address)
-            .ok_or_else(|| format!("mesh address {:?} is not an IPv4 CIDR", mesh.address))?;
-        let IpAddr::V4(own_address) = own.0 else {
-            return Err(format!("mesh address {:?} is not IPv4", mesh.address));
-        };
         let mut steps = HostSteps {
             key,
-            ip,
-            own_address,
-            own_prefix: own.1,
+            address: &mesh.address,
+            link: None,
         };
         apply_steps(&mut steps, mesh, votes, previous).await
     }
@@ -1102,7 +1096,9 @@ mod linux {
     /// The steps of one apply, in the order [`apply_steps`] runs them.
     trait ApplySteps {
         /// Creates the link if it is missing, sets its address and brings it
-        /// up.
+        /// up. Every check an apply makes before the ruleset belongs to this
+        /// step, so a missing `ip` or a mesh address that is not IPv4 fails
+        /// here.
         fn link(&mut self) -> impl Future<Output = Result<(), String>> + Send;
         /// Loads `ruleset` with `nft -f -`.
         fn ruleset(&mut self, ruleset: &str) -> impl Future<Output = Result<(), String>> + Send;
@@ -1127,24 +1123,35 @@ mod linux {
     /// loads the WireGuard module that the generic netlink family needs, and
     /// a failed ruleset still needs the device to remove peers from.
     ///
-    /// When the ruleset does not load, WireGuard is configured with no peers,
-    /// which also removes every peer an earlier apply set, and the ruleset's
-    /// error is returned, with the removal's error after it if that failed
-    /// too.
+    /// Every failure before the ruleset loads, of the link step or of the
+    /// ruleset itself, leaves WireGuard with no peers (section 6.9): it is
+    /// configured with none, which also removes every peer an earlier apply
+    /// set, and the failed step's error is returned, with the removal's error
+    /// after it if that failed too. After a failed link step the device may
+    /// not exist, and then it has no peers to remove: a removal that finds no
+    /// such device ([`no_such_device`]) adds nothing to the link's error.
     async fn apply_steps<S: ApplySteps>(
         steps: &mut S,
         mesh: &SpecMesh,
         votes: Option<&SpecVotes>,
         previous: Option<&SpecMesh>,
     ) -> Result<(), String> {
-        steps.link().await?;
-        if let Err(error) = steps.ruleset(&nft_ruleset(Some(mesh), votes)).await {
+        // The error of the step that failed, and whether it was the link.
+        let loaded = match steps.link().await {
+            Ok(()) => steps
+                .ruleset(&nft_ruleset(Some(mesh), votes))
+                .await
+                .map_err(|error| (error, false)),
+            Err(error) => Err((error, true)),
+        };
+        if let Err((error, link_failed)) = loaded {
             let no_peers = SpecMesh {
                 peers: Vec::new(),
                 ..mesh.clone()
             };
             return Err(match steps.wireguard(&no_peers, None).await {
                 Ok(()) => error,
+                Err(cleared) if link_failed && no_such_device(&cleared) => error,
                 Err(cleared) => format!("{error}; could not remove the mesh peers: {cleared}"),
             });
         }
@@ -1152,9 +1159,24 @@ mod linux {
         steps.routes(mesh).await
     }
 
+    /// Whether `error`, from [`set_wireguard`], says the WireGuard device
+    /// does not exist: the kernel's `ENODEV`, which the error ends with as
+    /// `(os error 19)`.
+    fn no_such_device(error: &str) -> bool {
+        error.ends_with("(os error 19)")
+    }
+
     /// The steps on this host, with its `ip`, `nft` and generic netlink.
     struct HostSteps<'a> {
         key: &'a MeshKey,
+        /// `spec.mesh.address`, which the link step parses.
+        address: &'a str,
+        /// What the link step resolved, for the routes.
+        link: Option<HostLink>,
+    }
+
+    /// The host's `ip` and the mesh address with its prefix length.
+    struct HostLink {
         ip: PathBuf,
         own_address: Ipv4Addr,
         own_prefix: u8,
@@ -1162,16 +1184,26 @@ mod linux {
 
     impl ApplySteps for HostSteps<'_> {
         async fn link(&mut self) -> Result<(), String> {
-            let ip = &self.ip;
+            let ip = find_tool("ip", "iproute2")?;
+            let (own, own_prefix) = parse_cidr(self.address)
+                .ok_or_else(|| format!("mesh address {:?} is not an IPv4 CIDR", self.address))?;
+            let IpAddr::V4(own_address) = own else {
+                return Err(format!("mesh address {:?} is not IPv4", self.address));
+            };
             // Creating the link loads the WireGuard module, so it must happen
             // before the generic netlink family is resolved.
             if !Path::new("/sys/class/net").join(INTERFACE).exists() {
-                run(ip, &["link", "add", "dev", INTERFACE, "type", "wireguard"]).await?;
+                run(&ip, &["link", "add", "dev", INTERFACE, "type", "wireguard"]).await?;
             }
-            let address = format!("{}/{}", self.own_address, self.own_prefix);
-            run(ip, &["address", "replace", &address, "dev", INTERFACE]).await?;
-            remove_other_addresses(ip, self.own_address, self.own_prefix).await?;
-            run(ip, &["link", "set", "dev", INTERFACE, "up"]).await?;
+            let cidr = format!("{own_address}/{own_prefix}");
+            run(&ip, &["address", "replace", &cidr, "dev", INTERFACE]).await?;
+            remove_other_addresses(&ip, own_address, own_prefix).await?;
+            run(&ip, &["link", "set", "dev", INTERFACE, "up"]).await?;
+            self.link = Some(HostLink {
+                ip,
+                own_address,
+                own_prefix,
+            });
             Ok(())
         }
 
@@ -1192,12 +1224,15 @@ mod linux {
         }
 
         async fn routes(&mut self, mesh: &SpecMesh) -> Result<(), String> {
+            let Some(link) = &self.link else {
+                return Err("the mesh routes need the link step first".to_owned());
+            };
             let desired = desired_routes(mesh);
             for cidr in &desired {
-                run(&self.ip, &["route", "replace", cidr, "dev", INTERFACE]).await?;
+                run(&link.ip, &["route", "replace", cidr, "dev", INTERFACE]).await?;
             }
-            let own = (IpAddr::V4(self.own_address), self.own_prefix);
-            remove_other_routes(&self.ip, &desired, own).await
+            let own = (IpAddr::V4(link.own_address), link.own_prefix);
+            remove_other_routes(&link.ip, &desired, own).await
         }
     }
 
@@ -1781,6 +1816,9 @@ mod linux {
             fail_link: bool,
             fail_ruleset: bool,
             fail_wireguard: bool,
+            /// WireGuard fails as the kernel answers when the device does
+            /// not exist.
+            no_device: bool,
             fail_delete_link: bool,
             /// The peers the device has after the steps so far.
             peers: usize,
@@ -1822,6 +1860,12 @@ mod linux {
                 }
                 self.ran
                     .push(Step::Wireguard(mesh.peers.len(), previous.is_some()));
+                if self.no_device {
+                    // The text `set_wireguard` returns for `ENODEV`.
+                    return Err("the kernel refused the WireGuard query: \
+                                No such device (os error 19)"
+                        .to_owned());
+                }
                 outcome(self.fail_wireguard, "WireGuard")?;
                 self.peers = mesh.peers.len();
                 Ok(())
@@ -1943,6 +1987,94 @@ mod linux {
                 "nft failed; could not remove the mesh peers: WireGuard failed"
             );
             assert_eq!(steps.ran.last(), Some(&Step::Wireguard(0, false)));
+        }
+
+        /// A link step that fails leaves WireGuard with no peers too, which
+        /// removes those an earlier apply set, and the apply returns the
+        /// link's error. No ruleset is loaded and no route is set.
+        #[tokio::test]
+        async fn a_failed_link_leaves_wireguard_with_no_peers() {
+            let mesh = two_peer_mesh();
+            let mut steps = FakeSteps {
+                fail_link: true,
+                peers: 2,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, Some(&mesh))
+                .await
+                .unwrap_err();
+            assert_eq!(error, "the link failed");
+            assert_eq!(steps.ran, vec![Step::Link, Step::Wireguard(0, false)]);
+            assert_eq!(steps.peers, 0);
+
+            // When removing the peers fails too, both errors are returned,
+            // the link's first.
+            let mut steps = FakeSteps {
+                fail_link: true,
+                fail_wireguard: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "the link failed; could not remove the mesh peers: WireGuard failed"
+            );
+            assert_eq!(steps.ran, vec![Step::Link, Step::Wireguard(0, false)]);
+        }
+
+        /// After a failed link step the device may not exist, and then it has
+        /// no peers: a removal that finds no such device returns the link's
+        /// error alone. Only there: after a failed ruleset, and in the apply's
+        /// own WireGuard step, a missing device is an error like any other.
+        #[tokio::test]
+        async fn a_missing_device_is_ignored_only_when_clearing_after_a_failed_link() {
+            let mesh = two_peer_mesh();
+            let mut steps = FakeSteps {
+                fail_link: true,
+                no_device: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error, "the link failed");
+            assert_eq!(steps.ran, vec![Step::Link, Step::Wireguard(0, false)]);
+
+            let mut steps = FakeSteps {
+                fail_ruleset: true,
+                no_device: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "nft failed; could not remove the mesh peers: the kernel refused the \
+                 WireGuard query: No such device (os error 19)"
+            );
+
+            let mut steps = FakeSteps {
+                no_device: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "the kernel refused the WireGuard query: No such device (os error 19)"
+            );
+            assert_eq!(
+                steps.ran,
+                vec![
+                    Step::Link,
+                    Step::Ruleset(nft_ruleset(Some(&mesh), None)),
+                    Step::Wireguard(2, false),
+                ]
+            );
         }
 
         /// A ruleset that does not load leaves the device with no peers, and
@@ -2157,21 +2289,6 @@ mod linux {
             let error = remove_steps(&mut steps).await.unwrap_err();
             assert_eq!(error, "ip link del failed");
             assert_eq!(steps.ran, vec![Step::DeleteLink]);
-        }
-
-        /// A link that cannot be set up stops the apply before the ruleset
-        /// and before any peer.
-        #[tokio::test]
-        async fn a_failed_link_configures_nothing_else() {
-            let mut steps = FakeSteps {
-                fail_link: true,
-                ..FakeSteps::default()
-            };
-            let error = apply_steps(&mut steps, &two_peer_mesh(), None, None)
-                .await
-                .unwrap_err();
-            assert_eq!(error, "the link failed");
-            assert_eq!(steps.ran, vec![Step::Link]);
         }
     }
 }
