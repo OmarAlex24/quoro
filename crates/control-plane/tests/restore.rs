@@ -2205,6 +2205,142 @@ async fn a_lease_of_a_node_declared_lost_through_the_api_waits_for_its_gate() {
     ready_grants(&mut setup, &moving, moving.old_token).await;
 }
 
+/// R, then the old holder's renewal answered from R (section 8.4, "From R
+/// until the holder has taken the grant"): the row reads `local` with the
+/// mark, and the holder's gate is open, counted at the stored 9 s. The
+/// restore revokes the row, the holder is cut off and declared lost while
+/// that gate is open. The row reads `local`, so the declaration releases it
+/// whatever its gate; the restore enforces the gate itself, and the target's
+/// `ready` reports move nothing until it has passed. Then the volume turns
+/// `ready` and the row names the target at the next token, its grant held
+/// on the lost holder (section 8.4, "Grants of a marked row").
+#[tokio::test]
+async fn a_lost_holders_row_r_wrote_is_restored_only_once_its_gate_passed() {
+    let mut setup = setup().await;
+    set_warm(&setup).await;
+    setup
+        .state
+        .server
+        .state
+        .hub
+        .set_voter_support(Arc::new(EverySupport));
+    let backup_id = run_backup(&mut setup, &vec![21; 64 * 1024]).await;
+    let (lease_id, old_token): (String, i64) = sqlx::query_as(
+        "SELECT id, fencing_token FROM leases WHERE resource_type = 'app' AND resource_id = ?",
+    )
+    .bind(&setup.state.app_id)
+    .fetch_one(setup.state.server.state.store.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 9000 WHERE id = ?")
+        .bind(&lease_id)
+        .execute(setup.state.server.state.store.pool())
+        .await
+        .unwrap();
+    let res = setup
+        .state
+        .owner
+        .patch(
+            setup
+                .state
+                .server
+                .url(&format!("/api/v1/apps/{}", setup.state.app_id)),
+        )
+        .json(&json!({ "ha_policy": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+
+    let renewal = format!("msg_{}", ulid_like());
+    let text = NodeMessage::LeaseRenew(LeaseRenew {
+        lease_id: LeaseId(lease_id.clone()),
+        fencing_token: u64::try_from(old_token).unwrap(),
+    })
+    .to_frame(&renewal, None)
+    .to_text();
+    setup
+        .state
+        .socket
+        .send(WsMessage::Text(text.into()))
+        .await
+        .unwrap();
+    let answer = recv_type(&mut setup.state.socket, "lease_grant").await;
+    assert_eq!(answer["re"], renewal.as_str(), "{answer}");
+    assert_eq!(answer["body"]["duration_ms"], 9_000, "{answer}");
+    let gate = setup
+        .state
+        .server
+        .state
+        .hub
+        .authority()
+        .gate_remaining(&lease_id)
+        .expect("the answer from R opened the holder's gate");
+    let passes = tokio::time::Instant::now() + gate;
+    assert!(gate > Duration::from_secs(9), "{gate:?}");
+
+    let res = restore(
+        &setup.state.owner,
+        &setup.state.server,
+        &backup_id,
+        &setup.node_b.node_id,
+    )
+    .await;
+    assert_eq!(res.status(), 202, "restore: {}", res.text().await.unwrap());
+    let volume_id = res.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let revoke = recv_type(&mut setup.state.socket, "lease_revoke").await;
+    assert_eq!(revoke["body"]["lease_id"], lease_id.as_str());
+    let snapshot = desired_state_with_volume(&mut setup.socket_b, &volume_id).await;
+    let moving = Moving {
+        lease_id: lease_id.clone(),
+        old_token,
+        revoke_id: revoke["id"].as_str().unwrap().to_string(),
+        volume_id,
+        rev: snapshot["body"]["rev"].as_u64().unwrap(),
+    };
+    drop_old_session(&mut setup).await;
+    declare_old_node_lost(&setup).await;
+    let (mode, unsettled, revoked): (String, i64, Option<String>) =
+        sqlx::query_as("SELECT mode, unsettled, revoked_at FROM leases WHERE id = ?")
+            .bind(&lease_id)
+            .fetch_one(setup.state.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!((mode.as_str(), unsettled), ("local", 1), "the row R wrote");
+    assert!(revoked.is_some());
+
+    ready_waits(&mut setup, &moving).await;
+    assert!(
+        tokio::time::Instant::now() < passes - Duration::from_millis(500),
+        "the test ran too slowly"
+    );
+
+    tokio::time::sleep_until(passes).await;
+    send(&mut setup.socket_b, restored(&moving)).await;
+    wait_for_volume(
+        &setup.state.owner,
+        &setup.state.server,
+        &mut setup.socket_b,
+        &moving.volume_id,
+        "ready",
+    )
+    .await;
+    let (holder, token, unsettled, revoked): (String, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT holder_node_id, fencing_token, unsettled, revoked_at FROM leases WHERE id = ?",
+    )
+    .bind(&lease_id)
+    .fetch_one(setup.state.server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (holder.as_str(), token, unsettled, revoked),
+        (setup.node_b.node_id.as_str(), old_token + 1, 1, None)
+    );
+}
+
 /// Makes the moving lease `expiring` for `D`, with its gate counted from now
 /// at 3 s, the test's shortcut for a gate that has run most of its course
 /// (section 8.4): it passes 5 s later, after 3 s and two margins of 1 s.

@@ -463,6 +463,12 @@ pub(crate) async fn held_while_away(
             }));
         }
     }
+    // A row that reads `local` is not held on its gate here, also one that R
+    // wrote while its holder still held the lease `expiring` (section 8.4,
+    // "Ending the renewals"), whose gate may still be open. That gate is
+    // enforced at the grant: the failover's change takes its new token from
+    // `leases::grant_app_lease`, which waits for the gate, and a held grant
+    // waits for it again at the send (`session::held`, `try_send_held`).
     if lease.mode == "expiring" && !authority.passed(&lease.id) {
         return Ok(Some(
             "the source is not connected and the lease's gate has not passed: the source may \

@@ -493,6 +493,12 @@ pub(crate) async fn is_released(
                 declaration_releases(lease, &lost_at, last_seen_at.as_deref())
             })
     });
+    // A row that reads `local` skips the gate here, also one that R wrote
+    // while its holder still held the lease `expiring` (section 8.4, "Ending
+    // the renewals"), whose gate may still be open. That gate is enforced
+    // further on, for every new token: `grant_app_lease` waits for it, the
+    // restore checks it again (`backups::restore::restore_ready`), and a held
+    // grant waits for it at the send (`session::held`, `try_send_held`).
     Ok(gone && (lease.mode == "local" || authority.passed(&lease.id)))
 }
 

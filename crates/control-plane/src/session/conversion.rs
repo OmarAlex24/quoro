@@ -1654,6 +1654,109 @@ pub(super) mod tests {
         f.done();
     }
 
+    /// "Settling a lease": a settling `ping` goes out while the policy is
+    /// `warm`, then R writes the row, and the policy is back on `warm` by
+    /// the `pong`. Every check of the `pong` passes again but one: the row's
+    /// newest write is R, not the write the answer read, so the `pong`
+    /// writes nothing and the row stays `local` with the mark.
+    #[tokio::test]
+    async fn r_between_a_settles_ping_and_its_pong_refuses_the_settle() {
+        let f = fixture("warm", "expiring", Some(D as i64), true).await;
+        let (mut session, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
+        let answer = renew(&mut session, "msg_r1", 3).await;
+        assert_answer(&answer, "msg_r1", 3, D);
+        let ping = ping_of(&answer);
+
+        let before_r = f.writes().await;
+        end_renewals(&f).await;
+        assert_eq!(f.writes().await, before_r + 1, "R wrote the row");
+        set_policy(&f, "warm").await;
+        let writes = f.writes().await;
+        pong(&mut session, &ping).await;
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.fencing_token, row.unsettled),
+            ("local", 3, true),
+            "the row's newest write changed since the answer: no settle"
+        );
+        assert_eq!(f.writes().await, writes);
+        f.done();
+    }
+
+    /// The double flip. R, then back on `warm` with a renewal whose answer
+    /// pings to settle, then off `warm` again before the `pong`. The second
+    /// policy change writes nothing, because the row already reads `local`
+    /// with the mark, so the row's newest write is still the one the `ping`
+    /// recorded. The `pong` is refused because the policy is off `warm`, and
+    /// the row stays `local` with the mark.
+    #[tokio::test]
+    async fn a_pong_after_the_policy_left_warm_again_settles_nothing() {
+        let f = fixture("warm", "expiring", Some(D as i64), false).await;
+        let (mut session, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
+        end_renewals(&f).await;
+        let off = renew(&mut session, "msg_r1", 3).await;
+        assert_answer(&off, "msg_r1", 3, D);
+        assert!(of_type(&off, "ping").is_empty(), "no settle off warm");
+
+        set_policy(&f, "warm").await;
+        let answer = renew(&mut session, "msg_r2", 3).await;
+        assert_answer(&answer, "msg_r2", 3, D);
+        let ping = ping_of(&answer);
+        let writes = f.writes().await;
+        end_renewals(&f).await;
+        assert_eq!(f.writes().await, writes, "the second R writes nothing");
+
+        pong(&mut session, &ping).await;
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.fencing_token, row.unsettled),
+            ("local", 3, true),
+            "off warm at the pong: no settle"
+        );
+        assert_eq!(f.writes().await, writes);
+        f.done();
+    }
+
+    /// A renewal whose conversion R ended, without majority support: no
+    /// answer and no write, and the conversion still ends ("Changing the
+    /// mode"). Once support returns, the next renewal is answered from R,
+    /// with no write either.
+    #[tokio::test]
+    async fn an_ended_conversions_renewal_without_support_gets_no_answer() {
+        let f = fixture("warm", "local", Some(30_000), false).await;
+        let (mut session, _) = f.session(Some(("held", LeaseMode::Local, 3))).await;
+        assert!(
+            f.state
+                .hub
+                .note_conversion_sent(&f.node_id, session.generation, LEASE, 3, 30_000)
+        );
+        end_renewals(&f).await;
+        let writes = f.writes().await;
+
+        f.state
+            .hub
+            .set_voter_support(Arc::new(crate::authority::NoVoterSupport));
+        let refused = renew(&mut session, "msg_r1", 3).await;
+        assert!(of_type(&refused, "lease_grant").is_empty(), "{refused:?}");
+        assert_eq!(f.writes().await, writes);
+        assert_eq!(f.state.hub.authority().gate_remaining(LEASE), None);
+        assert_eq!(
+            f.state
+                .hub
+                .conversion_in_flight(&f.node_id, session.generation, LEASE),
+            None,
+            "the policy change ended the conversion"
+        );
+
+        f.state.hub.set_voter_support(Arc::new(EverySupport));
+        let answer = renew(&mut session, "msg_r2", 3).await;
+        assert_answer(&answer, "msg_r2", 3, D);
+        assert_eq!(f.writes().await, writes);
+        let row = f.row().await;
+        assert_eq!((row.mode.as_str(), row.unsettled), ("local", true));
+        f.done();
+    }
+
     /// The unsafe direction while R waits. `failoverApp` finds the lease
     /// held while its holder is neither connected nor declared lost, for a
     /// marked row whatever its mode. A primary restart seeds the start gate

@@ -2251,3 +2251,44 @@ async fn leaving_warm_writes_r_in_the_policy_changes_transaction() {
     assert_eq!(view["local_pending"], true, "{view}");
     assert_eq!(view["unsettled"], true, "{view}");
 }
+
+/// #555, R from `hot`: `hot` is read as `warm` (section 8.4, as the lease
+/// code reads it), so an `updateApp` that takes a `hot` app's policy to
+/// `none` writes R in its transaction as from `warm`: the row reads
+/// `local` with the unsettled mark, at its token and with its
+/// `duration_ms` kept, in one change-log entry.
+#[tokio::test]
+async fn leaving_hot_writes_r_as_leaving_warm_does() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    set_policy(&server, &app_id, "hot").await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    let before = lease_entries(&server, &lease_id).await;
+
+    let res = owner
+        .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+        .json(&json!({ "ha_policy": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    assert_eq!(policy_of(&server, &app_id).await, "none");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 1, false)
+    );
+    assert_eq!(lease_entries(&server, &lease_id).await, before + 1);
+    let view = lease_view(&server, &owner, &app_id).await;
+    assert_eq!(view["local_pending"], true, "{view}");
+}
