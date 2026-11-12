@@ -198,13 +198,16 @@ impl VoteListener {
         let mut firewall = self.inner.firewall.clone();
         let mut tick = tokio::time::interval(self.inner.options.bind_retry);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut serving: Option<(SocketAddr, JoinHandle<()>)> = None;
+        let mut serving = Serving {
+            bound: Arc::clone(&self.inner.bound),
+            task: None,
+        };
         let mut failing: Option<BindFailure> = None;
         loop {
             let covered = *firewall.borrow_and_update();
             let wanted = listen_address(desired.borrow_and_update().as_ref())
                 .filter(|address| covered == Some(*address));
-            self.pass(wanted, &mut serving, &mut failing).await;
+            self.pass(wanted, &mut serving.task, &mut failing).await;
             tokio::select! {
                 () = &mut stop => break,
                 changed = desired.changed() => {
@@ -220,7 +223,7 @@ impl VoteListener {
                 _ = tick.tick() => {}
             }
         }
-        if let Some((_, task)) = serving {
+        if let Some((_, task)) = serving.task.take() {
             task.abort();
             let _ = task.await;
         }
@@ -446,6 +449,29 @@ struct BindFailure {
     since: Instant,
     /// The last failure logged at `warn`.
     warned: Instant,
+}
+
+/// The task serving the listening socket in [`VoteListener::run`], and its
+/// address. However `run` ends, a panic and an abort of its own task
+/// included, dropping this aborts the serving task and then reports no
+/// socket, so the mesh manager never waits for a report that cannot come
+/// ([`crate::mesh::ListenerLink`]). The abort is not synchronous: the socket
+/// closes when the runtime next drops the aborted task, shortly after the
+/// report. The normal end of `run` awaits the task first and leaves nothing
+/// here.
+struct Serving {
+    bound: Arc<watch::Sender<Option<SocketAddr>>>,
+    task: Option<(SocketAddr, JoinHandle<()>)>,
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        if let Some((_, task)) = self.task.take() {
+            task.abort();
+        }
+        self.bound
+            .send_if_modified(|current| current.take().is_some());
+    }
 }
 
 impl Inner {
@@ -837,6 +863,41 @@ fn error(status: StatusCode, text: &str) -> Response<Full<Bytes>> {
         status,
         &serde_json::json!({ "error": util::one_line(text, ERROR_CHARS) }),
     )
+}
+
+// Binds nothing, so it runs on every target.
+#[cfg(test)]
+mod serving_tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::{oneshot, watch};
+
+    use super::Serving;
+
+    /// Dropping the guard of a `run` that ended without closing its socket
+    /// reports no socket at once and aborts the serving task, which drops
+    /// what that task owns, its listening socket included.
+    #[tokio::test]
+    async fn dropping_the_guard_aborts_the_serving_task_and_reports_no_socket() {
+        let addr: SocketAddr = "127.0.0.1:51821".parse().unwrap();
+        let (bound, bound_rx) = watch::channel(Some(addr));
+        let (owned, dropped) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _owned = owned;
+            std::future::pending::<()>().await;
+        });
+        drop(Serving {
+            bound: Arc::new(bound),
+            task: Some((addr, task)),
+        });
+        assert_eq!(*bound_rx.borrow(), None);
+        let closed = tokio::time::timeout(Duration::from_secs(5), dropped)
+            .await
+            .expect("the aborted task is dropped");
+        assert!(closed.is_err(), "the task's sender is dropped, not used");
+    }
 }
 
 // The tests bind 127.0.0.x source addresses, which only Linux routes to the
