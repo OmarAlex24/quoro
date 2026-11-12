@@ -113,6 +113,7 @@ pub fn hello_body(node_id: &str) -> wire::Hello {
         dropped_events: 0,
         volume_snapshot: Some(wire::SnapshotMethod::Reflink),
         custody_public_key: None,
+        mesh_rules: None,
     }
 }
 

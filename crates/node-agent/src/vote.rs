@@ -692,8 +692,11 @@ pub async fn current_term(store: &NodeStore) -> Result<u64, AgentError> {
 /// once it committed. `spec.votes` is read once the transaction holds the
 /// write lock, so the vote is decided against the voter-set version that any
 /// `support_grant` written meanwhile carries (section 8.10 rule 4). A state
-/// that cannot be read or written, or no `spec.votes`, is
-/// [`VoteDecision::Unavailable`], never `granted`.
+/// that cannot be read or written, no `spec.votes`, or a `spec.votes` in
+/// which votes are not open ([`SpecVotes::open`], sections 6.12 and 8.9) is
+/// [`VoteDecision::Unavailable`], never `granted`, and writes nothing. The
+/// last is checked here, under the write lock, so a state that closed votes
+/// after the caller last looked decides no vote.
 pub async fn answer_vote(
     store: &NodeStore,
     request: &VoteRequest,
@@ -705,12 +708,18 @@ pub async fn answer_vote(
 ) -> VoteDecision {
     store
         .update_vote_state(|state| {
-            let Some(votes) = votes() else {
-                return (
-                    VoteDecision::Unavailable("this machine is not a voter".to_owned()),
+            let unavailable = |reason: &str| {
+                (
+                    VoteDecision::Unavailable(reason.to_owned()),
                     VoteWrite::default(),
-                );
+                )
             };
+            let Some(votes) = votes() else {
+                return unavailable("this machine is not a voter");
+            };
+            if !votes.open() {
+                return unavailable("votes closed before this vote was decided");
+            }
             decide_vote(state, request, node_id, cluster_id, &votes, peer, received)
         })
         .await
@@ -1350,6 +1359,7 @@ mod tests {
                 voter(ME, &["node"], B),
                 voter("nod_w", &["edge", "witness"], WITNESS),
             ],
+            listen: None,
         }
     }
 
@@ -1758,17 +1768,61 @@ mod tests {
         }
     }
 
-    async fn vote(store: &NodeStore, request: &VoteRequest, peer: &str) -> VoteDecision {
+    /// Answers `request` from `peer` under [`spec_votes`] with `listen` set
+    /// to `listen`.
+    async fn vote_listen(
+        store: &NodeStore,
+        request: &VoteRequest,
+        peer: &str,
+        listen: Option<bool>,
+    ) -> VoteDecision {
         answer_vote(
             store,
             request,
             ME,
             CLUSTER,
-            || Some(spec_votes()),
+            || {
+                Some(SpecVotes {
+                    listen,
+                    ..spec_votes()
+                })
+            },
             Some(ip(peer)),
             &at("boot-a", secs(500)),
         )
         .await
+    }
+
+    /// Answers `request` from `peer` while votes are open.
+    async fn vote(store: &NodeStore, request: &VoteRequest, peer: &str) -> VoteDecision {
+        vote_listen(store, request, peer, Some(true)).await
+    }
+
+    /// Sections 6.12 and 8.9: a `spec.votes` in which votes are not open,
+    /// read inside the transaction, decides no vote and writes nothing,
+    /// whatever the request; the same request is granted once votes are
+    /// open.
+    #[tokio::test]
+    async fn a_vote_while_votes_are_closed_is_unavailable_and_writes_nothing() {
+        let (_dir, store) = open().await;
+        store.raise_term(1).await.unwrap();
+        let request = vote_request(2, "nod_a");
+        for listen in [None, Some(false)] {
+            let decision = vote_listen(&store, &request, A, listen).await;
+            assert_eq!(
+                decision,
+                VoteDecision::Unavailable("votes closed before this vote was decided".to_owned()),
+                "listen {listen:?}"
+            );
+            assert_eq!(store.vote().await.unwrap(), None, "listen {listen:?}");
+            assert_eq!(
+                store.highest_term().await.unwrap(),
+                Some(1),
+                "listen {listen:?}"
+            );
+        }
+        let answer = answered(vote_listen(&store, &request, A, Some(true)).await);
+        assert_eq!((answer.vote, answer.term), (VoteOutcome::Granted, 2));
     }
 
     /// Sections 8.8 and 8.9: a granted vote is stored with its term before

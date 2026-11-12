@@ -2576,6 +2576,8 @@ impl Session {
             mesh_public_key: self.mesh_public_key.clone(),
             volume_snapshot: self.volume_snapshot,
             custody_public_key,
+            // This agent applies every rule of section 6.9 (section 5.1).
+            mesh_rules: Some(crate::mesh::MESH_RULES),
         }))
     }
 

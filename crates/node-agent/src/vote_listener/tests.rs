@@ -22,6 +22,7 @@ use super::{
     VoteListenerOptions, WarnLimit, connection_caller, listen_address, local_caller_uid,
 };
 use crate::lease::{HostClock, ManualHostClock};
+use crate::mesh::ListenerLink;
 use crate::reconcile::Snapshot;
 use crate::store::NodeStore;
 use crate::util;
@@ -69,6 +70,15 @@ fn spec_votes(port: u16) -> SpecVotes {
             voter("nod_a", &["node"], NODE_A),
             voter("nod_w", &["witness"], WITNESS),
         ],
+        listen: Some(true),
+    }
+}
+
+/// [`spec_votes`] with `listen` set to `listen`.
+fn spec_votes_listen(port: u16, listen: Option<bool>) -> SpecVotes {
+    SpecVotes {
+        listen,
+        ..spec_votes(port)
     }
 }
 
@@ -99,6 +109,8 @@ struct Harness {
     /// What the mesh manager would publish: the listener address its loaded
     /// firewall covers.
     firewall: watch::Sender<Option<SocketAddr>>,
+    /// What the listener reports it holds ([`ListenerLink::bound`]).
+    bound: watch::Receiver<Option<SocketAddr>>,
     listener: VoteListener,
     task: JoinHandle<()>,
     _stop: tokio::sync::oneshot::Sender<()>,
@@ -122,13 +134,14 @@ impl Harness {
         ));
         let (desired, desired_rx) = watch::channel(snapshot(Some(spec_votes(port))));
         let (firewall, firewall_rx) = watch::channel(Some(own(port)));
+        let (link, bound) = ListenerLink::detached(firewall_rx);
         let listener = VoteListener::new(
             store.clone(),
             ME.to_owned(),
             CLUSTER.to_owned(),
             clock,
             desired_rx,
-            firewall_rx,
+            link,
             options,
         );
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -140,6 +153,7 @@ impl Harness {
             store,
             desired,
             firewall,
+            bound,
             listener,
             task,
             _stop: stop,
@@ -332,12 +346,13 @@ async fn an_oversized_body_or_another_request_is_no_vote() {
     .await
     .expect("an answer");
     assert_eq!(get.status, 405, "{get:?}");
-    assert!(get.body.get("vote").is_none(), "{get:?}");
+    assert_error_body(&get);
 
     let other = post(port, NODE_A, "/v1/votes", &vote)
         .await
         .expect("an answer");
     assert_eq!(other.status, 404, "{other:?}");
+    assert_error_body(&other);
     assert_eq!(h.store.vote().await.unwrap(), None, "no vote taken");
 
     // The same vote within the limit is granted.
@@ -345,6 +360,73 @@ async fn an_oversized_body_or_another_request_is_no_vote() {
         .await
         .expect("an answer");
     assert_vote(&reply, "granted", None);
+}
+
+/// The body of every answer but `200` (section 8.9): `{"error": "<text>"}`
+/// and nothing else, so no vote.
+fn assert_error_body(reply: &Reply) {
+    let body = reply.body.as_object().expect("an object body");
+    assert_eq!(body.len(), 1, "{reply:?}");
+    assert!(body["error"].is_string(), "{reply:?}");
+}
+
+/// Section 8.9: a body above 4 KiB is answered `413`, and one that does not
+/// arrive in time `408`, each with the `{"error": ...}` body and before any
+/// write. A declared length above the limit is refused before any of the
+/// body is read.
+#[tokio::test]
+async fn a_body_too_large_or_too_late_is_answered_with_the_error_body() {
+    let port = free_port();
+    let h = Harness::start(port).await;
+
+    // Only the head, with a length above the limit: refused unread.
+    let head = format!(
+        "POST /v1/vote HTTP/1.1\r\nhost: voter\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        BODY_LIMIT + 1
+    );
+    let reply = send(port, NODE_A, head.into_bytes())
+        .await
+        .expect("an answer");
+    assert_eq!(reply.status, 413, "{reply:?}");
+    assert_error_body(&reply);
+
+    // A body that stops halfway and never ends: `408` once the read limit
+    // has passed.
+    let vote = vote_body(2, "nod_a").to_string();
+    let partial = format!(
+        "POST /v1/vote HTTP/1.1\r\nhost: voter\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        vote.len(),
+        &vote[..vote.len() / 2]
+    );
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind(format!("{NODE_A}:0").parse().unwrap()).unwrap();
+    let mut stream = socket.connect(own(port)).await.expect("connect");
+    stream.write_all(partial.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    // The stream stays open on this side, so the answer comes from the
+    // listener's own read limit.
+    let mut chunk = [0u8; 1024];
+    let limit = VoteListenerOptions::quick().read_timeout;
+    loop {
+        let read = tokio::time::timeout(limit * 10, stream.read(&mut chunk))
+            .await
+            .expect("an answer within the read limit")
+            .unwrap();
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+    }
+    let reply = parse_reply(&raw).expect("an answer");
+    assert_eq!(reply.status, 408, "{reply:?}");
+    assert_error_body(&reply);
+
+    assert_eq!(h.store.vote().await.unwrap(), None, "no vote taken");
+    assert_eq!(
+        h.store.highest_term().await.unwrap(),
+        None,
+        "nothing written"
+    );
 }
 
 /// A vote request whose `term` is above 2^53 - 1 ([`MAX_TERM`]) is answered
@@ -415,6 +497,69 @@ async fn the_listener_rebinds_when_the_port_changes() {
     h.desired.send_replace(snapshot(None));
     assert!(listening(second, false).await, "no spec.votes, no listener");
     assert!(!h.task.is_finished(), "the loop keeps following");
+}
+
+/// Section 8.9: the listener listens only while `spec.votes.listen` is
+/// `true`. With `spec.votes` and the firewall for its address loaded but no
+/// `listen`, or `listen: false`, nothing listens; `listen: true` binds, and a
+/// new desired state without it closes the listener, whose report to the
+/// mesh manager goes back to no socket. A connection accepted before votes
+/// closed is answered `503` and decides nothing.
+#[tokio::test]
+async fn the_listener_listens_only_while_votes_are_open() {
+    let port = free_port();
+    // A read limit long enough for the connection accepted early to stay
+    // open through the steps below.
+    let options = VoteListenerOptions {
+        read_timeout: Duration::from_secs(5),
+        ..VoteListenerOptions::quick()
+    };
+    let h = Harness::start_with(port, options).await;
+    assert_eq!(*h.bound.borrow(), Some(own(port)), "reported");
+
+    // A connection accepted while votes are open.
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind(format!("{NODE_A}:0").parse().unwrap()).unwrap();
+    let mut early = socket.connect(own(port)).await.expect("connect");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    for closed in [None, Some(false)] {
+        h.desired
+            .send_replace(snapshot(Some(spec_votes_listen(port, closed))));
+        assert!(listening(port, false).await, "listen {closed:?}: closed");
+        assert_eq!(*h.bound.borrow(), None, "listen {closed:?}: no socket");
+        assert_eq!(*h.firewall.borrow(), Some(own(port)), "the firewall stays");
+        tokio::time::sleep(VoteListenerOptions::quick().bind_retry * 4).await;
+        assert!(
+            listening(port, false).await,
+            "listen {closed:?}: no retry binds"
+        );
+    }
+
+    let body = vote_body(2, "nod_a").to_string();
+    let request = format!(
+        "POST /v1/vote HTTP/1.1\r\nhost: voter\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    early.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), early.read_to_end(&mut raw))
+        .await
+        .expect("an answer in time")
+        .unwrap();
+    let reply = parse_reply(&raw).expect("an answer");
+    assert_eq!(reply.status, 503, "{reply:?}");
+    assert_error_body(&reply);
+    assert_eq!(reply.body["error"], "votes are not open", "{reply:?}");
+    assert_eq!(h.store.vote().await.unwrap(), None, "no vote taken");
+    assert_eq!(h.store.highest_term().await.unwrap(), None);
+
+    h.desired
+        .send_replace(snapshot(Some(spec_votes_listen(port, Some(true)))));
+    assert!(listening(port, true).await, "votes open again");
+    assert_eq!(*h.bound.borrow(), Some(own(port)));
+    let reply = h.vote(port, NODE_A, &vote_body(2, "nod_a")).await;
+    assert_vote(&reply, "granted", None);
 }
 
 /// The listener fails closed: it listens only while the mesh firewall loaded
@@ -513,7 +658,8 @@ async fn the_answer_waits_for_the_vote_to_be_written() {
 }
 
 /// The listener's address is the own mesh address without its prefix, on
-/// `spec.votes.port`, and there is none without `spec.votes` or `spec.mesh`.
+/// `spec.votes.port`, and there is none without `spec.votes` or `spec.mesh`,
+/// nor while `spec.votes.listen` is absent or `false` (section 8.9).
 #[test]
 fn the_listen_address_needs_votes_and_a_mesh_address() {
     let with_votes = snapshot(Some(spec_votes(51821)));
@@ -522,6 +668,13 @@ fn the_listen_address_needs_votes_and_a_mesh_address() {
         Some("127.0.0.1:51821".parse().unwrap())
     );
     assert_eq!(listen_address(snapshot(None).as_ref()), None);
+    for closed in [None, Some(false)] {
+        assert_eq!(
+            listen_address(snapshot(Some(spec_votes_listen(51821, closed))).as_ref()),
+            None,
+            "listen {closed:?}"
+        );
+    }
     let mut no_mesh = with_votes.unwrap();
     no_mesh.state.spec.mesh = None;
     assert_eq!(listen_address(Some(&no_mesh)), None);

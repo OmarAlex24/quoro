@@ -883,11 +883,14 @@ impl NodeHub {
         self.0.voters.current(self.0.store.pool()).await
     }
 
-    /// Rebuilds every live session's desired state whenever the voter set or
-    /// its version changes, whichever write changed it: every voter's
-    /// `spec.votes` names them all (section 6.12). It reads the set again
-    /// after every commit that moves the change log's head, and stops with
-    /// the hub.
+    /// Rebuilds every live session's desired state whenever the voter set,
+    /// its version, or whether votes are open changes, whichever write
+    /// changed it: every voter's `spec.votes` names them all and carries
+    /// `listen` while votes are open (section 6.12). It reads the set again
+    /// after every commit that moves the change log's head, a `hello` that
+    /// records a node's `mesh_rules` included, and stops with the hub. A
+    /// primary's start, a promoted one's included, reads the stored
+    /// `nodes.mesh_rules` with the first set its sessions build.
     pub(crate) fn spawn_voter_watch(&self) {
         let hub = Arc::downgrade(&self.0);
         let mut head = self.0.store.change_log_head();
@@ -5421,16 +5424,21 @@ async fn connect_node(
     // session's end nor a later session's check reads this hello's own
     // log_seq as the stored acknowledgement (ADR 0261).
     hub.raise_log_ack(node_id, generation, stored_log_seq);
+    // Section 5.1 and migration 0015: the mesh rules the node applies, NULL
+    // when its `hello` reports none. The decoding of `hello` kept it within
+    // 1 to 2^53 - 1, so it fits.
+    let mesh_rules = hello.mesh_rules.map(i64_of);
     sqlx::query(
         "UPDATE nodes SET status = 'connected', agent_version = ?, engine_version = ?, \
-         capacity = ?, kvm = ?, volume_snapshot = ?, applied_rev = ?, log_seq = ?, last_seen_at = ? \
-         WHERE id = ?",
+         capacity = ?, kvm = ?, volume_snapshot = ?, mesh_rules = ?, applied_rev = ?, log_seq = ?, \
+         last_seen_at = ? WHERE id = ?",
     )
     .bind(&hello.agent_version)
     .bind(&hello.engine_version)
     .bind(&capacity)
     .bind(&kvm)
     .bind(volume_snapshot)
+    .bind(mesh_rules)
     .bind(i64_of(hello.applied_rev))
     .bind(i64_of(hello.log_seq))
     .bind(&now)
@@ -6333,6 +6341,7 @@ mod tests {
             mesh_public_key: None,
             volume_snapshot: None,
             custody_public_key: None,
+            mesh_rules: None,
         }
     }
 

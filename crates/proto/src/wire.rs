@@ -287,6 +287,39 @@ pub struct Hello {
     /// from older agents. The private half never leaves the machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custody_public_key: Option<String>,
+    /// The version of the mesh firewall rules (section 6.9) this machine's
+    /// node agent applies whenever its desired state carries `spec.mesh`,
+    /// from M5b (section 5.1). Absent from older agents. When present it is
+    /// an integer from 1 to [`MAX_MESH_RULES`]: any other value, `null`
+    /// included, fails the decoding of the `hello`, which the primary
+    /// answers `bad_message` as it does any other malformed body (section
+    /// 5.18).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "mesh_rules_version"
+    )]
+    pub mesh_rules: Option<u64>,
+}
+
+/// The highest `hello.mesh_rules` (section 5.1): 2^53 - 1.
+pub const MAX_MESH_RULES: u64 = (1 << 53) - 1;
+
+/// Reads a present `hello.mesh_rules`: an integer from 1 to
+/// [`MAX_MESH_RULES`]. A negative number, a fraction, `null` or any value
+/// that is not an integer fails as a `u64` would; 0 and a value above the
+/// ceiling fail here.
+fn mesh_rules_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let version = u64::deserialize(deserializer)?;
+    if (1..=MAX_MESH_RULES).contains(&version) {
+        Ok(Some(version))
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "mesh_rules {version} is not from 1 to {MAX_MESH_RULES}"
+        )))
+    }
 }
 
 /// How a node snapshots a volume (section 5.1, ADR 0146).
@@ -1109,6 +1142,20 @@ pub struct SpecVotes {
     pub port: u16,
     /// Every voter, this machine included.
     pub voters: Vec<SpecVoter>,
+    /// `true` once votes are open: the voter serves votes on `port`
+    /// (sections 6.12 and 8.9). Absent until then; the primary never sends
+    /// `false`, and a voter takes anything other than `true` as not open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<bool>,
+}
+
+impl SpecVotes {
+    /// Whether votes are open: `listen` is `true` (section 6.12). An absent
+    /// `listen` and `false` both read as closed.
+    #[must_use]
+    pub fn open(&self) -> bool {
+        self.listen == Some(true)
+    }
 }
 
 /// One entry of `spec.votes.voters` (section 6.12).
@@ -1833,6 +1880,70 @@ mod tests {
         assert!(without.get("custody_public_key").is_none(), "{without}");
     }
 
+    /// A `hello` body with `mesh_rules` set to the JSON text `value`, or
+    /// without the field.
+    fn hello_with_mesh_rules(value: Option<&str>) -> RawFrame {
+        let field = value.map_or_else(String::new, |value| format!(r#","mesh_rules":{value}"#));
+        let text = format!(
+            r#"{{"v":1,"type":"hello","id":"msg_1","body":{{
+            "node_id":"nod_1","agent_version":"0.1.0","engine_version":"fake",
+            "boot_id":"8f1c","stored_rev":0,"applied_rev":0,"log_seq":0,
+            "log_hash":"0000","leases":[],"capacity":{{"cpus":1,"memory_mb":1,"disk_gb":1}},
+            "allocated":{{"cpus":0,"memory_mb":0,"disk_gb":0}},
+            "kvm":{{"available":true,"kernel":"6.11.2"}},"dropped_events":0{field}}}}}"#
+        );
+        RawFrame::parse(&text).unwrap()
+    }
+
+    /// Section 5.1: `mesh_rules` is optional, an integer from 1 to 2^53 - 1
+    /// that round-trips; a `hello` without it leaves the member out. Any
+    /// other value fails the body, which section 5.18 answers
+    /// `bad_message`.
+    #[test]
+    fn hello_mesh_rules_is_an_integer_from_1_to_2_53_minus_1() {
+        for (text, version) in [("1", 1), ("2", 2), ("9007199254740991", MAX_MESH_RULES)] {
+            let raw = hello_with_mesh_rules(Some(text));
+            let message = NodeMessage::from_raw(&raw).unwrap();
+            let NodeMessage::Hello(hello) = &message else {
+                panic!("not a hello");
+            };
+            assert_eq!(hello.mesh_rules, Some(version), "{text}");
+            let again = message.to_frame(&raw.id, None);
+            assert_eq!(again.body["mesh_rules"], json!(version), "{text}");
+            assert_eq!(NodeMessage::from_raw(&again).unwrap(), message, "{text}");
+        }
+
+        let raw = hello_with_mesh_rules(None);
+        let message = NodeMessage::from_raw(&raw).unwrap();
+        let NodeMessage::Hello(hello) = &message else {
+            panic!("not a hello");
+        };
+        assert_eq!(hello.mesh_rules, None);
+        let again = message.to_frame(&raw.id, None);
+        assert!(again.body.get("mesh_rules").is_none(), "{}", again.body);
+
+        for text in [
+            "0",
+            "9007199254740992",
+            "18446744073709551615",
+            "-2",
+            "2.0",
+            "2.5",
+            "\"2\"",
+            "null",
+        ] {
+            let raw = hello_with_mesh_rules(Some(text));
+            let error = NodeMessage::from_raw(&raw).unwrap_err();
+            assert!(
+                matches!(&error, DecodeError::BadBody { kind, .. } if kind == "hello"),
+                "{text}: {error:?}"
+            );
+            assert_eq!(error.code(), crate::ErrorCode::BadMessage, "{text}");
+            assert!(!error.is_fatal(), "{text}");
+            assert_eq!(error.message_id(), Some("msg_1"), "{text}");
+        }
+    }
+
     #[test]
     fn the_dns_challenge_examples_decode_and_round_trip() {
         let text = r#"{"v":1,"type":"dns_challenge","id":"msg_01JC9ZW2A4C6E8G0J2M4P6R8T0",
@@ -2225,6 +2336,21 @@ mod tests {
         assert_eq!(votes.voters[1].mesh_address, None);
         assert_eq!(votes.voters[2].roles, vec!["edge", "witness"]);
         assert_eq!(serde_json::to_value(&spec).unwrap(), example);
+
+        // `listen`: absent until votes open, `true` once they are, and a
+        // `false` reads as closed.
+        assert_eq!(votes.listen, None);
+        assert!(!votes.open());
+        let mut open = example.clone();
+        open["votes"]["listen"] = json!(true);
+        let spec: Spec = serde_json::from_value(open.clone()).unwrap();
+        let votes = spec.votes.as_ref().unwrap();
+        assert_eq!(votes.listen, Some(true));
+        assert!(votes.open());
+        assert_eq!(serde_json::to_value(&spec).unwrap(), open);
+        open["votes"]["listen"] = json!(false);
+        let spec: Spec = serde_json::from_value(open).unwrap();
+        assert!(!spec.votes.unwrap().open());
 
         // A voter entry without `mesh_address` reads as null.
         let voter: SpecVoter =

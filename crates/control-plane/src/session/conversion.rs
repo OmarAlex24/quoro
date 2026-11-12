@@ -881,6 +881,7 @@ pub(super) mod tests {
             mesh_public_key: None,
             volume_snapshot: None,
             custody_public_key: None,
+            mesh_rules: None,
         }
     }
 

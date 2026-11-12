@@ -19,6 +19,12 @@
 //! [`MeshManager`] keeps the interface equal to the newest verified snapshot:
 //! every snapshot whose `spec.mesh` or `spec.votes` changed is evaluated, and
 //! a failed apply or an unchanged one is retried at least every [`REAPPLY`].
+//! It also tells the vote listener where it may listen ([`ListenerLink`]):
+//! only while votes are open, and never through an apply that configures the
+//! peers of a state in which they are not (section 8.9).
+//!
+//! These are version [`MESH_RULES`] of the mesh rules, which `hello` reports
+//! (section 5.1).
 
 use std::fmt::{self, Write as _};
 use std::future::Future;
@@ -47,6 +53,13 @@ pub const INTERFACE: &str = "quoro-wg0";
 
 /// Name of the nftables table that filters the mesh interface.
 const TABLE: &str = "quoro_mesh";
+
+/// The version of the mesh rules of section 6.9 that this agent applies,
+/// which `hello.mesh_rules` reports (section 5.1). Version 2 is every rule
+/// of that section: the firewall table loaded before any peer, and the
+/// "New connections" rule that only root processes of this machine open
+/// connections through the mesh. A change to those rules raises it here.
+pub const MESH_RULES: u64 = 2;
 
 /// How long an applied mesh may stand without being re-applied.
 pub const REAPPLY: Duration = Duration::from_secs(60);
@@ -637,26 +650,108 @@ pub struct MeshManager<D: MeshDriver> {
     driver: D,
     key: MeshKey,
     firewall: watch::Sender<Option<SocketAddr>>,
+    /// The address the vote listener holds a socket on, or may be about to
+    /// bind, as the listener reports it ([`ListenerLink::bound`]).
+    bound: watch::Receiver<Option<SocketAddr>>,
+    bound_tx: Arc<watch::Sender<Option<SocketAddr>>>,
+}
+
+/// What the vote listener and the [`MeshManager`] share
+/// ([`MeshManager::listener_link`]): the address the manager lets the
+/// listener listen on, and the address the listener reports it holds, so
+/// that the manager can wait for the listener to stop before an apply.
+pub struct ListenerLink {
+    /// The address the listener may listen on ([`MeshManager::firewall`]).
+    pub(crate) firewall: watch::Receiver<Option<SocketAddr>>,
+    /// Where the listener reports the address it holds a socket on, or is
+    /// about to bind; `None` once its socket is closed.
+    pub(crate) bound: Arc<watch::Sender<Option<SocketAddr>>>,
+}
+
+impl ListenerLink {
+    /// A link that follows `firewall` with no manager behind it, for tests
+    /// that drive the listener alone. The receiver reads what the listener
+    /// reports. Only the vote listener's tests use it, and they run on Linux.
+    #[cfg(all(test, target_os = "linux"))]
+    #[must_use]
+    pub(crate) fn detached(
+        firewall: watch::Receiver<Option<SocketAddr>>,
+    ) -> (Self, watch::Receiver<Option<SocketAddr>>) {
+        let (bound, bound_rx) = watch::channel(None);
+        (
+            Self {
+                firewall,
+                bound: Arc::new(bound),
+            },
+            bound_rx,
+        )
+    }
+}
+
+/// The address the vote listener may listen on for `mesh` and `votes`: the
+/// one whose firewall rules the ruleset loads ([`vote_listen_address`]),
+/// and only while votes are open (`spec.votes.listen`, section 8.9).
+#[must_use]
+pub fn open_listen_address(mesh: &SpecMesh, votes: Option<&SpecVotes>) -> Option<SocketAddr> {
+    vote_listen_address(mesh, votes.filter(|votes| votes.open()))
 }
 
 impl<D: MeshDriver> MeshManager<D> {
     /// A manager that applies `desired` with `driver` and `key`.
     #[must_use]
     pub fn new(driver: D, key: MeshKey) -> Self {
+        let (bound_tx, bound) = watch::channel(None);
         Self {
             driver,
             key,
             firewall: watch::Sender::new(None),
+            bound,
+            bound_tx: Arc::new(bound_tx),
         }
     }
 
-    /// The vote listener's address whose firewall rules are loaded
-    /// ([`vote_listen_address`]): set by a successful apply of a mesh with
-    /// `spec.votes`, and `None` from the moment an apply fails or the mesh is
-    /// removed. The vote listener listens only on this address.
+    /// The address the vote listener may listen on
+    /// ([`open_listen_address`]): set by a successful apply of a mesh whose
+    /// `spec.votes` has `listen: true`, and `None` from the moment an apply
+    /// fails, the mesh is removed, or an apply is about to change it.
     #[must_use]
     pub fn firewall(&self) -> watch::Receiver<Option<SocketAddr>> {
         self.firewall.subscribe()
+    }
+
+    /// The link the vote listener needs ([`ListenerLink`]): the listener
+    /// listens only where [`MeshManager::firewall`] says, and reports its
+    /// socket back, so that an apply that closes the listener waits for its
+    /// socket to close before it configures any peer.
+    #[must_use]
+    pub fn listener_link(&self) -> ListenerLink {
+        ListenerLink {
+            firewall: self.firewall.subscribe(),
+            bound: Arc::clone(&self.bound_tx),
+        }
+    }
+
+    /// Before an apply whose listener address is `listen`: takes the
+    /// listener's address away when it differs, and then, when the listener
+    /// reports a socket other than on `listen`, waits until it reports none.
+    /// Returns at once when the listener holds no socket, including when no
+    /// listener runs.
+    ///
+    /// The listener reports an address before it binds and checks this
+    /// manager's address after that ([`ListenerLink`]), so a listener that
+    /// reads no socket here can no longer bind one.
+    async fn close_listener_unless(&self, listen: Option<SocketAddr>) {
+        if *self.firewall.borrow() != listen {
+            self.publish_firewall(None);
+        }
+        let held = *self.bound.borrow();
+        if held.is_none() || held == listen {
+            return;
+        }
+        self.publish_firewall(None);
+        let mut bound = self.bound.clone();
+        // The manager holds a sender, so the channel stays open.
+        let _ = bound.wait_for(Option::is_none).await;
     }
 
     /// Publishes the address the loaded firewall covers.
@@ -679,8 +774,9 @@ impl<D: MeshDriver> MeshManager<D> {
     /// A failed apply is retried without waiting for a snapshot or the
     /// period: after [`RETRY_FIRST`], then after twice the last wait, up to
     /// [`REAPPLY`] ([`retry_delay`]). A successful apply resets the wait. An
-    /// apply whose firewall does not load leaves WireGuard with no peers, so
-    /// the retry is what brings the peers back within seconds. A machine
+    /// apply that fails before its firewall loads, in the link step or in the
+    /// firewall itself, leaves WireGuard with no peers, so the retry is what
+    /// brings the peers back within seconds. A machine
     /// without `nft` installed keeps an empty mesh and retries; the failure is
     /// logged at `error` at most once per [`REAPPLY`], with how many were held
     /// back since, and at `debug` otherwise. A snapshot without a mesh ends
@@ -740,6 +836,13 @@ impl<D: MeshDriver> MeshManager<D> {
                     // The retries of a removal do not set this apply's wait.
                     state.retry_delay = None;
                 }
+                // Section 8.9: a voter that applies a state without `listen`
+                // stops listening before it configures that state's peers.
+                // The listener loses its address first, and a socket it
+                // holds anywhere this state does not listen is closed before
+                // the driver runs.
+                let listen = open_listen_address(mesh, votes);
+                self.close_listener_unless(listen).await;
                 match self
                     .driver
                     .apply(&self.key, mesh, votes, state.applied.as_ref())
@@ -753,7 +856,7 @@ impl<D: MeshDriver> MeshManager<D> {
                         state.last_apply = Some(tokio::time::Instant::now());
                         state.retry_delay = None;
                         state.retry_at = None;
-                        self.publish_firewall(vote_listen_address(mesh, votes));
+                        self.publish_firewall(listen);
                     }
                     Err(error) => {
                         self.publish_firewall(None);
@@ -982,17 +1085,10 @@ mod linux {
         votes: Option<&SpecVotes>,
         previous: Option<&SpecMesh>,
     ) -> Result<(), String> {
-        let ip = find_tool("ip", "iproute2")?;
-        let own = parse_cidr(&mesh.address)
-            .ok_or_else(|| format!("mesh address {:?} is not an IPv4 CIDR", mesh.address))?;
-        let IpAddr::V4(own_address) = own.0 else {
-            return Err(format!("mesh address {:?} is not IPv4", mesh.address));
-        };
         let mut steps = HostSteps {
             key,
-            ip,
-            own_address,
-            own_prefix: own.1,
+            address: &mesh.address,
+            link: None,
         };
         apply_steps(&mut steps, mesh, votes, previous).await
     }
@@ -1000,7 +1096,9 @@ mod linux {
     /// The steps of one apply, in the order [`apply_steps`] runs them.
     trait ApplySteps {
         /// Creates the link if it is missing, sets its address and brings it
-        /// up.
+        /// up. Every check an apply makes before the ruleset belongs to this
+        /// step, so a missing `ip` or a mesh address that is not IPv4 fails
+        /// here.
         fn link(&mut self) -> impl Future<Output = Result<(), String>> + Send;
         /// Loads `ruleset` with `nft -f -`.
         fn ruleset(&mut self, ruleset: &str) -> impl Future<Output = Result<(), String>> + Send;
@@ -1025,24 +1123,35 @@ mod linux {
     /// loads the WireGuard module that the generic netlink family needs, and
     /// a failed ruleset still needs the device to remove peers from.
     ///
-    /// When the ruleset does not load, WireGuard is configured with no peers,
-    /// which also removes every peer an earlier apply set, and the ruleset's
-    /// error is returned, with the removal's error after it if that failed
-    /// too.
+    /// Every failure before the ruleset loads, of the link step or of the
+    /// ruleset itself, leaves WireGuard with no peers (section 6.9): it is
+    /// configured with none, which also removes every peer an earlier apply
+    /// set, and the failed step's error is returned, with the removal's error
+    /// after it if that failed too. After a failed link step the device may
+    /// not exist, and then it has no peers to remove: a removal that finds no
+    /// such device ([`no_such_device`]) adds nothing to the link's error.
     async fn apply_steps<S: ApplySteps>(
         steps: &mut S,
         mesh: &SpecMesh,
         votes: Option<&SpecVotes>,
         previous: Option<&SpecMesh>,
     ) -> Result<(), String> {
-        steps.link().await?;
-        if let Err(error) = steps.ruleset(&nft_ruleset(Some(mesh), votes)).await {
+        // The error of the step that failed, and whether it was the link.
+        let loaded = match steps.link().await {
+            Ok(()) => steps
+                .ruleset(&nft_ruleset(Some(mesh), votes))
+                .await
+                .map_err(|error| (error, false)),
+            Err(error) => Err((error, true)),
+        };
+        if let Err((error, link_failed)) = loaded {
             let no_peers = SpecMesh {
                 peers: Vec::new(),
                 ..mesh.clone()
             };
             return Err(match steps.wireguard(&no_peers, None).await {
                 Ok(()) => error,
+                Err(cleared) if link_failed && no_such_device(&cleared) => error,
                 Err(cleared) => format!("{error}; could not remove the mesh peers: {cleared}"),
             });
         }
@@ -1050,9 +1159,24 @@ mod linux {
         steps.routes(mesh).await
     }
 
+    /// Whether `error`, from [`set_wireguard`], says the WireGuard device
+    /// does not exist: the kernel's `ENODEV`, which the error ends with as
+    /// `(os error 19)`.
+    fn no_such_device(error: &str) -> bool {
+        error.ends_with("(os error 19)")
+    }
+
     /// The steps on this host, with its `ip`, `nft` and generic netlink.
     struct HostSteps<'a> {
         key: &'a MeshKey,
+        /// `spec.mesh.address`, which the link step parses.
+        address: &'a str,
+        /// What the link step resolved, for the routes.
+        link: Option<HostLink>,
+    }
+
+    /// The host's `ip` and the mesh address with its prefix length.
+    struct HostLink {
         ip: PathBuf,
         own_address: Ipv4Addr,
         own_prefix: u8,
@@ -1060,16 +1184,26 @@ mod linux {
 
     impl ApplySteps for HostSteps<'_> {
         async fn link(&mut self) -> Result<(), String> {
-            let ip = &self.ip;
+            let ip = find_tool("ip", "iproute2")?;
+            let (own, own_prefix) = parse_cidr(self.address)
+                .ok_or_else(|| format!("mesh address {:?} is not an IPv4 CIDR", self.address))?;
+            let IpAddr::V4(own_address) = own else {
+                return Err(format!("mesh address {:?} is not IPv4", self.address));
+            };
             // Creating the link loads the WireGuard module, so it must happen
             // before the generic netlink family is resolved.
             if !Path::new("/sys/class/net").join(INTERFACE).exists() {
-                run(ip, &["link", "add", "dev", INTERFACE, "type", "wireguard"]).await?;
+                run(&ip, &["link", "add", "dev", INTERFACE, "type", "wireguard"]).await?;
             }
-            let address = format!("{}/{}", self.own_address, self.own_prefix);
-            run(ip, &["address", "replace", &address, "dev", INTERFACE]).await?;
-            remove_other_addresses(ip, self.own_address, self.own_prefix).await?;
-            run(ip, &["link", "set", "dev", INTERFACE, "up"]).await?;
+            let cidr = format!("{own_address}/{own_prefix}");
+            run(&ip, &["address", "replace", &cidr, "dev", INTERFACE]).await?;
+            remove_other_addresses(&ip, own_address, own_prefix).await?;
+            run(&ip, &["link", "set", "dev", INTERFACE, "up"]).await?;
+            self.link = Some(HostLink {
+                ip,
+                own_address,
+                own_prefix,
+            });
             Ok(())
         }
 
@@ -1090,12 +1224,15 @@ mod linux {
         }
 
         async fn routes(&mut self, mesh: &SpecMesh) -> Result<(), String> {
+            let Some(link) = &self.link else {
+                return Err("the mesh routes need the link step first".to_owned());
+            };
             let desired = desired_routes(mesh);
             for cidr in &desired {
-                run(&self.ip, &["route", "replace", cidr, "dev", INTERFACE]).await?;
+                run(&link.ip, &["route", "replace", cidr, "dev", INTERFACE]).await?;
             }
-            let own = (IpAddr::V4(self.own_address), self.own_prefix);
-            remove_other_routes(&self.ip, &desired, own).await
+            let own = (IpAddr::V4(link.own_address), link.own_prefix);
+            remove_other_routes(&link.ip, &desired, own).await
         }
     }
 
@@ -1667,6 +1804,9 @@ mod linux {
             /// previous mesh came with them.
             Wireguard(usize, bool),
             Routes,
+            /// Whether [`FakeSteps::probe`] accepted a TCP connection when
+            /// WireGuard was about to be configured.
+            Listening(bool),
         }
 
         /// Steps that record what ran and fail where they are told to.
@@ -1676,9 +1816,15 @@ mod linux {
             fail_link: bool,
             fail_ruleset: bool,
             fail_wireguard: bool,
+            /// WireGuard fails as the kernel answers when the device does
+            /// not exist.
+            no_device: bool,
             fail_delete_link: bool,
             /// The peers the device has after the steps so far.
             peers: usize,
+            /// An address to try a TCP connection to just before WireGuard
+            /// is configured, recorded as [`Step::Listening`].
+            probe: Option<std::net::SocketAddr>,
         }
 
         fn outcome(failing: bool, what: &str) -> Result<(), String> {
@@ -1705,8 +1851,21 @@ mod linux {
                 mesh: &SpecMesh,
                 previous: Option<&SpecMesh>,
             ) -> Result<(), String> {
+                if let Some(probe) = self.probe {
+                    // A blocking connect: it does not yield, so no other
+                    // task, the vote listener included, runs between the
+                    // steps before it and this probe.
+                    let listening = std::net::TcpStream::connect(probe).is_ok();
+                    self.ran.push(Step::Listening(listening));
+                }
                 self.ran
                     .push(Step::Wireguard(mesh.peers.len(), previous.is_some()));
+                if self.no_device {
+                    // The text `set_wireguard` returns for `ENODEV`.
+                    return Err("the kernel refused the WireGuard query: \
+                                No such device (os error 19)"
+                        .to_owned());
+                }
                 outcome(self.fail_wireguard, "WireGuard")?;
                 self.peers = mesh.peers.len();
                 Ok(())
@@ -1830,6 +1989,94 @@ mod linux {
             assert_eq!(steps.ran.last(), Some(&Step::Wireguard(0, false)));
         }
 
+        /// A link step that fails leaves WireGuard with no peers too, which
+        /// removes those an earlier apply set, and the apply returns the
+        /// link's error. No ruleset is loaded and no route is set.
+        #[tokio::test]
+        async fn a_failed_link_leaves_wireguard_with_no_peers() {
+            let mesh = two_peer_mesh();
+            let mut steps = FakeSteps {
+                fail_link: true,
+                peers: 2,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, Some(&mesh))
+                .await
+                .unwrap_err();
+            assert_eq!(error, "the link failed");
+            assert_eq!(steps.ran, vec![Step::Link, Step::Wireguard(0, false)]);
+            assert_eq!(steps.peers, 0);
+
+            // When removing the peers fails too, both errors are returned,
+            // the link's first.
+            let mut steps = FakeSteps {
+                fail_link: true,
+                fail_wireguard: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "the link failed; could not remove the mesh peers: WireGuard failed"
+            );
+            assert_eq!(steps.ran, vec![Step::Link, Step::Wireguard(0, false)]);
+        }
+
+        /// After a failed link step the device may not exist, and then it has
+        /// no peers: a removal that finds no such device returns the link's
+        /// error alone. Only there: after a failed ruleset, and in the apply's
+        /// own WireGuard step, a missing device is an error like any other.
+        #[tokio::test]
+        async fn a_missing_device_is_ignored_only_when_clearing_after_a_failed_link() {
+            let mesh = two_peer_mesh();
+            let mut steps = FakeSteps {
+                fail_link: true,
+                no_device: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error, "the link failed");
+            assert_eq!(steps.ran, vec![Step::Link, Step::Wireguard(0, false)]);
+
+            let mut steps = FakeSteps {
+                fail_ruleset: true,
+                no_device: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "nft failed; could not remove the mesh peers: the kernel refused the \
+                 WireGuard query: No such device (os error 19)"
+            );
+
+            let mut steps = FakeSteps {
+                no_device: true,
+                ..FakeSteps::default()
+            };
+            let error = apply_steps(&mut steps, &mesh, None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "the kernel refused the WireGuard query: No such device (os error 19)"
+            );
+            assert_eq!(
+                steps.ran,
+                vec![
+                    Step::Link,
+                    Step::Ruleset(nft_ruleset(Some(&mesh), None)),
+                    Step::Wireguard(2, false),
+                ]
+            );
+        }
+
         /// A ruleset that does not load leaves the device with no peers, and
         /// the manager retries after [`super::super::RETRY_FIRST`] without a
         /// new snapshot: once the ruleset loads, the peers are back, long
@@ -1841,6 +2088,7 @@ mod linux {
                 version: 1,
                 port: 51821,
                 voters: Vec::new(),
+                listen: Some(true),
             };
             let state = quoro_proto::wire::DesiredState {
                 rev: 1,
@@ -1898,6 +2146,121 @@ mod linux {
             task.abort();
         }
 
+        /// Section 8.9: a voter that applies a desired state without
+        /// `listen` stops listening before it configures that state's
+        /// peers. A real vote listener on 127.0.0.1 is bound while votes are
+        /// open; the next state drops `listen`, and the manager runs the
+        /// apply only once the listener's socket is closed, so nothing
+        /// accepts a connection when WireGuard gets its peers. The
+        /// listener here follows a state in which votes stay open, so only
+        /// the manager's wait closes it before the peers.
+        #[tokio::test]
+        async fn a_state_without_listen_closes_the_listener_before_any_peer() {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let listener_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let mesh = SpecMesh {
+                address: "127.0.0.1/8".to_owned(),
+                ..two_peer_mesh()
+            };
+            let open = SpecVotes {
+                version: 1,
+                port,
+                voters: Vec::new(),
+                listen: Some(true),
+            };
+            let closed = SpecVotes {
+                listen: None,
+                ..open.clone()
+            };
+            let state = |votes: &SpecVotes| {
+                Some(crate::reconcile::Snapshot {
+                    rev: 1,
+                    state: quoro_proto::wire::DesiredState {
+                        rev: 1,
+                        issued_at: String::new(),
+                        term: 0,
+                        spec: quoro_proto::wire::Spec {
+                            mesh: Some(mesh.clone()),
+                            votes: Some(votes.clone()),
+                            ..quoro_proto::wire::Spec::default()
+                        },
+                        signature: String::new(),
+                    },
+                })
+            };
+            let (desired_tx, desired_rx) = tokio::sync::watch::channel(state(&open));
+            let steps = std::sync::Arc::new(tokio::sync::Mutex::new(FakeSteps {
+                probe: Some(listener_addr),
+                ..FakeSteps::default()
+            }));
+            let manager = super::super::MeshManager::new(
+                StepsDriver(std::sync::Arc::clone(&steps)),
+                MeshKey { private: [7; 32] },
+            );
+
+            let dir = std::env::temp_dir().join(format!(
+                "quoro-mesh-listener-{}",
+                crate::util::hex(&crate::util::random_bytes::<8>())
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let store = crate::store::NodeStore::open(&dir).await.unwrap();
+            let (_listener_desired, listener_rx) = tokio::sync::watch::channel(state(&open));
+            let listener = crate::vote_listener::VoteListener::new(
+                store,
+                "nod_me".to_owned(),
+                "cls_1".to_owned(),
+                std::sync::Arc::new(crate::lease::ManualHostClock::new(
+                    Some("boot-a"),
+                    Duration::from_secs(1000),
+                )),
+                listener_rx,
+                manager.listener_link(),
+                crate::vote_listener::VoteListenerOptions::quick(),
+            );
+            let listener_task = tokio::spawn(listener.run(std::future::pending()));
+            let task = tokio::spawn(manager.run(desired_rx, std::future::pending()));
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while tokio::net::TcpStream::connect(listener_addr).await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the listener binds once votes are open");
+            steps.lock().await.ran.clear();
+
+            desired_tx.send_replace(state(&closed));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !steps.lock().await.ran.contains(&Step::Routes) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the state without listen is applied");
+            assert_eq!(
+                steps.lock().await.ran,
+                vec![
+                    Step::Link,
+                    Step::Ruleset(nft_ruleset(Some(&mesh), Some(&closed))),
+                    Step::Listening(false),
+                    Step::Wireguard(2, true),
+                    Step::Routes,
+                ],
+                "the listener is closed before any peer"
+            );
+            assert!(
+                tokio::net::TcpStream::connect(listener_addr).await.is_err(),
+                "and stays closed"
+            );
+            task.abort();
+            listener_task.abort();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// A removal deletes the link, and its peers with it, before the
         /// table.
         #[tokio::test]
@@ -1926,21 +2289,6 @@ mod linux {
             let error = remove_steps(&mut steps).await.unwrap_err();
             assert_eq!(error, "ip link del failed");
             assert_eq!(steps.ran, vec![Step::DeleteLink]);
-        }
-
-        /// A link that cannot be set up stops the apply before the ruleset
-        /// and before any peer.
-        #[tokio::test]
-        async fn a_failed_link_configures_nothing_else() {
-            let mut steps = FakeSteps {
-                fail_link: true,
-                ..FakeSteps::default()
-            };
-            let error = apply_steps(&mut steps, &two_peer_mesh(), None, None)
-                .await
-                .unwrap_err();
-            assert_eq!(error, "the link failed");
-            assert_eq!(steps.ran, vec![Step::Link]);
         }
     }
 }
@@ -2209,6 +2557,7 @@ table inet quoro_mesh {
                 voter("nod_w", &["edge", "witness"], Some("10.43.0.1")),
                 voter("nod_new", &["node"], None),
             ],
+            listen: Some(true),
         }
     }
 
@@ -2754,8 +3103,10 @@ table inet quoro_mesh {
     }
 
     /// The firewall watch holds the vote listener's address while a
-    /// successful apply of a mesh with `spec.votes` stands, and `None` once
-    /// an apply fails, without `spec.votes`, and once the mesh is removed.
+    /// successful apply of a mesh with `spec.votes` and `listen: true`
+    /// stands, and `None` once an apply fails, without `spec.votes` or its
+    /// `listen` (section 8.9), and once the mesh is removed. Without
+    /// `listen` the firewall's rules are still loaded.
     #[tokio::test(start_paused = true)]
     async fn the_firewall_watch_follows_the_loaded_rules() {
         let with_votes = |votes: Option<SpecVotes>| {
@@ -2785,6 +3136,22 @@ table inet quoro_mesh {
         recorded.fail_applies(false);
         at(2_010).await;
         assert_eq!(*firewall.borrow(), Some(listener), "the retry succeeded");
+
+        for closed in [None, Some(false)] {
+            let applies = recorded.calls().len();
+            let not_open = SpecVotes {
+                listen: closed,
+                ..changed.clone()
+            };
+            desired_tx.send(with_votes(Some(not_open.clone()))).unwrap();
+            at(1).await;
+            assert_eq!(*firewall.borrow(), None, "listen {closed:?}");
+            assert_eq!(recorded.calls().len(), applies + 1, "listen {closed:?}");
+            assert_eq!(recorded.votes().last(), Some(&Some(not_open)));
+        }
+        desired_tx.send(with_votes(Some(changed.clone()))).unwrap();
+        at(1).await;
+        assert_eq!(*firewall.borrow(), Some(listener), "open again");
 
         desired_tx.send(with_votes(None)).unwrap();
         at(1).await;
