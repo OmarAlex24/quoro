@@ -53,7 +53,8 @@
 //!   at that token (ADR 0256; [`super::conversion`]), and every settle of
 //!   the lease pending on the session is cleared, whether planned from its
 //!   `hello` or waiting for its `pong` ("Settling a lease"); the settle's
-//!   row write also refuses a settling `ping` at or below the grant's token. The `pong` of that `ping` with no refusal before it
+//!   row write also refuses a settling `ping` at or below the grant's
+//!   token. The `pong` of that `ping` with no refusal before it
 //!   writes the row `local` at the token and clears the mark, as a `local`
 //!   report does, if the row's newest write is still the one recorded with
 //!   the `ping` and every other check holds again. It also passes ADR 0257's

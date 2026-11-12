@@ -417,6 +417,9 @@ impl NodeHub {
         let replaced = {
             let mut registry = self.0.held.lock().expect("held grant lock");
             match registry.entries.get_mut(&lease.id) {
+                // The same grant is held already. Over an entry R dropped and
+                // kept only for its held-back revoke, this updates
+                // `eligible_on` and nothing else: the grant stays dropped.
                 Some(held) if held.kind == Kind::NewToken && held.names(lease) => {
                     if held.eligible_on.is_none() {
                         held.eligible_on = live;
