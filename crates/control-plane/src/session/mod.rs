@@ -5252,11 +5252,12 @@ impl Session {
                     // `warm`. Only a `hello` that listed it `local`, `held`
                     // or `uncertain`, at the row's token; that listing also
                     // passes ADR 0257's barrier on this session.
-                    let listed_local = reported.as_ref().is_some_and(|(state, claimed, expiring)| {
-                        !*expiring
-                            && *claimed == token
-                            && (state == "held" || state == "uncertain")
-                    });
+                    let listed_local =
+                        reported.as_ref().is_some_and(|(state, claimed, expiring)| {
+                            !*expiring
+                                && *claimed == token
+                                && (state == "held" || state == "uncertain")
+                        });
                     let regrant = reported.is_some_and(|(state, claimed, _)| {
                         claimed == token && (state == "held" || state == "uncertain")
                     });

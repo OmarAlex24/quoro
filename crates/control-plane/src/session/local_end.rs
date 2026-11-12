@@ -965,7 +965,7 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::conversion::tests::{
         APP, EverySupport, Fixture, LEASE, actor, assert_answer, end_renewals, fixture, frames,
         hello, of_type, ping_of, pong, renew, restart, set_policy, write_row,
@@ -985,7 +985,7 @@ mod tests {
     const D: u64 = 15_000;
 
     #[derive(Debug)]
-    struct NoSupport;
+    pub(in crate::session) struct NoSupport;
     impl VoterSupport for NoSupport {
         fn supports(&self, _duration_ms: u64) -> bool {
             false
@@ -995,13 +995,17 @@ mod tests {
     /// A session of the fixture's node on `state` whose `hello` lists the
     /// lease as `listed`, past its start, keeping the channel the hub queues
     /// on and the grants and `ping`s its start queued on its outbox.
-    struct Live {
-        session: Session,
-        rx: mpsc::UnboundedReceiver<String>,
-        start: Vec<Value>,
+    pub(in crate::session) struct Live {
+        pub(in crate::session) session: Session,
+        pub(in crate::session) rx: mpsc::UnboundedReceiver<String>,
+        pub(in crate::session) start: Vec<Value>,
     }
 
-    async fn live(state: &AppState, f: &Fixture, listed: Option<(&str, LeaseMode, u64)>) -> Live {
+    pub(in crate::session) async fn live(
+        state: &AppState,
+        f: &Fixture,
+        listed: Option<(&str, LeaseMode, u64)>,
+    ) -> Live {
         let hub = &state.hub;
         let (generation, rx, _closed, _changed) = hub.attach(&f.node_id);
         let mut session = Session::new(hub.clone(), f.node_id.clone(), generation);
@@ -1019,7 +1023,7 @@ mod tests {
     }
 
     /// The grants and `ping`s the hub queued on the session's channel.
-    fn queued(live: &mut Live) -> Vec<Value> {
+    pub(in crate::session) fn queued(live: &mut Live) -> Vec<Value> {
         let mut texts = Vec::new();
         while let Ok(text) = live.rx.try_recv() {
             texts.push(text);
@@ -1032,7 +1036,7 @@ mod tests {
 
     /// The row's creation entry, as every row written by the primary has
     /// one: the fixture inserts its row with none.
-    async fn created(f: &Fixture) {
+    pub(in crate::session) async fn created(f: &Fixture) {
         write_row(
             f,
             "UPDATE leases SET fencing_token = fencing_token WHERE id = ?",
@@ -1041,7 +1045,7 @@ mod tests {
     }
 
     /// The node acknowledges the lease's newest write on `live`.
-    async fn ack(state: &AppState, f: &Fixture, live: &Live) {
+    pub(in crate::session) async fn ack(state: &AppState, f: &Fixture, live: &Live) {
         let mut conn = state.store.pool().acquire().await.unwrap();
         let seq = crate::leases::newest_write_seq(&mut conn, LEASE)
             .await
@@ -1055,7 +1059,7 @@ mod tests {
     /// A policy change off `warm` as `updateApp` commits it: R, what follows
     /// it and `app.left_stopped` in the transaction, then the hub's part
     /// once it commits.
-    async fn r(f: &Fixture) {
+    pub(in crate::session) async fn r(f: &Fixture) {
         r_on(&f.state, f).await;
     }
 
@@ -1140,7 +1144,10 @@ mod tests {
         )
     }
 
-    async fn view(state: &AppState, f: &Fixture) -> (bool, Vec<String>, bool) {
+    pub(in crate::session) async fn view(
+        state: &AppState,
+        f: &Fixture,
+    ) -> (bool, Vec<String>, bool) {
         let row = f.row().await;
         let mut conn = state.store.pool().acquire().await.unwrap();
         let (pending, waiting) = state.hub.grant_view(&mut conn, &row).await.unwrap();
@@ -1152,7 +1159,7 @@ mod tests {
 
     /// The `local` grant at `token` and its `ping`, in that order, as the
     /// only frames: their ids.
-    fn grant_then_ping(frames: &[Value], token: u64) -> (String, String) {
+    pub(in crate::session) fn grant_then_ping(frames: &[Value], token: u64) -> (String, String) {
         assert_eq!(frames.len(), 2, "{frames:?}");
         let grant = &frames[0];
         assert_eq!(grant["type"], "lease_grant", "{frames:?}");
@@ -1168,7 +1175,7 @@ mod tests {
         )
     }
 
-    async fn state(f: &Fixture) -> (String, i64, Option<i64>, bool, bool) {
+    pub(in crate::session) async fn state(f: &Fixture) -> (String, i64, Option<i64>, bool, bool) {
         let row = f.row().await;
         let revoked = row.is_revoked();
         (
@@ -1635,7 +1642,7 @@ mod tests {
     }
 
     /// The holder's refusal `code` of the grant `grant` on `session`.
-    async fn refuse(session: &mut Session, grant: &str, code: ErrorCode) {
+    pub(in crate::session) async fn refuse(session: &mut Session, grant: &str, code: ErrorCode) {
         let refusal = NodeMessage::Error(ProtocolError {
             code,
             message: "refused".to_string(),
