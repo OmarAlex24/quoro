@@ -226,6 +226,7 @@ fn ok_result() -> NodeMessage {
         error: None,
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     })
 }
 

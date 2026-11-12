@@ -2481,4 +2481,38 @@ mod tests {
         assert_eq!(raw.body["code"], "custody_key_changed");
         assert_eq!(ControlMessage::from_raw(&raw).unwrap(), changed);
     }
+
+    /// Section 5.17: an `ok` answer to `switchover_freeze` carries the final
+    /// snapshot's `snapshot_seq`, and a failed one the code
+    /// `replication_failed`; every other answer carries no `snapshot_seq`.
+    #[test]
+    fn a_freeze_answer_carries_its_snapshot_seq_or_replication_failed() {
+        let frozen = NodeMessage::CommandResult(crate::CommandResult {
+            status: crate::CommandStatus::Ok,
+            detail: None,
+            error: None,
+            lines: None,
+            metrics: None,
+            snapshot_seq: Some(42),
+        });
+        let raw = RawFrame::parse(&frozen.to_frame("msg_1", Some("msg_0")).to_text()).unwrap();
+        assert_eq!(raw.body, json!({"status": "ok", "snapshot_seq": 42}));
+        assert_eq!(NodeMessage::from_raw(&raw).unwrap(), frozen);
+
+        let failed = NodeMessage::CommandResult(crate::CommandResult {
+            status: crate::CommandStatus::Error,
+            detail: None,
+            error: Some(crate::ErrorBody {
+                code: crate::ErrorCode::ReplicationFailed,
+                message: "the target refused the final snapshot".to_owned(),
+            }),
+            lines: None,
+            metrics: None,
+            snapshot_seq: None,
+        });
+        let raw = RawFrame::parse(&failed.to_frame("msg_2", Some("msg_0")).to_text()).unwrap();
+        assert_eq!(raw.body["error"]["code"], "replication_failed");
+        assert!(raw.body.get("snapshot_seq").is_none(), "{}", raw.body);
+        assert_eq!(NodeMessage::from_raw(&raw).unwrap(), failed);
+    }
 }

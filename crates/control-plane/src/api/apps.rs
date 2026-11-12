@@ -2986,6 +2986,153 @@ pub async fn failover_app(
     Ok((StatusCode::ACCEPTED, Json(app)).into_response())
 }
 
+/// The audit operation and idempotency scope of `switchoverApp`.
+const SWITCHOVER_APP: &str = "POST /api/v1/apps/{app_id}/switchover";
+
+/// Body of `switchoverApp` (`openapi.yaml` `SwitchoverAppRequest`).
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[schema(
+    title = "SwitchoverAppRequest",
+    description = "The node to move the app to."
+)]
+pub struct SwitchoverAppRequest {
+    /// The app's warm node, `App.warm.node_id`.
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub node_id: String,
+}
+
+/// Starts a planned switchover of a `warm` app to its warm node: the
+/// source freezes the app's writes and ships a final snapshot, then the
+/// lease moves as for a failover ([`crate::switchover`], ADR 0177). Answers
+/// once the switchover started; `app.switched_over` or
+/// `app.switchover_failed` ends it.
+///
+/// # Errors
+///
+/// `forbidden` without `app:failover` or with `approval_required` for an
+/// agent, `not_found` for an unknown app, `validation_failed` for a `node_id`
+/// that is not the app's warm node, `conflict` with the contract's reasons,
+/// or a database error.
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/switchover",
+    tag = "apps",
+    operation_id = "switchoverApp",
+    extensions(("x-quoro-scope" = json!("app:failover"))),
+    params(
+        ("app_id" = String, Path, description = "App id (`app_...`).",
+            pattern = "^app_[0-9A-HJKMNP-TV-Z]{26}$"),
+        ("Idempotency-Key" = Option<String>, Header,
+            description = "Client-chosen key. A repeated call with the same key and the same body returns the original answer instead of starting a second switchover.",
+            nullable = false, min_length = 1, max_length = 128),
+        ("Quoro-Justification" = Option<String>, Header,
+            description = "The agent's stated reason for the call. Required when the caller is an agent; it is recorded in the audit log (ADR 0031). Human callers may omit it.",
+            nullable = false, min_length = 1, max_length = 2000),
+        ("Quoro-Incident" = Option<String>, Header,
+            description = "The incident (`inc_...`) the call belongs to, when an agent acts on an incident (ADR 0032).",
+            nullable = false, pattern = "^inc_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    request_body(content = SwitchoverAppRequest, content_type = "application/json",
+        description = "The warm node to move the app to."),
+    responses(
+        (status = 202, description = "The switchover started.", body = App,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::ApprovalRequired),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
+        (status = 422, response = crate::openapi::ValidationFailed),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+pub async fn switchover_app(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    identity: crate::auth::Identity,
+    headers: HeaderMap,
+    Path(app_id): Path<String>,
+    ApiJson(body): ApiJson<SwitchoverAppRequest>,
+) -> Result<Response, ApiError> {
+    let ctx = CallCtx::new(identity, request_id.0, SWITCHOVER_APP, &headers);
+    let params = json!({ "node_id": body.node_id });
+    let target = app_target(&app_id);
+    let project_id = crate::api::volumes::app_project(&state, &app_id).await;
+    ctx.authorize(
+        &state,
+        Scope::AppFailover,
+        Some(&target),
+        project_id.as_deref(),
+        &params,
+    )
+    .await?;
+
+    let key = idempotency_key(&headers)?;
+    if let Some(key) = &key {
+        match state
+            .idempotency
+            .begin(ctx.identity.id(), SWITCHOVER_APP, key, &params)
+        {
+            Begin::Proceed => {}
+            Begin::Replay(status, stored) => {
+                ctx.audit_replay(
+                    &state,
+                    Scope::AppFailover,
+                    &target,
+                    project_id.as_deref(),
+                    &params,
+                )
+                .await?;
+                return Ok((status, Json(stored)).into_response());
+            }
+            Begin::Conflict => return Err(ApiError::conflict("Idempotency-Key reused")),
+        }
+    }
+
+    // The refusals, the call's record and the start of the steps run in
+    // their own task, which the handler only awaits: a client that gives up
+    // meanwhile neither drops a switchover whose record was written nor
+    // leaves its Idempotency-Key in flight.
+    let node_id = body.node_id;
+    let task = tokio::spawn(async move {
+        match crate::switchover::start(&state, &ctx, &app_id, &node_id, &params).await {
+            Ok(app) => {
+                if let Some(key) = &key {
+                    state.idempotency.finish(
+                        ctx.identity.id(),
+                        SWITCHOVER_APP,
+                        key,
+                        StatusCode::ACCEPTED,
+                        serde_json::to_value(&app).unwrap_or(Value::Null),
+                    );
+                }
+                Ok(app)
+            }
+            Err(error) => {
+                if let Some(key) = &key {
+                    state
+                        .idempotency
+                        .abandon(ctx.identity.id(), SWITCHOVER_APP, key);
+                }
+                ctx.audit_error(
+                    &state,
+                    Some(Scope::AppFailover),
+                    Some(&target),
+                    project_id.as_deref(),
+                    &params,
+                    &error,
+                )
+                .await?;
+                Err(error)
+            }
+        }
+    });
+    let app = task
+        .await
+        .map_err(|error| ApiError::internal(&format!("the switchover task failed: {error}")))??;
+    Ok((StatusCode::ACCEPTED, Json(app)).into_response())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn set_desired_status(
     state: AppState,
@@ -3447,6 +3594,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/apps/{app_id}/start", post(start_app))
         .route("/api/v1/apps/{app_id}/stop", post(stop_app))
         .route("/api/v1/apps/{app_id}/failover", post(failover_app))
+        .route("/api/v1/apps/{app_id}/switchover", post(switchover_app))
         .route(
             "/api/v1/apps/{app_id}/env",
             get(get_app_env).put(replace_app_env),
@@ -3484,6 +3632,7 @@ pub fn routes() -> Router<AppState> {
         start_app,
         stop_app,
         failover_app,
+        switchover_app,
         get_app_env,
         replace_app_env,
         super::deployments::list_app_deployments,
@@ -3514,6 +3663,7 @@ pub fn routes() -> Router<AppState> {
             AppEnvList,
             AppEnvReplaceRequest,
             FailoverAppRequest,
+            SwitchoverAppRequest,
             Deployment,
             super::deployments::DeploymentList,
             super::deployments::CreateDeploymentRequest,

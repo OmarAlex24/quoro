@@ -57,6 +57,7 @@ pub mod store;
 pub(crate) mod subnet;
 pub mod support;
 pub mod sweeper;
+pub(crate) mod switchover;
 pub mod tunnel;
 pub mod voters;
 pub mod vulns;
@@ -191,9 +192,6 @@ pub struct AppState {
     /// and the loop that keeps it fresh (ADR 0150). The loop only runs once
     /// the binary calls [`vulns::Vulns::spawn`].
     pub vulns: vulns::Vulns,
-    /// The apps whose failover is running, in memory only (`failoverApp`
-    /// `in_progress`).
-    pub(crate) failovers: failover::Running,
 }
 
 impl AppState {
@@ -333,7 +331,6 @@ impl AppState {
             interactive: interactive::Interactive::default(),
             backups,
             vulns,
-            failovers: failover::Running::default(),
         };
         // Every session the previous process left open ends with
         // `primary_restarted` before the listener opens.

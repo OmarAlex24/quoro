@@ -203,6 +203,7 @@ fn ok_result() -> NodeMessage {
         error: None,
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     })
 }
 
@@ -216,6 +217,7 @@ fn fence_failed_result() -> NodeMessage {
         }),
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     })
 }
 
@@ -906,6 +908,7 @@ async fn a_refused_fence_ack_lets_the_desired_state_out_and_is_sent_again() {
             }),
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         }),
         Some(command["id"].as_str().unwrap()),
     )

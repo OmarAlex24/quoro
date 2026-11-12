@@ -41,9 +41,11 @@
 //!
 //! **One at a time.** A failover of an app holds [`Running`] from its
 //! `in_progress` check until it answers, so a second call of the same app
-//! answers `in_progress`. The set is in memory only, as the call is. A call
-//! while the hub holds a grant of the app's lease that it has not sent
-//! answers `in_progress` too (`App.lease.grant_pending`, ADR 0292).
+//! answers `in_progress`. A switchover ([`crate::switchover`]) holds the same
+//! set, so either one running makes the other answer `in_progress`. The set
+//! is in memory only, as the call is; the hub keeps it. A call while the hub
+//! holds a grant of the app's lease that it has not sent answers
+//! `in_progress` too (`App.lease.grant_pending`, ADR 0292).
 
 use crate::AppState;
 use crate::api::apps::{
@@ -77,14 +79,14 @@ const RECHECK: Duration = Duration::from_millis(250);
 /// How many times the change waits for an open gate before it gives up.
 const GATE_TRIES: u32 = 10;
 
-/// The apps whose failover is running (`in_progress`).
+/// The apps whose failover or switchover is running (`in_progress`).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Running(Arc<Mutex<HashSet<String>>>);
 
 impl Running {
-    /// Marks `app_id`'s failover running until the guard drops, or `None`
-    /// when one already runs.
-    fn start(&self, app_id: &str) -> Option<RunningGuard> {
+    /// Marks `app_id`'s failover or switchover running until the guard
+    /// drops, or `None` when one already runs.
+    pub(crate) fn start(&self, app_id: &str) -> Option<RunningGuard> {
         let mut running = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         running.insert(app_id.to_string()).then(|| RunningGuard {
             running: Arc::clone(&self.0),
@@ -93,8 +95,8 @@ impl Running {
     }
 }
 
-/// Holds an app's failover running ([`Running::start`]).
-struct RunningGuard {
+/// Holds an app's failover or switchover running ([`Running::start`]).
+pub(crate) struct RunningGuard {
     running: Arc<Mutex<HashSet<String>>>,
     app_id: String,
 }
@@ -109,28 +111,38 @@ impl Drop for RunningGuard {
 }
 
 /// A `409 conflict` with `reason`.
-fn conflict(reason: Reason, detail: impl Into<String>) -> ApiError {
+pub(crate) fn conflict(reason: Reason, detail: impl Into<String>) -> ApiError {
     ApiError {
         reason: Some(reason),
         ..ApiError::conflict(detail)
     }
 }
 
-/// What a failover the refusals let through moves.
-struct Plan {
-    app_id: String,
+/// What a failover or switchover the refusals let through moves.
+pub(crate) struct Plan {
+    pub(crate) app_id: String,
     /// The warm node, which gets the lease.
-    warm: String,
+    pub(crate) warm: String,
     /// The volume's node, which holds the lease.
-    source: String,
+    pub(crate) source: String,
     /// The app's `ready` volume, on `source`.
-    volume_id: String,
+    pub(crate) volume_id: String,
     /// The app's lease as the refusals read it.
-    lease: Lease,
+    pub(crate) lease: Lease,
+}
+
+/// Which call the change moves the lease for, and what it writes for it.
+pub(crate) enum Outcome<'a> {
+    /// `failoverApp`: `app.failed_over`, and the call's own audit record
+    /// with `params`.
+    Failover { params: &'a Value },
+    /// `switchoverApp`: `app.switched_over` with the final snapshot that
+    /// the freeze shipped. The call's record was written when it started.
+    Switchover { snapshot_seq: u64 },
 }
 
 /// What the change moved, for what follows its commit.
-struct Moved {
+pub(crate) struct Moved {
     lease: Lease,
     /// The grant to the warm node waits ([`leases::NewGrant::Waiting`]): the
     /// hub holds it instead of sending it.
@@ -173,10 +185,10 @@ pub(crate) async fn run(
     if app.ha_policy != HaPolicy::Warm {
         return Err(conflict(Reason::NotWarm, "the app's ha_policy is not warm"));
     }
-    let Some(_running) = state.failovers.start(app_id) else {
+    let Some(_running) = state.hub.running().start(app_id) else {
         return Err(conflict(
             Reason::InProgress,
-            "a failover of the app is already running",
+            "a failover or switchover of the app is already running",
         ));
     };
     // ADR 0292: while a grant of the app's lease waits, a failover answers
@@ -201,16 +213,23 @@ pub(crate) async fn run(
     let revoked = state.hub.is_connected(&plan.source)
         && !plan.lease.is_revoked()
         && revoke(state, ctx, &plan).await?;
-    let moved = match release_and_change(state, ctx, &plan, params).await {
+    let outcome = Outcome::Failover { params };
+    let moved = match release_and_change(state, ctx, &plan, &outcome).await {
         Ok(moved) => moved,
         Err(error) if revoked => return Err(stays_revoked(state, &plan, error).await),
         Err(error) => return Err(error),
     };
+    let app = after_commit(state, &plan, moved);
+    Ok(answer(state, app, "failoverApp").await)
+}
 
-    // The move is committed: nothing below fails the call.
+/// What follows the commit of the change, which fails nothing: the warm
+/// node gets its grant, or the hub holds it, then every node concerned its
+/// new desired state. Returns the app as the change wrote it.
+pub(crate) fn after_commit(state: &AppState, plan: &Plan, moved: Moved) -> App {
     if moved.waiting {
         // ADR 0292: the hub holds the grant and sends it once the write is
-        // replicated and supported; the 202 below shows the wait, so the
+        // replicated and supported; a failover's 202 shows the wait, so the
         // grant is held before the answer reads it.
         state.hub.hold_grant(&moved.lease);
     } else {
@@ -222,21 +241,21 @@ pub(crate) async fn run(
     }
     let mut wake = vec![plan.warm.clone(), plan.source.clone()];
     wake.extend(moved.vm_nodes);
-    for node_id in crate::warm::with_copy_holders(state, app_id, wake) {
+    for node_id in crate::warm::with_copy_holders(state, &plan.app_id, wake) {
         state.hub.node_changed(&node_id);
     }
-    Ok(answer(state, moved.app).await)
+    moved.app
 }
 
 /// The wait for the source's release, then the change.
-async fn release_and_change(
+pub(crate) async fn release_and_change(
     state: &AppState,
     ctx: &CallCtx,
     plan: &Plan,
-    params: &Value,
+    outcome: &Outcome<'_>,
 ) -> Result<Moved, ApiError> {
     wait_for_release(state, plan).await?;
-    change(state, ctx, plan, params).await
+    change(state, ctx, plan, outcome).await
 }
 
 /// `error`, a refusal after this call revoked the source, with
@@ -369,7 +388,7 @@ async fn refuse(state: &AppState, app: &App, node_id: &str) -> Result<Plan, ApiE
 /// `snapshot_seq`, and when the source took that snapshot. The warm node's
 /// own report, not `App.warm.state`: a complete copy is one with a
 /// `snapshot_seq` (section 6.13).
-fn complete_copy(
+pub(crate) fn complete_copy(
     state: &AppState,
     warm: &str,
     volume_id: &str,
@@ -479,7 +498,7 @@ pub(crate) async fn held_while_away(
 }
 
 /// The app's `ready` volume, first by id.
-async fn ready_volume(
+pub(crate) async fn ready_volume(
     conn: &mut SqliteConnection,
     app_id: &str,
 ) -> Result<Option<Volume>, ApiError> {
@@ -516,7 +535,7 @@ async fn newest_seq(conn: &mut SqliteConnection) -> Result<Option<i64>, ApiError
 ///
 /// The refusals that read the database are checked again under the writer
 /// first, with their reasons. Returns whether this call revoked the lease.
-async fn revoke(state: &AppState, ctx: &CallCtx, plan: &Plan) -> Result<bool, ApiError> {
+pub(crate) async fn revoke(state: &AppState, ctx: &CallCtx, plan: &Plan) -> Result<bool, ApiError> {
     let mut w = state.store.begin_write().await?;
     let (app, warm_node_id) = app_and_warm(&mut w.tx, &plan.app_id).await?;
     if app.ha_policy != HaPolicy::Warm {
@@ -530,7 +549,7 @@ async fn revoke(state: &AppState, ctx: &CallCtx, plan: &Plan) -> Result<bool, Ap
     let volume = ready_volume(&mut w.tx, &plan.app_id).await?;
     if volume.is_none_or(|volume| volume.id != plan.volume_id || volume.node_id != plan.source) {
         return Err(ApiError::conflict(
-            "the app's volume changed while the failover started; try again",
+            "the app's volume changed while the move started; try again",
         ));
     }
     if leases::app_lease(&mut w.tx, &plan.app_id)
@@ -541,7 +560,7 @@ async fn revoke(state: &AppState, ctx: &CallCtx, plan: &Plan) -> Result<bool, Ap
         .is_none()
     {
         return Err(ApiError::conflict(
-            "the app's lease changed while the failover started; try again",
+            "the app's lease changed while the move started; try again",
         ));
     };
     let Some(lease) =
@@ -670,8 +689,8 @@ async fn released(state: &AppState, plan: &Plan) -> Result<bool, ApiError> {
 }
 
 /// The change that moves the lease, in one transaction: the grant to the
-/// warm node, the volume, the instances, the app, `app.failed_over` and the
-/// audit records. An open gate rolls it back and tries again once it passed,
+/// warm node, the volume, the instances, the app, `app.failed_over` or
+/// `app.switched_over` ([`Outcome`]) and the audit records. An open gate rolls it back and tries again once it passed,
 /// at most [`GATE_TRIES`] times. A grant that must wait is written with the
 /// mark set and moves everything else the same way; the caller holds it
 /// (ADR 0292). One that waits because support lapsed meanwhile moves
@@ -680,7 +699,7 @@ async fn change(
     state: &AppState,
     ctx: &CallCtx,
     plan: &Plan,
-    params: &Value,
+    outcome: &Outcome<'_>,
 ) -> Result<Moved, ApiError> {
     let hub = &state.hub;
     let actor = ctx.identity.actor();
@@ -876,23 +895,43 @@ async fn change(
         let payload = app_payload(&mut w.tx, &app).await?;
         changelog::append(&mut w.tx, &actor, "app", &app.id, Op::Update, payload).await?;
 
-        let mut data = json!({
-            "app_id": app.id,
-            "from_node_id": plan.source,
-            "to_node_id": plan.warm,
-            "fencing_token": lease.fencing_token,
-            "snapshot_seq": snapshot_seq,
-            // ADR 0292: whether the grant to the warm node waits, so the app
-            // starts later.
-            "grant_pending": waiting,
-        });
-        if let Some(taken_at) = &snapshot_taken_at {
-            data["snapshot_taken_at"] = json!(taken_at);
-        }
+        let (kind, data) = match outcome {
+            Outcome::Failover { .. } => {
+                let mut data = json!({
+                    "app_id": app.id,
+                    "from_node_id": plan.source,
+                    "to_node_id": plan.warm,
+                    "fencing_token": lease.fencing_token,
+                    "snapshot_seq": snapshot_seq,
+                    // ADR 0292: whether the grant to the warm node waits, so
+                    // the app starts later.
+                    "grant_pending": waiting,
+                });
+                if let Some(taken_at) = &snapshot_taken_at {
+                    data["snapshot_taken_at"] = json!(taken_at);
+                }
+                ("app.failed_over", data)
+            }
+            // `events.schema.json` `data_app_switched_over`: the final
+            // snapshot the freeze shipped, which the warm node's report may
+            // not show yet.
+            Outcome::Switchover {
+                snapshot_seq: final_seq,
+            } => (
+                "app.switched_over",
+                json!({
+                    "app_id": app.id,
+                    "from_node_id": plan.source,
+                    "to_node_id": plan.warm,
+                    "fencing_token": lease.fencing_token,
+                    "snapshot_seq": final_seq,
+                }),
+            ),
+        };
         events::emit(
             &mut w.tx,
             NewEvent {
-                kind: "app.failed_over",
+                kind,
                 source: Source::ControlPlane,
                 subject_type: "app",
                 subject_id: &app.id,
@@ -905,7 +944,8 @@ async fn change(
         .await?;
 
         // audit-log-format.md section 3.7: the new token's `lease.grant`
-        // system record, then the call's own.
+        // system record, then a failover's own; a switchover wrote its own
+        // when it started.
         crate::audit::append(
             &mut w.tx,
             &crate::backups::restore::system_record(
@@ -921,15 +961,17 @@ async fn change(
             ),
         )
         .await?;
-        ctx.append_ok(
-            &mut w.tx,
-            Some(Scope::AppFailover),
-            Some(&app_target(&app.id)),
-            Some(&app.project_id),
-            params,
-            lease_seq,
-        )
-        .await?;
+        if let Outcome::Failover { params } = outcome {
+            ctx.append_ok(
+                &mut w.tx,
+                Some(Scope::AppFailover),
+                Some(&app_target(&app.id)),
+                Some(&app.project_id),
+                params,
+                lease_seq,
+            )
+            .await?;
+        }
         w.commit().await?;
         return Ok(Moved {
             lease,
@@ -946,17 +988,18 @@ async fn change(
 
 /// `app`, as the change wrote it, as `getApp` shows it: its cost, lease and
 /// warm copy attached. The move is committed, so a view that cannot be read
-/// is left out with a warning rather than failing the call.
-async fn answer(state: &AppState, mut app: App) -> App {
+/// is left out with a warning, which names `operation`, rather than failing
+/// the call.
+pub(crate) async fn answer(state: &AppState, mut app: App, operation: &str) -> App {
     let apps = std::slice::from_mut(&mut app);
     if let Err(error) = crate::backups::cost::attach(state, apps).await {
-        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "failoverApp answers without the app's cost");
+        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "{operation} answers without the app's cost");
     }
     if let Err(error) = crate::api::leases::attach(state, apps).await {
-        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "failoverApp answers without the app's lease");
+        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "{operation} answers without the app's lease");
     }
     if let Err(error) = crate::warm::attach(state, apps).await {
-        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "failoverApp answers without the app's warm copy");
+        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "{operation} answers without the app's warm copy");
     }
     app
 }

@@ -1505,6 +1505,7 @@ impl Session {
                         error: None,
                         lines: None,
                         metrics: None,
+                        snapshot_seq: None,
                     };
                     write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
                 } else if command.kind == "logs_query" {
@@ -1524,6 +1525,7 @@ impl Session {
                                         error: None,
                                         lines: None,
                                         metrics: None,
+                                        snapshot_seq: None,
                                     };
                                     write_message(
                                         sink,
@@ -1556,6 +1558,7 @@ impl Session {
                                 error: None,
                                 lines: None,
                                 metrics: None,
+                                snapshot_seq: None,
                             },
                         },
                         Err(message) => bad_result(&message),
@@ -1592,6 +1595,7 @@ impl Session {
                         }),
                         lines: None,
                         metrics: None,
+                        snapshot_seq: None,
                     };
                     write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
                 }
@@ -1640,6 +1644,7 @@ impl Session {
                         error: None,
                         lines: None,
                         metrics: None,
+                        snapshot_seq: None,
                     });
                     write_message(sink, result, Some(&raw.id)).await?;
                 }
@@ -1766,6 +1771,7 @@ impl Session {
                     error: None,
                     lines: None,
                     metrics: None,
+                    snapshot_seq: None,
                 };
                 write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
                 return Ok(None);
@@ -1783,6 +1789,7 @@ impl Session {
                 error: None,
                 lines: None,
                 metrics: None,
+                snapshot_seq: None,
             };
             write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
             return Ok(None);
@@ -1795,6 +1802,7 @@ impl Session {
                 error: None,
                 lines: None,
                 metrics: None,
+                snapshot_seq: None,
             };
             write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
             return Ok(None);
@@ -1805,6 +1813,7 @@ impl Session {
             error: None,
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         };
         write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
 
@@ -2185,6 +2194,7 @@ impl Session {
             error: None,
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         };
         write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
         Ok(())
@@ -2235,6 +2245,7 @@ impl Session {
             error: None,
             lines: Some(kept),
             metrics: None,
+            snapshot_seq: None,
         }
     }
 
@@ -2253,6 +2264,7 @@ impl Session {
             error: None,
             lines: None,
             metrics: Some(ring.query(node, &vm_ids)),
+            snapshot_seq: None,
         }
     }
 
@@ -2294,6 +2306,7 @@ impl Session {
             error: None,
             lines: Some(kept),
             metrics: None,
+            snapshot_seq: None,
         })
     }
 
@@ -2879,6 +2892,7 @@ fn open_error_result(error: OpenError) -> CommandResult {
         }),
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     }
 }
 
@@ -2893,6 +2907,7 @@ fn interactive_unavailable() -> CommandResult {
         }),
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     }
 }
 
@@ -2973,6 +2988,7 @@ fn build_not_found() -> CommandResult {
         }),
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     }
 }
 
@@ -3003,6 +3019,7 @@ fn bad_result(message: &str) -> CommandResult {
         }),
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     }
 }
 

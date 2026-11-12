@@ -127,6 +127,7 @@ pub fn ok_result(detail: Option<String>) -> NodeMessage {
         error: None,
         lines: None,
         metrics: None,
+        snapshot_seq: None,
     })
 }
 

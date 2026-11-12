@@ -1718,6 +1718,7 @@ async fn an_unrecorded_failed_fence_holds_the_grant() {
             }),
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         }),
         revokes[0]["id"].as_str(),
     )
@@ -2066,6 +2067,7 @@ async fn a_step_4_row_with_an_unrecorded_failed_fence_gets_the_superseded_revoke
             }),
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         }),
         revokes[0]["id"].as_str(),
     )
@@ -2151,6 +2153,7 @@ async fn an_unrecorded_failed_fence_holds_an_unmarked_rows_grant_at_the_session_
             }),
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         }),
         revokes[0]["id"].as_str(),
     )

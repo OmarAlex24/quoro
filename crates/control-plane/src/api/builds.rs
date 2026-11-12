@@ -1292,6 +1292,7 @@ mod tests {
             }),
             lines: None,
             metrics: None,
+            snapshot_seq: None,
         };
         assert!(command_is_not_found(&answer(
             quoro_proto::ErrorCode::NotFound
