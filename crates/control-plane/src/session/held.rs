@@ -36,13 +36,15 @@
 //!
 //! The settle clears the mark once the holder renews while the policy is
 //! `warm` ([`super::conversion`]), and so does the holder's `local` report
-//! at its next session start ([`super::local_report`]). Out of scope (issue
-//! #555, ADR 0261): the `pong` after a same-token `local` grant, R and the
-//! conversion grant, and the resend of the same-token `local` grant. Until
-//! the holder reports or renews, a row marked here stays marked after its
-//! grant is taken, and moves only as a `local` lease does, which is safe. `failoverApp` ([`crate::failover`]) holds its
+//! at its next session start ([`super::local_report`]). The same-token
+//! `local` grant that ends the renewals after R, and its resend, are held
+//! here too, as [`Kind::LocalEnd`]; its send and the `pong` after it are
+//! [`super::local_end`]. Out of scope (issue #555): the conversion grant.
+//! Until the holder reports or renews, a row marked here stays marked after
+//! its grant is taken, and moves only as a `local` lease does, which is
+//! safe. `failoverApp` ([`crate::failover`]) holds its
 //! waiting grant with [`NodeHub::hold_grant`] and answers `in_progress` while
-//! [`NodeHub::grant_pending`] (ADR 0292).
+//! [`NodeHub::row_grant_pending`] (ADR 0292).
 
 use super::{ControlMessage, NodeHub, new_msg_id};
 use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind};
@@ -58,30 +60,76 @@ pub(super) const TICK: Duration = Duration::from_secs(1);
 /// The grants the hub holds, by lease id.
 #[derive(Debug, Default)]
 pub(super) struct Registry {
-    entries: HashMap<String, HeldGrant>,
+    pub(super) entries: HashMap<String, HeldGrant>,
+    /// The last registration number given ([`HeldGrant::registration`]).
+    registrations: u64,
+}
+
+impl Registry {
+    /// Holds `held` for `lease_id` as a new registration, replacing any
+    /// entry there, and returns the one it replaced. Every entry goes in
+    /// through here, so no two registrations compare equal.
+    pub(super) fn insert(&mut self, lease_id: String, mut held: HeldGrant) -> Option<HeldGrant> {
+        self.registrations += 1;
+        held.registration = self.registrations;
+        self.entries.insert(lease_id, held)
+    }
+
+    /// Removes the entry of `lease_id` only while it is still `held`, the
+    /// registration read before, unchanged since: a grant held again since,
+    /// or changed in place (sent, or made eligible), stays.
+    pub(super) fn remove_if(&mut self, lease_id: &str, held: &HeldGrant) -> Option<HeldGrant> {
+        if self.entries.get(lease_id) == Some(held) {
+            self.entries.remove(lease_id)
+        } else {
+            None
+        }
+    }
+}
+
+/// What a held grant sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// The row's grant at a new token ("Grants of a marked row").
+    NewToken,
+    /// The same-token `local` grant that ends an `expiring` lease's
+    /// renewals after R, and its resend ("Ending the renewals" steps 2 and
+    /// 3; [`super::local_end`]).
+    LocalEnd,
 }
 
 /// One held grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct HeldGrant {
+pub(super) struct HeldGrant {
+    pub(super) kind: Kind,
     /// The row's token and holder when it was held.
-    token: i64,
-    holder: String,
+    pub(super) token: i64,
+    pub(super) holder: String,
     /// The grant length the support check counts: the row's `duration_ms`
     /// for an `expiring` row, `D` for a `local` one ("Grants of a marked
     /// row", section 8.8: `D` is what every `support_request` carries).
-    support_ms: u64,
+    pub(super) support_ms: u64,
     /// The holder's session generation the grant may go out on: set by a
     /// session start that finds the row a step-4 row the node does not hold,
     /// or by a registration while that session is live after its `hello`.
     /// `None` while it waits for the holder's next session start.
-    eligible_on: Option<u64>,
+    pub(super) eligible_on: Option<u64>,
     /// The generation it went out on.
-    sent_on: Option<u64>,
+    pub(super) sent_on: Option<u64>,
     /// A revoke of the lease at this token, in the mode the node lists it,
     /// held back until support returns; the grant follows its answer ("The
     /// holder fenced first" step 4).
-    revoke_first: Option<u64>,
+    pub(super) revoke_first: Option<u64>,
+    /// R dropped this grant with a new token when it committed ("Ending the
+    /// renewals": "is dropped when R commits"), and the entry stays only for
+    /// its held-back revoke ([`Self::revoke_first`]): the grant never goes
+    /// out and never reads as pending, and the next attempt after the
+    /// revoke drops the entry.
+    pub(super) grant_dropped: bool,
+    /// Which registration this is, given by [`Registry::insert`]: an entry
+    /// held again for the same row is never equal to the one before it,
+    /// though every other field may match.
+    pub(super) registration: u64,
 }
 
 /// The grant length a held grant of `lease` needs majority support for:
@@ -99,28 +147,70 @@ pub(super) fn support_ms(lease: &leases::Lease) -> u64 {
 }
 
 impl HeldGrant {
-    fn of(lease: &leases::Lease, eligible_on: Option<u64>) -> Self {
+    pub(super) fn of(lease: &leases::Lease, eligible_on: Option<u64>) -> Self {
         Self {
+            kind: Kind::NewToken,
             token: lease.fencing_token,
             holder: lease.holder_node_id.clone(),
             support_ms: support_ms(lease),
             eligible_on,
             sent_on: None,
             revoke_first: None,
+            grant_dropped: false,
+            registration: 0,
         }
     }
 
-    fn names(&self, lease: &leases::Lease) -> bool {
+    pub(super) fn names(&self, lease: &leases::Lease) -> bool {
         self.token == lease.fencing_token && self.holder == lease.holder_node_id
     }
 
-    fn pending(&self) -> bool {
-        self.sent_on.is_none()
+    /// Not sent yet, and waiting as a grant does, with `live` the holder's
+    /// current session after its `hello`. A grant with a new token is
+    /// pending until it is sent, unless R dropped it. The same-token `local`
+    /// grant that ends the renewals is pending only while `live` is the
+    /// session it may go out on ("Grants of a marked row": "While the
+    /// holder's current session is such a session, `grant_pending` is true
+    /// until the grant is sent on it"); while it waits for such a session,
+    /// it is not ("`grant_pending` stays false for it"), and "When that
+    /// session ends first, the grant again waits for such a session and is
+    /// not pending".
+    fn pending(&self, live: Option<u64>) -> bool {
+        if self.sent_on.is_some() || self.grant_dropped {
+            return false;
+        }
+        match self.kind {
+            Kind::NewToken => true,
+            Kind::LocalEnd => self.eligible_on.is_some() && self.eligible_on == live,
+        }
+    }
+}
+
+/// Test seam: a pause in [`NodeHub::held_session_start`] between its read of
+/// an entry's row and its change of that entry
+/// ([`NodeHub::pause_next_held_start`]).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct Pause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl Pause {
+    /// Waits until the session start has read the row and paused.
+    pub(super) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the session start go on to its change of the entry.
+    pub(super) fn release(&self) {
+        self.release.notify_one();
     }
 }
 
 /// What one attempt at a held grant found.
-enum Attempt {
+pub(super) enum Attempt {
     /// It went out.
     Sent,
     /// It waits; the entry stays.
@@ -313,7 +403,9 @@ impl NodeHub {
     /// a second call never sends it twice. While the holder's session is
     /// live after its `hello`, the grant may go out on it: the node cannot
     /// hold a token written after its `hello`. Otherwise it waits for the
-    /// holder's next session start.
+    /// holder's next session start. A held same-token `local` grant that
+    /// names the row is replaced: this grant has a new token, and goes out
+    /// only through [`Self::try_send_held`], gated.
     pub(crate) fn hold_grant(&self, lease: &leases::Lease) {
         let live = {
             let sessions = self.0.sessions.lock().expect("session lock");
@@ -325,7 +417,10 @@ impl NodeHub {
         let replaced = {
             let mut registry = self.0.held.lock().expect("held grant lock");
             match registry.entries.get_mut(&lease.id) {
-                Some(held) if held.names(lease) => {
+                // The same grant is held already. Over an entry R dropped and
+                // kept only for its held-back revoke, this updates
+                // `eligible_on` and nothing else: the grant stays dropped.
+                Some(held) if held.kind == Kind::NewToken && held.names(lease) => {
                     if held.eligible_on.is_none() {
                         held.eligible_on = live;
                     }
@@ -336,9 +431,7 @@ impl NodeHub {
                 // attempt would only drop the entry ([`Self::held_eligible`]
                 // keeps the same guard).
                 Some(held) if held.token > lease.fencing_token => None,
-                _ => registry
-                    .entries
-                    .insert(lease.id.clone(), HeldGrant::of(lease, live)),
+                _ => registry.insert(lease.id.clone(), HeldGrant::of(lease, live)),
             }
         };
         if let Some(replaced) = replaced {
@@ -359,32 +452,53 @@ impl NodeHub {
     /// rather than write a second token (ADR 0295). What the API shows, and
     /// what a failover's `in_progress` reads, is [`Self::row_grant_pending`].
     pub(crate) fn grant_pending(&self, lease_id: &str) -> bool {
-        self.0
+        let held = self
+            .0
             .held
             .lock()
             .expect("held grant lock")
             .entries
             .get(lease_id)
-            .is_some_and(HeldGrant::pending)
+            .cloned();
+        held.is_some_and(|held| self.is_pending(&held))
+    }
+
+    /// Whether `held` reads as pending ([`HeldGrant::pending`]) against its
+    /// holder's current session after its `hello`, read now. The caller
+    /// holds no lock: the registry lock and the sessions lock are never
+    /// held together here.
+    fn is_pending(&self, held: &HeldGrant) -> bool {
+        let live = self
+            .0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(&held.holder)
+            .filter(|handle| handle.hello_recorded)
+            .map(|handle| handle.generation);
+        held.pending(live)
     }
 
     /// The held grant of `lease` as `Lease.grant_pending` shows it: an entry
     /// not sent yet that names the row as it stands, at its token and
-    /// holder, for a row that carries the mark and is not revoked (section
-    /// 8.4, "Grants of a marked row"). Whichever operation held it counts:
-    /// a failover, a restore, a regrant or `createVolume`.
+    /// holder, for a row that carries the mark and is not revoked, and that
+    /// reads as pending ([`HeldGrant::pending`]; section 8.4, "Grants of a
+    /// marked row"). Whichever operation held it counts: a failover, a
+    /// restore, a regrant or `createVolume`.
     fn held_of_row(&self, lease: &leases::Lease) -> Option<HeldGrant> {
         if !lease.unsettled || lease.is_revoked() {
             return None;
         }
-        self.0
+        let held = self
+            .0
             .held
             .lock()
             .expect("held grant lock")
             .entries
             .get(&lease.id)
-            .filter(|held| held.names(lease) && held.pending())
-            .cloned()
+            .filter(|held| held.names(lease))
+            .cloned()?;
+        self.is_pending(&held).then_some(held)
     }
 
     /// `Lease.grant_pending` of `lease`, the row as just read, with no
@@ -398,8 +512,14 @@ impl NodeHub {
     /// `Lease.grant_pending` and `Lease.grant_waiting_on` of `lease`, read on
     /// `conn` with no write: whether a grant of the row as it stands waits,
     /// and the machines of the required set that have not acknowledged the
-    /// row's newest write, with its holder while the grant waits for that
-    /// holder's next session start (section 8.4, "Grants of a marked row").
+    /// row's newest write (section 8.4, "Grants of a marked row"). A grant
+    /// with a new token also lists its holder while it waits for that
+    /// holder's next session start: "`grant_waiting_on` also lists that
+    /// node until its session starts". The same-token `local` grant that
+    /// ends the renewals lists only "the machines of the required set that
+    /// have not acknowledged R", and only while it is pending; while it
+    /// waits for a session that shows the lease, "`grant_waiting_on` stays
+    /// empty".
     ///
     /// # Errors
     ///
@@ -413,7 +533,7 @@ impl NodeHub {
             return Ok((false, Vec::new()));
         };
         let mut waiting = BTreeSet::new();
-        if held.eligible_on.is_none() {
+        if held.kind == Kind::NewToken && held.eligible_on.is_none() {
             waiting.insert(held.holder.clone());
         }
         if let Some(seq) = leases::newest_write_seq(conn, &lease.id).await?
@@ -444,9 +564,7 @@ impl NodeHub {
         .map_err(|e| format!("cannot read the held grants: {}", e.code.as_str()))?;
         let mut registry = self.0.held.lock().expect("held grant lock");
         for row in rows {
-            registry
-                .entries
-                .insert(row.id.clone(), HeldGrant::of(&row, None));
+            registry.insert(row.id.clone(), HeldGrant::of(&row, None));
         }
         Ok(())
     }
@@ -486,7 +604,7 @@ impl NodeHub {
             {
                 Err(held)
             } else {
-                Ok(registry.entries.insert(lease.id.clone(), held))
+                Ok(registry.insert(lease.id.clone(), held))
             }
         };
         match replaced {
@@ -544,6 +662,8 @@ impl NodeHub {
                 Some(row) => leases::fenced(conn, unrecorded, row).await?,
                 None => false,
             };
+            #[cfg(test)]
+            self.held_start_paused().await;
             // What the entry was when it changed, so a revoke it held back
             // goes with the session it was eligible on.
             let changed = {
@@ -554,7 +674,7 @@ impl NodeHub {
                         entry.revoke_first = None;
                         Some(held)
                     }
-                    Some(entry) if *entry == held => registry.entries.remove(&lease_id),
+                    Some(entry) if *entry == held => registry.remove_if(&lease_id, &held),
                     _ => None,
                 }
             };
@@ -563,6 +683,26 @@ impl NodeHub {
             }
         }
         Ok(())
+    }
+
+    /// Test seam: the next [`NodeHub::held_session_start`] pauses once, after
+    /// it read the row of an entry and before it changes that entry, until
+    /// the returned pause is released.
+    #[cfg(test)]
+    pub(super) fn pause_next_held_start(&self) -> std::sync::Arc<Pause> {
+        let pause = std::sync::Arc::new(Pause::default());
+        *self.0.held_start_pause.lock().expect("pause lock") = Some(pause.clone());
+        pause
+    }
+
+    /// Waits at the pause [`NodeHub::pause_next_held_start`] set, once.
+    #[cfg(test)]
+    async fn held_start_paused(&self) {
+        let pause = self.0.held_start_pause.lock().expect("pause lock").take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     /// A session start found the step-4 row `lease` listed at the row's
@@ -589,7 +729,7 @@ impl NodeHub {
 
     /// Forgets the held-back revoke of an entry that goes, so its session's
     /// `hello` position may count again.
-    fn release_held_revoke(&self, held: &HeldGrant) {
+    pub(super) fn release_held_revoke(&self, held: &HeldGrant) {
         let (Some(generation), Some(_)) = (held.eligible_on, held.revoke_first) else {
             return;
         };
@@ -628,7 +768,7 @@ impl NodeHub {
     /// grant goes out only then: the node holds a grant back until it has
     /// answered the revokes before it (section 4.2 rule 3), and waiting for
     /// every one of them is the side that grants less.
-    fn session_ready(&self, node_id: &str, generation: u64) -> bool {
+    pub(super) fn session_ready(&self, node_id: &str, generation: u64) -> bool {
         let sessions = self.0.sessions.lock().expect("session lock");
         sessions
             .get(node_id)
@@ -685,6 +825,40 @@ impl NodeHub {
                 .collect()
         };
         for (lease_id, held) in entries {
+            // An unsent grant goes once its row no longer owes it, whether
+            // or not a session may take it, so it never reads as pending
+            // for a holder that is away. A same-token `local` grant has
+            // nothing left to end, the policy back on `warm` included
+            // ([`super::local_end`]); a grant with a new token goes on the
+            // test its send makes under the writer gate ([`new_token_row`]),
+            // such as once R has written its row since it was held. An entry
+            // whose step-4 revoke is held back for support stays until that
+            // revoke goes out: section 5.1 revokes the lease the node listed,
+            // whatever the row says since, and the next attempt drops it. A
+            // grant that R dropped as it committed goes then, unread: it
+            // never goes out ("Ending the renewals").
+            if held.sent_on.is_none() && held.revoke_first.is_none() {
+                let obsolete = match held.kind {
+                    _ if held.grant_dropped => Ok(true),
+                    Kind::LocalEnd => self.local_end_obsolete(&lease_id, &held).await,
+                    Kind::NewToken => self.new_token_obsolete(&lease_id, &held).await,
+                };
+                match obsolete {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        self.drop_held(&lease_id, &held);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            code = %e.code.as_str(),
+                            lease_id,
+                            "cannot read a held grant's row; trying again"
+                        );
+                        continue;
+                    }
+                }
+            }
             let Some(generation) = held.eligible_on else {
                 continue;
             };
@@ -702,14 +876,13 @@ impl NodeHub {
             if !self.session_ready(&held.holder, generation) {
                 continue;
             }
-            match self.try_send_held(&lease_id, &held, generation).await {
+            let attempt = match held.kind {
+                Kind::NewToken => self.try_send_held(&lease_id, &held, generation).await,
+                Kind::LocalEnd => self.try_send_local_end(&lease_id, &held, generation).await,
+            };
+            match attempt {
                 Ok(Attempt::Sent | Attempt::Wait) => {}
-                Ok(Attempt::Drop) => {
-                    let mut registry = self.0.held.lock().expect("held grant lock");
-                    if registry.entries.get(&lease_id) == Some(&held) {
-                        registry.entries.remove(&lease_id);
-                    }
-                }
+                Ok(Attempt::Drop) => self.drop_held(&lease_id, &held),
                 Err(e) => tracing::warn!(
                     code = %e.code.as_str(),
                     lease_id,
@@ -717,6 +890,31 @@ impl NodeHub {
                 ),
             }
         }
+    }
+
+    /// Drops the entry of `lease_id` an attempt read as `held`, only while it
+    /// is still that registration, unchanged ([`Registry::remove_if`]): a
+    /// grant held again since the read stays. A revoke it held back is
+    /// released, so its session's `hello` position may count again.
+    pub(super) fn drop_held(&self, lease_id: &str, held: &HeldGrant) {
+        let dropped = self
+            .0
+            .held
+            .lock()
+            .expect("held grant lock")
+            .remove_if(lease_id, held);
+        if let Some(dropped) = dropped {
+            self.release_held_revoke(&dropped);
+        }
+    }
+
+    /// Whether the held grant with a new token `held` of `lease_id`, not
+    /// sent yet, is owed no more: [`new_token_row`] reads its row on a pool
+    /// connection, as its send reads it under the writer gate.
+    async fn new_token_obsolete(&self, lease_id: &str, held: &HeldGrant) -> Result<bool, ApiError> {
+        let mut conn = self.0.store.pool().acquire().await?;
+        let row = new_token_row(&mut conn, &self.0.unrecorded_failures, lease_id, held).await?;
+        Ok(matches!(row, NewTokenRow::Obsolete))
     }
 
     /// Sends the revoke held back for support on `generation`, at the token
@@ -814,26 +1012,12 @@ impl NodeHub {
             }
         }
         let mut w = self.0.store.begin_write().await?;
-        let Some(row) = leases::by_id(&mut w.tx, lease_id).await? else {
-            return Ok(Attempt::Drop);
-        };
-        // The row still names the holder at the token, unrevoked and marked.
-        if !held.names(&row) || row.is_revoked() || !row.unsettled {
-            return Ok(Attempt::Drop);
-        }
-        // Section 8.5: a failed fence, recorded or not (step 1), or an
-        // acknowledgement pending delivery holds the grant; the
-        // acknowledgement's increment changes the token.
-        if leases::fenced(&mut w.tx, &self.0.unrecorded_failures, &row).await? {
-            return Ok(Attempt::Wait);
-        }
-        // Step 4: the row's newest write gave the lease its token.
-        if !leases::newest_write_gave_new_token(&mut w.tx, lease_id).await? {
-            return Ok(Attempt::Drop);
-        }
-        let Some(seq) = leases::newest_write_seq(&mut w.tx, lease_id).await? else {
-            return Ok(Attempt::Drop);
-        };
+        let (row, seq) =
+            match new_token_row(&mut w.tx, &self.0.unrecorded_failures, lease_id, held).await? {
+                NewTokenRow::Owed { row, seq } => (*row, seq),
+                NewTokenRow::Fenced => return Ok(Attempt::Wait),
+                NewTokenRow::Obsolete => return Ok(Attempt::Drop),
+            };
         if self
             .replicated(&mut w.tx, seq)
             .await
@@ -908,6 +1092,60 @@ impl NodeHub {
         self.node_changed(&row.holder_node_id);
         Ok(Attempt::Sent)
     }
+}
+
+/// What the row says of a held grant with a new token.
+pub(super) enum NewTokenRow {
+    /// The row still owes the grant: it is the row as read, and `seq` its
+    /// newest change-log write, the one the grant waits on.
+    Owed { row: Box<leases::Lease>, seq: u64 },
+    /// It may owe it, but a failed fence holds it (section 8.5): the entry
+    /// stays.
+    Fenced,
+    /// It owes it no more: the entry goes.
+    Obsolete,
+}
+
+/// Whether the row of `lease_id`, read on `conn`, still owes `held`, a grant
+/// with a new token. The one test of it, so the send under the writer gate
+/// ([`NodeHub::try_send_held`]) and the drop of an unsent entry whatever its
+/// eligibility ([`NodeHub::attempt_held`]) cannot disagree. The row must
+/// still name the holder at the held token, unrevoked and marked, and its
+/// newest write must have given the lease that token ("The holder fenced
+/// first" step 4): a later write that keeps the token, such as R, leaves the
+/// grant standing for nothing ("Not listed": "otherwise it gives nothing
+/// back"). A failed fence, recorded or not (step 1), or an acknowledgement
+/// pending delivery holds the grant before that test; the acknowledgement's
+/// increment changes the token.
+///
+/// # Errors
+///
+/// A database error.
+pub(super) async fn new_token_row(
+    conn: &mut sqlx::SqliteConnection,
+    unrecorded: &crate::fences::UnrecordedFailures,
+    lease_id: &str,
+    held: &HeldGrant,
+) -> Result<NewTokenRow, ApiError> {
+    let Some(row) = leases::by_id(conn, lease_id).await? else {
+        return Ok(NewTokenRow::Obsolete);
+    };
+    if !held.names(&row) || row.is_revoked() || !row.unsettled {
+        return Ok(NewTokenRow::Obsolete);
+    }
+    if leases::fenced(conn, unrecorded, &row).await? {
+        return Ok(NewTokenRow::Fenced);
+    }
+    if !leases::newest_write_gave_new_token(conn, lease_id).await? {
+        return Ok(NewTokenRow::Obsolete);
+    }
+    let Some(seq) = leases::newest_write_seq(conn, lease_id).await? else {
+        return Ok(NewTokenRow::Obsolete);
+    };
+    Ok(NewTokenRow::Owed {
+        row: Box::new(row),
+        seq,
+    })
 }
 
 #[cfg(test)]
@@ -991,6 +1229,37 @@ mod tests {
         assert!(hub.0.take_revoke(&node_id, generation, id).is_some());
         hub.latch_hello(&node_id, generation);
         assert_eq!(hub.countable_ack(&node_id), 7);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// A second session-start registration of the same row and revoke
+    /// replaces the first, equal to it in every field but its registration,
+    /// and releases the first's held-back revoke. An attempt that read the
+    /// first entry sends nothing and leaves the count alone; the fresh
+    /// entry's revoke goes out once.
+    #[tokio::test]
+    async fn a_stale_read_sends_no_held_revoke_over_a_fresh_registration() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (generation, mut rx, _closed, _changed) = hub.attach(&node_id);
+        let lease = marked("lse_one", &node_id);
+        hub.held_eligible(&lease, generation, Some(1));
+        let stale = entry(hub, "lse_one");
+        hub.held_eligible(&lease, generation, Some(1));
+        let fresh = entry(hub, "lse_one");
+        assert_ne!(stale, fresh);
+        assert_eq!(held_revokes(hub, &node_id), 1, "the first was released");
+
+        hub.send_held_revoke("lse_one", &stale, generation, 1);
+        assert!(rx.try_recv().is_err(), "the stale read sends nothing");
+        assert_eq!(held_revokes(hub, &node_id), 1);
+        assert_eq!(entry(hub, "lse_one"), fresh);
+
+        hub.send_held_revoke("lse_one", &fresh, generation, 1);
+        let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "lease_revoke");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(held_revokes(hub, &node_id), 0);
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
@@ -1078,6 +1347,70 @@ mod tests {
         other.holder_node_id = "nod_other".to_string();
         assert!(!hub.row_grant_pending(&other), "another holder");
         assert!(hub.grant_pending("lse_one"), "the entry stays");
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// A re-entry's `hold_grant` over a held `local` grant that ends the
+    /// renewals and names the same row holds a new-token grant: a grant
+    /// with a new token never goes out through the same-token grant's path,
+    /// which checks no gate.
+    #[tokio::test]
+    async fn a_hold_grant_over_a_local_end_entry_holds_a_new_token_grant() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let lease = marked("lse_one", &node_id);
+        let mut held = HeldGrant::of(&lease, None);
+        held.kind = super::Kind::LocalEnd;
+        hub.0
+            .held
+            .lock()
+            .unwrap()
+            .insert("lse_one".to_string(), held);
+        hub.hold_grant(&lease);
+        assert_eq!(entry(hub, "lse_one").kind, super::Kind::NewToken);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// An attempt reads an entry, decides to drop it, and a registration of
+    /// the same row lands before the drop: the same-token `local` grant held
+    /// again, equal to the one read in every field but its registration. The
+    /// drop leaves the fresh registration held. Nor does it remove an entry
+    /// changed in place since the read (sent meanwhile); only the entry as
+    /// read goes.
+    #[tokio::test]
+    async fn a_stale_drop_never_removes_a_fresh_registration() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let lease = marked("lse_one", &node_id);
+        hub.hold_local_end_on(&lease, 1);
+        let stale = entry(hub, "lse_one");
+        hub.hold_local_end_on(&lease, 1);
+        let fresh = entry(hub, "lse_one");
+        hub.drop_held("lse_one", &stale);
+        assert_eq!(
+            hub.0.held.lock().unwrap().entries.get("lse_one"),
+            Some(&fresh),
+            "the fresh registration stays"
+        );
+
+        hub.0
+            .held
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut("lse_one")
+            .unwrap()
+            .sent_on = Some(1);
+        hub.drop_held("lse_one", &fresh);
+        assert_eq!(
+            entry(hub, "lse_one").sent_on,
+            Some(1),
+            "changed in place since the read"
+        );
+
+        let read = entry(hub, "lse_one");
+        hub.drop_held("lse_one", &read);
+        assert!(!hub.0.held.lock().unwrap().entries.contains_key("lse_one"));
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 

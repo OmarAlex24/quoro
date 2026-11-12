@@ -1728,7 +1728,26 @@ pub async fn update_app(
         .await?;
 
     match update_app_tx(&state, &ctx, &app_id, &body, &params).await {
-        Ok((mut app, vm_ids, warm_wake)) => {
+        Ok((mut app, vm_ids, warm_wake, ended, left_stopped)) => {
+            if let Some(dropped) = left_stopped {
+                tracing::info!(
+                    app_id = %app_id,
+                    node_id = %dropped.node_id,
+                    token = dropped.fencing_token,
+                    "the policy left warm: the held grant was dropped and the app stays stopped"
+                );
+            }
+            // Section 8.4, "Ending the renewals" step 2: once R is
+            // replicated, while the policy is still off `warm` and while the
+            // primary holds majority support, the holder gets the
+            // same-token `local` grant. This change left the policy off
+            // `warm`, so the grant is held whether or not R wrote the row
+            // this time. A held grant with a new token that R dropped goes
+            // first; its `app.left_stopped` committed with R. Nothing here
+            // awaits before the wakes below.
+            if let Some(ended) = ended {
+                state.hub.end_renewals_committed(&ended);
+            }
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
             }
@@ -1764,13 +1783,13 @@ pub async fn update_app(
     }
 }
 
-async fn update_app_tx(
+pub(crate) async fn update_app_tx(
     state: &AppState,
     ctx: &CallCtx,
     app_id: &str,
     body: &UpdateAppRequest,
     params: &Value,
-) -> Result<(App, Vec<String>, Option<Vec<String>>), ApiError> {
+) -> Result<UpdatedApp, ApiError> {
     validate_update(body)?;
     if !deploy::is_id_with_prefix("app", app_id) {
         return Err(ApiError::not_found("app"));
@@ -1784,6 +1803,8 @@ async fn update_app_tx(
     let mut app = app_from_row(&row)?;
     let was_warm = app.ha_policy == HaPolicy::Warm;
     let mut changed = Vec::new();
+    // The lease row after R, when the policy leaves `warm`.
+    let mut ended = None;
 
     // A new replica count is checked against the app as it is now, and against
     // the placement this request sets when it sets one (ADR 0142).
@@ -1853,10 +1874,10 @@ async fn update_app_tx(
         // that leaves `warm` (`hot` is read as `warm`, as the lease code
         // reads it) writes the lease row `local` with the unsettled mark in
         // this transaction (R), so a failed request writes neither. Nothing is
-        // sent here.
+        // sent here: what follows is read here and acted on once it commits.
         let warmish = |policy: HaPolicy| matches!(policy, HaPolicy::Warm | HaPolicy::Hot);
         if warmish(app.ha_policy) && !warmish(policy) {
-            crate::leases::end_renewals(&mut w.tx, app_id, &ctx.identity.actor()).await?;
+            ended = crate::leases::leave_warm(&mut w.tx, app_id, &ctx.identity.actor()).await?;
         }
         app.ha_policy = policy;
         changed.push("ha_policy");
@@ -1982,9 +2003,36 @@ async fn update_app_tx(
         )
         .await?;
     }
+    // "Ending the renewals": whether R drops a held grant with a new token
+    // is decided here, under the writer gate, and its `app.left_stopped`
+    // commits with R and the policy, so no drop after the commit can lose it.
+    let left_stopped = match &ended {
+        Some(ended) => {
+            let actor = ctx.identity.actor();
+            let by = crate::session::PolicyChange {
+                project_id: &app.project_id,
+                request_id: &ctx.request_id,
+                actor: &actor,
+            };
+            state.hub.record_left_stopped(&mut w.tx, ended, &by).await?
+        }
+        None => None,
+    };
     w.commit().await?;
-    Ok((app, vm_ids, warm_wake))
+    Ok((app, vm_ids, warm_wake, ended, left_stopped))
 }
+
+/// What [`update_app_tx`] committed: the app, the VMs to wake, the nodes
+/// whose warm settings changed, the lease row after R with what follows it,
+/// when the policy left `warm`, and the grant R dropped, for which the
+/// transaction recorded `app.left_stopped`.
+pub(crate) type UpdatedApp = (
+    App,
+    Vec<String>,
+    Option<Vec<String>>,
+    Option<crate::leases::Ended>,
+    Option<crate::session::LeftStopped>,
+);
 
 /// Why `updateApp` refuses `ha_policy` `warm` for an app (`openapi.yaml`
 /// `UpdateAppRequest.ha_policy`).

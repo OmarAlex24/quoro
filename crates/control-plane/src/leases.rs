@@ -15,6 +15,7 @@ use crate::deploy;
 use crate::error::ApiError;
 use crate::fences::UnrecordedFailures;
 use crate::store::now_rfc3339;
+use futures_util::TryStreamExt as _;
 use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ResourceType, RevokeReason};
 use serde_json::{Value, json};
 use sqlx::sqlite::SqliteRow;
@@ -225,6 +226,10 @@ pub(crate) async fn newest_write_seq(
 /// lack a `fencing_token` give nothing to compare with, and read as no new
 /// token, the side that grants less.
 ///
+/// The entries are read newest first, one at a time, and the read stops at
+/// the first earlier entry that carries a token: a held grant's attempt asks
+/// this on every tick, and a lease's log only grows.
+///
 /// # Errors
 ///
 /// A database error.
@@ -232,31 +237,31 @@ pub(crate) async fn newest_write_gave_new_token(
     conn: &mut SqliteConnection,
     lease_id: &str,
 ) -> Result<bool, ApiError> {
-    let payloads: Vec<String> = sqlx::query_scalar(
-        "SELECT payload FROM change_log WHERE entity_type = 'lease' AND entity_id = ? \
-         ORDER BY seq DESC",
-    )
-    .bind(lease_id)
-    .fetch_all(&mut *conn)
-    .await?;
     let token = |payload: &str| {
         serde_json::from_str::<Value>(payload)
             .ok()
             .and_then(|payload| payload.get("fencing_token").and_then(Value::as_i64))
     };
-    let mut entries = payloads.iter();
-    let Some(newest) = entries.next() else {
+    let mut payloads = sqlx::query_scalar::<_, String>(
+        "SELECT payload FROM change_log WHERE entity_type = 'lease' AND entity_id = ? \
+         ORDER BY seq DESC",
+    )
+    .bind(lease_id)
+    .fetch(&mut *conn);
+    let Some(newest) = payloads.try_next().await? else {
         return Ok(false);
     };
-    let Some(newest) = token(newest) else {
+    let Some(newest) = token(&newest) else {
         return Ok(false);
     };
-    if payloads.len() == 1 {
-        return Ok(true);
+    let mut earlier = false;
+    while let Some(payload) = payloads.try_next().await? {
+        earlier = true;
+        if let Some(before) = token(&payload) {
+            return Ok(newest > before);
+        }
     }
-    Ok(entries
-        .find_map(|payload| token(payload))
-        .is_some_and(|before| newest > before))
+    Ok(!earlier)
 }
 
 /// Whether `lease` is a step-4 row for the node it names ("The holder fenced
@@ -1175,8 +1180,10 @@ pub(crate) async fn write_local_report(
 /// one change-log entry. Any mode is written: "The row stays `local` with the
 /// mark that R set", and marking more only delays a move ("The mark"). A row
 /// that already reads `local` with the mark is left as it is. Returns the
-/// row as it stands after the call, `None` when the app has no unrevoked
-/// lease.
+/// row R wrote, `None` when it wrote nothing: the app has no unrevoked
+/// lease, or its row already reads `local` with the mark. Whether the
+/// same-token `local` grant that ends the renewals follows is
+/// [`leave_warm`]'s answer, read after this write.
 ///
 /// # Errors
 ///
@@ -1193,7 +1200,7 @@ pub(crate) async fn end_renewals(
         return Ok(None);
     }
     if lease.mode == "local" && lease.unsettled {
-        return Ok(Some(lease));
+        return Ok(None);
     }
     sqlx::query("UPDATE leases SET mode = 'local', unsettled = 1 WHERE id = ?")
         .bind(&lease.id)
@@ -1203,6 +1210,93 @@ pub(crate) async fn end_renewals(
     lease.unsettled = true;
     changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
     Ok(Some(lease))
+}
+
+/// What a policy change off `warm` left for the hub, once its transaction
+/// commits ([`leave_warm`]).
+#[derive(Clone, Debug)]
+pub(crate) struct Ended {
+    /// The app's lease row as the transaction leaves it.
+    pub lease: Lease,
+    /// R wrote the row ([`end_renewals`]).
+    pub wrote: bool,
+    /// R turned a row that read `expiring` into `local`: a grant with a new
+    /// token held for that row and not sent is dropped as R commits, and R's
+    /// transaction records `app.left_stopped` for it ("Ending the renewals").
+    pub from_expiring: bool,
+    /// The same-token `local` grant that ends the renewals is held for the
+    /// row: it is unrevoked, marked and reads `local`, and its newest write
+    /// gave it no new token ([`newest_write_gave_new_token`]).
+    pub hold: bool,
+}
+
+/// R, then what follows it, in the transaction of a policy change off `warm`
+/// (section 8.4, "Ending the renewals" steps 1 and 2): `None` when the app
+/// has no unrevoked lease. When the policy leaves `warm`, step 2 has the
+/// primary, "once R is replicated (below), while the policy is still off
+/// `warm` and while it holds majority support (section 8.8)", send "the
+/// holder the same-token `local` grant". Every change off `warm` leaves the
+/// policy off `warm`, so the grant is owed whether or not R wrote the row
+/// this time: a row R finds already `local` with the mark, as a return to
+/// `warm` and back before any settle leaves it, still gets it. A row whose
+/// newest write gave it a new token gets none: that write's grant ("Grants
+/// of a marked row") is the one the row waits for, and it goes out through
+/// its own path, gated.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn leave_warm(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    actor: &Actor,
+) -> Result<Option<Ended>, ApiError> {
+    let before = app_lease(conn, app_id).await?;
+    let wrote = end_renewals(conn, app_id, actor).await?.is_some();
+    let from_expiring = wrote && before.is_some_and(|before| before.mode == "expiring");
+    let Some(lease) = app_lease(conn, app_id).await? else {
+        return Ok(None);
+    };
+    if lease.is_revoked() {
+        return Ok(None);
+    }
+    let hold = lease.unsettled
+        && lease.mode == "local"
+        && !newest_write_gave_new_token(conn, &lease.id).await?;
+    Ok(Some(Ended {
+        lease,
+        wrote,
+        from_expiring,
+        hold,
+    }))
+}
+
+/// The write that precedes the resend of the same-token `local` grant when
+/// the holder reports a token above the row's (section 8.4, "The holder's
+/// next `hello`", third bullet): the row takes `mode` `local` and the
+/// holder's `token`, and keeps the mark. The caller has checked, in the same
+/// single-writer transaction, that the holder may be recorded so. Returns
+/// the row as written.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn write_marked_local(
+    conn: &mut SqliteConnection,
+    mut lease: Lease,
+    token: i64,
+    actor: &Actor,
+) -> Result<Lease, ApiError> {
+    sqlx::query("UPDATE leases SET mode = 'local', fencing_token = ?, unsettled = 1 WHERE id = ?")
+        .bind(token)
+        .bind(&lease.id)
+        .execute(&mut *conn)
+        .await?;
+    lease.mode = "local".to_string();
+    lease.fencing_token = token;
+    lease.unsettled = true;
+    changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+    Ok(lease)
 }
 
 /// Revokes the app's lease and writes its change-log entry; the caller builds
@@ -1305,6 +1399,56 @@ mod tests {
         let lease = *lease;
         w.commit().await.unwrap();
         (store, lease, actor, data_dir)
+    }
+
+    /// Whether a lease's newest write gave it a new token, for each shape
+    /// of its change log (each list oldest first, `None` a payload with no
+    /// `fencing_token`). Only the first earlier entry that carries a token
+    /// is compared with: an older one, above or below it, changes nothing.
+    #[tokio::test]
+    async fn the_newest_write_gave_a_new_token_compares_with_the_first_earlier_token() {
+        let (store, _lease, actor, data_dir) = store_with_lease().await;
+        let cases: [(&str, &[Option<i64>], bool); 9] = [
+            ("lse_empty", &[], false),
+            ("lse_only", &[Some(3)], true),
+            ("lse_only_untokened", &[None], false),
+            ("lse_newest_untokened", &[Some(3), None], false),
+            ("lse_earlier_untokened", &[None, None, Some(4)], false),
+            ("lse_raised", &[Some(2), None, Some(3), None, Some(4)], true),
+            ("lse_kept", &[Some(3), Some(4), None, Some(4)], false),
+            ("lse_older_above", &[Some(9), Some(3), Some(4)], true),
+            ("lse_older_below", &[Some(1), Some(5), Some(4)], false),
+        ];
+        let mut w = store.begin_write().await.unwrap();
+        for (lease_id, log, _) in cases {
+            for token in log {
+                let payload = match token {
+                    Some(token) => serde_json::json!({ "fencing_token": token }),
+                    None => serde_json::json!({ "mode": "local" }),
+                };
+                crate::changelog::append(
+                    &mut w.tx,
+                    &actor,
+                    "lease",
+                    lease_id,
+                    crate::changelog::Op::Update,
+                    payload,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        for (lease_id, log, expected) in cases {
+            assert_eq!(
+                super::newest_write_gave_new_token(&mut w.tx, lease_id)
+                    .await
+                    .unwrap(),
+                expected,
+                "{lease_id}: {log:?}"
+            );
+        }
+        drop(w);
+        std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
     /// ADR 0203: the stored duration rises before a longer grant, never

@@ -872,9 +872,10 @@ async fn an_expiring_rows_regrant_waits_for_its_gate() {
 /// nothing goes out on that session (section 8.4, "Grants of a marked row";
 /// issue #703): a `warm` or `hot` app's `expiring` regrant over the `local`
 /// row that stores no duration raises it (ADR 0268), with or without
-/// support. After each, the row is set back by hand to the unmarked `local`
-/// row it was, so the next case starts from it. Before #703 those regrants
-/// wrote nothing.
+/// support. After each, the row is set back by hand to an unmarked `local`
+/// row that stores no duration, at the token the raise wrote, so the next
+/// case starts from it with the token still rising. Before #703 those
+/// regrants wrote nothing.
 #[tokio::test]
 async fn the_regrant_has_the_mode_the_policy_wants() {
     let server = start_with_patient_node_session().await;
@@ -932,6 +933,10 @@ async fn the_regrant_has_the_mode_the_policy_wants() {
             "{policy}"
         );
         drop(socket);
+        // Back to an unmarked `local` row that stores no duration, at the
+        // token the raise wrote: a token only rises, so the next regrant's
+        // write gives the lease a new token, as every one does.
+        current += 1;
         sqlx::query(
             "UPDATE leases SET fencing_token = ?, mode = 'local', duration_ms = NULL, \
              unsettled = 0 WHERE id = ?",

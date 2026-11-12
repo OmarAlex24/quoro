@@ -18,10 +18,13 @@ pub mod desired;
 pub mod drain;
 mod follow;
 mod held;
+mod local_end;
 mod local_report;
 pub(crate) mod mesh;
 pub mod serving;
 mod votes;
+
+pub(crate) use local_end::{LeftStopped, PolicyChange};
 
 use crate::AppState;
 use crate::changelog::{self, Actor, ActorType, Op};
@@ -490,6 +493,14 @@ struct SessionHandle {
     /// conversion grant follows (section 8.4, "From R until the holder has
     /// taken the grant", ADR 0256; [`conversion`]).
     local_sent: HashMap<String, u64>,
+    /// The leases this session settles from its `hello` or at a `pong`
+    /// (section 8.4, "Settling a lease"; [`conversion`]). Kept here, under
+    /// this lock, so the same-token `local` grant clears them in the hold
+    /// that records it ([`NodeHub::queue_local_end`]).
+    settles: conversion::Settles,
+    /// The `local` grants that end renewals, their barrier `ping`s, and
+    /// what the session's `hello` and renewals showed ([`local_end`]).
+    local_end: local_end::SessionState,
 }
 
 /// A follower's position in the change log, kept in memory for its live
@@ -624,6 +635,10 @@ struct HubInner {
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
     /// Test seam: failures to inject, each once ([`NodeHub::inject_fault`]).
     faults: Mutex<Vec<Fault>>,
+    /// Test seam: pauses the next check of a held grant at a session start
+    /// ([`NodeHub::pause_next_held_start`]).
+    #[cfg(test)]
+    held_start_pause: Mutex<Option<Arc<held::Pause>>>,
     /// Test seam: the node ids whose session task has returned, in order,
     /// the newest [`SESSION_ENDS_KEPT`] only ([`NodeHub::session_tasks_ended`]).
     session_tasks_ended: watch::Sender<Vec<String>>,
@@ -763,6 +778,8 @@ impl NodeHub {
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             faults: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            held_start_pause: Mutex::new(None),
             session_tasks_ended: watch::channel(Vec::new()).0,
             serving_inputs: Notify::new(),
             revoke_answers: Notify::new(),
@@ -1921,6 +1938,8 @@ impl NodeHub {
                 start_done: false,
                 conversions: HashMap::new(),
                 local_sent: HashMap::new(),
+                settles: conversion::Settles::default(),
+                local_end: local_end::SessionState::default(),
             },
         );
         (generation, rx, closed_rx, changed)
@@ -2727,11 +2746,6 @@ struct Session {
     lost_at: Option<String>,
     /// The message ids of those revokes still unanswered.
     lost_revokes: HashSet<String>,
-    /// The same-token `local` grants this session sent of leases its `hello`
-    /// listed `held` or `uncertain` at that token, by message id: a refusal
-    /// with `bad_message` means the lease expired on the way (section 8.5,
-    /// "Regrant from `hello`").
-    same_token_grants: HashMap<String, (String, u64)>,
     /// Change-log follow on this session (sections 5.14 and 7.1).
     follow: follow::Follow,
     /// When follow goes on after a `bad_message` or a failed read
@@ -2751,9 +2765,10 @@ struct Session {
     /// When the next `support_request` is due, every `S / 3` (section 5.27);
     /// `None` while none goes out.
     support_due: Option<Instant>,
-    /// The leases this session settles (section 8.4, "Settling a lease";
+    /// The longest `duration_ms` this session granted for each lease, for
+    /// the settle's row write (section 8.4, "Settling a lease";
     /// [`conversion`]).
-    settles: conversion::Settles,
+    granted: HashMap<String, u64>,
 }
 
 impl Session {
@@ -2777,14 +2792,13 @@ impl Session {
             step4_eligible: HashSet::new(),
             lost_at: None,
             lost_revokes: HashSet::new(),
-            same_token_grants: HashMap::new(),
             follow: follow::Follow::Off,
             follow_retry: None,
             welcome_primary: None,
             voter_snapshots: VecDeque::new(),
             acked_votes_version: None,
             support_due: None,
-            settles: conversion::Settles::default(),
+            granted: HashMap::new(),
         }
     }
 }
@@ -3178,6 +3192,8 @@ impl Session {
                     )
                 })
                 .collect();
+            self.hub
+                .note_hello_listing(&self.node_id, self.generation, &hello.leases);
             if self.revoke_stale_leases(&hello.leases, outbox).await {
                 self.hub
                     .stale_leases_revoked(&self.node_id, self.generation);
@@ -3456,15 +3472,24 @@ impl Session {
                             outbox.push(start_not_finished(&raw.id));
                             return true;
                         }
-                    } else if let Some((lease_id, token)) = self.same_token_grants.remove(re)
+                    } else if let Some((lease_id, token, true)) =
+                        self.hub
+                            .take_local_grant(&self.node_id, self.generation, re)
                         && error.code == quoro_proto::ErrorCode::BadMessage
                         && !self
                             .hub
                             .0
                             .revoked_on_session(&self.node_id, self.generation, &lease_id)
                     {
-                        // The lease expired while the grant was on its way
-                        // (section 8.5, "Regrant from `hello`").
+                        // Any refusal of a same-token `local` grant drops its
+                        // barrier `ping`: the `pong` after it writes nothing
+                        // and passes no barrier. A `bad_message` refusal of
+                        // one sent on a session whose `hello` listed the lease
+                        // `held` or `uncertain` at that token, the one that
+                        // ends the renewals included, means the lease expired
+                        // while the grant was on its way (section 8.5,
+                        // "Regrant from `hello`"; section 8.4, "The holder
+                        // fenced first").
                         self.regrant(&lease_id, token, outbox).await;
                     }
                 }
@@ -4118,6 +4143,13 @@ impl Session {
             }
         };
         let token = renew.fencing_token.max(1);
+        // Only an `expiring` lease renews: evidence that the holder holds the
+        // lease so at the row's token, which a held `local` grant waits for
+        // ([`local_end`]).
+        if lease_token(&lease) == token {
+            self.hub
+                .saw_expiring(&self.node_id, self.generation, lease_id, token);
+        }
         let in_flight = self
             .hub
             .conversion_in_flight(&self.node_id, self.generation, lease_id);
@@ -4735,18 +4767,29 @@ impl Session {
                         && (lease.unsettled || (lease.mode == "local" && *claimed == token))
                         && warm.contains(&lease.resource_id)
                     {
-                        self.settles.report(&lease.id, *claimed);
+                        self.hub
+                            .report_settle(&self.node_id, self.generation, &lease.id, *claimed);
                         continue;
                     }
                     // "Grants of a marked row": every grant of a marked row
                     // other than a renewal's answer goes through the
                     // held-grant path; the regrant above does (its write
                     // waits). A holder's `local` report cleared the mark
-                    // before this pass ([`local_report`]); one the node lists
-                    // `expiring` at the row's token while the policy is off
-                    // `warm` gets nothing here: the same-token `local` resend
-                    // is #555.
+                    // before this pass ([`local_report`]). One the node lists
+                    // `expiring` at the row's token or above, over a row that
+                    // reads `local`, while the policy is off `warm`, gets the
+                    // same-token `local` grant again through that path ("The
+                    // holder's next `hello`", third bullet, ADR 0255;
+                    // [`local_end`]).
                     if lease.unsettled {
+                        if lease.mode == "local"
+                            && !warm.contains(&lease.resource_id)
+                            && let Some((state, claimed, true)) = &reported
+                            && (state == "held" || state == "uncertain")
+                            && *claimed >= token
+                        {
+                            self.resend_local_end(&lease, *claimed).await;
+                        }
                         continue;
                     }
                     if lease.mode == "expiring" {
@@ -4778,20 +4821,14 @@ impl Session {
                         }
                         continue;
                     }
-                    let id = new_msg_id();
-                    if lease.mode == "local"
-                        && reported.is_some_and(|(state, claimed, _)| {
-                            claimed == token && (state == "held" || state == "uncertain")
-                        })
-                    {
-                        self.same_token_grants
-                            .insert(id.clone(), (lease.id.clone(), token));
-                    }
-                    outbox.push(
-                        ControlMessage::LeaseGrant(lease.grant())
-                            .to_frame(&id, None)
-                            .to_text(),
-                    );
+                    let regrant = reported.is_some_and(|(state, claimed, _)| {
+                        claimed == token && (state == "held" || state == "uncertain")
+                    });
+                    // ADR 0257: a `ping` follows every same-token `local`
+                    // grant, and no conversion grant goes out before its
+                    // `pong`. A refusal of a grant the `hello` listed `held`
+                    // or `uncertain` at that token gives the lease back.
+                    self.queue_local_grant(&lease, token, regrant, outbox).await;
                 }
             }
             Err(e) => {

@@ -61,14 +61,16 @@ pub(super) struct InFlight {
     pub duration_ms: u64,
 }
 
-/// What one session knows of the leases it settles.
+/// What one session knows of the leases it settles from `hello` or waits
+/// to settle at a `pong`. It lives with the session's handle in the hub
+/// ([`NodeHub`]), under the sessions lock, so the send of the same-token
+/// `local` grant, which may run on the held-grant task, clears it in the
+/// same hold that records the grant ([`NodeHub::queue_local_end`]).
 #[derive(Debug, Default)]
 pub(super) struct Settles {
     /// The holder's token its `hello` listed for each lease that this
     /// session settles from `hello`.
     reported: HashMap<String, u64>,
-    /// The longest `duration_ms` this session granted for each lease.
-    granted: HashMap<String, u64>,
     /// Each settling `ping` not answered yet, by its message id.
     pings: HashMap<String, Pinged>,
 }
@@ -78,16 +80,21 @@ pub(super) struct Settles {
 /// transaction left it ([`leases::newest_write_seq`]), `None` for a row the
 /// log has no entry of.
 #[derive(Debug)]
-struct Pinged {
+pub(super) struct Pinged {
     lease_id: String,
     token: u64,
     seq: Option<u64>,
 }
 
 impl Settles {
-    /// The settle of `lease_id` from the holder's `hello`, at `token`.
-    pub(super) fn report(&mut self, lease_id: &str, token: u64) {
-        self.reported.insert(lease_id.to_string(), token);
+    /// Drops every settle of `lease_id` pending on the session, whether
+    /// planned from its `hello` or waiting for its `pong`: the same-token
+    /// `local` grant goes out ("Settling a lease": "Sending the same-token
+    /// `local` grant clears any pending settle for that lease"), so none of
+    /// them writes the row afterwards.
+    pub(super) fn forget(&mut self, lease_id: &str) {
+        self.reported.remove(lease_id);
+        self.pings.retain(|_, pinged| pinged.lease_id != lease_id);
     }
 }
 
@@ -250,8 +257,10 @@ impl NodeHub {
     /// Records that `generation` sent `node_id` the conversion grant of
     /// `lease_id` at `token` for `duration_ms`, so the next renewal of it on
     /// that session is answered as the first one. Called when the grant is
-    /// queued, which follows the barrier `pong` (ADR 0257). Returns whether
-    /// `generation` is still the node's session.
+    /// queued. Refused (`false`) unless ADR 0257's barrier passed for the
+    /// lease at `token` on `generation`: the `pong` after its same-token
+    /// `local` grant, or the session's `hello` listing the lease `local`
+    /// ([`NodeHub::barrier_passed`]). Returns whether it was recorded.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "nothing sends a conversion grant yet (#555)")
@@ -264,6 +273,14 @@ impl NodeHub {
         token: u64,
         duration_ms: u64,
     ) -> bool {
+        if !self.barrier_passed(node_id, generation, lease_id, token) {
+            tracing::warn!(
+                lease_id,
+                node_id,
+                "no conversion grant before the barrier's pong (ADR 0257)"
+            );
+            return false;
+        }
         let mut sessions = self.0.sessions.lock().expect("session lock");
         let Some(handle) = sessions
             .get_mut(node_id)
@@ -280,18 +297,12 @@ impl NodeHub {
         true
     }
 
-    /// Records that `generation` queued the same-token `local` grant of
-    /// `lease_id` at `token`: from then on no renewal of the lease at that
-    /// token or below is answered on that session (section 8.4, "From R until
-    /// the holder has taken the grant", ADR 0256). Returns whether
-    /// `generation` is still the node's session.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the local grant that ends the renewals is the next layer (#555)"
-        )
-    )]
+    /// Test seam: records `generation`'s same-token `local` grant of
+    /// `lease_id` at `token` as [`NodeHub::queue_local_end`] does, and
+    /// nothing else: the session's settles are not cleared, so a test can
+    /// pin the settle's own refusal ([`Session::on_pong`]) alone. Returns
+    /// whether `generation` is still the node's session.
+    #[cfg(test)]
     pub(super) fn note_local_grant_sent(
         &self,
         node_id: &str,
@@ -309,6 +320,132 @@ impl NodeHub {
         let sent = handle.local_sent.entry(lease_id.to_string()).or_insert(0);
         *sent = (*sent).max(token);
         true
+    }
+
+    /// Test seam: what `generation` knows of settling `lease_id`: the token
+    /// its `hello` registered a settle at, and the tokens of its settling
+    /// `ping`s not answered yet.
+    #[cfg(test)]
+    pub(super) fn settle_state(
+        &self,
+        node_id: &str,
+        generation: u64,
+        lease_id: &str,
+    ) -> (Option<u64>, Vec<u64>) {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(node_id)
+            .filter(|handle| handle.generation == generation)
+            .map(|handle| {
+                (
+                    handle.settles.reported.get(lease_id).copied(),
+                    handle
+                        .settles
+                        .pings
+                        .values()
+                        .filter(|pinged| pinged.lease_id == lease_id)
+                        .map(|pinged| pinged.token)
+                        .collect(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// Registers on `generation` the settle of `lease_id` from its `hello`,
+    /// at the holder's `token`.
+    pub(super) fn report_settle(&self, node_id: &str, generation: u64, lease_id: &str, token: u64) {
+        let mut sessions = self.0.sessions.lock().expect("session lock");
+        if let Some(handle) = sessions
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+        {
+            handle.settles.reported.insert(lease_id.to_string(), token);
+        }
+    }
+
+    /// The token `generation`'s `hello` registered a settle of `lease_id`
+    /// at.
+    fn reported_settle(&self, node_id: &str, generation: u64, lease_id: &str) -> Option<u64> {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(node_id)
+            .filter(|handle| handle.generation == generation)
+            .and_then(|handle| handle.settles.reported.get(lease_id).copied())
+    }
+
+    /// Registers on `generation` a settling `ping` of `lease_id` at
+    /// `token`, recorded against `seq`, and returns its message id; `None`
+    /// when one is already unanswered for the lease, when `generation` is
+    /// not the node's session, or when the session has queued the
+    /// same-token `local` grant at `token` or above since the settling
+    /// answer was read. The answer commits before this runs, so a grant may
+    /// be queued in between ([`NodeHub::queue_local_end`]); this check,
+    /// under the lock that records the grant, keeps a settle from being
+    /// planned after it.
+    fn register_settle_ping(
+        &self,
+        node_id: &str,
+        generation: u64,
+        lease_id: &str,
+        token: u64,
+        seq: Option<u64>,
+    ) -> Option<String> {
+        let mut sessions = self.0.sessions.lock().expect("session lock");
+        let handle = sessions
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)?;
+        if handle
+            .local_sent
+            .get(lease_id)
+            .is_some_and(|sent| token <= *sent)
+            || handle
+                .settles
+                .pings
+                .values()
+                .any(|pinged| pinged.lease_id == lease_id)
+        {
+            return None;
+        }
+        let id = new_msg_id();
+        handle.settles.pings.insert(
+            id.clone(),
+            Pinged {
+                lease_id: lease_id.to_string(),
+                token,
+                seq,
+            },
+        );
+        Some(id)
+    }
+
+    /// The settling `ping` `re` answered on `generation`, if it is one
+    /// still pending.
+    fn take_settle_ping(&self, node_id: &str, generation: u64, re: &str) -> Option<Pinged> {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+            .and_then(|handle| handle.settles.pings.remove(re))
+    }
+
+    /// `generation` settled `lease_id`: its settle from `hello` is done.
+    fn settled(&self, node_id: &str, generation: u64, lease_id: &str) {
+        if let Some(handle) = self
+            .0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+        {
+            handle.settles.reported.remove(lease_id);
+        }
     }
 
     /// The token of the same-token `local` grant `generation` sent for
@@ -370,18 +507,15 @@ impl Session {
     /// settle's row write ("the longest `duration_ms` it granted on that
     /// session").
     pub(super) fn note_granted(&mut self, lease_id: &str, duration_ms: u64) {
-        let longest = self
-            .settles
-            .granted
-            .entry(lease_id.to_string())
-            .or_insert(0);
+        let longest = self.granted.entry(lease_id.to_string()).or_insert(0);
         *longest = (*longest).max(duration_ms);
     }
 
     /// The token this session's `hello` registered a settle of `lease_id`
     /// at.
     pub(super) fn reported_settle(&self, lease_id: &str) -> Option<u64> {
-        self.settles.reported.get(lease_id).copied()
+        self.hub
+            .reported_settle(&self.node_id, self.generation, lease_id)
     }
 
     /// Queues the settling `ping` after an answer of `lease_id` at `token`,
@@ -392,7 +526,9 @@ impl Session {
     /// change-log write as the settling answer's transaction left it, read
     /// after any write that transaction made and before its commit: the
     /// `pong` settles only a row still at that write ([`Session::on_pong`]).
-    /// An unanswered `ping` keeps the `seq` of the answer it followed.
+    /// An unanswered `ping` keeps the `seq` of the answer it followed. No
+    /// `ping` follows once the session queued the same-token `local` grant
+    /// at that token ([`NodeHub::register_settle_ping`]).
     pub(super) fn ping_to_settle(
         &mut self,
         lease_id: &str,
@@ -400,24 +536,12 @@ impl Session {
         seq: Option<u64>,
         outbox: &mut Vec<String>,
     ) {
-        if self
-            .settles
-            .pings
-            .values()
-            .any(|pinged| pinged.lease_id == lease_id)
+        if let Some(id) =
+            self.hub
+                .register_settle_ping(&self.node_id, self.generation, lease_id, token, seq)
         {
-            return;
+            outbox.push(ControlMessage::Ping.to_frame(&id, None).to_text());
         }
-        let id = new_msg_id();
-        outbox.push(ControlMessage::Ping.to_frame(&id, None).to_text());
-        self.settles.pings.insert(
-            id,
-            Pinged {
-                lease_id: lease_id.to_string(),
-                token,
-                seq,
-            },
-        );
     }
 
     /// A `pong` (section 5.20): when it answers a settling `ping`, the row is
@@ -443,7 +567,15 @@ impl Session {
     /// settle sends a new one, recorded against the row as that answer reads
     /// it.
     pub(super) async fn on_pong(&mut self, re: Option<&str>) {
-        let Some(pinged) = re.and_then(|re| self.settles.pings.remove(re)) else {
+        let Some(pinged) = re.and_then(|re| {
+            self.hub
+                .take_settle_ping(&self.node_id, self.generation, re)
+        }) else {
+            // Not a settle's: the `pong` after a same-token `local` grant
+            // ([`super::local_end`]).
+            if let Some(re) = re {
+                self.on_barrier_pong(re).await;
+            }
             return;
         };
         let Pinged {
@@ -451,10 +583,10 @@ impl Session {
             token,
             seq,
         } = pinged;
-        let granted = self.settles.granted.get(&lease_id).copied().unwrap_or(0);
+        let granted = self.granted.get(&lease_id).copied().unwrap_or(0);
         match self.settle_row(&lease_id, token, seq, granted).await {
             Ok(Some(lease)) => {
-                self.settles.reported.remove(&lease_id);
+                self.hub.settled(&self.node_id, self.generation, &lease_id);
                 tracing::info!(
                     lease_id,
                     node_id = %self.node_id,
@@ -484,6 +616,17 @@ impl Session {
     ) -> Result<Option<Lease>, crate::error::ApiError> {
         let mut w = self.hub.0.store.begin_write().await?;
         if !self.hub.is_current(&self.node_id, self.generation) {
+            return Ok(None);
+        }
+        // The session sent the same-token `local` grant since: the holder may
+        // hold the lease `local` now, so no settle `ping` from before it
+        // settles the lease, the `pong` arriving after the holder took
+        // `local` ([`super::local_end`]).
+        if self
+            .hub
+            .local_grant_sent(&self.node_id, self.generation, lease_id)
+            .is_some_and(|sent| token <= sent)
+        {
             return Ok(None);
         }
         let Some(row) = leases::by_id(&mut w.tx, lease_id).await? else {
@@ -561,7 +704,7 @@ pub(super) mod tests {
     const D: u64 = 15_000;
 
     #[derive(Debug)]
-    struct EverySupport;
+    pub(in crate::session) struct EverySupport;
 
     impl VoterSupport for EverySupport {
         fn supports(&self, _duration_ms: u64) -> bool {
@@ -757,7 +900,11 @@ pub(super) mod tests {
 
     /// The node renews the lease at `token` on `session`; the frames the
     /// session queued in answer.
-    async fn renew(session: &mut Session, id: &str, token: u64) -> Vec<Value> {
+    pub(in crate::session) async fn renew(
+        session: &mut Session,
+        id: &str,
+        token: u64,
+    ) -> Vec<Value> {
         let mut outbox = Vec::new();
         let renew = NodeMessage::LeaseRenew(LeaseRenew {
             lease_id: LeaseId(LEASE.to_string()),
@@ -769,7 +916,7 @@ pub(super) mod tests {
         frames(outbox)
     }
 
-    async fn pong(session: &mut Session, re: &str) {
+    pub(in crate::session) async fn pong(session: &mut Session, re: &str) {
         let mut outbox = Vec::new();
         let pong = NodeMessage::Pong.to_frame("msg_pong", Some(re)).to_text();
         session.handle_text(&pong, &mut outbox).await;
@@ -778,7 +925,12 @@ pub(super) mod tests {
 
     /// The one `lease_grant` among `frames`, which answers `re`, `expiring`
     /// at `token` for `duration_ms`.
-    fn assert_answer(frames: &[Value], re: &str, token: u64, duration_ms: u64) {
+    pub(in crate::session) fn assert_answer(
+        frames: &[Value],
+        re: &str,
+        token: u64,
+        duration_ms: u64,
+    ) {
         let grants = of_type(frames, "lease_grant");
         assert_eq!(grants.len(), 1, "{frames:?}");
         let grant = grants[0];
@@ -1478,22 +1630,23 @@ pub(super) mod tests {
     }
 
     /// R, as `updateApp` writes it when the policy leaves `warm`: the policy
-    /// and the row in one single-writer transaction.
-    pub(in crate::session) async fn end_renewals(f: &Fixture) {
+    /// and the row in one single-writer transaction. The row R wrote, `None`
+    /// when it wrote nothing.
+    pub(in crate::session) async fn end_renewals(f: &Fixture) -> Option<Lease> {
         let mut w = f.state.store.begin_write().await.unwrap();
         sqlx::query("UPDATE apps SET ha_policy = 'none' WHERE id = ?")
             .bind(APP)
             .execute(&mut *w.tx)
             .await
             .unwrap();
-        leases::end_renewals(&mut w.tx, APP, &actor())
+        let written = leases::end_renewals(&mut w.tx, APP, &actor())
             .await
-            .unwrap()
             .unwrap();
         w.commit().await.unwrap();
+        written
     }
 
-    async fn set_policy(f: &Fixture, policy: &str) {
+    pub(in crate::session) async fn set_policy(f: &Fixture, policy: &str) {
         sqlx::query("UPDATE apps SET ha_policy = ? WHERE id = ?")
             .bind(policy)
             .bind(APP)
@@ -1528,11 +1681,12 @@ pub(super) mod tests {
         let mut w = f.state.store.begin_write().await.unwrap();
         let again = leases::end_renewals(&mut w.tx, APP, &actor())
             .await
-            .unwrap()
             .unwrap();
         w.commit().await.unwrap();
-        assert_eq!((again.mode.as_str(), again.unsettled), ("local", true));
-        assert_eq!(f.writes().await, writes + 1, "already local and marked");
+        assert_eq!(again, None, "already local and marked: nothing written");
+        let row = f.row().await;
+        assert_eq!((row.mode.as_str(), row.unsettled), ("local", true));
+        assert_eq!(f.writes().await, writes + 1);
 
         let mut w = f.state.store.begin_write().await.unwrap();
         leases::revoke_app_lease(&mut w.tx, APP, &actor())
@@ -1869,7 +2023,7 @@ pub(super) mod tests {
     }
 
     /// The one settling `ping` among `frames`: its message id.
-    fn ping_of(frames: &[Value]) -> String {
+    pub(in crate::session) fn ping_of(frames: &[Value]) -> String {
         let pings = of_type(frames, "ping");
         assert_eq!(pings.len(), 1, "{frames:?}");
         pings[0]["id"].as_str().unwrap().to_string()

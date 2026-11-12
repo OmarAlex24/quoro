@@ -17,9 +17,11 @@
 //! start (#555), is checked here over the case 2 row; its other cases are
 //! the `session::local_report` unit tests. R in `updateApp`'s transaction
 //! (#555) is checked here too; its renewals are the `session::conversion`
-//! unit tests. Out of scope here, as in the code: the `pong` after a
-//! same-token `local` grant, the conversion grant and the same-token
-//! resend.
+//! unit tests. The same-token `local` grant that follows R, its `ping` and
+//! the `pong`'s write are checked here over a machine of the required set
+//! that is down, declared lost, then removed; their other cases, the resend
+//! from `hello` included, are the `session::local_end` unit tests. Out of
+//! scope here, as in the code: the conversion grant.
 
 mod common;
 
@@ -2183,6 +2185,14 @@ async fn lease_entries(server: &Server, lease_id: &str) -> i64 {
     .unwrap()
 }
 
+/// How many `app.left_stopped` events are stored.
+async fn left_stopped(server: &Server) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM events WHERE type = 'app.left_stopped'")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
 /// The app's stored `ha_policy`.
 async fn policy_of(server: &Server, app_id: &str) -> String {
     sqlx::query_scalar("SELECT ha_policy FROM apps WHERE id = ?")
@@ -2198,7 +2208,8 @@ async fn policy_of(server: &Server, app_id: &str) -> String {
 /// and with its `duration_ms` kept, in one change-log entry, and
 /// `Lease.local_pending` turns true. An `updateApp` that fails later in the
 /// same transaction (a placement for a stateful app) writes neither the
-/// policy nor R.
+/// policy nor R. No grant with a new token was held, so R drops none and
+/// no `app.left_stopped` is emitted.
 #[tokio::test]
 async fn leaving_warm_writes_r_in_the_policy_changes_transaction() {
     let server = start_with_patient_node_session().await;
@@ -2250,6 +2261,7 @@ async fn leaving_warm_writes_r_in_the_policy_changes_transaction() {
     let view = lease_view(&server, &owner, &app_id).await;
     assert_eq!(view["local_pending"], true, "{view}");
     assert_eq!(view["unsettled"], true, "{view}");
+    assert_eq!(left_stopped(&server).await, 0, "no held grant to drop");
 }
 
 /// #555, R from `hot`: `hot` is read as `warm` (section 8.4, as the lease
@@ -2291,4 +2303,386 @@ async fn leaving_hot_writes_r_as_leaving_warm_does() {
     assert_eq!(lease_entries(&server, &lease_id).await, before + 1);
     let view = lease_view(&server, &owner, &app_id).await;
     assert_eq!(view["local_pending"], true, "{view}");
+}
+
+/// #555, "Ending the renewals" steps 2 and 3 and "When R is replicated",
+/// over `updateApp`. A holds the lease `expiring` and renews it; B, the
+/// other machine with the `node` role, is down; a witness gives A majority
+/// support. `updateApp` takes the policy off `warm`: R is written, and its
+/// `local` grant waits on B (`grant_pending`, `grant_waiting_on`). Declaring
+/// B lost does not take it out of the required set. Once B's removal is
+/// acknowledged by A, R is replicated; once A and the witness support the
+/// new voters, the same-token `local` grant goes out with no
+/// `duration_ms`, then a `ping`. A's `pong` writes the row `local`,
+/// unmarked, and `local_pending` turns false.
+#[tokio::test]
+async fn the_local_grant_waits_for_a_down_node_until_its_removal_is_replicated() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let b = enroll(&server, &owner, "node-b", &["node"]).await;
+    let w = enroll(&server, &owner, "witness-w", &["witness"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    let (mut on_w, _) = session(&server, &w, None, Vec::new(), false).await;
+    on_a.support().await;
+    on_w.support().await;
+    assert!(server.state.hub.authority().supports(D));
+    set_policy(&server, &app_id, "warm").await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    // A renews at the row's token: it holds the lease `expiring` there.
+    on_a.send(
+        NodeMessage::LeaseRenew(quoro_proto::LeaseRenew {
+            lease_id: quoro_proto::LeaseId(lease_id.clone()),
+            fencing_token: 1,
+        }),
+        None,
+    )
+    .await;
+    on_a.settle().await;
+
+    let res = owner
+        .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+        .json(&json!({ "ha_policy": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let seq = newest_write(&server, &lease_id).await;
+    let mut seen = follow_to(&mut on_a, seq).await;
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, vec![b.node_id.clone()])
+    );
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+
+    let res = owner
+        .post(server.url(&format!("/api/v1/nodes/{}/declare-lost", b.node_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, vec![b.node_id.clone()]),
+        "a node declared lost counts until it is removed"
+    );
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+
+    let mut wtx = server.state.store.begin_write().await.unwrap();
+    sqlx::query("UPDATE nodes SET status = 'removed' WHERE id = ?")
+        .bind(&b.node_id)
+        .execute(&mut *wtx.tx)
+        .await
+        .unwrap();
+    let removal = changelog::append(
+        &mut wtx.tx,
+        &Actor::system("test"),
+        "node",
+        &b.node_id,
+        Op::Update,
+        json!({ "id": b.node_id, "status": "removed" }),
+    )
+    .await
+    .unwrap();
+    wtx.commit().await.unwrap();
+    let mut seen = follow_to(&mut on_a, u64::try_from(removal).unwrap()).await;
+    assert_eq!(pending(&server, &owner, &app_id).await, (true, Vec::new()));
+    // The removal changes the voters: the support given before it no
+    // longer counts, so nothing goes out until a majority supports again.
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    seen.extend(support_keeping_frames(&mut on_a).await);
+    on_w.support().await;
+    assert!(server.state.hub.authority().supports(D));
+    read_until(&mut on_a, &mut seen, Duration::from_secs(10), |seen| {
+        seen.iter().any(|frame| frame["type"] == "ping") && !grants_of(seen, &lease_id).is_empty()
+    })
+    .await;
+    let grants = grants_of(&seen, &lease_id);
+    assert_eq!(grants.len(), 1, "{seen:?}");
+    let grant = grants[0];
+    assert_eq!(grant["body"]["mode"], "local");
+    assert_eq!(grant["body"]["fencing_token"], 1);
+    assert!(grant["body"].get("duration_ms").is_none(), "{grant}");
+    assert!(grant["re"].is_null(), "{grant}");
+    let at = |id: &Value| seen.iter().position(|frame| frame["id"] == *id).unwrap();
+    let ping = seen
+        .iter()
+        .find(|frame| frame["type"] == "ping")
+        .unwrap()
+        .clone();
+    assert!(
+        at(&grant["id"]) < at(&ping["id"]),
+        "the grant, then the ping"
+    );
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 1, false),
+        "not before the pong"
+    );
+
+    on_a.send(NodeMessage::Pong, ping["id"].as_str()).await;
+    on_a.settle().await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 0, false)
+    );
+    let view = lease_view(&server, &owner, &app_id).await;
+    assert_eq!(view["local_pending"], false, "{view}");
+    assert_eq!(view["grant_pending"], false, "{view}");
+}
+
+/// #555, a `local` grant that waits for evidence. A holds the lease `local`
+/// at token 1, granted after its `hello`, and has not renewed it: no
+/// evidence on this session. `updateApp` takes the policy off `warm`; R
+/// marks the row, and its `local` grant waits for evidence, which is no
+/// grant pending: `grant_pending` false and `grant_waiting_on` empty. Back on
+/// `warm`, the entry is dropped and `failoverApp` does not answer
+/// `in_progress`.
+#[tokio::test]
+async fn a_local_grant_waiting_for_evidence_never_answers_a_failover_in_progress() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    set_policy(&server, &app_id, "warm").await;
+    let res = owner
+        .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+        .json(&json!({ "ha_policy": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let seq = newest_write(&server, &lease_id).await;
+    let mut seen = follow_to(&mut on_a, seq).await;
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), None, 1, false)
+    );
+
+    set_policy(&server, &app_id, "warm").await;
+    after_a_tick(&mut on_a).await;
+    let res = owner
+        .post(server.url(&format!("/api/v1/apps/{app_id}/failover")))
+        .json(&json!({ "node_id": a.node_id }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = res.json().await.unwrap();
+    assert_ne!(body["reason"], "in_progress", "{body}");
+    assert_eq!(pending(&server, &owner, &app_id).await, (false, Vec::new()));
+}
+
+/// #555, "Ending the renewals" step 2: the `local` grant follows every
+/// policy change off `warm`, not only one that writes the row. A holds the
+/// lease `expiring` at token 1 and renews it there; no majority supports
+/// `D` yet. The policy leaves `warm`: R writes the row and its grant is
+/// held, waiting on A. Back on `warm`, the held grant is dropped. Off `warm`
+/// again before any settle: the row still reads `local` with the mark, so R
+/// writes nothing, and the grant is held again, waiting on A. Once A holds
+/// the row's newest write and supports `D`, the same-token `local` grant
+/// goes out, then its `ping`, whose `pong` writes the row `local`, unmarked.
+#[tokio::test]
+async fn a_second_change_off_warm_before_any_settle_holds_the_local_grant_again() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    set_policy(&server, &app_id, "warm").await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    on_a.send(
+        NodeMessage::LeaseRenew(quoro_proto::LeaseRenew {
+            lease_id: quoro_proto::LeaseId(lease_id.clone()),
+            fencing_token: 1,
+        }),
+        None,
+    )
+    .await;
+    on_a.settle().await;
+    let leave_warm = || async {
+        let res = owner
+            .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+            .json(&json!({ "ha_policy": "none" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    };
+
+    leave_warm().await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 1, false)
+    );
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, vec![a.node_id.clone()])
+    );
+    // Back on `warm`: the held task drops the grant. A reads no frame, so
+    // it acknowledges nothing meanwhile.
+    set_policy(&server, &app_id, "warm").await;
+    tokio::time::sleep(PAST_TICK).await;
+    assert_eq!(pending(&server, &owner, &app_id).await, (false, Vec::new()));
+
+    let entries = lease_entries(&server, &lease_id).await;
+    leave_warm().await;
+    assert_eq!(lease_entries(&server, &lease_id).await, entries, "no write");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 1, false)
+    );
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, vec![a.node_id.clone()]),
+        "held again"
+    );
+
+    let mut seen = follow_to(&mut on_a, newest_write(&server, &lease_id).await).await;
+    assert_eq!(pending(&server, &owner, &app_id).await, (true, Vec::new()));
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    seen.extend(support_keeping_frames(&mut on_a).await);
+    // The grant, then its `ping`.
+    let ping_after_grant = |seen: &[Value]| {
+        let grant = seen.iter().position(|frame| {
+            frame["type"] == "lease_grant" && frame["body"]["lease_id"] == lease_id
+        })?;
+        seen[grant..]
+            .iter()
+            .find(|frame| frame["type"] == "ping")
+            .cloned()
+    };
+    read_until(&mut on_a, &mut seen, Duration::from_secs(10), |seen| {
+        ping_after_grant(seen).is_some()
+    })
+    .await;
+    let grants = grants_of(&seen, &lease_id);
+    assert_eq!(grants.len(), 1, "{seen:?}");
+    let grant = grants[0].clone();
+    assert_eq!(grant["body"]["mode"], "local");
+    assert_eq!(grant["body"]["fencing_token"], 1);
+    assert!(grant["body"].get("duration_ms").is_none(), "{grant}");
+    let ping = ping_after_grant(&seen).unwrap();
+
+    on_a.send(NodeMessage::Pong, ping["id"].as_str()).await;
+    on_a.settle().await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 0, false)
+    );
+    let view = lease_view(&server, &owner, &app_id).await;
+    assert_eq!(view["local_pending"], false, "{view}");
+    assert_eq!(view["grant_pending"], false, "{view}");
+}
+
+/// #555, `updateApp` off `warm` over a row whose newest write gave the
+/// lease a new token. The case 2 row: a regrant wrote it `local` at token 2
+/// with the mark, and its grant waits for support. The policy is set to
+/// `warm`, then `updateApp` takes it off `warm`: R writes nothing (the row
+/// already reads `local` with the mark), no same-token `local` grant is held
+/// over it, and the grant with a new token stays pending, so no
+/// `app.left_stopped` is emitted. Once a majority supports `D`, that grant
+/// goes out as before, `local` at token 2, through the path of a grant with
+/// a new token: no `ping` follows it.
+#[tokio::test]
+async fn leaving_warm_over_a_held_new_token_grant_keeps_it() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    let lease = listed(&lease_id, &app_id, LeaseMode::Local, 1, "expired");
+    let (mut on_a, frames) = session(&server, &a, Some(on_a.log.clone()), vec![lease], true).await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (2, "local".to_string(), None, 1, false)
+    );
+    follow_to(&mut on_a, newest_write(&server, &lease_id).await).await;
+    assert_eq!(pending(&server, &owner, &app_id).await, (true, Vec::new()));
+
+    set_policy(&server, &app_id, "warm").await;
+    let entries = lease_entries(&server, &lease_id).await;
+    let res = owner
+        .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+        .json(&json!({ "ha_policy": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    assert_eq!(policy_of(&server, &app_id).await, "none");
+    assert_eq!(
+        lease_entries(&server, &lease_id).await,
+        entries,
+        "R writes nothing"
+    );
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (2, "local".to_string(), None, 1, false)
+    );
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, Vec::new()),
+        "the grant with a new token stays"
+    );
+    assert_eq!(left_stopped(&server).await, 0, "R wrote nothing");
+    let mut seen = after_a_tick(&mut on_a).await;
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    assert_eq!(pending(&server, &owner, &app_id).await, (true, Vec::new()));
+
+    seen.extend(support_keeping_frames(&mut on_a).await);
+    read_until(&mut on_a, &mut seen, Duration::from_secs(10), |seen| {
+        !grants_of(seen, &lease_id).is_empty()
+    })
+    .await;
+    seen.extend(after_a_tick(&mut on_a).await);
+    let grants = grants_of(&seen, &lease_id);
+    assert_eq!(grants.len(), 1, "{seen:?}");
+    let grant = grants[0];
+    assert_eq!(grant["body"]["mode"], "local");
+    assert_eq!(grant["body"]["fencing_token"], 2);
+    assert!(grant["body"].get("duration_ms").is_none(), "{grant}");
+    let at = seen
+        .iter()
+        .position(|frame| frame["id"] == grant["id"])
+        .unwrap();
+    assert!(
+        seen[at..].iter().all(|frame| frame["type"] != "ping"),
+        "no ping follows a grant with a new token: {seen:?}"
+    );
+    assert_eq!(pending(&server, &owner, &app_id).await, (false, Vec::new()));
 }
