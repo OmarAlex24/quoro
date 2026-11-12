@@ -2831,10 +2831,21 @@ async fn a_restarted_primary_revokes_then_thaws_a_frozen_source() {
     recv_type(s.on_source(), "lease_revoke").await;
     s.unmoved(true, "the revoke committed").await;
 
-    drop(s.on_source.take());
+    // The first primary is not stopped: its steps still wait on the revoke,
+    // and once the source leaves they would move the lease while the warm
+    // node is connected. The warm node leaves first, so those steps stop at
+    // the change (the warm node is not connected) and move nothing, as a
+    // primary that stopped after its revoke; the test waits for them to end
+    // before the restart, so nothing of the first primary runs beside the
+    // second.
     drop(s.on_warm.take());
-    disconnected(&s.server, &s.source.node_id).await;
     disconnected(&s.server, &s.warm.node_id).await;
+    drop(s.on_source.take());
+    disconnected(&s.server, &s.source.node_id).await;
+    let (status, body) = after_the_steps(&s).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["reason"], Value::Null, "{body}");
+    s.unmoved(true, "the first primary's steps ended").await;
     let failed_before = events_of(&s.server, "app.switchover_failed").await;
     let restarted =
         common::restart_with_resolver(&s.server, Arc::new(quoro_control_plane::ReferenceAsDigest))
