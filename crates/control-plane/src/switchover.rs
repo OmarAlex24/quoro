@@ -59,14 +59,16 @@ use std::time::Duration;
 /// The shortest freeze bound (see [`freeze_bound`]).
 const FREEZE_BOUND_MIN_S: i64 = 120;
 
+/// The longest freeze bound (see [`freeze_bound`]).
+const FREEZE_BOUND_MAX_S: i64 = 600;
+
 /// How long the primary waits, after the source's `ok`, for the warm node
 /// to report the final snapshot as its complete copy. The warm node reports
 /// on every change and at least every 30 s (section 5.3), and its report may
-/// reach the primary just after the source's answer.
+/// reach the primary just after the source's answer. The wait wakes on each
+/// warm report the hub applies and on each session that ends, so a report
+/// already in, or one that arrives, ends it at once.
 const COPY_WAIT: Duration = Duration::from_secs(35);
-
-/// How often that wait reads the warm node's report again.
-const COPY_RECHECK: Duration = Duration::from_millis(250);
 
 /// How long the primary waits for the source to answer `switchover_thaw`.
 /// The thaw is best-effort: a source that does not answer and reports
@@ -78,16 +80,27 @@ const REVOKED: &str = "the app's lease is revoked: a switchover stopped after it
                        failoverApp to the same warm node completes the move";
 
 /// How long the primary waits for the source's answer to
-/// `switchover_freeze`: `max(120 s, 4 × interval_s)`.
+/// `switchover_freeze`: `4 × interval_s`, at least two minutes and at most
+/// ten.
 ///
 /// An `in_sync` copy lags by at most two intervals (section 6.13), so the
 /// final cycle ships at most about two intervals of writes. The bound gives
-/// it twice that, and never less than two minutes. On the bound the primary
-/// thaws the source and the switchover fails at its `freeze` step; a freeze
-/// that answers `ok` after the thaw went out is resumed by that thaw, which
-/// the node handles after the freeze.
+/// it twice that, and never less than two minutes. It is capped at ten
+/// minutes because the app serves nothing while it is frozen, and a final
+/// cycle that has not ended by then is a failed switchover, better thawed
+/// and reported; the cap also bounds how long a source that never answers
+/// keeps a `failoverApp` of the app answering `in_progress`. The contract
+/// sets no number. With the wait for the warm node's report
+/// ([`COPY_WAIT`]), a switchover keeps the app frozen for at most ten
+/// minutes and 35 seconds before it revokes or thaws.
+///
+/// On the bound the primary thaws the source and the switchover fails at
+/// its `freeze` step; a freeze that answers `ok` after the thaw went out is
+/// resumed by that thaw, which the node handles after the freeze.
 fn freeze_bound(interval_s: i64) -> Duration {
-    let seconds = interval_s.saturating_mul(4).max(FREEZE_BOUND_MIN_S);
+    let seconds = interval_s
+        .saturating_mul(4)
+        .clamp(FREEZE_BOUND_MIN_S, FREEZE_BOUND_MAX_S);
     Duration::from_secs(u64::try_from(seconds).unwrap_or(u64::MAX))
 }
 
@@ -455,8 +468,16 @@ async fn final_copy_reported(
     final_seq: u64,
 ) -> Result<(), String> {
     let plan = &steps.plan;
+    let hub = &state.hub;
     let deadline = tokio::time::Instant::now() + steps.copy_wait;
     loop {
+        // Registered before the checks, so a report or a session end
+        // between a check and the wait still wakes it.
+        let reported_now = hub.warm_reported().notified();
+        let session_ended = hub.revoke_answers().notified();
+        tokio::pin!(reported_now, session_ended);
+        reported_now.as_mut().enable();
+        session_ended.as_mut().enable();
         let reported = failover::complete_copy(state, &plan.warm, &plan.volume_id, &plan.app_id)
             .map(|(seq, _)| seq);
         if reported.is_some_and(|seq| seq >= final_seq) {
@@ -465,7 +486,8 @@ async fn final_copy_reported(
         if !state.hub.is_connected(&plan.warm) {
             return Err("the warm node is no longer connected".to_owned());
         }
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             return Err(match reported {
                 Some(seq) => format!(
                     "the warm node reports its complete copy at snapshot {seq}, not at the final \
@@ -476,7 +498,11 @@ async fn final_copy_reported(
                 ),
             });
         }
-        tokio::time::sleep(COPY_RECHECK).await;
+        tokio::select! {
+            () = &mut reported_now => {}
+            () = &mut session_ended => {}
+            () = tokio::time::sleep(deadline - now) => {}
+        }
     }
 }
 
@@ -535,10 +561,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_freeze_bound_is_four_intervals_and_never_below_two_minutes() {
+    fn the_freeze_bound_is_four_intervals_between_two_and_ten_minutes() {
+        assert_eq!(freeze_bound(0), Duration::from_secs(120));
         assert_eq!(freeze_bound(30), Duration::from_secs(120));
-        assert_eq!(freeze_bound(30 * 60), Duration::from_secs(4 * 30 * 60));
         assert_eq!(freeze_bound(31), Duration::from_secs(124));
-        assert_eq!(freeze_bound(i64::MAX), Duration::from_secs(u64::MAX >> 1));
+        assert_eq!(freeze_bound(150), Duration::from_secs(600));
+        assert_eq!(freeze_bound(151), Duration::from_secs(600));
+        assert_eq!(freeze_bound(30 * 60), Duration::from_secs(600));
+        assert_eq!(freeze_bound(i64::MAX), Duration::from_secs(600));
     }
 }

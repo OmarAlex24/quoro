@@ -654,6 +654,9 @@ struct HubInner {
     /// failover waiting on its revoke checks again (`openapi.yaml`
     /// `failoverApp`).
     revoke_answers: Notify,
+    /// Woken by every `status_report.warm` the hub applies, so a switchover
+    /// waiting for the warm node's copy of its final snapshot checks again.
+    warm_reported: Notify,
 }
 
 /// Test seam: a failure the hub injects once, where a database read or
@@ -793,6 +796,7 @@ impl NodeHub {
             session_tasks_ended: watch::channel(Vec::new()).0,
             serving_inputs: Notify::new(),
             revoke_answers: Notify::new(),
+            warm_reported: Notify::new(),
         }))
     }
 
@@ -809,6 +813,11 @@ impl NodeHub {
     /// Woken by every answered `lease_revoke` and every session that ends.
     pub(crate) fn revoke_answers(&self) -> &Notify {
         &self.0.revoke_answers
+    }
+
+    /// Woken by every `status_report.warm` the hub applies.
+    pub(crate) fn warm_reported(&self) -> &Notify {
+        &self.0.warm_reported
     }
 
     /// Test seam: holds `node_id`'s next snapshot that differs from the last
@@ -1669,6 +1678,8 @@ impl NodeHub {
             }
             before != reported
         };
+        // After the report is stored, so a waiter woken here reads it.
+        self.0.warm_reported.notify_waiters();
         if changed {
             self.node_changed(node_id);
             return Vec::new();

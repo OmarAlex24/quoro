@@ -3257,3 +3257,44 @@ async fn a_thaw_that_was_not_delivered_is_said_in_the_event() {
         "{data}"
     );
 }
+
+/// A warm node that already reported the final snapshot when the source
+/// answers its freeze costs no wait: the revoke follows the answer at once.
+#[tokio::test]
+async fn a_final_snapshot_already_reported_means_no_wait() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let freeze = s.started().await;
+    s.report_fresh_copy(9).await;
+    let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    let answered = tokio::time::Instant::now();
+    send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+    recv_type(s.on_source(), "lease_revoke").await;
+    assert!(
+        answered.elapsed() < Duration::from_secs(2),
+        "the revoke came {:?} after the answer",
+        answered.elapsed()
+    );
+}
+
+/// A warm node whose report of the final snapshot arrives after the source's
+/// answer wakes the wait as it arrives: the revoke follows that report at
+/// once, not at the end of the wait.
+#[tokio::test]
+async fn a_final_snapshot_reported_after_the_answer_wakes_the_wait() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let freeze = s.started().await;
+    let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    none_of(s.on_source(), "lease_revoke", "before the warm node reports").await;
+    let reported = tokio::time::Instant::now();
+    s.report_fresh_copy(9).await;
+    recv_type(s.on_source(), "lease_revoke").await;
+    assert!(
+        reported.elapsed() < Duration::from_secs(2),
+        "the revoke came {:?} after the report",
+        reported.elapsed()
+    );
+}
