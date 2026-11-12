@@ -3127,12 +3127,48 @@ async fn a_failure_after_the_revoke_sends_no_thaw_and_emits_nothing() {
     assert_eq!(vm_desired(&s).await, "stopped");
 }
 
-/// A source that leaves after the revoke went out is no failure: as for
-/// `failoverApp`, the wait goes on once the source is not connected and the
-/// lease's gate has passed, and the switchover completes with
-/// `app.switched_over` and no thaw.
+/// A source that leaves after the revoke went out, while its lease's gate
+/// is open, may still run the app: as for `failoverApp`
+/// (`a_source_that_leaves_before_answering_holds_the_lease`), the wait
+/// answers `lease_held` at once. The switchover cannot go back, so it ends
+/// as after `fence_failed`: no grant, no event, the lease revoked and the
+/// app's VM stopped until `failoverApp`.
 #[tokio::test]
-async fn a_source_that_leaves_after_the_revoke_still_moves_once_its_gate_passed() {
+async fn a_source_that_leaves_after_the_revoke_leaves_the_app_stopped_until_failover() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let freeze = s.started().await;
+    s.report_fresh_copy(9).await;
+    let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+    recv_type(s.on_source(), "lease_revoke").await;
+    // A gate that has not passed: the holder may still run the app.
+    s.server
+        .state
+        .hub
+        .authority()
+        .seed(LEASE_ID, &s.source.node_id, Some(15_000));
+    s.disconnect_source().await;
+
+    let (status, body) = after_the_steps(&s).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["reason"], Value::Null, "{body}");
+    assert!(
+        body["detail"].as_str().unwrap().contains("failoverApp"),
+        "{body}"
+    );
+    none_of(s.on_warm(), "lease_grant", "the gate is open").await;
+    assert_eq!(events_of(&s.server, "app.switched_over").await, 0);
+    assert_eq!(events_of(&s.server, "app.switchover_failed").await, 0);
+    s.unmoved(true, "the gate is open").await;
+    assert_eq!(vm_desired(&s).await, "stopped");
+}
+
+/// A source that leaves after the revoke went out, with no gate open (none
+/// was ever counted for its lease), no longer holds it: the wait goes on as
+/// for `failoverApp`, and the switchover completes with `app.switched_over`.
+#[tokio::test]
+async fn a_source_that_leaves_after_the_revoke_with_no_gate_open_moves() {
     let mut s = Setup::new().await;
     s.in_sync().await;
     let freeze = s.started().await;
