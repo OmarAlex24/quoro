@@ -392,12 +392,11 @@ async fn freeze(state: &AppState, steps: &Steps) -> Result<u64, String> {
     {
         // `snapshot_seq` is at least 1 (`events.schema.json`): a 0 names no
         // snapshot.
-        Ok(result) if result.status == CommandStatus::Ok => result
-            .snapshot_seq
-            .filter(|seq| *seq >= 1)
-            .ok_or_else(|| {
+        Ok(result) if result.status == CommandStatus::Ok => {
+            result.snapshot_seq.filter(|seq| *seq >= 1).ok_or_else(|| {
                 "the source answered the freeze without a snapshot_seq of at least 1".to_owned()
-            }),
+            })
+        }
         Ok(result) => Err(result
             .error
             .map(|error| format!("{}: {}", code_name(error.code), error.message))

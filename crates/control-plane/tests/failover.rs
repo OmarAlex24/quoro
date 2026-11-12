@@ -2684,9 +2684,12 @@ async fn a_freeze_answered_without_its_snapshot_fails_the_switchover() {
 async fn a_freeze_that_outlasts_its_bound_thaws_the_source() {
     let mut s = Setup::new().await;
     s.in_sync().await;
-    s.server.state.hub.inject_fault(Fault::ShortSwitchoverWaits {
-        app_id: s.app_id.clone(),
-    });
+    s.server
+        .state
+        .hub
+        .inject_fault(Fault::ShortSwitchoverWaits {
+            app_id: s.app_id.clone(),
+        });
     let _freeze = s.started().await;
     let data = s.failed_at("freeze").await;
     assert_eq!(
@@ -3072,7 +3075,12 @@ async fn a_frozen_report_while_a_switchover_runs_gets_no_thaw() {
     // A thaw would go out from its own task after a database read: give it
     // the time to arrive before the frames are read.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    none_of(s.on_source(), "command", "a frozen report during the switchover").await;
+    none_of(
+        s.on_source(),
+        "command",
+        "a frozen report during the switchover",
+    )
+    .await;
     let freeze_id = freeze["id"].as_str().unwrap().to_string();
     send(s.on_source(), replication_failed(), Some(&freeze_id)).await;
     s.failed_at("freeze").await;
@@ -3225,9 +3233,12 @@ async fn support_or_a_fence_lost_during_the_freeze_stops_it_before_the_revoke() 
 async fn a_warm_copy_older_than_the_final_snapshot_stops_it_before_the_revoke() {
     let mut s = Setup::new().await;
     s.in_sync().await;
-    s.server.state.hub.inject_fault(Fault::ShortSwitchoverWaits {
-        app_id: s.app_id.clone(),
-    });
+    s.server
+        .state
+        .hub
+        .inject_fault(Fault::ShortSwitchoverWaits {
+            app_id: s.app_id.clone(),
+        });
     let freeze = s.started().await;
     let freeze_id = freeze["id"].as_str().unwrap().to_string();
     send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
@@ -3288,7 +3299,12 @@ async fn a_final_snapshot_reported_after_the_answer_wakes_the_wait() {
     let freeze_id = freeze["id"].as_str().unwrap().to_string();
     send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    none_of(s.on_source(), "lease_revoke", "before the warm node reports").await;
+    none_of(
+        s.on_source(),
+        "lease_revoke",
+        "before the warm node reports",
+    )
+    .await;
     let reported = tokio::time::Instant::now();
     s.report_fresh_copy(9).await;
     recv_type(s.on_source(), "lease_revoke").await;
