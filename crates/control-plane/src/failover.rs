@@ -93,14 +93,6 @@ impl Running {
             app_id: app_id.to_string(),
         })
     }
-
-    /// Whether a failover or switchover of `app_id` runs.
-    pub(crate) fn contains(&self, app_id: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(app_id)
-    }
 }
 
 /// Holds an app's failover or switchover running ([`Running::start`]).
@@ -228,7 +220,7 @@ pub(crate) async fn run(
         Err(error) => return Err(error),
     };
     let app = after_commit(state, &plan, moved);
-    Ok(answer(state, app).await)
+    Ok(answer(state, app, "failoverApp").await)
 }
 
 /// What follows the commit of the change, which fails nothing: the warm
@@ -396,7 +388,7 @@ async fn refuse(state: &AppState, app: &App, node_id: &str) -> Result<Plan, ApiE
 /// `snapshot_seq`, and when the source took that snapshot. The warm node's
 /// own report, not `App.warm.state`: a complete copy is one with a
 /// `snapshot_seq` (section 6.13).
-fn complete_copy(
+pub(crate) fn complete_copy(
     state: &AppState,
     warm: &str,
     volume_id: &str,
@@ -557,7 +549,7 @@ pub(crate) async fn revoke(state: &AppState, ctx: &CallCtx, plan: &Plan) -> Resu
     let volume = ready_volume(&mut w.tx, &plan.app_id).await?;
     if volume.is_none_or(|volume| volume.id != plan.volume_id || volume.node_id != plan.source) {
         return Err(ApiError::conflict(
-            "the app's volume changed while the failover started; try again",
+            "the app's volume changed while the move started; try again",
         ));
     }
     if leases::app_lease(&mut w.tx, &plan.app_id)
@@ -568,7 +560,7 @@ pub(crate) async fn revoke(state: &AppState, ctx: &CallCtx, plan: &Plan) -> Resu
         .is_none()
     {
         return Err(ApiError::conflict(
-            "the app's lease changed while the failover started; try again",
+            "the app's lease changed while the move started; try again",
         ));
     };
     let Some(lease) =
@@ -996,17 +988,18 @@ async fn change(
 
 /// `app`, as the change wrote it, as `getApp` shows it: its cost, lease and
 /// warm copy attached. The move is committed, so a view that cannot be read
-/// is left out with a warning rather than failing the call.
-pub(crate) async fn answer(state: &AppState, mut app: App) -> App {
+/// is left out with a warning, which names `operation`, rather than failing
+/// the call.
+pub(crate) async fn answer(state: &AppState, mut app: App, operation: &str) -> App {
     let apps = std::slice::from_mut(&mut app);
     if let Err(error) = crate::backups::cost::attach(state, apps).await {
-        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "failoverApp answers without the app's cost");
+        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "{operation} answers without the app's cost");
     }
     if let Err(error) = crate::api::leases::attach(state, apps).await {
-        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "failoverApp answers without the app's lease");
+        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "{operation} answers without the app's lease");
     }
     if let Err(error) = crate::warm::attach(state, apps).await {
-        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "failoverApp answers without the app's warm copy");
+        tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "{operation} answers without the app's warm copy");
     }
     app
 }

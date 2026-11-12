@@ -682,8 +682,9 @@ pub enum Fault {
     /// turns to none from then on.
     FailoverSupportLapse { app_id: String },
     /// The next switchover of `app_id` waits at most one second for the
-    /// source's answer to `switchover_freeze`.
-    ShortFreezeBound { app_id: String },
+    /// source's answer to `switchover_freeze`, and at most one second for the
+    /// warm node to report the final snapshot.
+    ShortSwitchoverWaits { app_id: String },
 }
 
 /// A test seam that holds one node's next snapshot after it is built and
@@ -1514,11 +1515,6 @@ impl NodeHub {
         reports
     }
 
-    /// The newest `status_report.warm` of each node that reported one since
-    /// the primary started, keyed by node id (section 5.3). Kept in memory
-    /// only (migration 0011), so it is empty after a restart until the nodes
-    /// report again.
-    #[must_use]
     /// The apps whose failover or switchover runs in this process.
     pub(crate) fn running(&self) -> &crate::failover::Running {
         &self.0.running
@@ -1562,24 +1558,33 @@ impl NodeHub {
     /// restart, gets `switchover_thaw`. Each one goes out from its own task:
     /// its answer arrives on the session that is applying this report.
     ///
+    /// The thaw holds the app in the shared set ([`NodeHub::running`]) from
+    /// this report until it is answered or times out, so a switchover that
+    /// starts meanwhile answers `in_progress`: its freeze never reaches the
+    /// node ahead of this thaw. While a failover or switchover of the app
+    /// runs, or another thaw of it waits, the report sends none.
+    ///
     /// A switchover that stopped after its revoke left the lease revoked:
     /// the session start sent that revoke right after `welcome`, before this
     /// report was read, so the node handles the thaw after it. When that
     /// revoke's fence succeeded, the thaw finds nothing frozen and the VM
     /// stays stopped. A revoke answered `fence_failed` has not confirmed the
-    /// stop, and this thaw does not cover that case.
+    /// stop, and this thaw does not cover that case, whether the primary
+    /// restarted or not.
     fn thaw_unclaimed(&self, node_id: &str, report: &[wire::WarmStatus]) {
         for entry in report {
-            if entry.role != wire::WarmRole::Source
-                || entry.frozen != Some(true)
-                || self.0.running.contains(&entry.app_id)
-            {
+            if entry.role != wire::WarmRole::Source || entry.frozen != Some(true) {
                 continue;
             }
+            let Some(running) = self.0.running.start(&entry.app_id) else {
+                continue;
+            };
             let hub = self.clone();
             let node_id = node_id.to_owned();
             let app_id = entry.app_id.clone();
             tokio::spawn(async move {
+                // Held until the thaw is answered or times out.
+                let _running = running;
                 let vm_id: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
                     "SELECT id FROM vms WHERE app_id = ? AND node_id = ? ORDER BY id LIMIT 1",
                 )
@@ -1605,6 +1610,11 @@ impl NodeHub {
         }
     }
 
+    /// The newest `status_report.warm` of each node that reported one since
+    /// the primary started, keyed by node id (section 5.3). Kept in memory
+    /// only (migration 0011), so it is empty after a restart until the nodes
+    /// report again.
+    #[must_use]
     pub(crate) fn warm_reports(&self) -> HashMap<String, Vec<wire::WarmStatus>> {
         self.0
             .warm_reports

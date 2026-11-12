@@ -2596,6 +2596,7 @@ async fn a_switchover_freezes_the_source_then_moves_the_lease() {
     );
 
     let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    s.report_fresh_copy(9).await;
     send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
     let revoke = recv_type(s.on_source(), "lease_revoke").await;
     assert_eq!(revoke["body"]["reason"], "moved");
@@ -2659,20 +2660,22 @@ async fn a_failed_freeze_thaws_the_source_and_moves_nothing() {
     );
 }
 
-/// An `ok` answer to the freeze that names no final snapshot is a failed
-/// freeze: `app.switched_over` could not name the snapshot.
+/// An `ok` answer to the freeze that names no final snapshot, or names 0,
+/// is a failed freeze: `app.switched_over` could not name the snapshot.
 #[tokio::test]
 async fn a_freeze_answered_without_its_snapshot_fails_the_switchover() {
-    let mut s = Setup::new().await;
-    s.in_sync().await;
-    let freeze = s.started().await;
-    let freeze_id = freeze["id"].as_str().unwrap().to_string();
-    send(s.on_source(), freeze_ok(None), Some(&freeze_id)).await;
-    let data = s.failed_at("freeze").await;
-    assert!(
-        data["error"].as_str().unwrap().contains("snapshot_seq"),
-        "{data}"
-    );
+    for seq in [None, Some(0)] {
+        let mut s = Setup::new().await;
+        s.in_sync().await;
+        let freeze = s.started().await;
+        let freeze_id = freeze["id"].as_str().unwrap().to_string();
+        send(s.on_source(), freeze_ok(seq), Some(&freeze_id)).await;
+        let data = s.failed_at("freeze").await;
+        assert!(
+            data["error"].as_str().unwrap().contains("snapshot_seq"),
+            "{seq:?}: {data}"
+        );
+    }
 }
 
 /// A source that does not answer the freeze within the bound is thawed, and
@@ -2681,7 +2684,7 @@ async fn a_freeze_answered_without_its_snapshot_fails_the_switchover() {
 async fn a_freeze_that_outlasts_its_bound_thaws_the_source() {
     let mut s = Setup::new().await;
     s.in_sync().await;
-    s.server.state.hub.inject_fault(Fault::ShortFreezeBound {
+    s.server.state.hub.inject_fault(Fault::ShortSwitchoverWaits {
         app_id: s.app_id.clone(),
     });
     let _freeze = s.started().await;
@@ -2820,6 +2823,7 @@ async fn a_restarted_primary_revokes_then_thaws_a_frozen_source() {
     s.in_sync().await;
     let freeze = s.started().await;
     let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    s.report_fresh_copy(9).await;
     send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
     recv_type(s.on_source(), "lease_revoke").await;
     s.unmoved(true, "the revoke committed").await;
@@ -2993,4 +2997,263 @@ async fn an_agent_needs_an_approval_to_switch_over() {
     .unwrap();
     assert_eq!(approval.as_deref(), Some(approval_id.as_str()));
     assert!(grant.is_some());
+}
+
+/// `switchoverApp`'s answer once no step of the app runs any more: it is
+/// called again while it answers `in_progress`, for at most 30 s.
+async fn after_the_steps(s: &Setup) -> (u16, Value) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let res = s.switchover().await;
+        let status = res.status().as_u16();
+        let body: Value = res.json().await.unwrap();
+        if status != 409 || body["reason"] != "in_progress" {
+            return (status, body);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the steps never ended: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Whether the source got `switchover_thaw` among `frames`.
+fn has_thaw(frames: &[Value]) -> bool {
+    frames
+        .iter()
+        .any(|frame| frame["type"] == "command" && frame["body"]["kind"] == "switchover_thaw")
+}
+
+/// The app's VM's `desired_status`.
+async fn vm_desired(s: &Setup) -> String {
+    sqlx::query_scalar("SELECT desired_status FROM vms WHERE id = ?")
+        .bind(VM_ID)
+        .fetch_one(s.server.state.store.pool())
+        .await
+        .unwrap()
+}
+
+/// A thaw sent for a `frozen: true` report holds the app in the shared set
+/// until the source answers it: a switchover called meanwhile answers
+/// `in_progress` and sends no freeze, so no freeze reaches the node ahead of
+/// the thaw. Once the thaw is answered, a switchover starts.
+#[tokio::test]
+async fn a_thaw_that_waits_for_its_answer_holds_off_a_switchover() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let app_id = s.app_id.clone();
+    send(s.on_source(), frozen_report(&app_id), None).await;
+    let thaw = command_of(s.on_source(), "switchover_thaw").await;
+    assert_eq!(
+        thaw["body"]["params"],
+        json!({ "app_id": s.app_id, "vm_id": VM_ID })
+    );
+    refused(s.switchover().await, 409, "conflict", Some("in_progress")).await;
+    refused(s.failover().await, 409, "conflict", Some("in_progress")).await;
+    none_of(s.on_source(), "command", "while the thaw waits").await;
+
+    let thaw_id = thaw["id"].as_str().unwrap().to_string();
+    send(s.on_source(), ok_result(), Some(&thaw_id)).await;
+    let (status, body) = after_the_steps(&s).await;
+    assert_eq!(status, 202, "{body}");
+    command_of(s.on_source(), "switchover_freeze").await;
+}
+
+/// A source that reports `frozen: true` while a switchover of its app runs
+/// gets no thaw from the report: the switchover's own steps end the freeze.
+#[tokio::test]
+async fn a_frozen_report_while_a_switchover_runs_gets_no_thaw() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let freeze = s.started().await;
+    let app_id = s.app_id.clone();
+    send(s.on_source(), frozen_report(&app_id), None).await;
+    // A thaw would go out from its own task after a database read: give it
+    // the time to arrive before the frames are read.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    none_of(s.on_source(), "command", "a frozen report during the switchover").await;
+    let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    send(s.on_source(), replication_failed(), Some(&freeze_id)).await;
+    s.failed_at("freeze").await;
+}
+
+/// A failure after the revoke goes no way back: the source answers the
+/// revoke `fence_failed`, or leaves before it answers. The switchover sends
+/// no thaw, emits no event, and leaves the lease revoked and the app's VM
+/// stopped; a later `switchoverApp` answers the revoked lease's `conflict`.
+#[tokio::test]
+async fn a_failure_after_the_revoke_sends_no_thaw_and_emits_nothing() {
+    for leaves in [false, true] {
+        let case = if leaves {
+            "the source leaves"
+        } else {
+            "fence_failed"
+        };
+        let mut s = Setup::new().await;
+        s.in_sync().await;
+        let freeze = s.started().await;
+        s.report_fresh_copy(9).await;
+        let freeze_id = freeze["id"].as_str().unwrap().to_string();
+        send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+        let revoke = recv_type(s.on_source(), "lease_revoke").await;
+        if leaves {
+            s.disconnect_source().await;
+        } else {
+            let revoke_id = revoke["id"].as_str().unwrap().to_string();
+            send(s.on_source(), fence_failed_result(), Some(&revoke_id)).await;
+        }
+        let (status, body) = after_the_steps(&s).await;
+        assert_eq!(status, 409, "{case}: {body}");
+        assert_eq!(body["reason"], Value::Null, "{case}: {body}");
+        assert!(
+            body["detail"].as_str().unwrap().contains("failoverApp"),
+            "{case}: {body}"
+        );
+        if !leaves {
+            let frames = frames_until_settled(s.on_source()).await;
+            assert!(!has_thaw(&frames), "{case}: {frames:?}");
+        }
+        assert_eq!(
+            events_of(&s.server, "app.switchover_failed").await,
+            0,
+            "{case}"
+        );
+        assert_eq!(events_of(&s.server, "app.switched_over").await, 0, "{case}");
+        s.unmoved(true, case).await;
+        assert_eq!(vm_desired(&s).await, "stopped", "{case}");
+    }
+}
+
+/// The revoke's own check under the writer: the app's lease changed while
+/// the source froze. Nothing is revoked; the source is thawed and the
+/// switchover fails at `revoke`.
+#[tokio::test]
+async fn a_lease_that_changed_during_the_freeze_stops_it_at_the_revoke() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let freeze = s.started().await;
+    s.sql("UPDATE leases SET fencing_token = 6 WHERE id = ?")
+        .await;
+    s.report_fresh_copy(9).await;
+    let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+    let thaw = command_of(s.on_source(), "switchover_thaw").await;
+    let thaw_id = thaw["id"].as_str().unwrap().to_string();
+    send(s.on_source(), ok_result(), Some(&thaw_id)).await;
+    let data = event_data(&s.server, "app.switchover_failed").await;
+    assert_eq!(data["step"], "revoke", "{data}");
+    assert!(
+        data["error"]
+            .as_str()
+            .unwrap()
+            .contains("lease changed while the move started"),
+        "{data}"
+    );
+    none_of(s.on_source(), "lease_revoke", "the lease changed").await;
+    let revoked_at: Option<String> = sqlx::query_scalar("SELECT revoked_at FROM leases")
+        .fetch_one(s.server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(revoked_at, None);
+    assert_eq!(events_of(&s.server, "app.switched_over").await, 0);
+}
+
+/// A lease revoked by something else while the source froze: the revoke
+/// finds it revoked and the switchover goes forward, with no thaw and no
+/// `app.switchover_failed`.
+#[tokio::test]
+async fn a_lease_revoked_meanwhile_goes_forward_with_no_thaw() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let freeze = s.started().await;
+    s.sql("UPDATE leases SET revoked_at = '2026-11-09T10:00:00Z' WHERE id = ?")
+        .await;
+    s.report_fresh_copy(9).await;
+    let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+    let (status, body) = after_the_steps(&s).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["reason"], Value::Null, "{body}");
+    let frames = frames_until_settled(s.on_source()).await;
+    assert!(!has_thaw(&frames), "{frames:?}");
+    assert_eq!(events_of(&s.server, "app.switchover_failed").await, 0);
+}
+
+/// Majority support that lapses, or a failed fence that appears, while the
+/// source froze stops the switchover before the revoke: the source is
+/// thawed and it fails at `revoke`.
+#[tokio::test]
+async fn support_or_a_fence_lost_during_the_freeze_stops_it_before_the_revoke() {
+    for fence in [false, true] {
+        let mut s = Setup::new().await;
+        s.in_sync().await;
+        let freeze = s.started().await;
+        if fence {
+            let failure = json!({
+                "detected_at": "2026-11-09T10:00:00Z",
+                "lease_ids": ["lse_0000000000000000000000000X"],
+                "app_ids": [],
+                "vm_ids": [],
+            })
+            .to_string();
+            sqlx::query("UPDATE nodes SET fence_failure = ? WHERE id = ?")
+                .bind(&failure)
+                .bind(&s.warm.node_id)
+                .execute(s.server.state.store.pool())
+                .await
+                .unwrap();
+        } else {
+            set_support(&s.server, false);
+        }
+        s.report_fresh_copy(9).await;
+        let freeze_id = freeze["id"].as_str().unwrap().to_string();
+        send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+        let data = s.failed_at("revoke").await;
+        let expected = if fence { "failed fence" } else { "majority" };
+        assert!(
+            data["error"].as_str().unwrap().contains(expected),
+            "{expected}: {data}"
+        );
+    }
+}
+
+/// The warm node must report the final snapshot as its complete copy before
+/// the revoke: a copy older than it stops the switchover at `revoke`, and
+/// the source is thawed. The test shortens the wait for that report to 1 s.
+#[tokio::test]
+async fn a_warm_copy_older_than_the_final_snapshot_stops_it_before_the_revoke() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    s.server.state.hub.inject_fault(Fault::ShortSwitchoverWaits {
+        app_id: s.app_id.clone(),
+    });
+    let freeze = s.started().await;
+    let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+    let data = s.failed_at("revoke").await;
+    assert_eq!(
+        data["error"],
+        "the warm node reports its complete copy at snapshot 3, not at the final snapshot 9",
+        "{data}"
+    );
+}
+
+/// A thaw the source cannot get, because its session ended, is said in
+/// `app.switchover_failed`'s `error`: the source may still be frozen.
+#[tokio::test]
+async fn a_thaw_that_was_not_delivered_is_said_in_the_event() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let _freeze = s.started().await;
+    s.disconnect_source().await;
+    let data = event_data(&s.server, "app.switchover_failed").await;
+    assert_eq!(data["step"], "freeze", "{data}");
+    assert!(
+        data["error"]
+            .as_str()
+            .unwrap()
+            .contains("; the thaw was not delivered: "),
+        "{data}"
+    );
 }

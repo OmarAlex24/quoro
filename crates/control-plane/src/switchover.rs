@@ -15,8 +15,10 @@
 //! 3. **The revoke**, as `failoverApp`'s: one transaction revokes the lease
 //!    (reason `moved`), stops the app's instances and writes the
 //!    `lease.revoke` record, then the revoke goes out on the source's
-//!    session. Right before it, both nodes' sessions, the fences and majority
-//!    support are checked again.
+//!    session. Right before it, both nodes' sessions, the warm node's copy,
+//!    the fences and majority support are checked again: the warm node must
+//!    report a complete copy at the final snapshot or later
+//!    ([`final_copy_reported`]).
 //! 4. **The wait and the change**, as `failoverApp`'s, emitting
 //!    `app.switched_over` with the final snapshot's `snapshot_seq`.
 //!
@@ -36,7 +38,9 @@
 //!
 //! **After a primary restart** no switchover of this process runs, so a
 //! source that reports `frozen: true` gets `switchover_thaw`
-//! ([`crate::session::NodeHub`], section 5.17).
+//! ([`crate::session::NodeHub`], section 5.17). That thaw holds the same set
+//! until it is answered, so no switchover's freeze can reach the node ahead
+//! of it.
 
 use crate::AppState;
 use crate::api::apps::{APP_COLUMNS, App, HaPolicy, WarmState, app_from_row, app_target};
@@ -54,6 +58,15 @@ use std::time::Duration;
 
 /// The shortest freeze bound (see [`freeze_bound`]).
 const FREEZE_BOUND_MIN_S: i64 = 120;
+
+/// How long the primary waits, after the source's `ok`, for the warm node
+/// to report the final snapshot as its complete copy. The warm node reports
+/// on every change and at least every 30 s (section 5.3), and its report may
+/// reach the primary just after the source's answer.
+const COPY_WAIT: Duration = Duration::from_secs(35);
+
+/// How often that wait reads the warm node's report again.
+const COPY_RECHECK: Duration = Duration::from_millis(250);
 
 /// How long the primary waits for the source to answer `switchover_thaw`.
 /// The thaw is best-effort: a source that does not answer and reports
@@ -85,6 +98,9 @@ struct Steps {
     /// The app's VM on the source, which the freeze pauses.
     vm_id: String,
     bound: Duration,
+    /// How long the warm node may take to report the final snapshot
+    /// ([`COPY_WAIT`]).
+    copy_wait: Duration,
 }
 
 /// Where a switchover that moved nothing stopped (`app.switchover_failed`
@@ -150,11 +166,12 @@ pub(crate) async fn start(
         ));
     }
     let mut steps = refuse(state, &mut app, node_id).await?;
-    // Test seam: a bound a test can outlast.
-    if state.hub.take_fault(&Fault::ShortFreezeBound {
+    // Test seam: waits a test can outlast.
+    if state.hub.take_fault(&Fault::ShortSwitchoverWaits {
         app_id: app_id.to_owned(),
     }) {
         steps.bound = Duration::from_secs(1);
+        steps.copy_wait = Duration::from_secs(1);
     }
 
     // The call's own record, when the switchover starts
@@ -171,7 +188,7 @@ pub(crate) async fn start(
     .await?;
     w.commit().await?;
 
-    let answer = failover::answer(state, app).await;
+    let answer = failover::answer(state, app, "switchoverApp").await;
     // The steps run in their own task, which holds `running` until the
     // last of them: a client that gives up does not stop a switchover
     // halfway.
@@ -301,6 +318,7 @@ async fn refuse(state: &AppState, app: &mut App, node_id: &str) -> Result<Steps,
         project_id: app.project_id.clone(),
         vm_id,
         bound: freeze_bound(interval_s),
+        copy_wait: COPY_WAIT,
     })
 }
 
@@ -312,7 +330,7 @@ async fn run_steps(state: AppState, ctx: CallCtx, steps: Steps, _running: Runnin
         Ok(seq) => seq,
         Err(error) => return give_up(&state, &ctx, &steps, Step::Freeze, &error).await,
     };
-    if let Err(error) = before_revoke(&state, plan).await {
+    if let Err(error) = before_revoke(&state, &steps, snapshot_seq).await {
         return give_up(&state, &ctx, &steps, Step::Revoke, &error).await;
     }
     // Revoked by this call or meanwhile, the lease no longer comes back to
@@ -359,9 +377,14 @@ async fn freeze(state: &AppState, steps: &Steps) -> Result<u64, String> {
         .command(&plan.source, "switchover_freeze", params, steps.bound)
         .await
     {
+        // `snapshot_seq` is at least 1 (`events.schema.json`): a 0 names no
+        // snapshot.
         Ok(result) if result.status == CommandStatus::Ok => result
             .snapshot_seq
-            .ok_or_else(|| "the source answered the freeze without snapshot_seq".to_owned()),
+            .filter(|seq| *seq >= 1)
+            .ok_or_else(|| {
+                "the source answered the freeze without a snapshot_seq of at least 1".to_owned()
+            }),
         Ok(result) => Err(result
             .error
             .map(|error| format!("{}: {}", code_name(error.code), error.message))
@@ -384,16 +407,18 @@ fn code_name(code: quoro_proto::ErrorCode) -> String {
 }
 
 /// What may have changed while the source froze, checked again right
-/// before the revoke: both nodes' sessions, the fences and majority
-/// support.
-async fn before_revoke(state: &AppState, plan: &Plan) -> Result<(), String> {
+/// before the revoke: both nodes' sessions, the warm node's copy of the
+/// final snapshot `final_seq`, the fences and majority support.
+async fn before_revoke(state: &AppState, steps: &Steps, final_seq: u64) -> Result<(), String> {
     let hub = &state.hub;
+    let plan = &steps.plan;
     if !hub.is_connected(&plan.source) {
         return Err("the source node is no longer connected".to_owned());
     }
     if !hub.is_connected(&plan.warm) {
         return Err("the warm node is no longer connected".to_owned());
     }
+    final_copy_reported(state, steps, final_seq).await?;
     let mut conn = state
         .store
         .pool()
@@ -420,17 +445,59 @@ async fn before_revoke(state: &AppState, plan: &Plan) -> Result<(), String> {
     Ok(())
 }
 
+/// Waits until the warm node reports a complete copy at `final_seq` or
+/// later, for at most `steps.copy_wait`: the change moves the lease onto
+/// that copy, and an older one would lose the writes the final snapshot
+/// shipped.
+async fn final_copy_reported(
+    state: &AppState,
+    steps: &Steps,
+    final_seq: u64,
+) -> Result<(), String> {
+    let plan = &steps.plan;
+    let deadline = tokio::time::Instant::now() + steps.copy_wait;
+    loop {
+        let reported = failover::complete_copy(state, &plan.warm, &plan.volume_id, &plan.app_id)
+            .map(|(seq, _)| seq);
+        if reported.is_some_and(|seq| seq >= final_seq) {
+            return Ok(());
+        }
+        if !state.hub.is_connected(&plan.warm) {
+            return Err("the warm node is no longer connected".to_owned());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(match reported {
+                Some(seq) => format!(
+                    "the warm node reports its complete copy at snapshot {seq}, not at the final \
+                     snapshot {final_seq}"
+                ),
+                None => format!(
+                    "the warm node reports no complete copy, not the final snapshot {final_seq}"
+                ),
+            });
+        }
+        tokio::time::sleep(COPY_RECHECK).await;
+    }
+}
+
 /// A step before the revoke failed: the source gets `switchover_thaw`, then
-/// `app.switchover_failed` is emitted. Nothing moved.
+/// `app.switchover_failed` is emitted. Nothing moved. A thaw that was not
+/// delivered is said in the event's `error`: the source may still be
+/// frozen, until a later report of `frozen: true` gets its thaw.
 async fn give_up(state: &AppState, ctx: &CallCtx, steps: &Steps, step: Step, error: &str) {
     let plan = &steps.plan;
-    if let Err(thaw) = state
+    let error = match state
         .hub
         .thaw(&plan.source, &plan.app_id, &steps.vm_id)
         .await
     {
-        tracing::warn!(app_id = %plan.app_id, node_id = %plan.source, error = %thaw, "the source did not answer switchover_thaw; a later report of frozen: true thaws it");
-    }
+        Ok(()) => error.to_owned(),
+        Err(thaw) => {
+            tracing::warn!(app_id = %plan.app_id, node_id = %plan.source, error = %thaw, "the source did not answer switchover_thaw; a later report of frozen: true thaws it");
+            format!("{error}; the thaw was not delivered: {thaw}")
+        }
+    };
+    let error = error.as_str();
     let actor = ctx.identity.actor();
     let emitted = async {
         let mut w = state.store.begin_write().await?;
