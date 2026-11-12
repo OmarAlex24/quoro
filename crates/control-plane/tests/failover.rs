@@ -1138,6 +1138,97 @@ async fn a_lost_sources_expiring_lease_still_waits_for_its_gate() {
     assert_eq!(lease_now(&s).await, (s.warm.node_id.clone(), 6, false));
 }
 
+/// R, then the source's renewal answered from R (section 8.4, "From R until
+/// the holder has taken the grant"): the row reads `local` with the mark,
+/// and the source's gate is open, counted at the stored 9 s. The policy is
+/// back on `warm`, the source is cut off and declared lost while that gate
+/// is open, which revokes the row at token 5. The row reads `local`, so the
+/// failover finds it neither held while away nor on its gate; the gate is
+/// enforced at the grant, and the call stays open until it has passed. Only
+/// then does the lease name the warm node, at token 6, with its grant held
+/// on the lost source (section 8.4, "Grants of a marked row").
+#[tokio::test]
+async fn a_lost_holders_row_r_wrote_moves_only_once_its_gate_passed() {
+    let mut s = Setup::new().await;
+    set_support(&s.server, true);
+    s.sql("UPDATE leases SET mode = 'expiring', duration_ms = 9000 WHERE id = ?")
+        .await;
+    let res = s
+        .owner
+        .patch(s.server.url(&format!("/api/v1/apps/{}", s.app_id)))
+        .json(&json!({ "ha_policy": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let renewal = send(
+        s.on_source(),
+        NodeMessage::LeaseRenew(quoro_proto::LeaseRenew {
+            lease_id: quoro_proto::LeaseId(LEASE_ID.to_string()),
+            fencing_token: 4,
+        }),
+        None,
+    )
+    .await;
+    let answer = recv_type(s.on_source(), "lease_grant").await;
+    assert_eq!(answer["re"], renewal.as_str(), "{answer}");
+    assert_eq!(answer["body"]["mode"], "expiring", "{answer}");
+    assert_eq!(answer["body"]["duration_ms"], 9_000, "{answer}");
+    let gate = s
+        .server
+        .state
+        .hub
+        .authority()
+        .gate_remaining(LEASE_ID)
+        .expect("the answer from R opened the source's gate");
+    let passes = tokio::time::Instant::now() + gate;
+    assert!(gate > Duration::from_secs(9), "{gate:?}");
+
+    // `updateApp` cleared the warm node; back on `warm` as this file writes
+    // a warm app's rows.
+    sqlx::query("UPDATE apps SET ha_policy = 'warm', warm_node_id = ? WHERE id = ?")
+        .bind(&s.warm.node_id)
+        .bind(&s.app_id)
+        .execute(s.server.state.store.pool())
+        .await
+        .unwrap();
+    s.report_copy().await;
+    s.disconnect_source().await;
+    declare_source_lost(&s).await;
+    let (mode, unsettled): (String, i64) =
+        sqlx::query_as("SELECT mode, unsettled FROM leases WHERE id = ?")
+            .bind(LEASE_ID)
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!((mode.as_str(), unsettled), ("local", 1), "the row R wrote");
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 5, true));
+
+    let early = passes - Duration::from_millis(1_000);
+    assert!(
+        tokio::time::Instant::now() < early,
+        "the test ran too slowly"
+    );
+    let call = s.call(&s.warm.node_id);
+    tokio::time::sleep_until(early).await;
+    assert!(!call.is_finished(), "the call waits for the source's gate");
+    assert_eq!(
+        lease_now(&s).await,
+        (s.source.node_id.clone(), 5, true),
+        "nothing moved before the gate"
+    );
+
+    let res = call.await.unwrap();
+    assert!(tokio::time::Instant::now() >= passes, "not before the gate");
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let app: Value = res.json().await.unwrap();
+    let lease = &app["lease"];
+    assert_eq!(lease["holder_node_id"], s.warm.node_id.as_str(), "{lease}");
+    assert_eq!(lease["fencing_token"], 6, "{lease}");
+    assert_eq!(lease["grant_pending"], true, "{lease}");
+    assert_eq!(lease_now(&s).await, (s.warm.node_id.clone(), 6, false));
+}
+
 /// ADR 0292, ADR 0303. With support, a failover whose grant must wait for
 /// its write to be replicated over the machines with the `node` role goes
 /// on: the connected source gets its revoke, and once it answered, the

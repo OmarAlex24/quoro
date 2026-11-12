@@ -49,8 +49,8 @@ pub(crate) struct Lease {
     /// moves only as a `local` lease does. No write with a new token clears
     /// it; only the writes that record what the holder holds do: the settle
     /// ([`settle`]), the holder's `local` report ([`write_local_report`])
-    /// and, not built yet, the `pong` after a same-token `local` grant
-    /// (issue #555).
+    /// and the `pong` after a same-token `local` grant (issue #555). R sets
+    /// it ([`end_renewals`]).
     pub unsettled: bool,
 }
 
@@ -493,6 +493,12 @@ pub(crate) async fn is_released(
                 declaration_releases(lease, &lost_at, last_seen_at.as_deref())
             })
     });
+    // A row that reads `local` skips the gate here, also one that R wrote
+    // while its holder still held the lease `expiring` (section 8.4, "Ending
+    // the renewals"), whose gate may still be open. That gate is enforced
+    // further on, for every new token: `grant_app_lease` waits for it, the
+    // restore checks it again (`backups::restore::restore_ready`), and a held
+    // grant waits for it at the send (`session::held`, `try_send_held`).
     Ok(gone && (lease.mode == "local" || authority.passed(&lease.id)))
 }
 
@@ -1160,6 +1166,43 @@ pub(crate) async fn write_local_report(
     lease.unsettled = false;
     changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
     Ok(lease)
+}
+
+/// R, the write that ends an `expiring` lease's renewals (section 8.4,
+/// "Ending the renewals" step 1, ADR 0280): in the transaction of a policy
+/// change that leaves `warm`, the app's unrevoked lease row is written `mode`
+/// `local` with the unsettled mark, its token and `duration_ms` kept, with
+/// one change-log entry. Any mode is written: "The row stays `local` with the
+/// mark that R set", and marking more only delays a move ("The mark"). A row
+/// that already reads `local` with the mark is left as it is. Returns the
+/// row as it stands after the call, `None` when the app has no unrevoked
+/// lease.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn end_renewals(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    actor: &Actor,
+) -> Result<Option<Lease>, ApiError> {
+    let Some(mut lease) = app_lease(conn, app_id).await? else {
+        return Ok(None);
+    };
+    if lease.is_revoked() {
+        return Ok(None);
+    }
+    if lease.mode == "local" && lease.unsettled {
+        return Ok(Some(lease));
+    }
+    sqlx::query("UPDATE leases SET mode = 'local', unsettled = 1 WHERE id = ?")
+        .bind(&lease.id)
+        .execute(&mut *conn)
+        .await?;
+    lease.mode = "local".to_string();
+    lease.unsettled = true;
+    changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+    Ok(Some(lease))
 }
 
 /// Revokes the app's lease and writes its change-log entry; the caller builds

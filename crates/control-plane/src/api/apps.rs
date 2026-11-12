@@ -1849,6 +1849,15 @@ async fn update_app_tx(
                 "ha_policy cold needs a stateful app and a backup repository",
             ));
         }
+        // Section 8.4, "Ending the renewals" step 1 (ADR 0280): a policy
+        // that leaves `warm` (`hot` is read as `warm`, as the lease code
+        // reads it) writes the lease row `local` with the unsettled mark in
+        // this transaction (R), so a failed request writes neither. Nothing is
+        // sent here.
+        let warmish = |policy: HaPolicy| matches!(policy, HaPolicy::Warm | HaPolicy::Hot);
+        if warmish(app.ha_policy) && !warmish(policy) {
+            crate::leases::end_renewals(&mut w.tx, app_id, &ctx.identity.actor()).await?;
+        }
         app.ha_policy = policy;
         changed.push("ha_policy");
     }
