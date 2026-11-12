@@ -3087,50 +3087,56 @@ async fn a_frozen_report_while_a_switchover_runs_gets_no_thaw() {
 }
 
 /// A failure after the revoke goes no way back: the source answers the
-/// revoke `fence_failed`, or leaves before it answers. The switchover sends
-/// no thaw, emits no event, and leaves the lease revoked and the app's VM
-/// stopped; a later `switchoverApp` answers the revoked lease's `conflict`.
+/// revoke `fence_failed`. The switchover sends no thaw, emits no event, and
+/// leaves the lease revoked and the app's VM stopped; a later
+/// `switchoverApp` answers the revoked lease's `conflict`.
 #[tokio::test]
 async fn a_failure_after_the_revoke_sends_no_thaw_and_emits_nothing() {
-    for leaves in [false, true] {
-        let case = if leaves {
-            "the source leaves"
-        } else {
-            "fence_failed"
-        };
-        let mut s = Setup::new().await;
-        s.in_sync().await;
-        let freeze = s.started().await;
-        s.report_fresh_copy(9).await;
-        let freeze_id = freeze["id"].as_str().unwrap().to_string();
-        send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
-        let revoke = recv_type(s.on_source(), "lease_revoke").await;
-        if leaves {
-            s.disconnect_source().await;
-        } else {
-            let revoke_id = revoke["id"].as_str().unwrap().to_string();
-            send(s.on_source(), fence_failed_result(), Some(&revoke_id)).await;
-        }
-        let (status, body) = after_the_steps(&s).await;
-        assert_eq!(status, 409, "{case}: {body}");
-        assert_eq!(body["reason"], Value::Null, "{case}: {body}");
-        assert!(
-            body["detail"].as_str().unwrap().contains("failoverApp"),
-            "{case}: {body}"
-        );
-        if !leaves {
-            let frames = frames_until_settled(s.on_source()).await;
-            assert!(!has_thaw(&frames), "{case}: {frames:?}");
-        }
-        assert_eq!(
-            events_of(&s.server, "app.switchover_failed").await,
-            0,
-            "{case}"
-        );
-        assert_eq!(events_of(&s.server, "app.switched_over").await, 0, "{case}");
-        s.unmoved(true, case).await;
-        assert_eq!(vm_desired(&s).await, "stopped", "{case}");
-    }
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let freeze = s.started().await;
+    s.report_fresh_copy(9).await;
+    let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+    let revoke = recv_type(s.on_source(), "lease_revoke").await;
+    let revoke_id = revoke["id"].as_str().unwrap().to_string();
+    send(s.on_source(), fence_failed_result(), Some(&revoke_id)).await;
+    let (status, body) = after_the_steps(&s).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["reason"], Value::Null, "{body}");
+    assert!(
+        body["detail"].as_str().unwrap().contains("failoverApp"),
+        "{body}"
+    );
+    let frames = frames_until_settled(s.on_source()).await;
+    assert!(!has_thaw(&frames), "{frames:?}");
+    assert_eq!(events_of(&s.server, "app.switchover_failed").await, 0);
+    assert_eq!(events_of(&s.server, "app.switched_over").await, 0);
+    s.unmoved(true, "fence_failed").await;
+    assert_eq!(vm_desired(&s).await, "stopped");
+}
+
+/// A source that leaves after the revoke went out is no failure: as for
+/// `failoverApp`, the wait goes on once the source is not connected and the
+/// lease's gate has passed, and the switchover completes with
+/// `app.switched_over` and no thaw.
+#[tokio::test]
+async fn a_source_that_leaves_after_the_revoke_still_moves_once_its_gate_passed() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let freeze = s.started().await;
+    s.report_fresh_copy(9).await;
+    let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+    recv_type(s.on_source(), "lease_revoke").await;
+    s.disconnect_source().await;
+
+    assert_eq!(grant_of(s.on_warm()).await["body"]["fencing_token"], 5);
+    let data = event_data(&s.server, "app.switched_over").await;
+    assert_eq!(data["from_node_id"], s.source.node_id.as_str(), "{data}");
+    assert_eq!(data["to_node_id"], s.warm.node_id.as_str(), "{data}");
+    assert_eq!(data["snapshot_seq"], 9, "{data}");
+    assert_eq!(events_of(&s.server, "app.switchover_failed").await, 0);
 }
 
 /// The revoke's own check under the writer: the app's lease changed while
