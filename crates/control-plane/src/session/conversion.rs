@@ -6,9 +6,9 @@
 //! - **A conversion in flight.** The hub keeps, for each session generation,
 //!   the conversion grants it sent and whose first renewal it has not
 //!   answered ([`InFlight`]). It dies with the generation: after a session
-//!   cut or a restart, the holder's next `hello` decides (below). Nothing
-//!   sends a conversion grant yet; [`NodeHub::note_conversion_sent`] is where
-//!   its send records it.
+//!   cut or a restart, the holder's next `hello` decides (below). The send
+//!   ([`super::convert`]) records it in the hold of the sessions lock that
+//!   queues the grant ([`NodeHub::queue_conversion`]).
 //! - **The first answer.** A `lease_renew` of a lease in flight on its
 //!   session, at the conversion's token, over a row that still reads `local`,
 //!   is answered as the first one (ADR 0257: the conversion goes out only
@@ -43,9 +43,9 @@
 //!   Back on `warm` before that grant, the renewal is a settle's ("While R
 //!   waits").
 //!
-//! Not built here: sending the conversion grant, and the same-token `local`
-//! grant with its `ping` (issue #555). The holder's `local` report is
-//! [`super::local_report`].
+//! Not built here: sending the conversion grant ([`super::convert`]), and
+//! the same-token `local` grant with its `ping` ([`super::local_end`]). The
+//! holder's `local` report is [`super::local_report`].
 
 use super::{ControlMessage, NodeHub, Session, lease_token, new_msg_id};
 use crate::authority::{DEFAULT_DURATION_MS, GrantKind, MIN_DURATION_MS};
@@ -152,7 +152,7 @@ pub(super) fn plan(row: &Lease, token: u64, seen: Seen, warm: bool) -> Plan {
     // Section 8.4, "From R until the holder has taken the grant": once the
     // session sent the same-token `local` grant, it answers no renewal of the
     // lease on that session (ADR 0256), until a conversion grant follows,
-    // which lifts this ([`NodeHub::note_conversion_sent`]). A renewal at a
+    // which lifts this ([`NodeHub::queue_conversion`]). A renewal at a
     // higher token answers a later grant.
     if local_sent.is_some_and(|sent| token <= sent) {
         return Plan::Unanswered("the local grant ended the renewals on this session");
@@ -254,17 +254,15 @@ pub(super) fn counted(plan: Plan, row: &Lease) -> Option<GrantKind> {
 }
 
 impl NodeHub {
-    /// Records that `generation` sent `node_id` the conversion grant of
-    /// `lease_id` at `token` for `duration_ms`, so the next renewal of it on
-    /// that session is answered as the first one. Called when the grant is
-    /// queued. Refused (`false`) unless ADR 0257's barrier passed for the
-    /// lease at `token` on `generation`: the `pong` after its same-token
-    /// `local` grant, or the session's `hello` listing the lease `local`
+    /// Test seam: records that `generation` sent `node_id` the conversion
+    /// grant of `lease_id` at `token` for `duration_ms`, so the next renewal
+    /// of it on that session is answered as the first one, as
+    /// [`NodeHub::queue_conversion`] records it, but with no frame queued.
+    /// Refused (`false`) unless ADR 0257's barrier passed for the lease at
+    /// `token` on `generation`: the `pong` after its same-token `local`
+    /// grant, or the session's `hello` listing the lease `local`
     /// ([`NodeHub::barrier_passed`]). Returns whether it was recorded.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "nothing sends a conversion grant yet (#555)")
-    )]
+    #[cfg(test)]
     pub(crate) fn note_conversion_sent(
         &self,
         node_id: &str,
@@ -498,6 +496,9 @@ impl NodeHub {
             && handle.conversions.get(lease_id) == Some(&answered)
         {
             handle.conversions.remove(lease_id);
+            handle
+                .conversion_grants
+                .retain(|_, (id, in_flight)| !(*id == lease_id && *in_flight == answered));
         }
     }
 }

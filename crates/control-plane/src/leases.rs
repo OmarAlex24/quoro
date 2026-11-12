@@ -1310,6 +1310,29 @@ pub(crate) async fn leave_warm(
     }))
 }
 
+/// What a policy change onto `warm` finds for the conversion grant (section
+/// 8.4, "Changing the mode": "When the policy becomes `warm`, the primary
+/// sends the holder a `lease_grant` with `mode` `expiring`, the current token
+/// and a duration"), the mirror of [`leave_warm`]. Read in the transaction of
+/// a policy change from a policy that is neither `warm` nor `hot` to `warm`
+/// or `hot`: the app's lease row when it is unrevoked and reads `local`,
+/// marked or not, `None` otherwise. It writes nothing. The raise of
+/// `leases.duration_ms` that the grant may need is made where the grant is
+/// sent, and a marked row's conversion waits there until the mark clears.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn enter_warm(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+) -> Result<Option<Lease>, ApiError> {
+    let Some(lease) = app_lease(conn, app_id).await? else {
+        return Ok(None);
+    };
+    Ok((!lease.is_revoked() && lease.mode == "local").then_some(lease))
+}
+
 /// The write that precedes the resend of the same-token `local` grant when
 /// the holder reports a token above the row's (section 8.4, "The holder's
 /// next `hello`", third bullet): the row takes `mode` `local` and the

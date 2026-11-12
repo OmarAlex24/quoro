@@ -14,6 +14,7 @@
 //! asked for its support ([`votes`], sections 5.27 and 8.8).
 
 mod conversion;
+mod convert;
 pub mod desired;
 pub mod drain;
 mod follow;
@@ -518,6 +519,10 @@ struct SessionHandle {
     /// The `local` grants that end renewals, their barrier `ping`s, and
     /// what the session's `hello` and renewals showed ([`local_end`]).
     local_end: local_end::SessionState,
+    /// The conversion grants this session sent, by message id: the lease
+    /// and what it carried, so a refusal of one drops what it recorded
+    /// ([`convert`]).
+    conversion_grants: HashMap<String, (String, conversion::InFlight)>,
 }
 
 /// A follower's position in the change log, kept in memory for its live
@@ -2241,6 +2246,7 @@ impl NodeHub {
                 local_sent: HashMap::new(),
                 settles: conversion::Settles::default(),
                 local_end: local_end::SessionState::default(),
+                conversion_grants: HashMap::new(),
             },
         );
         (generation, rx, closed_rx, changed)
@@ -3878,6 +3884,27 @@ impl Session {
                         // "Regrant from `hello`"; section 8.4, "The holder
                         // fenced first").
                         self.regrant(&lease_id, token, outbox).await;
+                    } else if let Some((lease_id, in_flight)) =
+                        self.hub
+                            .take_conversion_grant(&self.node_id, self.generation, re)
+                    {
+                        // A refused conversion grant: what its send recorded
+                        // on this session goes, nothing is written, and no
+                        // other goes out on this session. The holder's next
+                        // `hello` decides ([`convert`]).
+                        self.hub.conversion_refused(
+                            &self.node_id,
+                            self.generation,
+                            &lease_id,
+                            in_flight,
+                        );
+                        tracing::warn!(
+                            node_id = %self.node_id,
+                            lease_id = %lease_id,
+                            token = in_flight.token,
+                            code = ?error.code,
+                            "the holder refused a conversion grant; nothing is written, and its next hello decides"
+                        );
                     }
                 }
             }
@@ -5219,6 +5246,17 @@ impl Session {
                         }
                         continue;
                     }
+                    // Section 8.4, "Changing the mode": "When the holder's
+                    // `hello` reports the lease as `local`, the primary sends
+                    // the conversion grant again", while the policy is
+                    // `warm`. Only a `hello` that listed it `local`, `held`
+                    // or `uncertain`, at the row's token; that listing also
+                    // passes ADR 0257's barrier on this session.
+                    let listed_local = reported.as_ref().is_some_and(|(state, claimed, expiring)| {
+                        !*expiring
+                            && *claimed == token
+                            && (state == "held" || state == "uncertain")
+                    });
                     let regrant = reported.is_some_and(|(state, claimed, _)| {
                         claimed == token && (state == "held" || state == "uncertain")
                     });
@@ -5227,6 +5265,12 @@ impl Session {
                     // `pong`. A refusal of a grant the `hello` listed `held`
                     // or `uncertain` at that token gives the lease back.
                     self.queue_local_grant(&lease, token, regrant, outbox).await;
+                    // Held after the repeat and its `ping` are on the outbox:
+                    // the conversion is queued on the session's channel,
+                    // which the session sends after its outbox.
+                    if listed_local && warm.contains(&lease.resource_id) {
+                        self.hub.hold_conversion_on(&lease, self.generation);
+                    }
                 }
             }
             Err(e) => {

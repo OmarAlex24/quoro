@@ -59,7 +59,7 @@
 //!   report does, if the row's newest write is still the one recorded with
 //!   the `ping` and every other check holds again. It also passes ADR 0257's
 //!   barrier for the lease on that session: a conversion grant may follow
-//!   ([`NodeHub::note_conversion_sent`]). A barrier that passed on the
+//!   ([`super::convert`]). A barrier that passed on the
 //!   session before this grant no longer counts, nor does the `pong` of an
 //!   older grant's `ping`: only the newest grant's `pong` passes it. A later
 //!   policy change off `warm` on the same session holds the grant afresh, so
@@ -147,6 +147,15 @@ impl SessionState {
     /// the session's own, so nothing shown on an earlier session counts.
     fn evidence(&self, lease_id: &str, token: u64) -> bool {
         self.listed.get(lease_id) == Some(&token) || self.renewed.get(lease_id) == Some(&token)
+    }
+
+    /// Whether ADR 0257's barrier has passed for `lease_id` at `token` on
+    /// the session: the `pong` of the `ping` after its newest same-token
+    /// `local` grant arrived with no refusal before it, or the session's
+    /// `hello` listed the lease `local` at that token, which stands in for
+    /// it (ADR 0261).
+    pub(super) fn barrier_passed(&self, lease_id: &str, token: u64) -> bool {
+        self.passed.get(lease_id) == Some(&token) || self.listed_local.get(lease_id) == Some(&token)
     }
 }
 
@@ -464,7 +473,13 @@ impl NodeHub {
 
     /// Whether `generation`'s `hello` listed `lease_id` `held` or
     /// `uncertain` at `token`, in either mode.
-    fn hello_listed(&self, node_id: &str, generation: u64, lease_id: &str, token: u64) -> bool {
+    pub(super) fn hello_listed(
+        &self,
+        node_id: &str,
+        generation: u64,
+        lease_id: &str,
+        token: u64,
+    ) -> bool {
         self.0
             .sessions
             .lock()
@@ -655,6 +670,15 @@ impl NodeHub {
             .or_insert(0);
         *sent = (*sent).max(barrier.token);
         handle.settles.forget(&barrier.lease_id);
+        // A conversion of the lease in flight on the session ends here: the
+        // node takes this grant after it, so no renewal it sends from now on
+        // is a first renewal after the conversion (ADR 0256), and none is
+        // answered at that token ([`super::conversion`]). A refusal of that
+        // conversion grant, still on its way, finds nothing to drop.
+        handle.conversions.remove(&barrier.lease_id);
+        handle
+            .conversion_grants
+            .retain(|_, (lease_id, _)| *lease_id != barrier.lease_id);
         if fresh {
             // A grant sent after the session start has its own barrier: one
             // that passed before it, by a `pong` or the `hello`'s listing,
@@ -728,11 +752,8 @@ impl NodeHub {
     /// `generation`: the `pong` of the `ping` after its same-token `local`
     /// grant arrived with no refusal before it, or the session's `hello`
     /// listed the lease `local` at that token, which stands in for it (ADR
-    /// 0261). A conversion grant of the lease may go out only then.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "nothing sends a conversion grant yet (#555)")
-    )]
+    /// 0261). A conversion grant of the lease may go out only then
+    /// ([`super::convert`]).
     pub(crate) fn barrier_passed(
         &self,
         node_id: &str,
@@ -746,10 +767,7 @@ impl NodeHub {
             .expect("session lock")
             .get(node_id)
             .filter(|handle| handle.generation == generation)
-            .is_some_and(|handle| {
-                handle.local_end.passed.get(lease_id) == Some(&token)
-                    || handle.local_end.listed_local.get(lease_id) == Some(&token)
-            })
+            .is_some_and(|handle| handle.local_end.barrier_passed(lease_id, token))
     }
 }
 
@@ -897,6 +915,9 @@ impl Session {
                 tracing::warn!(code = %e.code.as_str(), lease_id = %barrier.lease_id, "cannot record the pong after a local grant");
             }
         }
+        // The barrier passed: a conversion grant held for the lease may go
+        // out now ([`super::convert`]).
+        self.hub.wake_held();
     }
 
     /// The `pong`'s write, in one single-writer transaction that finds
@@ -2754,10 +2775,11 @@ mod tests {
         let hub = &f.state.hub;
         hub.hold_grant(&f.row().await);
         assert!(hub.grant_pending(LEASE));
-        let ((_app, _vms, _warm, ended, dropped), actor) = update_app_off_warm(&f).await;
-        let ended = ended.expect("the app has a lease");
+        let (updated, actor) = update_app_off_warm(&f).await;
+        assert!(updated.converting.is_none(), "the policy left warm");
+        let ended = updated.ended.expect("the app has a lease");
         assert!(ended.wrote && ended.from_expiring);
-        let dropped = dropped.expect("R drops the held grant");
+        let dropped = updated.left_stopped.expect("R drops the held grant");
         assert_eq!(
             (dropped.node_id.as_str(), dropped.fencing_token),
             (f.node_id.as_str(), 4)

@@ -1728,7 +1728,14 @@ pub async fn update_app(
         .await?;
 
     match update_app_tx(&state, &ctx, &app_id, &body, &params).await {
-        Ok((mut app, vm_ids, warm_wake, ended, left_stopped)) => {
+        Ok(UpdatedApp {
+            mut app,
+            vm_ids,
+            warm_wake,
+            ended,
+            left_stopped,
+            converting,
+        }) => {
             if let Some(dropped) = left_stopped {
                 tracing::info!(
                     app_id = %app_id,
@@ -1747,6 +1754,14 @@ pub async fn update_app(
             // awaits before the wakes below.
             if let Some(ended) = ended {
                 state.hub.end_renewals_committed(&ended);
+            }
+            // Section 8.4, "Changing the mode": the policy became `warm` over
+            // a lease the row reads `local`, so the holder gets the
+            // conversion grant. It is held on the holder's current session,
+            // after its `hello`, in the same poll as the commit; with no
+            // such session, the holder's next session start decides.
+            if let Some(lease) = &converting {
+                state.hub.hold_conversion(lease);
             }
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
@@ -1805,6 +1820,8 @@ pub(crate) async fn update_app_tx(
     let mut changed = Vec::new();
     // The lease row after R, when the policy leaves `warm`.
     let mut ended = None;
+    // The `local` lease row to convert, when the policy becomes `warm`.
+    let mut converting = None;
 
     // A new replica count is checked against the app as it is now, and against
     // the placement this request sets when it sets one (ADR 0142).
@@ -1878,6 +1895,13 @@ pub(crate) async fn update_app_tx(
         let warmish = |policy: HaPolicy| matches!(policy, HaPolicy::Warm | HaPolicy::Hot);
         if warmish(app.ha_policy) && !warmish(policy) {
             ended = crate::leases::leave_warm(&mut w.tx, app_id, &ctx.identity.actor()).await?;
+        }
+        // Section 8.4, "Changing the mode": a policy that becomes `warm`
+        // converts a `local` lease with a same-token `expiring` grant. The
+        // row is read here and nothing is written; the grant is held once
+        // this transaction commits.
+        if !warmish(app.ha_policy) && warmish(policy) {
+            converting = crate::leases::enter_warm(&mut w.tx, app_id).await?;
         }
         app.ha_policy = policy;
         changed.push("ha_policy");
@@ -2019,20 +2043,34 @@ pub(crate) async fn update_app_tx(
         None => None,
     };
     w.commit().await?;
-    Ok((app, vm_ids, warm_wake, ended, left_stopped))
+    Ok(UpdatedApp {
+        app,
+        vm_ids,
+        warm_wake,
+        ended,
+        left_stopped,
+        converting,
+    })
 }
 
-/// What [`update_app_tx`] committed: the app, the VMs to wake, the nodes
-/// whose warm settings changed, the lease row after R with what follows it,
-/// when the policy left `warm`, and the grant R dropped, for which the
-/// transaction recorded `app.left_stopped`.
-pub(crate) type UpdatedApp = (
-    App,
-    Vec<String>,
-    Option<Vec<String>>,
-    Option<crate::leases::Ended>,
-    Option<crate::session::LeftStopped>,
-);
+/// What [`update_app_tx`] committed.
+pub(crate) struct UpdatedApp {
+    /// The app as written.
+    pub app: App,
+    /// The VMs to wake.
+    pub vm_ids: Vec<String>,
+    /// The nodes whose warm settings changed.
+    pub warm_wake: Option<Vec<String>>,
+    /// The lease row after R with what follows it, when the policy left
+    /// `warm`.
+    pub ended: Option<crate::leases::Ended>,
+    /// The grant R dropped, for which the transaction recorded
+    /// `app.left_stopped`.
+    pub left_stopped: Option<crate::session::LeftStopped>,
+    /// The `local` lease row to convert, when the policy became `warm`
+    /// ([`crate::leases::enter_warm`]).
+    pub converting: Option<crate::leases::Lease>,
+}
 
 /// Why `updateApp` refuses `ha_policy` `warm` for an app (`openapi.yaml`
 /// `UpdateAppRequest.ha_policy`).
