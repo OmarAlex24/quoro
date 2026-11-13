@@ -4881,6 +4881,11 @@
     color: var(--ink-2);
   }
 
+  /* A name or a path in the offer stays whole: `quoro-node.service` does not break at its hyphen. */
+  .ha-way-p code {
+    white-space: nowrap;
+  }
+
   .ha-cands {
     display: grid;
     gap: 6px;
