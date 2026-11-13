@@ -87,17 +87,25 @@ async fn set_term(store: &Store, term: &str) {
 }
 
 /// Inserts a disconnected node `id` with `cp_status`, and its `create` entry.
+/// It carries the capacity, allocation and KVM probe an enrolled node has,
+/// so the API can read it back as a `Node`.
 async fn insert_node(conn: &mut SqliteConnection, id: &str, cp_status: Option<&str>, now: &str) {
+    let capacity = json!({ "cpus": 8, "memory_mb": 16_384, "disk_gb": 200 });
+    let allocated = json!({ "cpus": 0, "memory_mb": 0, "disk_gb": 0 });
+    let kvm = json!({ "available": true, "kernel": "6.9.0" });
     sqlx::query(
         "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, \
          behind_nat, labels, capacity, allocated, kvm, engine_version, agent_version, \
          desired_rev, applied_rev, log_seq, last_seen_at, created_at) \
-         VALUES (?, ?, '[\"node\"]', ?, 'disconnected', '', NULL, 1, '{}', '{}', '{}', \
-         '{}', NULL, NULL, 0, 0, 0, ?, ?)",
+         VALUES (?, ?, '[\"node\"]', ?, 'disconnected', '', NULL, 1, '{}', ?, ?, ?, \
+         NULL, NULL, 0, 0, 0, ?, ?)",
     )
     .bind(id)
     .bind(id)
     .bind(cp_status)
+    .bind(capacity.to_string())
+    .bind(allocated.to_string())
+    .bind(kvm.to_string())
     .bind(now)
     .bind(now)
     .execute(&mut *conn)
@@ -106,9 +114,9 @@ async fn insert_node(conn: &mut SqliteConnection, id: &str, cp_status: Option<&s
     let payload = json!({
         "id": id, "name": id, "roles": ["node"], "cp_status": cp_status,
         "status": "disconnected", "public_key": "", "address": null, "behind_nat": 1,
-        "labels": {}, "capacity": {}, "allocated": {}, "kvm": {}, "engine_version": null,
-        "agent_version": null, "desired_rev": 0, "applied_rev": 0, "log_seq": 0,
-        "last_seen_at": now, "created_at": now, "lost_at": null,
+        "labels": {}, "capacity": capacity, "allocated": allocated, "kvm": kvm,
+        "engine_version": null, "agent_version": null, "desired_rev": 0, "applied_rev": 0,
+        "log_seq": 0, "last_seen_at": now, "created_at": now, "lost_at": null,
     });
     changelog::append(conn, &fixture_actor(), "node", id, Op::Create, payload)
         .await
