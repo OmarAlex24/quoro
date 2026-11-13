@@ -1515,6 +1515,16 @@ async fn a_scheduled_backup_without_the_repository_key_fails_at_once() {
         .execute(pool)
         .await
         .unwrap();
+    // The control-plane schedule backs up from the primary's node, and this
+    // harness enrolls node-alpha without that status: name it the primary.
+    sqlx::query(
+        "UPDATE nodes SET cp_status = 'primary' \
+         WHERE id = (SELECT node_id FROM volumes WHERE id = ?)",
+    )
+    .bind(&setup.volume_id)
+    .execute(pool)
+    .await
+    .unwrap();
     let blob = drop_repository_key(&setup.server, &setup.repo_id).await;
     let objects = bucket_keys(&setup.memory).await;
     let absent = Some("repository key absent".to_string());
