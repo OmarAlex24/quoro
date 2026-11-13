@@ -16,8 +16,9 @@
 //! attempt, so the next interval tries again (`node-agent-protocol.md`
 //! section 7.3, step 4). A volume backup that was already `queued` or
 //! `running` when this primary took over is recorded `failed` with the same
-//! error at the next tick, and its node's desired state no longer carries the
-//! job (`session::desired`).
+//! error at start, before the listener opens ([`fail_without_key`]), so no
+//! node's desired state carries its job (section 6.7). Each tick runs the same
+//! pass again as a fallback.
 
 use crate::AppState;
 use crate::api::apps::BackupSchedule;
@@ -93,8 +94,10 @@ pub async fn run(state: &AppState, now: time::OffsetDateTime) -> Result<Tick, Ap
     if state.backups.is_sweeping() {
         return Ok(tick);
     }
-    // Before the timeout, so such a backup fails with the reason it has.
-    for node_id in fail_without_key(&state.store).await? {
+    // The start already ran this pass ([`fail_without_key`]); here it is a
+    // fallback. Before the timeout, so such a backup fails with the reason it
+    // has.
+    for node_id in fail_inherited(&state.store).await? {
         tick.key_absent += 1;
         state.hub.node_changed(&node_id);
     }
@@ -115,6 +118,28 @@ pub async fn run(state: &AppState, now: time::OffsetDateTime) -> Result<Tick, Ap
     Ok(tick)
 }
 
+/// The start's pass, run once before the listener opens: records `failed`
+/// with [`super::KEY_ABSENT`] every `queued` or `running` volume backup whose
+/// repository key this primary does not hold, and notifies each one's node.
+/// No session has built a desired state yet, so no snapshot ever carries such
+/// a job and then drops it: a job leaves `spec.backups` once the primary has
+/// recorded its terminal status (`node-agent-protocol.md` sections 6.7 and
+/// 7.3, step 4). Returns the number of backups failed. Each tick of [`run`]
+/// repeats the pass as a fallback.
+///
+/// # Errors
+///
+/// A database error, as text for the start.
+pub async fn fail_without_key(state: &AppState) -> Result<usize, String> {
+    let nodes = fail_inherited(&state.store)
+        .await
+        .map_err(|e| format!("cannot fail the backups left without the repository key: {e:?}"))?;
+    for node_id in &nodes {
+        state.hub.node_changed(node_id);
+    }
+    Ok(nodes.len())
+}
+
 /// Records `failed` with [`super::KEY_ABSENT`] every `queued` or `running`
 /// volume backup of the repository while this primary does not hold its key,
 /// through [`seal::fail`], and returns the node of each one failed. Such a row
@@ -122,7 +147,7 @@ pub async fn run(state: &AppState, now: time::OffsetDateTime) -> Result<Tick, Ap
 /// longer queue one (`node-agent-protocol.md` section 7.3, step 4). A
 /// control-plane row was already resolved at start. A later report of the
 /// backup from its node finds the row terminal and changes nothing.
-async fn fail_without_key(store: &Store) -> Result<Vec<String>, ApiError> {
+async fn fail_inherited(store: &Store) -> Result<Vec<String>, ApiError> {
     let Some(repository) = repo::any(store).await? else {
         return Ok(Vec::new());
     };

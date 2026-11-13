@@ -368,6 +368,8 @@ impl AppState {
         // Every session the previous process left open ends with
         // `primary_restarted` before the listener opens.
         interactive::close_orphans(&state).await?;
+        // Sections 6.7, 7.3 step 4: backups left without the key fail before any session.
+        backups::dispatch::fail_without_key(&state).await?;
         sweeper::spawn(state.clone());
         vulns::findings::spawn(state.clone());
         audit_export::spawn(state.clone());
