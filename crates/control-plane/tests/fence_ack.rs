@@ -1845,3 +1845,207 @@ async fn a_failed_clear_of_lost_at_sends_nothing_after_the_answer() {
         );
     }
 }
+
+/// The highest fencing token the change log carries (section 8.6, "The
+/// cap"): 2^53 − 1.
+const MAX_TOKEN: i64 = (1 << 53) - 1;
+
+/// Sets the stored token of `lease_id`, as a row that reached the cap.
+async fn set_token(server: &Server, lease_id: &str, token: i64) {
+    sqlx::query("UPDATE leases SET fencing_token = ? WHERE id = ?")
+        .bind(token)
+        .bind(lease_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+}
+
+/// A second `local` lease row `node_id` holds, at `token`.
+async fn second_lease(server: &Server, node_id: &str, token: i64) {
+    sqlx::query(
+        "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+         fencing_token, granted_at) VALUES (?, 'app', ?, ?, 'local', ?, ?)",
+    )
+    .bind(SECOND_LEASE)
+    .bind(SECOND_APP)
+    .bind(node_id)
+    .bind(token)
+    .bind(quoro_control_plane::store::now_rfc3339())
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
+}
+
+/// Asserts a `409 conflict` with `reason: token_exhausted` whose detail
+/// names `lease_id` at the cap and not `other`.
+async fn assert_token_exhausted(res: reqwest::Response, lease_id: &str, other: &str) {
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["code"], "conflict", "{body}");
+    assert_eq!(body["reason"], "token_exhausted", "{body}");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(&format!("lease {lease_id} is at fencing token {MAX_TOKEN}")),
+        "{body}"
+    );
+    assert!(!detail.contains(other), "{body}");
+}
+
+/// `(result, result_detail)` of each record of `operation`, oldest first.
+async fn audit_results(server: &Server, operation: &str) -> Vec<(String, Option<String>)> {
+    sqlx::query_as("SELECT result, result_detail FROM audit_log WHERE operation = ? ORDER BY seq")
+        .bind(operation)
+        .fetch_all(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
+/// Section 8.5 step 3 and section 8.6, "The cap" (ADR 0321): an
+/// acknowledgement that lists a lease the node still holds at 2^53 − 1 is
+/// refused with `409 conflict` and `reason: token_exhausted`, and nothing is
+/// written: not that lease, not the other listed lease below the cap, not
+/// `fence_failure` nor `fence_ack_pending`, and no lease or node change-log
+/// entry. The refusal is audited. Once the row is one below the cap, the
+/// same acknowledgement raises it to the cap and succeeds.
+#[tokio::test]
+async fn an_ack_that_would_raise_a_token_past_the_cap_writes_nothing() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, mut socket, app_id, vm_id, lease_id) = node_with_lease(&server, &owner).await;
+    let node_id = node.node_id.clone();
+    send(
+        &mut socket,
+        fence_failed_event(&node_id, &lease_id, &app_id, &vm_id),
+    )
+    .await;
+    wait_for_node(
+        &owner,
+        &server,
+        Some(&mut socket),
+        &node_id,
+        "a fence_failure",
+        |node| !node["fence_failure"].is_null(),
+    )
+    .await;
+    // A second listed failure, of a lease the node holds below the cap.
+    second_lease(&server, &node_id, 5).await;
+    let failure = json!({
+        "detected_at": "2026-11-06T10:15:32Z",
+        "lease_ids": [lease_id, SECOND_LEASE],
+        "app_ids": [app_id, SECOND_APP],
+        "vm_ids": [vm_id],
+    });
+    sqlx::query("UPDATE nodes SET fence_failure = ? WHERE id = ?")
+        .bind(failure.to_string())
+        .bind(&node_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    set_token(&server, &lease_id, MAX_TOKEN).await;
+    let listed = get_node(&owner, &server, &node_id).await["fence_failure"].clone();
+
+    let before = log_head(&server).await;
+    let res = ack(
+        &owner,
+        &server,
+        &node_id,
+        json!({ "lease_ids": [SECOND_LEASE, lease_id] }),
+    )
+    .await;
+    assert_token_exhausted(res, &lease_id, SECOND_LEASE).await;
+    assert_eq!(
+        lease_row(&server, &lease_id).await,
+        (MAX_TOKEN, None, node_id.clone())
+    );
+    assert_eq!(
+        lease_row(&server, SECOND_LEASE).await,
+        (5, None, node_id.clone())
+    );
+    assert_eq!(
+        get_node(&owner, &server, &node_id).await["fence_failure"],
+        listed,
+        "fence_failure is left as it was"
+    );
+    assert_eq!(fence_ack_pending(&server, &node_id).await, None);
+    assert!(entries_after(&server, before).await.is_empty());
+    let operation = "POST /api/v1/nodes/{node_id}/fence-ack";
+    assert_eq!(
+        audit_results(&server, operation).await,
+        vec![("error".to_string(), Some("token_exhausted".to_string()))]
+    );
+
+    // One below the cap: raised to it, and the acknowledgement carries it.
+    set_token(&server, &lease_id, MAX_TOKEN - 1).await;
+    let res = ack(
+        &owner,
+        &server,
+        &node_id,
+        json!({ "lease_ids": [SECOND_LEASE, lease_id] }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let (token, revoked_at, _) = lease_row(&server, &lease_id).await;
+    assert_eq!((token, revoked_at.is_some()), (MAX_TOKEN, true));
+    let (token, revoked_at, _) = lease_row(&server, SECOND_LEASE).await;
+    assert_eq!((token, revoked_at.is_some()), (6, true));
+    let command = of_type(&recv_until(&mut socket, &["command"]).await, "command")[0].clone();
+    assert_eq!(command["body"]["kind"], "fence_ack", "{command}");
+    assert_eq!(
+        command["body"]["params"]["fencing_tokens"],
+        json!({ lease_id.as_str(): MAX_TOKEN, SECOND_LEASE: 6 })
+    );
+}
+
+/// Section 8.3 and section 8.6, "The cap" (ADR 0325): declaring a node lost
+/// that holds a lease at 2^53 − 1 is refused with `409 conflict` and
+/// `reason: token_exhausted`, and nothing is written: neither of its leases,
+/// not `lost_at`, and no lease or node change-log entry. The refusal is
+/// audited. Once the row is one below the cap, the declaration raises it to
+/// the cap and succeeds.
+#[tokio::test]
+async fn declaring_lost_a_node_whose_lease_is_at_the_cap_writes_nothing() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, socket, _app_id, _vm_id, lease_id) = node_with_lease(&server, &owner).await;
+    let node_id = node.node_id.clone();
+    drop(socket);
+    wait_disconnected(&server, &node_id).await;
+    second_lease(&server, &node_id, 3).await;
+    set_token(&server, &lease_id, MAX_TOKEN).await;
+
+    let before = log_head(&server).await;
+    assert_token_exhausted(
+        declare_lost(&owner, &server, &node_id).await,
+        &lease_id,
+        SECOND_LEASE,
+    )
+    .await;
+    assert_eq!(
+        lease_row(&server, &lease_id).await,
+        (MAX_TOKEN, None, node_id.clone())
+    );
+    assert_eq!(
+        lease_row(&server, SECOND_LEASE).await,
+        (3, None, node_id.clone())
+    );
+    assert_eq!(lost_at(&server, &node_id).await, None);
+    assert!(entries_after(&server, before).await.is_empty());
+    let records = declare_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!((records[0].0.as_str(), records[0].3), ("error", None));
+    assert_eq!(
+        audit_results(&server, "POST /api/v1/nodes/{node_id}/declare-lost").await,
+        vec![("error".to_string(), Some("token_exhausted".to_string()))]
+    );
+
+    // One below the cap: raised to it, and the node is declared lost.
+    set_token(&server, &lease_id, MAX_TOKEN - 1).await;
+    let res = declare_lost(&owner, &server, &node_id).await;
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let (token, revoked_at, _) = lease_row(&server, &lease_id).await;
+    assert_eq!((token, revoked_at.is_some()), (MAX_TOKEN, true));
+    let (token, revoked_at, _) = lease_row(&server, SECOND_LEASE).await;
+    assert_eq!((token, revoked_at.is_some()), (4, true));
+    assert!(lost_at(&server, &node_id).await.is_some());
+}

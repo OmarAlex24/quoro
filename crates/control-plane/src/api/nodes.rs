@@ -740,8 +740,9 @@ pub async fn set_node_tunnel(
 /// `forbidden` for an agent or without `node:fence_ack`, `validation_failed`
 /// for an empty list, a repeated id or one that is not an `lse_` id,
 /// `not_found` for an unknown node, `conflict` when the node has no failed
-/// fence or `lease_ids` differs from its outstanding ones, or a database
-/// error.
+/// fence or `lease_ids` differs from its outstanding ones, `conflict` with
+/// `reason: token_exhausted` when a listed lease the node still holds is
+/// already at the token cap (section 8.6, ADR 0321), or a database error.
 pub async fn ack_node_fence(
     State(state): State<AppState>,
     identity: Identity,
@@ -802,6 +803,11 @@ fn stored_token(token: i64) -> u64 {
 /// failed fence it recorded at that token (ADR 0247); and one with no row,
 /// [`crate::fences::UNKNOWN_LEASE_TOKEN`] (P-0273). The node clears only the
 /// failed fences below its lease's token.
+///
+/// A listed lease the node still holds that is already at the token cap
+/// refuses the whole acknowledgement with `token_exhausted` before anything
+/// is written (section 8.6, ADR 0321, [`crate::leases::bump_tokens`]): the
+/// transaction is dropped, so `fence_failure` stays as it was.
 async fn fence_ack_tx(
     state: &AppState,
     ctx: &CallCtx,
@@ -950,7 +956,8 @@ async fn fence_ack_tx(
 ///
 /// `forbidden` for an agent or without `node:declare_lost`, `not_found` for
 /// an unknown node, `conflict` for a removed node or one that is connected,
-/// or a database error.
+/// `conflict` with `reason: token_exhausted` when a lease the node holds is
+/// already at the token cap (section 8.6, ADR 0325), or a database error.
 pub async fn declare_node_lost(
     State(state): State<AppState>,
     identity: Identity,
@@ -1000,7 +1007,10 @@ pub async fn declare_node_lost(
 ///
 /// The checks run in the contract's order: an unknown node is `not_found`,
 /// a `removed` one and a connected one `conflict`, and one already declared
-/// lost changes nothing and is returned as it is.
+/// lost changes nothing and is returned as it is. A lease the node holds
+/// that is already at the token cap refuses the declaration with
+/// `token_exhausted` before anything is written (section 8.6, ADR 0325), so
+/// `lost_at` stays unset.
 ///
 /// Only rows that name the node and are not revoked yet change: a lease whose
 /// row names another node already carries a higher token than this node's,
