@@ -367,3 +367,61 @@ async fn welcome_lists_at_most_16_urls() {
     assert_eq!(urls, expected);
     assert!(!urls.contains(&machines[4][2]), "{urls:?}");
 }
+
+/// Section 5.10 (ADR 0235): "every other connected machine" is read as
+/// other than the primary, so a `sealed` machine finds its own
+/// `control_plane_urls` in its own `welcome`, merged in the order of its
+/// enrollment like any other machine's. That lets the agent of a promoted
+/// machine reach its own new control plane. Its first session binds its
+/// custody key and seals the keys to it; the next one, with the same key,
+/// starts `sealed`.
+#[tokio::test]
+async fn a_sealed_machine_finds_its_own_urls_in_its_own_welcome() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let reader = enrolled(&server, &owner, "node-reader", &["node"]).await;
+    let other = enrolled(&server, &owner, "node-other", &["node"]).await;
+    enrolled_at(&server, &reader.node_id, "2026-11-01T10:00:00Z").await;
+    enrolled_at(&server, &other.node_id, "2026-11-01T11:00:00Z").await;
+    let _other = sealed(&server, &other, &["https://192.0.2.22:8443"]).await;
+
+    let key = CustodyKey::generate(&mut custody::os_rng());
+    let own_urls = ["https://192.0.2.21:8443", "https://node-reader.local:8443"];
+    let (first, _) = session(
+        &server,
+        &reader,
+        hello(&reader.node_id, Some(&key), &own_urls),
+    )
+    .await;
+    let seals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_key_custody WHERE node_id = ?")
+        .bind(&reader.node_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(seals, 3, "every key in use is sealed to the reader");
+    drop(first);
+    timeout(Duration::from_secs(10), async {
+        while server.state.hub.is_connected(&reader.node_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the closed session ends");
+
+    let (_socket, urls) = session(
+        &server,
+        &reader,
+        hello(&reader.node_id, Some(&key), &own_urls),
+    )
+    .await;
+    assert_eq!(
+        urls,
+        owned(&[
+            OWN[0],
+            OWN[1],
+            "https://192.0.2.21:8443",
+            "https://192.0.2.22:8443",
+            "https://node-reader.local:8443",
+        ])
+    );
+}
