@@ -941,11 +941,10 @@ async fn a_declaration_before_the_hello_is_revoked_first_and_frees_nothing_until
     let declared =
         declare_lost_after_its_last_report(&setup.app.owner, &setup.app.server, &node_id).await;
     let (row_token, revoked_at, holder) = lease_row(&setup.app.server, &lease_id).await;
-    assert_eq!(
-        (row_token, holder.as_str()),
-        (token, node_id.as_str()),
-        "the restore revoked the row already, so the declaration keeps its token"
-    );
+    // At least the token the node holds, whichever way the declaration
+    // treats a row the restore already revoked (section 5.13).
+    assert!(row_token >= token, "{row_token} < {token}");
+    assert_eq!(holder, node_id);
     assert!(revoked_at.is_some());
 
     // The node returns once the declaration has committed.
@@ -965,11 +964,16 @@ async fn a_declaration_before_the_hello_is_revoked_first_and_frees_nothing_until
     );
     let revoke = frames[1].clone();
     assert_eq!(revoke["body"]["lease_id"], lease_id.as_str());
-    assert_eq!(revoke["body"]["fencing_token"], json!(token));
+    assert!(
+        revoke["body"]["fencing_token"]
+            .as_i64()
+            .is_some_and(|revoked| revoked >= token),
+        "at least the token the node holds: {revoke}"
+    );
     assert_eq!(revoke["body"]["reason"], "declared_lost", "{revoke}");
     assert!(
-        !binds_lease(&frames[2], &lease_id),
-        "no VM under the revoked lease: {}",
+        names_vm(&frames[2], &setup.app.vm_id).is_none() && !binds_lease(&frames[2], &lease_id),
+        "neither the moved app's VM nor a VM under the revoked lease: {}",
         frames[2]["body"]["spec"]["vms"]
     );
     setup.app.socket = socket;
@@ -1000,9 +1004,9 @@ async fn a_declaration_before_the_hello_is_revoked_first_and_frees_nothing_until
     ready_grants(&mut setup, &moving).await;
     let frames = frames_until_settled(&mut setup.app.socket).await;
     assert!(
-        frames
-            .iter()
-            .all(|frame| frame["type"] != "lease_grant" && !binds_lease(frame, &lease_id)),
+        frames.iter().all(|frame| frame["type"] != "lease_grant"
+            && names_vm(frame, &setup.app.vm_id).is_none()
+            && !binds_lease(frame, &lease_id)),
         "nothing gives the old node the lease or the VM back: {frames:?}"
     );
 }
@@ -1017,8 +1021,8 @@ async fn a_declaration_before_the_hello_is_revoked_first_and_frees_nothing_until
 ///   row still reads `disconnected`;
 /// - the node said `hello`, and the session start's write waits on the
 ///   writer, which the test holds, as does a declaration sent after it.
-///   Whichever of the two takes the writer first, the declaration finds the
-///   session.
+///   The writer serves them in arrival order, so the `hello` commits first
+///   and the declaration finds the node connected.
 ///
 /// Both are refused and write nothing: the lease keeps its token and stays
 /// unrevoked, `lost_at` stays unset, the change log gets no lease entry and
