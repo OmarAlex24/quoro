@@ -140,10 +140,6 @@ pub(super) struct HeldGrant {
     /// and its `ping` ([`super::convert`]). Changed in place, keeping the
     /// registration.
     pub(super) barrier_on: Option<u64>,
-    /// A conversion: the change-log `seq` of the raise of `duration_ms`
-    /// this entry's own attempt wrote and committed ([`super::convert`]).
-    /// Changed in place, keeping the registration.
-    pub(super) raised_seq: Option<u64>,
 }
 
 /// The grant length a held grant of `lease` needs majority support for:
@@ -173,7 +169,6 @@ impl HeldGrant {
             grant_dropped: false,
             registration: 0,
             barrier_on: None,
-            raised_seq: None,
         }
     }
 

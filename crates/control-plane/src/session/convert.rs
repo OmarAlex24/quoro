@@ -20,24 +20,25 @@
 //! - **When it goes.** One pure function ([`convert_step`]) decides from
 //!   the row and the session: no conversion over a marked row; ADR 0257's
 //!   barrier first, the same-token `local` grant and its `ping` sent by the
-//!   entry itself when the session has not shown the holder's mode; the
-//!   raise of `leases.duration_ms` to `D` before a grant of `D` (ADR 0254),
-//!   sent once that raise is replicated over the required set (ADR 0268),
-//!   with the stored duration meanwhile when it is shorter, and nothing for
-//!   a row that stores none (ADR 0289).
+//!   entry itself when the session has not shown the holder's mode; a row
+//!   that stores no duration raised to `D` first, in its own committed write
+//!   (ADR 0254, ADR 0289); then every conversion grant only once the row's
+//!   newest change-log write is replicated over the required set, never at
+//!   once (ADR 0268). It carries `D`, or the stored duration when that is
+//!   shorter, which needs no raise.
 //! - **The send.** Under the writer gate, the row found again unrevoked,
 //!   naming the entry and reading `local`, the policy `warm`, no failed
 //!   fence, the session ready, its start's grants queued, no conversion in
 //!   flight on it, and majority support for the duration sent (for `D`
-//!   before the barrier or the raise, which precede a grant of `D`). The
-//!   grant carries the row's token, `mode` `expiring`, the duration and no
-//!   `re` (ADR 0256). It is queued and recorded on the session in one hold
-//!   of the sessions lock ([`NodeHub::queue_conversion`]), which checks the
-//!   start's grants queued and the barrier again, so the session start's
-//!   same-token `local` repeat never reaches the node after it: its first
-//!   renewal is then answered as the first one, writing the row `expiring`
-//!   ([`super::conversion`]). The send writes nothing but a raise; the
-//!   conversion grant counts toward no gate (ADR 0241).
+//!   before the barrier or the raise). The grant carries the row's token,
+//!   `mode` `expiring`, the duration and no `re` (ADR 0256). It is queued
+//!   and recorded on the session in one hold of the sessions lock
+//!   ([`NodeHub::queue_conversion`]), which checks the start's grants queued
+//!   and the barrier again, so the session start's same-token `local` repeat
+//!   never reaches the node after it: its first renewal is then answered as
+//!   the first one, writing the row `expiring` ([`super::conversion`]). The
+//!   send writes nothing; the raise is a step of its own, committed before
+//!   any send. The conversion grant counts toward no gate (ADR 0241).
 //! - **A refusal.** A refusal of the grant drops what its send recorded and
 //!   the held entry, writes nothing, and sends no other on that session
 //!   ([`NodeHub::conversion_refused`]): the holder's next `hello` decides.
@@ -66,10 +67,6 @@ pub(super) struct ConvertFacts {
     /// The lease row's newest change-log write is replicated over the
     /// required set.
     pub newest_replicated: bool,
-    /// The raise this entry wrote itself ([`HeldGrant::raised_seq`]):
-    /// `Some(true)` once that write is replicated over the required set,
-    /// `Some(false)` before, `None` when this entry wrote no raise.
-    pub own_raise_replicated: Option<bool>,
     /// The row's stored `duration_ms`, as a valid duration (3 000 to
     /// 600 000 ms), or `None` for NULL or invalid.
     pub stored_ms: Option<u64>,
@@ -85,53 +82,53 @@ pub(super) enum ConvertStep {
     /// Raise `leases.duration_ms` to `D`, commit, and wait for that raise
     /// to be replicated.
     RaiseAndWait,
-    /// Raise `leases.duration_ms` to `D`, and send the conversion now with
-    /// the stored, shorter duration.
-    RaiseAndSend { duration_ms: u64 },
-    /// Send the conversion with `duration_ms`.
+    /// Send the conversion with `duration_ms`, writing nothing.
     Send { duration_ms: u64 },
 }
 
-/// Whether the conversion grant goes out now, and how, in this order:
+/// Whether the conversion grant goes out now, and how, in this order
+/// (section 8.4, "Changing the mode" and "From R until the holder has taken
+/// the grant"):
 ///
-/// 1. **A marked row waits.** Section 8.4 does not state whether a
-///    conversion may go out over a row that carries the unsettled mark;
-///    this function reads it as no, which grants less. A marked row may
-///    disagree with its holder's mode ("The mark"), and "The primary sends
-///    no conversion grant to a holder whose mode it has not learned on the
-///    current session" ("From R until the holder has taken the grant"). The
-///    mark clears first, by the `pong` after a same-token `local` grant or
-///    by the next `hello`'s `local` report; then the conversion goes.
+/// 1. **A marked row waits.** "The primary sends no conversion grant to a
+///    holder whose mode it has not learned on the current session, and none
+///    over a row that carries the mark: the mark clears first ("The mark"
+///    below), by the `pong` after a same-token `local` grant or by the
+///    holder's `local` report, and the conversion goes after that."
 /// 2. **The barrier.** "After it sends a same-token `local` grant for a
 ///    lease, the primary therefore sends the node a `ping` (section 5.19),
 ///    and it sends no conversion grant for that lease until the node's
-///    `pong` arrives" (ADR 0257); a `hello` that listed the lease `local` at
-///    the token stands in for that `pong`. Section 8.4 does not state what
-///    the primary does on a session where neither happened, as when the
-///    lease was granted after the `hello`; this function reads it as: send
-///    the same-token `local` grant and its `ping` first, which on a node that
-///    holds the lease `local` changes nothing (section 5.12), and wait for
-///    the `pong`. That grants less. A refusal before the `pong` fails the
-///    barrier, and the entry sends no second barrier grant on that session:
-///    the next session decides.
+///    `pong` arrives" (ADR 0257); "the holder's next `hello` stands in for
+///    the `pong`" (ADR 0261). "When the policy becomes `warm` on a live
+///    session where neither happened, as when the lease was granted after
+///    the session's `hello`, the primary first sends the holder the
+///    same-token `local` grant and its `ping`, and sends the conversion grant
+///    only after that `pong`. It does so only over a row that carries no
+///    mark. [...] A refusal of the grant before the `pong` ends the
+///    conversion on that session: the primary sends no second such grant on
+///    it, and the holder's next `hello` decides."
 /// 3. **The raise.** "Before it sends a conversion grant, the primary raises
-///    `leases.duration_ms` to at least that grant's duration … A conversion
-///    grant longer than the duration held before the raise is sent only once
-///    that raise is replicated (ADR 0268). Until then the conversion grant
-///    carries the duration held before the raise; a row that held none, as a
-///    `local` row may not, has no shorter duration to fall back to, so its
-///    conversion grant waits for the raise (ADR 0289)." A row that stores no
-///    valid duration raises and waits; one that stores less than `D` raises
-///    and sends the stored duration now; one that stores `D` or more needs no
-///    raise, and the grant carries `D`.
-/// 4. **This entry's own raise.** Once this entry wrote the raise, the grant
-///    of `D` goes only once that raise is replicated ("waits for the raise",
-///    ADR 0289).
-/// 5. **A raise this entry did not write.** Section 8.4 does not state how a
-///    primary that did not write the raise, as one that restarted after an
-///    earlier primary's raise, knows it is replicated; this function reads it
-///    as: once the row's newest change-log write is replicated over the
-///    required set, which covers whichever write raised it, and grants less.
+///    `leases.duration_ms` to at least that grant's duration [...] A grant
+///    longer than the stored duration needs the raise first, so it goes once
+///    that raise is replicated (ADR 0268). A grant no longer than the stored
+///    duration needs no raise and may go without one. A row that stores none
+///    waits for the raise (ADR 0289)." A row that stores no valid duration is
+///    raised to `D`, and the entry waits. A row that stores a duration sends
+///    no raise: the grant carries `D` when the row stores `D` or more, and
+///    the stored duration when it stores less. That stored duration, rather
+///    than a raise to `D`, a wait for it and a grant of `D`: section 8.4 names
+///    a grant no longer than the stored duration as one that needs no raise,
+///    it is the smaller step (nothing is written), and it keeps the duration
+///    an earlier reading of this function sent, only no longer at once. The
+///    first answer after it carries the stored duration too
+///    ([`super::conversion::answer_ms`]).
+/// 4. **The newest write.** "Every conversion grant goes only once the lease
+///    row's newest change-log write is replicated over the required set
+///    ("When R is replicated" below), never at once: the primary may not
+///    have written the stored duration for this conversion, as after its
+///    restart." That holds for a grant of the stored duration too. A raise,
+///    this entry's or an earlier primary's, is the row's newest write or
+///    older, so this one wait covers it.
 #[must_use]
 pub(super) fn convert_step(facts: ConvertFacts) -> ConvertStep {
     if facts.marked {
@@ -144,27 +141,12 @@ pub(super) fn convert_step(facts: ConvertFacts) -> ConvertStep {
             ConvertStep::Barrier
         };
     }
-    match facts.stored_ms {
-        None => return ConvertStep::RaiseAndWait,
-        Some(stored) if stored < DEFAULT_DURATION_MS => {
-            return ConvertStep::RaiseAndSend {
-                duration_ms: stored,
-            };
-        }
-        Some(_) => {}
-    }
-    if let Some(replicated) = facts.own_raise_replicated {
-        return if replicated {
-            ConvertStep::Send {
-                duration_ms: DEFAULT_DURATION_MS,
-            }
-        } else {
-            ConvertStep::Wait
-        };
-    }
+    let Some(stored) = facts.stored_ms else {
+        return ConvertStep::RaiseAndWait;
+    };
     if facts.newest_replicated {
         ConvertStep::Send {
-            duration_ms: DEFAULT_DURATION_MS,
+            duration_ms: stored.min(DEFAULT_DURATION_MS),
         }
     } else {
         ConvertStep::Wait
@@ -287,16 +269,14 @@ impl NodeHub {
     }
 
     /// What [`convert_step`] reads of `row` on `generation`, on `conn`, with
-    /// the entry's `barrier_on` and `raised_seq`. A row the change log has
-    /// no entry of has no newest write to be replicated, and reads as not
-    /// replicated.
+    /// the entry's `barrier_on`. A row the change log has no entry of has no
+    /// newest write to be replicated, and reads as not replicated.
     async fn convert_facts(
         &self,
         conn: &mut sqlx::SqliteConnection,
         row: &Lease,
         generation: u64,
         barrier_on: Option<u64>,
-        raised_seq: Option<u64>,
     ) -> Result<ConvertFacts, ApiError> {
         let newest_replicated = match leases::newest_write_seq(conn, &row.id).await? {
             Some(seq) => self
@@ -305,15 +285,6 @@ impl NodeHub {
                 .map_err(|e| ApiError::internal(&e))?
                 .is_ok(),
             None => false,
-        };
-        let own_raise_replicated = match raised_seq {
-            Some(seq) => Some(
-                self.replicated(conn, seq)
-                    .await
-                    .map_err(|e| ApiError::internal(&e))?
-                    .is_ok(),
-            ),
-            None => None,
         };
         Ok(ConvertFacts {
             marked: row.unsettled,
@@ -325,7 +296,6 @@ impl NodeHub {
             ),
             barrier_sent_here: barrier_on == Some(generation),
             newest_replicated,
-            own_raise_replicated,
             stored_ms: stored_ms(row),
         })
     }
@@ -371,23 +341,15 @@ impl NodeHub {
                 return Ok(Attempt::Drop);
             }
             let facts = self
-                .convert_facts(
-                    &mut conn,
-                    &row,
-                    generation,
-                    held.barrier_on,
-                    held.raised_seq,
-                )
+                .convert_facts(&mut conn, &row, generation, held.barrier_on)
                 .await?;
             // Without majority support for what the step would send, or
-            // for the grant of `D` the barrier or the raise precedes, the
-            // conversion waits without taking the writer gate.
+            // for `D` before the barrier or the raise, the conversion waits
+            // without taking the writer gate.
             let needs_ms = match convert_step(facts) {
                 ConvertStep::Wait => return Ok(Attempt::Wait),
                 ConvertStep::Barrier | ConvertStep::RaiseAndWait => DEFAULT_DURATION_MS,
-                ConvertStep::RaiseAndSend { duration_ms } | ConvertStep::Send { duration_ms } => {
-                    duration_ms
-                }
+                ConvertStep::Send { duration_ms } => duration_ms,
             };
             if !self.0.authority.supports(needs_ms) {
                 return Ok(Attempt::Wait);
@@ -431,9 +393,9 @@ impl NodeHub {
                         && entry.eligible_on == Some(generation)
                         && entry.sent_on != Some(generation)
                 })
-                .map(|entry| (entry.barrier_on, entry.raised_seq))
+                .map(|entry| entry.barrier_on)
         };
-        let Some((barrier_on, raised_seq)) = live else {
+        let Some(barrier_on) = live else {
             return Ok(Attempt::Wait);
         };
         if self
@@ -443,7 +405,7 @@ impl NodeHub {
             return Ok(Attempt::Wait);
         }
         let facts = self
-            .convert_facts(&mut w.tx, &row, generation, barrier_on, raised_seq)
+            .convert_facts(&mut w.tx, &row, generation, barrier_on)
             .await?;
         let token = lease_token(&row);
         let actor = Actor {
@@ -506,6 +468,9 @@ impl NodeHub {
                 return Ok(Attempt::Wait);
             }
             ConvertStep::RaiseAndWait => {
+                // The raise is committed on its own; no grant goes with it.
+                // It is the row's newest write, so the next attempt sends
+                // only once it is replicated ([`convert_step`]).
                 let raised = leases::raise_duration(&mut w, lease_id, full, &actor).await?;
                 if raised.is_none() {
                     tracing::warn!(
@@ -517,11 +482,6 @@ impl NodeHub {
                 }
                 let seq = leases::newest_write_seq(&mut w.tx, lease_id).await?;
                 w.commit().await?;
-                if let Some(seq) = seq {
-                    self.change_conversion(lease_id, held.registration, |entry| {
-                        entry.raised_seq = Some(seq);
-                    });
-                }
                 tracing::info!(
                     lease_id,
                     seq = ?seq,
@@ -530,35 +490,13 @@ impl NodeHub {
                 );
                 return Ok(Attempt::Wait);
             }
-            ConvertStep::RaiseAndSend { duration_ms } => {
-                if !self.0.authority.supports(duration_ms) {
-                    return Ok(Attempt::Wait);
-                }
-                leases::raise_duration(&mut w, lease_id, full, &actor).await?;
-                if !self.send_conversion(&row, generation, duration_ms) {
-                    // Rolled back, the raise with it.
-                    drop(w);
-                    return Ok(Attempt::Wait);
-                }
-                // The grant carries the duration stored before the raise,
-                // so the stored duration covers it whether or not this
-                // commit lands (ADR 0254).
-                if let Err(e) = w.commit().await {
-                    tracing::warn!(
-                        %e,
-                        lease_id,
-                        "the raise after a conversion grant did not commit; the grant carried \
-                         the stored duration"
-                    );
-                }
-                duration_ms
-            }
             ConvertStep::Send { duration_ms } => {
                 if !self.0.authority.supports(duration_ms) {
                     return Ok(Attempt::Wait);
                 }
+                // The row's newest write is replicated, read under this
+                // writer gate ([`convert_step`]); nothing is written.
                 let sent = self.send_conversion(&row, generation, duration_ms);
-                // Nothing is written.
                 drop(w);
                 if !sent {
                     return Ok(Attempt::Wait);
@@ -858,14 +796,14 @@ mod tests {
             barrier_passed: true,
             barrier_sent_here: false,
             newest_replicated: true,
-            own_raise_replicated: None,
             stored_ms: Some(D),
         }
     }
 
     /// Test 1: [`convert_step`] over every branch, in its order: the mark,
-    /// the barrier, the stored duration, the entry's own raise, then the
-    /// row's newest write.
+    /// the barrier, a row that stores no duration, then the row's newest
+    /// write, which every conversion grant waits for, one carrying a stored
+    /// duration below `D` included (section 8.4, "Changing the mode").
     #[test]
     fn convert_step_decides_in_its_order() {
         let send = ConvertStep::Send { duration_ms: D };
@@ -911,60 +849,48 @@ mod tests {
             ConvertStep::Wait
         );
 
-        // The stored duration.
-        assert_eq!(
-            convert_step(ConvertFacts {
-                stored_ms: None,
-                ..facts()
-            }),
-            ConvertStep::RaiseAndWait
-        );
-        for stored in [3_000, 5_000, D - 1] {
+        // A row that stores no duration is raised first, whether or not its
+        // newest write is replicated.
+        for newest_replicated in [true, false] {
+            assert_eq!(
+                convert_step(ConvertFacts {
+                    stored_ms: None,
+                    newest_replicated,
+                    ..facts()
+                }),
+                ConvertStep::RaiseAndWait,
+                "newest replicated: {newest_replicated}"
+            );
+        }
+
+        // Every other row waits for its newest write, then sends with no
+        // raise: `D` when it stores `D` or more, the stored duration when it
+        // stores less.
+        for (stored, sent) in [
+            (3_000, 3_000),
+            (5_000, 5_000),
+            (D - 1, D - 1),
+            (D, D),
+            (30_000, D),
+        ] {
             assert_eq!(
                 convert_step(ConvertFacts {
                     stored_ms: Some(stored),
                     newest_replicated: false,
                     ..facts()
                 }),
-                ConvertStep::RaiseAndSend {
-                    duration_ms: stored
-                },
-                "stored {stored}"
+                ConvertStep::Wait,
+                "stored {stored}, the newest write not replicated"
+            );
+            assert_eq!(
+                convert_step(ConvertFacts {
+                    stored_ms: Some(stored),
+                    ..facts()
+                }),
+                ConvertStep::Send { duration_ms: sent },
+                "stored {stored}, the newest write replicated"
             );
         }
-        assert_eq!(
-            convert_step(ConvertFacts {
-                stored_ms: Some(30_000),
-                ..facts()
-            }),
-            send
-        );
-
-        // The entry's own raise decides on its own.
-        assert_eq!(
-            convert_step(ConvertFacts {
-                own_raise_replicated: Some(false),
-                ..facts()
-            }),
-            ConvertStep::Wait
-        );
-        assert_eq!(
-            convert_step(ConvertFacts {
-                own_raise_replicated: Some(true),
-                newest_replicated: false,
-                ..facts()
-            }),
-            send
-        );
-
-        // A raise this entry did not write: the row's newest write.
-        assert_eq!(
-            convert_step(ConvertFacts {
-                newest_replicated: false,
-                ..facts()
-            }),
-            ConvertStep::Wait
-        );
     }
 
     /// Test 2: no conversion goes while the row's newest write is not
@@ -1225,7 +1151,6 @@ mod tests {
             ("local", Some(D as i64))
         );
         assert_eq!(f.writes().await, writes + 1, "the raise, in its own entry");
-        assert_eq!(entry(&f.state).unwrap().raised_seq, Some(newest(&f).await));
         assert!(conversions(&queued(&mut on)).is_empty(), "not replicated");
         hub.attempt_held().await;
         assert!(conversions(&queued(&mut on)).is_empty(), "not replicated");
@@ -1473,6 +1398,106 @@ mod tests {
         ack(&after, &f, &next).await;
         after.hub.attempt_held().await;
         the_conversion(&queued(&mut next), 3, D);
+        f.done().await;
+    }
+
+    /// The stored duration of the row this module's tests use when it is
+    /// shorter than `D`.
+    const SHORTER: u64 = 5_000;
+
+    /// Test 14, a row that stores a duration below `D` (section 8.4,
+    /// "Changing the mode": "Every conversion grant goes only once the lease
+    /// row's newest change-log write is replicated over the required set
+    /// [...], never at once [...]. A grant no longer than the stored duration
+    /// needs no raise"). The conversion waits, writing nothing, until the
+    /// row's newest write is acknowledged; then it carries the stored
+    /// duration, and no raise is ever written. The first answer carries the
+    /// stored duration too, and its gate counts it: `T_grant + 5 s + 2 x 1 s`.
+    #[tokio::test]
+    async fn a_shorter_stored_duration_waits_for_the_newest_write_and_goes_with_no_raise() {
+        let f = fixture("warm", "local", Some(SHORTER as i64), false).await;
+        created(&f).await;
+        let writes = f.writes().await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        hub.attempt_held().await;
+        hub.attempt_held().await;
+        assert!(
+            conversions(&queued(&mut on)).is_empty(),
+            "the newest write is not replicated"
+        );
+        assert_eq!(f.writes().await, writes, "no raise");
+        assert_eq!(entry(&f.state).unwrap().sent_on, None);
+
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        the_conversion(&queued(&mut on), 3, SHORTER);
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, on.session.generation, LEASE),
+            Some(InFlight {
+                token: 3,
+                duration_ms: SHORTER
+            })
+        );
+        assert_eq!(f.writes().await, writes, "the send writes nothing");
+        assert_eq!(f.row().await.duration_ms, Some(SHORTER as i64));
+
+        let answer = renew(&mut on.session, "msg_first", 3).await;
+        assert_answer(&answer, "msg_first", 3, SHORTER);
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.duration_ms),
+            ("expiring", Some(SHORTER as i64))
+        );
+        assert_eq!(
+            f.writes().await,
+            writes + 1,
+            "the first answer's write only"
+        );
+        let authority = f.state.hub.authority();
+        f.clock.advance(Duration::from_millis(6_999));
+        assert!(
+            !authority.passed(LEASE),
+            "the gate counts the stored duration"
+        );
+        f.clock.advance(Duration::from_millis(1));
+        assert!(authority.passed(LEASE));
+        f.done().await;
+    }
+
+    /// Test 14 across a primary restart: "the primary may not have written
+    /// the stored duration for this conversion, as after its restart"
+    /// (section 8.4, "Changing the mode"). Neither the first primary nor the
+    /// restarted one sends the conversion over a row that stores a duration
+    /// below `D` before the row's newest write is acknowledged on it, and
+    /// neither writes a raise. Then the restarted primary sends the stored
+    /// duration.
+    #[tokio::test]
+    async fn after_a_restart_a_shorter_stored_duration_waits_for_the_newest_write() {
+        let f = fixture("warm", "local", Some(SHORTER as i64), false).await;
+        created(&f).await;
+        let writes = f.writes().await;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        f.state.hub.attempt_held().await;
+        assert!(conversions(&queued(&mut on)).is_empty(), "not replicated");
+        drop(on);
+
+        let (after, _clock) = restart(&f).await;
+        after.hub.set_voter_support(Arc::new(EverySupport));
+        let mut next = live(&after, &f, Some(("held", LeaseMode::Local, 3))).await;
+        after.hub.attempt_held().await;
+        after.hub.attempt_held().await;
+        assert!(
+            conversions(&queued(&mut next)).is_empty(),
+            "the newest write is not acknowledged on this primary"
+        );
+        assert_eq!(f.writes().await, writes, "no raise on either primary");
+
+        ack(&after, &f, &next).await;
+        after.hub.attempt_held().await;
+        the_conversion(&queued(&mut next), 3, SHORTER);
+        assert_eq!(f.writes().await, writes, "the send writes nothing");
+        assert_eq!(f.row().await.duration_ms, Some(SHORTER as i64));
         f.done().await;
     }
 
