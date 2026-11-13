@@ -436,7 +436,7 @@ mod tests {
                 .collect(),
             disagreement: None,
             countable: true,
-            open: false,
+            closed_by: Vec::new(),
         });
         let clock = Arc::new(ManualBootClock::default());
         let tracker = SupportTracker::new(
@@ -575,7 +575,7 @@ mod tests {
             voters: voters.latest().unwrap().voters.clone(),
             disagreement: None,
             countable: true,
-            open: false,
+            closed_by: Vec::new(),
         });
         assert!(!tracker.supports(D));
         // An answer at the new version replaces it, even one whose `p_send`

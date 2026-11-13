@@ -34,7 +34,11 @@
 //!   [`OPEN_MESH_RULES`] or above in its last `hello` (`nodes.mesh_rules`,
 //!   section 6.12). Every voter's `spec.votes` then carries `listen: true`.
 //!   It is read with the set, so a change of it rebuilds every voter's
-//!   desired state as a change of the set does.
+//!   desired state as a change of the set does. Whether votes are open is
+//!   derived from the machines that keep them closed
+//!   ([`VoterSet::closed_by`]), so in any one set the primary's log line
+//!   about votes ([`VoterSet::log_votes`]) and `spec.votes.listen` cannot
+//!   disagree.
 
 use quoro_proto::wire::{SpecVoter, SpecVotes, SpecWitness};
 use serde_json::Value;
@@ -78,6 +82,16 @@ pub struct Disagreement {
     pub only_in_log: Vec<String>,
 }
 
+/// A machine with the `node` role that keeps votes closed (section 6.12):
+/// it never reported mesh rules, because it never connected or its last
+/// `hello` carried none, or it reported a version below [`OPEN_MESH_RULES`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedBy {
+    pub node_id: String,
+    /// `nodes.mesh_rules`, `None` when the machine never reported one.
+    pub mesh_rules: Option<i64>,
+}
+
 /// The voter set and its version, as one read transaction saw them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoterSet {
@@ -96,11 +110,11 @@ pub struct VoterSet {
     /// hold another set at this version, so nothing counts until the version
     /// moves on.
     pub countable: bool,
-    /// Whether votes are open: every machine with the `node` role that is
-    /// not removed has `nodes.mesh_rules` of [`OPEN_MESH_RULES`] or above
-    /// (section 6.12). A machine that never connected has none and keeps
-    /// them closed.
-    pub open: bool,
+    /// The machines that keep votes closed (section 6.12), in the rows'
+    /// order: every machine with the `node` role that is not removed and
+    /// has no `nodes.mesh_rules` of [`OPEN_MESH_RULES`] or above. Empty
+    /// exactly when votes are open ([`VoterSet::open`]).
+    pub closed_by: Vec<ClosedBy>,
 }
 
 impl VoterSet {
@@ -116,12 +130,47 @@ impl VoterSet {
         self.get(node_id).is_some()
     }
 
+    /// Whether votes are open: every machine with the `node` role that is
+    /// not removed has `nodes.mesh_rules` of [`OPEN_MESH_RULES`] or above
+    /// (section 6.12), so none keeps them closed. A machine that never
+    /// connected has none and keeps them closed.
+    #[must_use]
+    pub fn open(&self) -> bool {
+        self.closed_by.is_empty()
+    }
+
     /// Whether `other` names the same voters at the same version, with
     /// votes open or closed alike: what a machine's `spec.votes` carries,
     /// whatever log it was read with.
     #[must_use]
     pub fn same_voters(&self, other: &Self) -> bool {
-        self.version == other.version && self.voters == other.voters && self.open == other.open
+        self.version == other.version && self.voters == other.voters && self.open() == other.open()
+    }
+
+    /// Whether `other` has votes open alike, or closed by the same machines
+    /// at the same versions: what [`VoterSet::log_votes`] says. The
+    /// voter-set version and the head do not count.
+    #[must_use]
+    pub fn same_opening(&self, other: &Self) -> bool {
+        self.closed_by == other.closed_by
+    }
+
+    /// Logs at `info` whether promotion votes are open, and while they are
+    /// closed, the machines that keep them closed with what each reported
+    /// (section 6.12). `voters_version` is the voter-set version when the
+    /// line is written: a later change of the set alone writes no new line
+    /// ([`VoterSet::same_opening`]).
+    pub fn log_votes(&self) {
+        if self.open() {
+            tracing::info!(voters_version = self.version, "promotion votes open");
+        } else {
+            tracing::info!(
+                voters_version = self.version,
+                closed_by = ?describe_closed_by(&self.closed_by),
+                needs_mesh_rules = OPEN_MESH_RULES,
+                "promotion votes closed"
+            );
+        }
     }
 
     /// `spec.votes` and `spec.witness` for `node_id` (section 6.12):
@@ -150,7 +199,7 @@ impl VoterSet {
                 })
                 .collect(),
             // Absent while votes are closed: never `false` (section 6.12).
-            listen: self.open.then_some(true),
+            listen: self.open().then_some(true),
         };
         (Some(votes), witness)
     }
@@ -366,21 +415,41 @@ fn voters_of(rows: Vec<(String, String, Option<String>)>) -> Result<Vec<Voter>, 
     Ok(voters)
 }
 
-/// Whether votes are open (section 6.12) over the non-removed `nodes` rows
-/// `(id, roles, mesh_address, mesh_rules)`: every row with the `node` role
-/// has `mesh_rules` of [`OPEN_MESH_RULES`] or above. A row without the
-/// `node` role does not count, whatever it reports.
-fn votes_open(rows: &[(String, String, Option<String>, Option<i64>)]) -> Result<bool, String> {
+/// The machines that keep votes closed (section 6.12) among the non-removed
+/// `nodes` rows `(id, roles, mesh_address, mesh_rules)`, in their order:
+/// every row with the `node` role whose `mesh_rules` is missing or below
+/// [`OPEN_MESH_RULES`]. A row without the `node` role does not count,
+/// whatever it reports. Votes are open when there is none.
+fn votes_closed_by(
+    rows: &[(String, String, Option<String>, Option<i64>)],
+) -> Result<Vec<ClosedBy>, String> {
+    let mut closed_by = Vec::new();
     for (node_id, roles, _, mesh_rules) in rows {
         let roles: Vec<String> = serde_json::from_str(roles)
             .map_err(|e| format!("cannot read the roles of {node_id}: {e}"))?;
         if roles.iter().any(|role| role == "node")
             && mesh_rules.is_none_or(|version| version < OPEN_MESH_RULES)
         {
-            return Ok(false);
+            closed_by.push(ClosedBy {
+                node_id: node_id.clone(),
+                mesh_rules: *mesh_rules,
+            });
         }
     }
-    Ok(true)
+    Ok(closed_by)
+}
+
+/// `closed_by` as the log line about votes lists it: each machine's id with
+/// the mesh rules version it reported, or `not reported`.
+fn describe_closed_by(closed_by: &[ClosedBy]) -> String {
+    closed_by
+        .iter()
+        .map(|held| match held.mesh_rules {
+            Some(version) => format!("{} (mesh rules {version})", held.node_id),
+            None => format!("{} (not reported)", held.node_id),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Rule 2 of section 8.10: whether the voter set at `version`, whose voters
@@ -467,7 +536,7 @@ impl VoterLog {
         .map_err(read)?;
         // A read transaction: nothing to keep.
         tx.rollback().await.map_err(read)?;
-        let open = votes_open(&rows)?;
+        let closed_by = votes_closed_by(&rows)?;
         let rows = rows
             .into_iter()
             .map(|(node_id, roles, mesh_address, _)| (node_id, roles, mesh_address))
@@ -497,7 +566,7 @@ impl VoterLog {
             voters,
             disagreement,
             countable,
-            open,
+            closed_by,
         });
         if cache
             .latest
@@ -887,8 +956,12 @@ mod tests {
             ],
             disagreement: None,
             countable: true,
-            open: false,
+            closed_by: vec![ClosedBy {
+                node_id: "nod_a".to_string(),
+                mesh_rules: None,
+            }],
         };
+        assert!(!set.open());
         let (votes, witness) = set.spec_for("nod_a");
         let votes = votes.unwrap();
         assert_eq!((votes.version, votes.port), (31, 51821));
@@ -905,14 +978,51 @@ mod tests {
         // Open: every voter's `spec.votes` carries `listen: true`, and the
         // set differs from the closed one.
         let open = VoterSet {
-            open: true,
+            closed_by: Vec::new(),
             ..set.clone()
         };
+        assert!(open.open());
         for voter in ["nod_a", "nod_w"] {
             assert_eq!(open.spec_for(voter).0.unwrap().listen, Some(true));
         }
         assert!(!open.same_voters(&set));
         assert!(open.same_voters(&open.clone()));
+
+        // The log line about votes changes when votes open, and while they
+        // stay closed, when another machine or version keeps them closed;
+        // not on a new head alone, nor on a new voter-set version alone.
+        assert!(!open.same_opening(&set));
+        let moved = VoterSet {
+            head: 41,
+            ..set.clone()
+        };
+        assert!(moved.same_opening(&set));
+        let new_version = VoterSet {
+            head: 42,
+            version: 32,
+            ..set.clone()
+        };
+        assert!(new_version.same_opening(&set));
+        assert!(!new_version.same_voters(&set));
+        let reported = VoterSet {
+            closed_by: vec![ClosedBy {
+                node_id: "nod_a".to_string(),
+                mesh_rules: Some(1),
+            }],
+            ..set.clone()
+        };
+        assert!(!reported.same_opening(&set));
+        // Votes stay closed, so the voters' `spec.votes` is unchanged and
+        // the watch sends nothing new; only the log line changes.
+        assert!(reported.same_voters(&set));
+        let other = VoterSet {
+            closed_by: vec![ClosedBy {
+                node_id: "nod_b".to_string(),
+                mesh_rules: None,
+            }],
+            ..set.clone()
+        };
+        assert!(!other.same_opening(&set));
     }
 
     /// Section 6.12: votes open once every row with the `node` role reports
@@ -922,6 +1032,11 @@ mod tests {
     fn votes_open_only_when_every_node_role_row_reports_version_2() {
         let row =
             |roles: &str, rules: Option<i64>| ("nod_x".to_string(), roles.to_string(), None, rules);
+        fn votes_open(
+            rows: &[(String, String, Option<String>, Option<i64>)],
+        ) -> Result<bool, String> {
+            votes_closed_by(rows).map(|closed_by| closed_by.is_empty())
+        }
         let cases = [
             (vec![], true),
             (vec![row(r#"["node"]"#, Some(2))], true),
@@ -950,6 +1065,45 @@ mod tests {
             assert_eq!(votes_open(&rows).unwrap(), open, "{rows:?}");
         }
         assert!(votes_open(&[row("not json", Some(2))]).is_err());
+    }
+
+    /// Section 6.12: votes are held closed by each row with the `node` role
+    /// that reported no mesh rules or a version below 2, named with what it
+    /// reported, in the rows' order. A witness or an edge machine never holds
+    /// them closed, and with every node at 2 or above nobody does.
+    #[test]
+    fn votes_are_held_closed_by_each_node_role_row_below_version_2() {
+        let row = |id: &str, roles: &str, rules: Option<i64>| {
+            (id.to_string(), roles.to_string(), None, rules)
+        };
+        let held = |id: &str, rules: Option<i64>| ClosedBy {
+            node_id: id.to_string(),
+            mesh_rules: rules,
+        };
+        let rows = vec![
+            row("nod_old", r#"["node"]"#, None),
+            row("nod_two", r#"["node"]"#, Some(2)),
+            row("nod_one", r#"["node", "edge"]"#, Some(1)),
+            row("nod_w", r#"["witness"]"#, None),
+            row("nod_edge", r#"["edge"]"#, Some(1)),
+        ];
+        let closed_by = votes_closed_by(&rows).unwrap();
+        assert_eq!(
+            closed_by,
+            vec![held("nod_old", None), held("nod_one", Some(1))]
+        );
+        assert_eq!(
+            describe_closed_by(&closed_by),
+            "nod_old (not reported), nod_one (mesh rules 1)"
+        );
+
+        let all_at_two = vec![
+            row("nod_old", r#"["node"]"#, Some(2)),
+            row("nod_two", r#"["node"]"#, Some(2)),
+            row("nod_one", r#"["node", "edge"]"#, Some(3)),
+            row("nod_w", r#"["witness"]"#, None),
+        ];
+        assert!(votes_closed_by(&all_at_two).unwrap().is_empty());
     }
 
     mod agreement {
@@ -1018,6 +1172,16 @@ mod tests {
             async fn set_row_status(&self, node_id: &str, status: &str) {
                 sqlx::query("UPDATE nodes SET status = ? WHERE id = ?")
                     .bind(status)
+                    .bind(node_id)
+                    .execute(self.store.pool())
+                    .await
+                    .unwrap();
+            }
+
+            /// Sets `node_id`'s stored `mesh_rules` without a change-log entry.
+            async fn set_mesh_rules(&self, node_id: &str, mesh_rules: Option<i64>) {
+                sqlx::query("UPDATE nodes SET mesh_rules = ? WHERE id = ?")
+                    .bind(mesh_rules)
                     .bind(node_id)
                     .execute(self.store.pool())
                     .await
@@ -1207,6 +1371,59 @@ mod tests {
             assert!(!apart.countable);
             cluster.answer(&[&a, &b, &c], apart.version);
             assert!(!cluster.tracker.supports(D), "3 of the rows' 3");
+        }
+
+        /// Section 6.12: the machines that hold votes closed come from the
+        /// same read as the set: each machine with the `node` role that is
+        /// not removed and has not reported mesh rules 2 or above, with what
+        /// it stored. A machine stops holding them closed once it is
+        /// removed, and once every other one reports 2 or above, votes are
+        /// open and nobody holds them closed.
+        #[tokio::test]
+        async fn a_read_names_the_machines_that_hold_votes_closed() {
+            fn held(set: &VoterSet) -> Vec<(String, Option<i64>)> {
+                let mut held: Vec<(String, Option<i64>)> = set
+                    .closed_by
+                    .iter()
+                    .map(|closed| (closed.node_id.clone(), closed.mesh_rules))
+                    .collect();
+                held.sort();
+                held
+            }
+            let cluster = Cluster::new().await;
+            let old = cluster.enroll().await;
+            let one = cluster.enroll().await;
+            let two = cluster.enroll().await;
+            let gone = cluster.enroll().await;
+            cluster.set_mesh_rules(&one, Some(1)).await;
+            cluster.set_mesh_rules(&two, Some(2)).await;
+
+            let set = cluster.read().await;
+            assert!(!set.open(), "{set:?}");
+            let mut expected: Vec<(String, Option<i64>)> = vec![
+                (old.clone(), None),
+                (one.clone(), Some(1)),
+                (gone.clone(), None),
+            ];
+            expected.sort();
+            assert_eq!(held(&set), expected);
+
+            cluster.set_row_status(&gone, "removed").await;
+            cluster
+                .log_only(&gone, json!({ "id": gone, "status": "removed" }))
+                .await;
+            let set = cluster.read().await;
+            assert!(!set.open(), "{set:?}");
+            let mut expected: Vec<(String, Option<i64>)> =
+                vec![(old.clone(), None), (one.clone(), Some(1))];
+            expected.sort();
+            assert_eq!(held(&set), expected);
+
+            cluster.set_mesh_rules(&old, Some(2)).await;
+            cluster.set_mesh_rules(&one, Some(3)).await;
+            let set = cluster.read().await;
+            assert!(set.open(), "{set:?}");
+            assert!(set.closed_by.is_empty());
         }
     }
 }

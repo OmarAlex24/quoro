@@ -1000,6 +1000,13 @@ impl NodeHub {
     /// records a node's `mesh_rules` included, and stops with the hub. A
     /// primary's start, a promoted one's included, reads the stored
     /// `nodes.mesh_rules` with the first set its sessions build.
+    ///
+    /// It also logs at `info` whether votes are open, and while they are
+    /// closed which machines keep them closed ([`VoterSet::log_votes`]):
+    /// once for the first set it reads, and then only when that changes,
+    /// never for a head that moved alone.
+    ///
+    /// [`VoterSet::log_votes`]: crate::voters::VoterSet::log_votes
     pub(crate) fn spawn_voter_watch(&self) {
         let hub = Arc::downgrade(&self.0);
         let mut head = self.0.store.change_log_head();
@@ -1016,6 +1023,9 @@ impl NodeHub {
                 let hub = NodeHub(inner);
                 match hub.voter_set().await {
                     Ok(set) => {
+                        if last.as_ref().is_none_or(|last| !last.same_opening(&set)) {
+                            set.log_votes();
+                        }
                         if last.as_ref().is_some_and(|last| !last.same_voters(&set)) {
                             hub.nodes_changed_all();
                         }
