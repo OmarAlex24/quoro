@@ -12,7 +12,7 @@ use quoro_backup::{
     layout, unwrap_repo_key, wrap_repo_key,
 };
 use quoro_control_plane::backups::{Bucket, BucketFactory, BucketStore, RepositoryTarget};
-use quoro_control_plane::deploy;
+use quoro_control_plane::{ReferenceAsDigest, deploy};
 use quoro_proto::wire::{
     self, BackupState, Capacity as WireCapacity, Health, Heartbeat, Kvm as WireKvm, NodeMessage,
     ObservedStatus, StatusReport, VmStatus, VolumeState as WireVolumeState, VolumeStatus,
@@ -571,6 +571,8 @@ async fn wait_for_backup(
 struct Setup {
     server: Server,
     owner: reqwest::Client,
+    /// The node, to open another session after a restart.
+    node: Enrolled,
     socket: Socket,
     memory: Arc<MemoryStore>,
     app_id: String,
@@ -662,6 +664,7 @@ async fn setup() -> Setup {
     Setup {
         server,
         owner,
+        node,
         socket,
         memory,
         app_id,
@@ -1721,20 +1724,47 @@ fn reported_backup(
     }
 }
 
-/// `node-agent-protocol.md` section 7.3, step 4: a volume backup still
-/// `queued` or `running` while this primary does not hold the repository key,
-/// as a promoted primary inherits one, leaves its node's desired state, which
-/// is still built and sent with everything else. The next dispatch tick
-/// records the backup `failed` with `repository key absent`, with the event and
-/// records of any failure, and a later report of it from the node changes
-/// nothing. Once the key is restored, a new backup's job carries its source
-/// keys again.
+/// Ends the node's session and waits until the primary sees it gone, so a
+/// second primary started on the same database is the only one the node talks
+/// to.
+async fn end_session(setup: &mut Setup) {
+    setup.socket.close(None).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while setup.server.state.hub.is_connected(&setup.node.node_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the node's session did not end"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Starts a second primary on `setup`'s database, as a promoted primary starts
+/// on the database it rebuilt, with the same in-memory bucket. No session is
+/// open on it yet.
+async fn restart_primary(setup: &Setup) -> Server {
+    let restarted = common::restart_with_resolver(&setup.server, Arc::new(ReferenceAsDigest)).await;
+    restarted
+        .state
+        .backups
+        .set_factory(Arc::new(MemoryBuckets(Arc::clone(&setup.memory))));
+    restarted
+}
+
+/// `node-agent-protocol.md` sections 6.7 and 7.3, step 4: a volume backup
+/// still `queued` or `running` when a primary starts without the repository
+/// key, as a promoted primary inherits one, is recorded `failed` with
+/// `repository key absent` before any session opens, with the event and
+/// records of any failure. The node's first desired state therefore never
+/// carries the job, so no snapshot drops a job that is still active. A later
+/// report of the backup from the node changes nothing. Once the key is
+/// restored, a new backup's job carries its source keys again.
 #[tokio::test]
-async fn a_backup_in_progress_without_the_repository_key_leaves_the_desired_state_and_fails() {
+async fn a_backup_in_progress_fails_at_start_without_the_repository_key() {
     let mut setup = setup().await;
     let pool = setup.server.state.store.pool().clone();
-    let (node_id, vm_id): (String, String) = sqlx::query_as(
-        "SELECT v.node_id, m.id FROM volumes v JOIN vms m ON m.app_id = v.app_id WHERE v.id = ?",
+    let vm_id: String = sqlx::query_scalar(
+        "SELECT m.id FROM volumes v JOIN vms m ON m.app_id = v.app_id WHERE v.id = ?",
     )
     .bind(&setup.volume_id)
     .fetch_one(&pool)
@@ -1744,7 +1774,7 @@ async fn a_backup_in_progress_without_the_repository_key_leaves_the_desired_stat
     let now = time::OffsetDateTime::now_utc();
 
     // First a backup its node reported `running`, then one still `queued`,
-    // each accepted while this primary held the key.
+    // each accepted while the primary held the key.
     for (round, running) in [(1u64, true), (2, false)] {
         let res = setup
             .owner
@@ -1765,8 +1795,8 @@ async fn a_backup_in_progress_without_the_repository_key_leaves_the_desired_stat
             spec_jobs(snapshot) == [backup_id.clone()]
         })
         .await;
-        let rev = snapshot["body"]["rev"].as_u64().unwrap();
         if running {
+            let rev = snapshot["body"]["rev"].as_u64().unwrap();
             send(
                 &mut setup.socket,
                 status_report(
@@ -1785,52 +1815,23 @@ async fn a_backup_in_progress_without_the_repository_key_leaves_the_desired_stat
             )
             .await;
         }
+
+        // The primary starts again on the same database without the key, as
+        // a promoted primary starts on the one it rebuilt.
+        end_session(&mut setup).await;
         let blob = drop_repository_key(&setup.server, &setup.repo_id).await;
+        let restarted = restart_primary(&setup).await;
 
-        // The node's next desired state has neither the job nor the
-        // repository, and still has the app's VM and volume.
-        setup.server.state.hub.node_changed(&node_id);
-        let snapshot =
-            recv_spec(&mut setup.socket, |snapshot| spec_jobs(snapshot).is_empty()).await;
-        let spec = &snapshot["body"]["spec"];
-        assert!(spec.get("backup_repository").is_none(), "{snapshot}");
-        assert!(
-            spec["vms"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|vm| vm["vm_id"] == vm_id.as_str()),
-            "{snapshot}"
-        );
-        assert!(
-            spec["volumes"].as_array().unwrap().iter().any(|volume| {
-                volume["volume_id"] == setup.volume_id.as_str() && volume["state"] == "present"
-            }),
-            "{snapshot}"
-        );
-        let status: String = sqlx::query_scalar("SELECT status FROM backups WHERE id = ?")
-            .bind(&backup_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(status, if running { "running" } else { "queued" });
-
-        // The tick records it failed, as any failure: the row, its
-        // change-log entry, the `backup.failed` event and the `backup.seal`
-        // record.
-        let tick = quoro_control_plane::backups::dispatch::run(&setup.server.state, now)
-            .await
-            .unwrap();
-        assert_eq!((tick.key_absent, tick.queued, tick.timed_out), (1, 0, 0));
-        let failed = wait_for_backup(
-            &setup.owner,
-            &setup.server,
-            &mut setup.socket,
-            &backup_id,
-            "failed",
-        )
-        .await;
-        assert_eq!(failed["error"], absent);
+        // Before any session opens, the start has recorded the backup failed
+        // as any failure: the row, its change-log entry, the `backup.failed`
+        // event and the `backup.seal` record.
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM backups WHERE id = ?")
+                .bind(&backup_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("failed".to_string(), Some(absent.to_string())));
         let payload: String = sqlx::query_scalar(
             "SELECT payload FROM change_log WHERE entity_type = 'backup' AND entity_id = ? \
              ORDER BY seq DESC LIMIT 1",
@@ -1864,10 +1865,47 @@ async fn a_backup_in_progress_without_the_repository_key_leaves_the_desired_stat
         .await
         .unwrap();
         assert_eq!(records, 1);
+
+        setup.server = restarted;
+        let owner = setup.server.client();
+        setup
+            .server
+            .login(&owner, common::OWNER_EMAIL, common::OWNER_PASSWORD)
+            .await;
+        setup.owner = owner;
+
+        // The node's first desired state has neither the job nor the
+        // repository, and still has the app's VM and volume.
+        let (socket, first) = open(&setup.server, &setup.node).await;
+        setup.socket = socket;
+        assert!(spec_jobs(&first).is_empty(), "{first}");
+        let spec = &first["body"]["spec"];
+        assert!(spec.get("backup_repository").is_none(), "{first}");
+        assert!(
+            spec["vms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|vm| vm["vm_id"] == vm_id.as_str()),
+            "{first}"
+        );
+        assert!(
+            spec["volumes"].as_array().unwrap().iter().any(|volume| {
+                volume["volume_id"] == setup.volume_id.as_str() && volume["state"] == "present"
+            }),
+            "{first}"
+        );
+        let rev = first["body"]["rev"].as_u64().unwrap();
+
+        // Nothing is left for the tick's fallback pass or for the start's.
         let tick = quoro_control_plane::backups::dispatch::run(&setup.server.state, now)
             .await
             .unwrap();
         assert_eq!(tick.key_absent, 0);
+        let failed = quoro_control_plane::backups::dispatch::fail_without_key(&setup.server.state)
+            .await
+            .unwrap();
+        assert_eq!(failed, 0);
 
         // A later report of the backup changes nothing, even a `succeeded`
         // one with a real manifest. The volume report sent after it is

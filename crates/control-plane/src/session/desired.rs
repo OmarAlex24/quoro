@@ -2766,4 +2766,166 @@ mod tests {
         assert_eq!(target.vms.len(), 1);
         assert_eq!(target.vms[0].vm_id, newer);
     }
+
+    // -----------------------------------------------------------------------
+    // Without the repository key (ADR 0322)
+    // -----------------------------------------------------------------------
+
+    /// A repository whose `repo_key_enc` is empty, as a promoted primary
+    /// rebuilds it (`node-agent-protocol.md` section 7.3, step 4), on a
+    /// reachable provider whose secret `key` opens. Returns its id.
+    async fn insert_keyless_repository(store: &Store, key: &DataKey) -> String {
+        let now = crate::store::now_rfc3339();
+        sqlx::query(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('cluster_id', 'clu_keyless')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, name, role, password_hash, disabled, created_at) \
+             VALUES ('usr_backups', 'backups@example.com', 'backups', 'owner', 'x', 0, ?)",
+        )
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let provider_id = "prv_backups";
+        sqlx::query(
+            "INSERT INTO providers (id, kind, name, config_json, secret_enc, created_by, \
+             created_at, rotated_at) \
+             VALUES (?, 'object_store', 'bucket', ?, ?, 'usr_backups', ?, NULL)",
+        )
+        .bind(provider_id)
+        .bind(
+            r#"{"endpoint":"https://s3.example.com","bucket":"quoro","access_key_id":"AKIDEXAMPLE"}"#,
+        )
+        .bind(key.encrypt(
+            crate::backups::PROVIDER_SECRET_CONTEXT,
+            provider_id,
+            b"provider-secret",
+        ))
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let repository_id = deploy::new_id_with_prefix("brp");
+        sqlx::query(
+            "INSERT INTO backup_repositories (id, name, provider_id, prefix, repo_key_enc, \
+             recovery_key_fingerprint, created_by, created_at) \
+             VALUES (?, 'main', ?, 'quoro-backups', X'', '0123456789abcdef', 'usr_backups', ?)",
+        )
+        .bind(&repository_id)
+        .bind(provider_id)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        repository_id
+    }
+
+    /// A volume backup of `volume_id` on `node_id` in `status`, with a
+    /// manifest when it `succeeded`. Returns its id.
+    async fn insert_volume_backup(
+        store: &Store,
+        repository_id: &str,
+        app_id: &str,
+        volume_id: &str,
+        node_id: &str,
+        status: &str,
+    ) -> String {
+        let backup_id = deploy::new_id_with_prefix("bkp");
+        let manifest = (status == "succeeded").then(|| (format!("m/{backup_id}"), "0".repeat(64)));
+        sqlx::query(
+            "INSERT INTO backups (id, repository_id, source_kind, app_id, volume_id, node_id, \
+             status, \"trigger\", fencing_token, manifest_key, manifest_digest, logical_bytes, \
+             created_by_type, created_by_id, created_at) \
+             VALUES (?, ?, 'volume', ?, ?, ?, ?, 'api', 1, ?, ?, 4096, 'system', 'backups', ?)",
+        )
+        .bind(&backup_id)
+        .bind(repository_id)
+        .bind(app_id)
+        .bind(volume_id)
+        .bind(node_id)
+        .bind(status)
+        .bind(manifest.as_ref().map(|(key, _)| key.clone()))
+        .bind(manifest.as_ref().map(|(_, digest)| digest.clone()))
+        .bind(crate::store::now_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        backup_id
+    }
+
+    /// While this primary does not hold the repository key, a node whose only
+    /// backup work is a job gets neither the job nor the repository entry, as a
+    /// fallback for a job the start did not fail, and the rest of its snapshot
+    /// is built. A `restoring` volume still needs the key: without its
+    /// `restore` object the node would create the volume empty (section 6.7),
+    /// so the build fails.
+    #[tokio::test]
+    async fn without_the_repository_key_a_job_is_left_out_but_a_restore_fails_the_build() {
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DataKey::ephemeral();
+        let node = "nod_00000000000000000000000001";
+        insert_node(&store, node, &["node"], Some("10.42.1.0/24")).await;
+        let repository_id = insert_keyless_repository(&store, &key).await;
+        let app_id = deploy::new_id_with_prefix("app");
+        let volume_id = insert_volume(&store, &app_id, node, "ready").await;
+        insert_volume_backup(&store, &repository_id, &app_id, &volume_id, node, "queued").await;
+
+        let (jobs, restores, repository) = backup_jobs(&store, &key, node).await.unwrap();
+        assert!(jobs.is_empty());
+        assert!(restores.is_empty());
+        assert!(repository.is_none());
+        let spec = spec_keyed(&store, &key, node, &[]).await;
+        assert!(spec.backups.is_empty());
+        assert!(spec.backup_repository.is_none());
+        assert!(
+            spec.volumes
+                .iter()
+                .any(|volume| volume.volume_id == volume_id),
+            "the rest of the snapshot is built"
+        );
+
+        // A volume restoring onto the same node, from a backup of another app.
+        let other_app = deploy::new_id_with_prefix("app");
+        let restoring = insert_volume(&store, &other_app, node, "restoring").await;
+        let source = insert_volume_backup(
+            &store,
+            &repository_id,
+            &other_app,
+            &restoring,
+            node,
+            "succeeded",
+        )
+        .await;
+        sqlx::query("UPDATE volumes SET restored_from_backup_id = ? WHERE id = ?")
+            .bind(&source)
+            .bind(&restoring)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let Err(error) = backup_jobs(&store, &key, node).await else {
+            panic!("a restore was built without the repository key");
+        };
+        assert!(
+            error.starts_with("cannot decrypt the repository key"),
+            "{error}"
+        );
+        let built = build_spec(
+            &store,
+            node,
+            &ReferenceAsDigest,
+            &DigestCache::default(),
+            &key,
+            None,
+            &no_mesh_lookup(),
+            &Drains::default(),
+            &[],
+            &VoterLog::default(),
+        )
+        .await;
+        assert_eq!(built.err(), Some(error));
+    }
 }
