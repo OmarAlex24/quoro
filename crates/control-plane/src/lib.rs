@@ -49,6 +49,10 @@ pub mod leases;
 pub(crate) mod log_backfill;
 pub mod openapi;
 pub mod primary_status;
+/// The write that moves the primary status in `quoro cluster promote`, and
+/// the token-cap check of `--ack-fence` (node-agent-protocol.md section 7.3
+/// step 5, ADR 0236, ADR 0325).
+pub mod promotion;
 /// Quarantined copies of a volume: recording, refusals and deletion (ADR
 /// 0176).
 pub(crate) mod quarantines;
