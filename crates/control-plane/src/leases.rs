@@ -608,7 +608,8 @@ pub(crate) async fn held_by_node(
 /// records it revoked in the primary's view, with its holder still named, as
 /// when an operator declares a node lost (`node-agent-protocol.md` sections
 /// 8.3 and 8.5 step 3). Writes one change-log entry per lease and returns the
-/// rows; an id with no row, or held by another node, is skipped.
+/// rows; an id with no row, or held by another node, is skipped, and an id
+/// listed twice is raised once.
 ///
 /// The token cap (section 8.6, "The cap"; ADR 0321, ADR 0325): every lease
 /// to raise is read and checked before anything is written. When one is
@@ -680,7 +681,7 @@ pub(crate) fn token_exhausted(exhausted: &[&Lease]) -> ApiError {
         reason: Some(Reason::TokenExhausted),
         ..ApiError::conflict(format!(
             "{}, and {MAX_TOKEN} is the highest token the change log carries: the token cannot \
-             be raised, so nothing was written; recovery is a human action",
+             be raised, so no lease or node was changed; recovery is a human action",
             named.join("; ")
         ))
     }
@@ -1601,7 +1602,12 @@ mod tests {
                 &actor,
             )
             .await;
-            assert!(bumped.is_err(), "{token}: {bumped:?}");
+            let refused = bumped.expect_err(&format!("{token}: at or above the cap"));
+            assert_eq!(
+                refused.reason,
+                Some(crate::error::Reason::TokenExhausted),
+                "{token}"
+            );
             drop(w);
             let stored: i64 = sqlx::query_scalar("SELECT fencing_token FROM leases WHERE id = ?")
                 .bind(&lease.id)
@@ -1697,10 +1703,11 @@ mod tests {
         drop(w);
 
         // One below the cap: raised to it and recorded revoked.
+        // Listed twice, it is raised once, with one change-log entry.
         let mut w = store.begin_write().await.unwrap();
         let bumped = super::bump_tokens(
             &mut w.tx,
-            &[below.to_string()],
+            &[below.to_string(), below.to_string()],
             &lease.holder_node_id,
             &actor,
         )
