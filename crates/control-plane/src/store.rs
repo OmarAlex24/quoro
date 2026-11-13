@@ -5,7 +5,6 @@
 //! numbered migrations in `docs/contracts/migrations/`, compiled into the
 //! binary so the database and the contract cannot drift (D-0015).
 
-use quoro_proto::wire::MAX_TERM;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
@@ -858,14 +857,14 @@ async fn demotion_term(
         Err(TermError::Database(error)) => return Err(error),
         Err(TermError::Bad(value)) => (None, Some(value)),
     };
-    if let Some(term) = node_term.filter(|term| *term > MAX_TERM) {
+    if let Some(term) = node_term.filter(|term| *term > quoro_proto::wire::MAX_TERM) {
         tracing::error!(
             node_term = term,
-            max_term = MAX_TERM,
+            max_term = quoro_proto::wire::MAX_TERM,
             "the stale_term's term is above the term ceiling; it is not recorded"
         );
     }
-    let node_term = node_term.filter(|term| *term <= MAX_TERM);
+    let node_term = node_term.filter(|term| *term <= quoro_proto::wire::MAX_TERM);
     match (node_term, current) {
         (Some(term), Some(current)) if term > current => Ok(term),
         (Some(term), None) => {
@@ -882,7 +881,7 @@ async fn demotion_term(
                 meta_term = current,
                 "the stale_term carried no term above this primary's; recording meta.term + 1"
             );
-            Ok(current.saturating_add(1).min(MAX_TERM))
+            Ok(current.saturating_add(1).min(quoro_proto::wire::MAX_TERM))
         }
         (None, None) => Err(sqlx::Error::Protocol(format!(
             "the stale_term carried no term and meta.term {:?} holds no term: no term to record",
