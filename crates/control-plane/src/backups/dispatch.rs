@@ -141,26 +141,23 @@ pub async fn fail_without_key(state: &AppState) -> Result<usize, String> {
 }
 
 /// Records `failed` with [`super::KEY_ABSENT`] every `queued` or `running`
-/// volume backup of the repository while this primary does not hold its key,
-/// through [`seal::fail`], and returns the node of each one failed. Such a row
-/// can only come from before a promotion: the schedule and `createBackup` no
+/// volume backup whose repository has an empty `repo_key_enc`, through
+/// [`seal::fail`], and returns the node of each one failed. Such a row can
+/// only come from before a promotion: the schedule and `createBackup` no
 /// longer queue one (`node-agent-protocol.md` section 7.3, step 4). A
 /// control-plane row was already resolved at start. A later report of the
 /// backup from its node finds the row terminal and changes nothing.
 async fn fail_inherited(store: &Store) -> Result<Vec<String>, ApiError> {
-    let Some(repository) = repo::any(store).await? else {
-        return Ok(Vec::new());
-    };
-    if repository.holds_key() {
-        return Ok(Vec::new());
-    }
+    // The key's absence is read in the same statement as the rows: a key
+    // restored and a backup queued between two reads would otherwise fail a
+    // backup that has the key.
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, node_id FROM backups \
-         WHERE repository_id = ? AND source_kind = 'volume' \
-           AND status IN ('queued', 'running') \
-         ORDER BY id",
+        "SELECT b.id, b.node_id FROM backups b \
+         JOIN backup_repositories r ON r.id = b.repository_id \
+         WHERE b.source_kind = 'volume' AND b.status IN ('queued', 'running') \
+           AND length(r.repo_key_enc) = 0 \
+         ORDER BY b.id",
     )
-    .bind(&repository.id)
     .fetch_all(store.pool())
     .await?;
     let mut changed = Vec::new();
