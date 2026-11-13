@@ -7,8 +7,22 @@
 //! database by its change log's head: the head entry's `seq` and hash. It
 //! also says whether `--accept-loss` was given, with the statement.
 //!
-//! At each start, once the migrations ran and before any other change-log
-//! write, [`apply`] looks for the marker:
+//! At each start, the primary reads the marker in two steps:
+//!
+//! 1. Before anything else of the start, and so before the pre-upgrade
+//!    backup and the migrations (section 7.2), [`check`] reads the marker,
+//!    `meta.restore_marker`, the change log's head and, when the first write
+//!    is due, `primary-node`, all read-only, and decides what the marker
+//!    asks for ([`Pending`]). Every refusal of the start comes from this
+//!    step, so a refused start has written nothing, migrated nothing and
+//!    sealed no pre-upgrade backup, and the next start takes that backup and
+//!    records it.
+//! 2. Once the migrations ran, and before any other change-log write,
+//!    [`apply`] carries the decision out. Only a database error stops the
+//!    start there. No migration and nothing the start runs before [`apply`]
+//!    writes the change log, so the head [`check`] read still holds.
+//!
+//! What the marker asks for:
 //!
 //! - **It matches `meta.restore_marker`:** the first write already
 //!   committed. The marker is deleted and nothing is written again.
@@ -22,7 +36,9 @@
 //!   log, so that record is local. Once the transaction commits,
 //!   `primary-node` and the marker are deleted.
 //! - **Otherwise:** the marker belongs to another database. It is logged
-//!   and deleted, and nothing is written from it.
+//!   and deleted, and nothing is written from it. A marker that cannot be
+//!   read or parsed names no database this primary can match, so it takes
+//!   this path too, and the log says why.
 //!
 //! Without a marker, and after a marker that names another database,
 //! `primary-node` is applied as before ([`crate::primary_status::apply_marker`]).
@@ -30,8 +46,9 @@
 //! `--accept-loss` is not built yet: its part of the first write (the
 //! removals, the token raises, the seal deletions and `cluster.restored`)
 //! comes later in issue #838. A marker that asks for it and names this
-//! database refuses the start before anything is written, and stays, so the
-//! restore is not taken as done without that part.
+//! database stops the start in [`check`], before the migrations and with
+//! nothing written, and stays, so the restore is not taken as done without
+//! that part.
 
 use std::path::Path;
 
@@ -203,6 +220,32 @@ fn is_hash(text: &str) -> bool {
     text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// What [`check`] decided from the marker before the migrations, for
+/// [`apply`] to carry out after them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum Pending {
+    /// No marker.
+    NoMarker,
+    /// The marker matched `meta.restore_marker`: its first write committed.
+    AlreadyWritten {
+        /// The head the marker names.
+        head: Head,
+    },
+    /// The marker names this database's log head: the first write is due.
+    FirstWrite {
+        /// The marker.
+        marker: Marker,
+        /// The node `primary-node` names, trimmed; `None` without the file.
+        node_id: Option<String>,
+    },
+    /// The marker names another log head, or cannot be read or parsed.
+    OtherDatabase {
+        /// Why, for the log.
+        why: String,
+    },
+}
+
 /// What [`apply`] did with the marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Applied {
@@ -213,91 +256,74 @@ pub enum Applied {
     /// The first write committed; it marked `marked` lease rows and moved
     /// the primary status when `moved`.
     FirstWrite { marked: usize, moved: bool },
-    /// The marker named another log head: deleted, nothing written from it.
+    /// The marker named another log head, or could not be read or parsed:
+    /// deleted (a failure to delete it is logged), nothing written from it.
     OtherDatabase,
 }
 
-/// The restored primary's first start: looks for the marker, makes the first
-/// write when the marker names this database, and deletes it (see the module
-/// documentation). Runs after the migrations and before any other change-log
-/// write of the start.
+/// The first step of the restored primary's first start (see the module
+/// documentation): reads the marker and decides what it asks for. It runs
+/// before anything else of the start, before the pre-upgrade backup and the
+/// migrations, and writes nothing: no file, no row.
+///
+/// It reads `meta.restore_marker` and the change log's head from the
+/// database as it is, unmigrated. Both tables exist from the first schema,
+/// and no migration writes the log; a database without them yet (a new one)
+/// has no `restore_marker` and an empty log.
 ///
 /// # Errors
 ///
-/// A one-line reason that stops the start, with nothing written and the
-/// marker and `primary-node` left in place: a marker that cannot be read or
-/// parsed; a marker of this database that asks for `--accept-loss`, which is
-/// not built yet; a `primary-node` file that cannot be read when the first
-/// write is due; or a database error.
-pub async fn apply(store: &Store, data_dir: &Path) -> Result<Applied, String> {
+/// A one-line reason that stops the start, with nothing written, nothing
+/// migrated and the marker and `primary-node` left in place: a marker of this
+/// database that asks for `--accept-loss`, which is not built yet; a
+/// `primary-node` file that cannot be read when the first write is due; or a
+/// database error.
+pub async fn check(store: &Store, data_dir: &Path) -> Result<Pending, String> {
     let path = data_dir.join(MARKER_FILE);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    let marker = match std::fs::read(&path) {
+        Ok(bytes) => match Marker::parse(&bytes) {
+            Ok(marker) => marker,
+            Err(reason) => {
+                return Ok(Pending::OtherDatabase {
+                    why: format!("it is not a marker quoro restore writes: {reason}"),
+                });
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            primary_status::apply_marker(store, data_dir).await?;
-            return Ok(Applied::NoMarker);
+            return Ok(Pending::NoMarker);
         }
         Err(error) => {
-            return Err(format!(
-                "cannot read {}, left by quoro restore: {error}; give it the database file's owner",
-                path.display()
-            ));
+            return Ok(Pending::OtherDatabase {
+                why: format!("it cannot be read: {error}"),
+            });
         }
     };
-    let marker = Marker::parse(&bytes).map_err(|reason| {
+
+    let (consumed, head) = read_database(store).await.map_err(|error| {
         format!(
-            "{} is not a restore-pending marker quoro restore writes: {reason}; check that no \
-             quoro restore runs on this host, then restore again or delete it",
-            path.display()
+            "cannot read the database before the restored primary's first write: {error}; \
+             nothing was written"
         )
     })?;
-
-    let mut w = store
-        .begin_write()
-        .await
-        .map_err(|error| format!("cannot read the restore marker: {error}"))?;
-    let consumed: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = ?")
-        .bind(META_KEY)
-        .fetch_optional(&mut *w.tx)
-        .await
-        .map_err(|error| format!("cannot read meta.{META_KEY}: {error}"))?;
     if consumed.as_deref() == Some(marker.head.meta_value().as_str()) {
-        drop(w);
-        // The first write moved the status if `primary-node` asked for it; a
-        // file left by a crash after that commit is not applied again.
-        if !matches!(primary_status::read_file(data_dir), File::Missing) {
-            primary_status::remove_file(data_dir);
-        }
-        tracing::info!(
-            head_seq = marker.head.seq,
-            "the restored primary's first write already committed; deleting the restore-pending marker"
-        );
-        remove(&path);
-        return Ok(Applied::AlreadyWritten);
+        return Ok(Pending::AlreadyWritten { head: marker.head });
     }
-
-    let head = log_head(&mut w.tx)
-        .await
-        .map_err(|error| format!("cannot read the change log's head: {error}"))?;
     if head != marker.head {
-        drop(w);
-        tracing::warn!(
-            marker_seq = marker.head.seq,
-            marker_hash = %marker.head.hash,
-            log_seq = head.seq,
-            log_hash = %head.hash,
-            "the restore-pending marker names another database; deleting it without a first write"
-        );
-        remove(&path);
-        primary_status::apply_marker(store, data_dir).await?;
-        return Ok(Applied::OtherDatabase);
+        return Ok(Pending::OtherDatabase {
+            why: format!(
+                "it names the change log head at seq {} with hash {}, and this database's head \
+                 is seq {} with hash {}",
+                marker.head.seq, marker.head.hash, head.seq, head.hash
+            ),
+        });
     }
 
     if marker.accept_loss {
         return Err(format!(
             "{} asks for a restore with --accept-loss, whose first write (removing the other \
              nodes, raising their lease tokens, deleting their custody seals and recording \
-             cluster.restored) this version does not make yet; nothing was written",
+             cluster.restored) this version does not make yet; the start stops before its \
+             migrations, and nothing was written",
             path.display()
         ));
     }
@@ -307,13 +333,92 @@ pub async fn apply(store: &Store, data_dir: &Path) -> Result<Applied, String> {
         File::Unreadable(error) => {
             return Err(format!(
                 "cannot read {}, left by quoro restore: {error}; the restored primary's first \
-                 write must carry its move, so give it the database file's owner; nothing was \
-                 written",
+                 write must carry its move, so give it the database file's owner; the start \
+                 stops before its migrations, and nothing was written",
                 data_dir.join(primary_status::MARKER_FILE).display()
             ));
         }
     };
+    Ok(Pending::FirstWrite { marker, node_id })
+}
 
+/// `meta.restore_marker` and the change log's head, read in one read
+/// transaction from the database as it is, migrated or not.
+async fn read_database(store: &Store) -> Result<(Option<String>, Head), sqlx::Error> {
+    let mut tx = store.pool().begin().await?;
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('meta', 'change_log')",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let has = |name: &str| tables.iter().any(|table| table == name);
+    let consumed: Option<String> = if has("meta") {
+        sqlx::query_scalar("SELECT value FROM meta WHERE key = ?")
+            .bind(META_KEY)
+            .fetch_optional(&mut *tx)
+            .await?
+    } else {
+        None
+    };
+    let head = if has("change_log") {
+        log_head(&mut tx).await?
+    } else {
+        Head {
+            seq: 0,
+            hash: GENESIS_HASH.to_string(),
+        }
+    };
+    tx.rollback().await?;
+    Ok((consumed, head))
+}
+
+/// The second step of the restored primary's first start (see the module
+/// documentation): carries out what [`check`] decided. It runs once the
+/// migrations ran and before any other change-log write of the start.
+///
+/// # Errors
+///
+/// A one-line reason for a database error, which stops the start. The first
+/// write is then not committed, so none of it is written, and the marker and
+/// `primary-node` stay for the next start.
+pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<Applied, String> {
+    let path = data_dir.join(MARKER_FILE);
+    let (marker, node_id) = match pending {
+        Pending::NoMarker => {
+            primary_status::apply_marker(store, data_dir).await?;
+            return Ok(Applied::NoMarker);
+        }
+        Pending::AlreadyWritten { head } => {
+            // The first write moved the status if `primary-node` asked for
+            // it; a file left by a crash after that commit is not applied
+            // again.
+            if !matches!(primary_status::read_file(data_dir), File::Missing) {
+                primary_status::remove_file(data_dir);
+            }
+            tracing::info!(
+                head_seq = head.seq,
+                "the restored primary's first write already committed; deleting the restore-pending marker"
+            );
+            remove(&path);
+            return Ok(Applied::AlreadyWritten);
+        }
+        Pending::OtherDatabase { why } => {
+            tracing::warn!(
+                path = %path.display(),
+                why = %why,
+                "the restore-pending marker belongs to another database; deleting it without a first write"
+            );
+            remove(&path);
+            primary_status::apply_marker(store, data_dir).await?;
+            return Ok(Applied::OtherDatabase);
+        }
+        Pending::FirstWrite { marker, node_id } => (marker, node_id),
+    };
+
+    let mut w = store
+        .begin_write()
+        .await
+        .map_err(|error| format!("cannot begin the restored primary's first write: {error}"))?;
     let actor = Actor::system(ACTOR);
     let marked = crate::leases::mark_expiring_rows(&mut w.tx, &actor)
         .await

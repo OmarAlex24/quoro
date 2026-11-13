@@ -221,7 +221,8 @@ impl AppState {
     /// A message for the operator when the signing key cannot be loaded, the
     /// pre-upgrade backup fails, the migrations cannot be applied, `meta`
     /// cannot be completed, or a `restore-pending` marker stops the start
-    /// ([`restore_pending::apply`]).
+    /// ([`restore_pending::check`], before the backup and the migrations;
+    /// [`restore_pending::apply`] for a database error after them).
     pub async fn open(
         store: store::Store,
         config: ServerConfig,
@@ -264,6 +265,13 @@ impl AppState {
         if config.session_timeout_ms == 0 {
             config.session_timeout_ms = quoro_proto::wire::SESSION_TIMEOUT_MS;
         }
+        // After `quoro restore`, before anything else of the start: read what
+        // a `restore-pending` marker asks for, read-only (`backup-format.md`
+        // section 8.2, ADR 0285). Every refusal of the start comes from here,
+        // before the pre-upgrade backup and the migrations, so a refused start
+        // leaves the database as it was, and the next one still finds its
+        // migrations pending and records their backup (section 7.2).
+        let pending = restore_pending::check(&store, &config.data_dir).await?;
         let keys = Arc::new(
             ClusterKeys::load_or_generate(&config.data_dir)
                 .map_err(|e| format!("cannot load the cluster signing key: {e}"))?,
@@ -295,9 +303,10 @@ impl AppState {
         // primary status to the node on this host, before any session or
         // request sees either. It needs the migrated schema, so it comes
         // right after the migrations and before the pre-upgrade backup's
-        // record. Without a `restore-pending` marker, `primary-node` is
-        // applied on its own, as before.
-        restore_pending::apply(&store, &config.data_dir).await?;
+        // record; only a database error stops the start between the two.
+        // Without a `restore-pending` marker, `primary-node` is applied on
+        // its own, as before.
+        restore_pending::apply(&store, &config.data_dir, pending).await?;
         backups::control_plane::record_after_migration(
             &store, &keys, &data_key, &backups, migrated,
         )

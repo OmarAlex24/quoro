@@ -996,8 +996,8 @@ async fn a_backup_without_a_change_log_is_refused() {
 
 /// A restore that stops before the database is installed deletes the
 /// marker: one an interrupted earlier run left in the data directory, when
-/// a chunk fails, and its own, when the install fails after writing it (a
-/// `primary-node` that cannot be replaced).
+/// a chunk fails or a key file cannot be read, and its own, when the install
+/// fails after writing it (a `primary-node` that cannot be replaced).
 #[tokio::test]
 async fn a_restore_that_stops_before_installing_deletes_the_marker() {
     let fixture = Fixture::new().await;
@@ -1051,5 +1051,26 @@ async fn a_restore_that_stops_before_installing_deletes_the_marker() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("chunk"), "{error}");
+    assert_nothing_installed(&dir);
+
+    // A marker left by an earlier run, and a signing key file that cannot be
+    // read: the restore stops before it reads the repository.
+    let dir = fixture.data_dir("no-signing-key");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(restore_pending::MARKER_FILE),
+        Marker::plain(Head {
+            seq: 7,
+            hash: hash(7),
+        })
+        .to_bytes(),
+    )
+    .unwrap();
+    let mut options = fixture.options(&dir, None);
+    options.signing_key_file = fixture.base.join("no-such-signing.key");
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("signing key"), "{error}");
     assert_nothing_installed(&dir);
 }

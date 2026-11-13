@@ -15,8 +15,10 @@ use common::{Server, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::authority::VoterSupport;
 use quoro_control_plane::changelog::{self, Actor, Op};
+use quoro_control_plane::keys::SIGNING_KEY_FILE;
 use quoro_control_plane::restore_pending::{self, Marker};
 use quoro_control_plane::session::Fault;
+use quoro_control_plane::store::{Store, random_secret};
 use quoro_proto::wire::{
     self, Capacity as WireCapacity, Kvm as WireKvm, NodeMessage, StatusReport, WarmRole, WarmStatus,
 };
@@ -754,29 +756,24 @@ async fn a_disconnected_source_holds_the_lease_until_its_gate_passed() {
 /// the control-plane database is restored while the app's lease row reads
 /// `expiring` for the source. The restored log may lack the write that ended
 /// the lease's renewals, so the source may run the app `local`. The restored
-/// primary's first write marks the row, and a failover before the source's
-/// next `hello` waits, also once the row's gate has passed. Without the mark,
-/// the passed gate would let the lease move to the warm node.
+/// primary's first write marks the row, and a failover is refused before the
+/// source's next `hello`, also once the row's gate has passed. Without the
+/// mark, the passed gate would let the lease move to the warm node.
 #[tokio::test]
-async fn after_a_restore_a_failover_waits_for_the_holders_next_hello() {
+async fn after_a_restore_a_failover_is_refused_before_the_holders_next_hello() {
     let mut s = Setup::new().await;
     s.expiring().await;
     log_lease_row(&s).await;
-    // The primary stops; its database is restored as it stands, with the
-    // restore-pending marker naming its log head.
+    // The primary stops, once its sessions recorded their end; its database
+    // is restored as it stands, with the restore-pending marker naming its
+    // log head.
     drop(s.on_source.take());
     drop(s.on_warm.take());
     disconnected(&s.server, &s.source.node_id).await;
     disconnected(&s.server, &s.warm.node_id).await;
-    let head = settled_head(&s.server).await;
-    std::fs::write(
-        s.server.data_dir.join(restore_pending::MARKER_FILE),
-        Marker::plain(head.clone()).to_bytes(),
-    )
-    .unwrap();
-    s.server =
-        common::restart_with_resolver(&s.server, Arc::new(quoro_control_plane::ReferenceAsDigest))
-            .await;
+    settle(&s.server).await;
+    let (server, head) = restored_server(&s.server).await;
+    s.server = server;
     let pool = s.server.state.store.pool();
     let restored: Option<String> =
         sqlx::query_scalar("SELECT value FROM meta WHERE key = 'restore_marker'")
@@ -859,9 +856,10 @@ async fn log_lease_row(s: &Setup) {
     w.commit().await.unwrap();
 }
 
-/// The change log's head once no write has landed for a while: the stopped
-/// primary's sessions may still record their end.
-async fn settled_head(server: &Server) -> restore_pending::Head {
+/// Waits until no change-log write has landed for a while: the stopped
+/// primary's sessions may still record their end. The restore does not
+/// depend on it: [`restored_server`] names the head of its own copy.
+async fn settle(server: &Server) {
     let mut last: Option<restore_pending::Head> = None;
     loop {
         let head = {
@@ -869,11 +867,70 @@ async fn settled_head(server: &Server) -> restore_pending::Head {
             restore_pending::log_head(&mut conn).await.unwrap()
         };
         if last.as_ref() == Some(&head) {
-            return head;
+            return;
         }
         last = Some(head);
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+}
+
+/// The stopped primary's database as `quoro restore` installs it: a copy of
+/// the database file, taken with `VACUUM INTO`, and the signing key in a new
+/// data directory, with the `restore-pending` marker naming the copy's log
+/// head. Then a control plane starts on that directory, as after a restart.
+/// The old process's tasks still run in this test, but they write to the old
+/// file only, so the marker always names the head of the restored database.
+/// Returns the new server and that head.
+async fn restored_server(server: &Server) -> (Server, restore_pending::Head) {
+    let dir = std::env::temp_dir().join(format!("quoro-test-restored-{}", &random_secret()[..16]));
+    let keys = dir.join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    std::fs::copy(
+        server.data_dir.join("keys").join(SIGNING_KEY_FILE),
+        keys.join(SIGNING_KEY_FILE),
+    )
+    .unwrap();
+    let database = dir.join("quoro.db");
+    let path = database.to_str().unwrap();
+    assert!(!path.contains('\''), "{path}");
+    sqlx::query(&format!("VACUUM INTO '{path}'"))
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    let store = Store::open(&database).await.unwrap();
+    let head = {
+        let mut conn = store.pool().acquire().await.unwrap();
+        restore_pending::log_head(&mut conn).await.unwrap()
+    };
+    std::fs::write(
+        dir.join(restore_pending::MARKER_FILE),
+        Marker::plain(head.clone()).to_bytes(),
+    )
+    .unwrap();
+    let mut config = (*server.state.config).clone();
+    config.data_dir = dir.clone();
+    let state = quoro_control_plane::AppState::open(
+        store,
+        config,
+        Arc::new(quoro_control_plane::ReferenceAsDigest),
+        Arc::clone(&server.state.data_key),
+    )
+    .await
+    .unwrap();
+    let app = common::served(&state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (
+        Server {
+            base,
+            data_dir: dir,
+            state,
+        },
+        head,
+    )
 }
 
 /// Section 8.4: a source that is not connected holds a `local` lease until

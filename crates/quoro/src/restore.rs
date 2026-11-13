@@ -262,17 +262,18 @@ pub async fn run(args: &[String], node_data_dir: &Path) -> Result<(), Error> {
 /// the integrity check or the install fails.
 pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Report, Error> {
     ensure_fresh_data_dir(&options.data_dir)?;
-    let signing_seed = read_signing_seed(&options.signing_key_file)?;
-    let data_key = read_exact(&options.data_key_file, DATA_KEY_BYTES, "data key")?;
-    ensure_data_dir(&options.data_dir)?;
     // From here on, a restore that stops before the database is installed
     // deletes the marker, also one an interrupted earlier run left in this
-    // data directory, which holds no database (section 8.2). A dry run
-    // installs nothing and leaves the marker alone.
+    // data directory, which holds no database (section 8.2), and also when
+    // the key files cannot be read. A dry run installs nothing and leaves the
+    // marker alone.
     let mut pending = PendingMarker {
         path: options.data_dir.join(restore_pending::MARKER_FILE),
         armed: !options.dry_run,
     };
+    let signing_seed = read_signing_seed(&options.signing_key_file)?;
+    let data_key = read_exact(&options.data_key_file, DATA_KEY_BYTES, "data key")?;
+    ensure_data_dir(&options.data_dir)?;
 
     let root = layout::root(&options.prefix, &options.cluster_id);
     let (config, repo_key) =
