@@ -843,33 +843,92 @@ async fn a_file_marked_unchanged_whose_base_is_lost_goes_on_the_evidence_of_the_
     assert!(quarantined(&h).await.is_empty());
 }
 
+/// A `gone` mark was written because the live file was missing; the delete
+/// or the row's drop then failed, and the live file was put back since, as
+/// by an operator. Nothing proved it unchanged, so it is compared again
+/// before anything goes: the marked run deletes nothing and clears the
+/// mark, and the next run keeps the file as a quarantined copy. That holds
+/// whether the base is still there or was lost too.
 #[tokio::test]
-async fn a_live_file_back_after_a_gone_mark_is_no_evidence_for_its_own_delete() {
-    let h = Harness::new("handover-gone-back").await;
-    let path = returning_source(&h).await;
-    let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
-    h.engine.delete_volume(&vol()).await.expect("delete");
-    h.engine
-        .fail_next(FakeOp::DeleteVolume, EngineError::Io("injected".to_owned()));
-    assert!(matches!(hand_over(&h).await, HandOver::Failed(_)));
-    let mark = HandOverMark::Gone;
-    assert_eq!(
-        h.store.volume_hand_over_mark(VOL).await.expect("store"),
-        Some(mark.clone())
-    );
-    // The base is lost, and a live file with data is put back: the engine
-    // finds it, but nothing proved it unchanged.
-    std::fs::remove_file(&base.location).expect("lose the base");
-    h.engine
-        .ensure_volume(&vol(), 1)
-        .await
-        .expect("the file is back");
-    write_at(&path, 0, &[9_u8; 4096]);
-    for _ in 0..2 {
-        assert_marked_run_changes_nothing(&h, &mark, "a gone mark").await;
-        assert_eq!(read_at(&path, 0, 4096), vec![9_u8; 4096], "the file stays");
+async fn a_live_file_back_after_a_gone_mark_is_compared_again_before_anything_goes() {
+    for lose_base in [true, false] {
+        let what = format!("base lost {lose_base}");
+        let h = Harness::new(if lose_base {
+            "handover-gone-back-lost-base"
+        } else {
+            "handover-gone-back"
+        })
+        .await;
+        let path = returning_source(&h).await;
+        let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+        let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
+        h.engine.delete_volume(&vol()).await.expect("delete");
+        // The run that writes the mark fails before the row goes.
+        h.engine
+            .fail_next(FakeOp::DeleteVolume, EngineError::Io("injected".to_owned()));
+        assert!(matches!(hand_over(&h).await, HandOver::Failed(_)), "{what}");
+        let mark = HandOverMark::Gone;
+        assert_eq!(
+            h.store.volume_hand_over_mark(VOL).await.expect("store"),
+            Some(mark.clone()),
+            "{what}"
+        );
+        if lose_base {
+            std::fs::remove_file(&base.location).expect("lose the base");
+        }
+        // A live file with data the target never got is put back.
+        h.engine
+            .ensure_volume(&vol(), 1)
+            .await
+            .expect("the file is back");
+        write_at(&path, 0, &[9_u8; 4096]);
+
+        // A VM the engine holds attaches the file: the run waits, and the
+        // mark stands.
+        let attaching = engine_vm(&h.engine, "vm_01JD0WARM0000000000000002", true).await;
+        let reason = assert_marked_run_refused(&h, &mark, &what).await;
+        assert!(reason.contains("attached"), "{what}: {reason}");
+        h.engine.delete(&attaching).await.expect("delete");
+
+        // The engine finds the file: nothing is deleted, and the mark goes.
+        let outcome = hand_over(&h).await;
+        assert!(
+            matches!(&outcome, HandOver::Failed(reason) if reason.contains("compares the live file again")),
+            "{what}: {outcome:?}"
+        );
+        assert_eq!(
+            h.store.volume_hand_over_mark(VOL).await.expect("store"),
+            None,
+            "{what}: the mark goes"
+        );
+        assert!(
+            h.store.volume(VOL).await.expect("store").is_some(),
+            "{what}: the row stays"
+        );
+        assert_eq!(
+            read_at(&path, 0, 4096),
+            vec![9_u8; 4096],
+            "{what}: the file stays"
+        );
+        assert!(quarantined(&h).await.is_empty(), "{what}");
+        let error = h.row().await.error.expect("an error is shown");
+        assert!(error.contains("compares the live file again"), "{error}");
+
+        // The next run compares the file and keeps it as a quarantined copy
+        // before it goes.
+        let HandOver::Done(Some(id)) = hand_over(&h).await else {
+            panic!("{what}: the hand-over ends with a copy");
+        };
+        let records = quarantined(&h).await;
+        assert_eq!(records.len(), 1, "{what}: {records:?}");
+        assert_eq!(records[0].quarantine_id, id, "{what}");
+        assert_eq!(
+            read_at(&records[0].path, 0, 4096),
+            vec![9_u8; 4096],
+            "{what}: the copy holds the put-back data"
+        );
+        assert_handed_over(&h).await;
     }
-    assert!(quarantined(&h).await.is_empty());
 }
 
 #[tokio::test]

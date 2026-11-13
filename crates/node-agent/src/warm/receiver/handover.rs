@@ -60,11 +60,15 @@
 //! live file counts as gone only while another file the node records for
 //! the volume is there; a missing clone clears its mark, and a file marked
 //! `unchanged` goes, while the live file or such a file is there. A file
-//! marked `gone` still waits for another file: the mark was written because
-//! the live file was missing, so a live file the engine finds now was put
-//! back since, and it is no evidence for its own delete. Without evidence,
-//! the run fails with the warm copy's error and changes nothing, and a
-//! later pass tries again. An engine that refuses the live file, as while a
+//! marked `gone` goes only while the live file is still missing and another
+//! file shows the directory. The mark was written because the live file was
+//! missing, so a live file the engine finds now was put back since, and
+//! nothing proved it unchanged: that run deletes nothing, the mark goes,
+//! and the next pass compares the file again, which keeps it as a
+//! quarantined copy unless it proves it unchanged. No copy stands behind a
+//! `gone` mark, so clearing it loses nothing. Without evidence, the run
+//! fails with the warm copy's error and changes nothing, and a later pass
+//! tries again. An engine that refuses the live file, as while a
 //! VM it holds attaches it, holds the run as any refusal does (step 1). A
 //! mark cleared for a missing clone keeps the copy's record, reported
 //! without a hash: no record is ever forgotten here. A record goes by
@@ -462,10 +466,17 @@ impl<E: Engine + 'static> Inner<E> {
     ///   the volume, shows it ([`Self::directory_shown`]). The mark proved
     ///   the live file to hold no write the target lacks, and no VM has
     ///   written to it since, or the mark would be gone.
-    /// - `gone`: only another file the node records for the volume shows it.
+    /// - `gone`: the live file is asked about first ([`Self::live_file`]).
     ///   The mark was written because the live file was missing, so a live
-    ///   file the engine finds now was put back since, and nothing proved it
-    ///   unchanged: it is no evidence for its own delete.
+    ///   file the engine finds now was put back since, as by an operator,
+    ///   and nothing proved it unchanged: it is no evidence for its own
+    ///   delete, and it may hold writes the target lacks. Nothing is
+    ///   deleted: the mark goes, and the next pass compares the file again,
+    ///   which keeps it as a quarantined copy unless it proves it unchanged
+    ///   (section 9 step 2). No copy stands behind a `gone` mark, so
+    ///   clearing it loses nothing. While the live file is still missing,
+    ///   only another file the node records for the volume shows the
+    ///   directory.
     async fn marked_on_real_directory(
         &self,
         volume_id: &str,
@@ -475,6 +486,15 @@ impl<E: Engine + 'static> Inner<E> {
         let shown = if unchanged {
             self.directory_shown(volume_id).await?
         } else {
+            if matches!(self.live_file(volume_id).await?, LiveFile::Present) {
+                self.clear_mark(volume_id).await?;
+                return Err(HandOver::Failed(
+                    "the hand-over mark says the live file was missing, but the live file is \
+                     back: nothing is deleted, the mark goes, and the next pass compares the \
+                     live file again"
+                        .to_owned(),
+                ));
+            }
             self.volume_files_present(volume_id)
                 .await
                 .map_err(HandOver::Failed)?
