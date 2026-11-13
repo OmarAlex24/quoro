@@ -6,7 +6,7 @@
 use crate::AppState;
 
 use crate::auth::Identity;
-use crate::changelog::{self, Op};
+use crate::changelog::{self, Actor, Op};
 use crate::error::{ApiError, Target};
 use crate::request::{ApiJson, CallCtx, RequestId};
 use crate::session::NodeHub;
@@ -1013,13 +1013,9 @@ pub async fn declare_node_lost(
 /// `token_exhausted` before anything is written (section 8.6, ADR 0325), so
 /// `lost_at` stays unset.
 ///
-/// Only rows that name the node and are not revoked yet change: a lease whose
-/// row names another node already carries a higher token than this node's,
-/// and a revoked row is not held. `fence_failure` is left as it is (ADR 0202),
-/// and no release is recorded ([`crate::leases::Releases`]): a lease moves on
-/// `lost_at` through [`crate::leases::is_released`], which keeps an
-/// `expiring` lease behind its gate, and only while the node has not
-/// reported since ([`crate::leases::declaration_releases`]).
+/// The write itself is [`declare_lost_write`], which the promotion write of
+/// `quoro cluster promote --ack-fence` shares (section 7.3 step 5); the
+/// refusals above are this call's own and stay here.
 async fn declare_lost_tx(
     state: &AppState,
     ctx: &CallCtx,
@@ -1030,12 +1026,11 @@ async fn declare_lost_tx(
     if !is_id(Prefix::Node, node_id) {
         return Err(ApiError::not_found("node"));
     }
-    let row: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT status, lost_at FROM nodes WHERE id = ?")
-            .bind(node_id)
-            .fetch_optional(&mut *w.tx)
-            .await?;
-    let Some((status, lost_at)) = row else {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(&mut *w.tx)
+        .await?;
+    let Some(status) = status else {
         return Err(ApiError::not_found("node"));
     };
     if status == "removed" {
@@ -1052,27 +1047,7 @@ async fn declare_lost_tx(
         kind: "node".to_string(),
         id: node_id.to_string(),
     };
-    let change_seq = if lost_at.is_some() {
-        // ADR 0202: a repeat changes nothing and is still recorded.
-        None
-    } else {
-        let actor = ctx.identity.actor();
-        let held: Vec<String> = crate::leases::held_by_node(&mut w.tx, node_id)
-            .await?
-            .into_iter()
-            .map(|lease| lease.id)
-            .collect();
-        crate::leases::bump_tokens(&mut w.tx, &held, node_id, &actor).await?;
-        // Taken after the revokes, so `revoked_at <= lost_at` holds for each
-        // of them ([`crate::leases::is_released`]).
-        sqlx::query("UPDATE nodes SET lost_at = ? WHERE id = ?")
-            .bind(now_rfc3339())
-            .bind(node_id)
-            .execute(&mut *w.tx)
-            .await?;
-        let payload = crate::driver::node_payload(&mut w.tx, node_id).await?;
-        Some(changelog::append(&mut w.tx, &actor, "node", node_id, Op::Update, payload).await?)
-    };
+    let change_seq = declare_lost_write(&mut w.tx, node_id, &ctx.identity.actor()).await?;
     ctx.append_ok(
         &mut w.tx,
         Some(Scope::NodeDeclareLost),
@@ -1099,6 +1074,76 @@ async fn declare_lost_tx(
     .await?;
     w.commit().await?;
     Ok(node)
+}
+
+/// The write of declaring `node_id` lost (section 8.3, "Declaring a node
+/// lost"), in the caller's transaction, by `actor`:
+///
+/// 1. increments the `fencing_token` of every lease the node holds, `local`
+///    and `expiring`, and records it revoked in the primary's view, with the
+///    node still named as the last holder, one change-log entry per lease
+///    ([`crate::leases::bump_tokens`]);
+/// 2. sets `nodes.lost_at`, after those revokes, so `revoked_at <= lost_at`
+///    holds for each of them ([`crate::leases::is_released`]); the node
+///    stays enrolled and a voter;
+/// 3. writes the node's change-log entry, whose `seq` it returns.
+///
+/// A node already declared lost changes nothing and gives `None` (ADR 0202:
+/// a repeat changes nothing). A lease the node holds that is already at the
+/// token cap refuses with `token_exhausted` before anything is written
+/// (section 8.6, ADR 0325), and the caller drops its transaction.
+///
+/// Only rows that name the node and are not revoked yet change: a lease whose
+/// row names another node already carries a higher token than this node's,
+/// and a revoked row is not held, a row already revoked at the cap included.
+/// `fence_failure` is left as it is (ADR 0202), and no release is recorded
+/// ([`crate::leases::Releases`]): a lease moves on `lost_at` through
+/// [`crate::leases::is_released`], which keeps an `expiring` lease behind its
+/// gate, and only while the node has not reported since
+/// ([`crate::leases::declaration_releases`]).
+///
+/// It checks nothing else. `declareNodeLost` ([`declare_lost_tx`]) refuses
+/// an unknown, `removed` or connected node before it calls this. The
+/// promotion write of `quoro cluster promote --ack-fence` calls it directly
+/// for the old primary's node (section 7.3 step 5, [`crate::promotion`]):
+/// the contract gives that write no such refusal, and the new primary has no
+/// session with any node yet.
+///
+/// # Errors
+///
+/// `not_found` for a node with no row, `conflict` with `reason:
+/// token_exhausted` at the cap, or a database error.
+pub(crate) async fn declare_lost_write(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    actor: &Actor,
+) -> Result<Option<i64>, ApiError> {
+    let lost_at: Option<Option<String>> =
+        sqlx::query_scalar("SELECT lost_at FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(lost_at) = lost_at else {
+        return Err(ApiError::not_found("node"));
+    };
+    if lost_at.is_some() {
+        return Ok(None);
+    }
+    let held: Vec<String> = crate::leases::held_by_node(conn, node_id)
+        .await?
+        .into_iter()
+        .map(|lease| lease.id)
+        .collect();
+    crate::leases::bump_tokens(conn, &held, node_id, actor).await?;
+    sqlx::query("UPDATE nodes SET lost_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(node_id)
+        .execute(&mut *conn)
+        .await?;
+    let payload = crate::driver::node_payload(conn, node_id).await?;
+    Ok(Some(
+        changelog::append(conn, actor, "node", node_id, Op::Update, payload).await?,
+    ))
 }
 
 /// Removes a node from the cluster (`node-agent-protocol.md` section 10):

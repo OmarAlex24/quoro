@@ -668,23 +668,31 @@ pub(crate) async fn bump_tokens(
 /// [`MAX_TOKEN`] and that token, so the operator sees which row cannot move.
 #[must_use]
 pub(crate) fn token_exhausted(exhausted: &[&Lease]) -> ApiError {
-    let named: Vec<String> = exhausted
+    let named: Vec<(&str, i64)> = exhausted
         .iter()
-        .map(|lease| {
-            format!(
-                "lease {} is at fencing token {}",
-                lease.id, lease.fencing_token
-            )
-        })
+        .map(|lease| (lease.id.as_str(), lease.fencing_token))
         .collect();
     ApiError {
         reason: Some(Reason::TokenExhausted),
-        ..ApiError::conflict(format!(
-            "{}, and {MAX_TOKEN} is the highest token the change log carries: the token cannot \
-             be raised, so no lease or node was changed; recovery is a human action",
-            named.join("; ")
-        ))
+        ..ApiError::conflict(token_exhausted_detail(&named))
     }
+}
+
+/// The text of [`token_exhausted`], naming each `(lease id, token)` in
+/// `named`. `quoro cluster promote --ack-fence` words its own refusal with it
+/// ([`crate::promotion::TokenExhausted`]), so every path that refuses at the
+/// cap says the same thing.
+#[must_use]
+pub(crate) fn token_exhausted_detail(named: &[(&str, i64)]) -> String {
+    let named: Vec<String> = named
+        .iter()
+        .map(|(lease_id, token)| format!("lease {lease_id} is at fencing token {token}"))
+        .collect();
+    format!(
+        "{}, and {MAX_TOKEN} is the highest token the change log carries: the token cannot \
+         be raised, so no lease or node was changed; recovery is a human action",
+        named.join("; ")
+    )
 }
 
 /// The highest token any primary issues (section 8.5): 2^53 − 1, the highest
@@ -1336,6 +1344,47 @@ pub(crate) async fn write_marked_local(
     lease.unsettled = true;
     changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
     Ok(lease)
+}
+
+/// The mark on every `expiring` row (section 8.4, "The mark", ADR 0280):
+/// the first write of any control-plane restore, plain or forced
+/// (`backup-format.md` section 8.2, issue #838), and of any `--accept-loss`
+/// promotion (section 7.3 step 5) sets the unsettled mark on every lease row
+/// whose `mode` reads `expiring`, because such a write may lack R or the
+/// writes after it. A revoked row is marked too: the contract names every
+/// `expiring` row, and marking more only delays a move ("The mark"). Only
+/// the mark changes; the token, holder, mode, `duration_ms` and
+/// `revoked_at` are kept. Each row it marks gets one change-log entry
+/// carrying the whole row, as the other writers of the mark do
+/// ([`end_renewals`], [`write_marked_local`]). A row that already carries
+/// the mark is left as it is and gets no entry, and a `local` row is never
+/// touched. Runs in the caller's transaction; returns the rows it marked,
+/// oldest first.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn mark_expiring_rows(
+    conn: &mut SqliteConnection,
+    actor: &Actor,
+) -> Result<Vec<Lease>, ApiError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {LEASE_COLUMNS} FROM leases WHERE mode = 'expiring' AND unsettled = 0 ORDER BY id"
+    ))
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut marked = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut lease = lease_from_row(row)?;
+        sqlx::query("UPDATE leases SET unsettled = 1 WHERE id = ?")
+            .bind(&lease.id)
+            .execute(&mut *conn)
+            .await?;
+        lease.unsettled = true;
+        changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+        marked.push(lease);
+    }
+    Ok(marked)
 }
 
 /// Revokes the app's lease and writes its change-log entry; the caller builds
@@ -2356,6 +2405,109 @@ mod tests {
         assert_eq!(raised.fencing_token, 2);
         assert!(raised.revoked_at.is_some());
         assert_eq!(log_len(&store).await, entries + 1);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// Section 8.4, "The mark": the first write of a restore or of an
+    /// `--accept-loss` promotion marks every `expiring` row, a revoked one
+    /// included, and only those. Each marked row keeps its token, holder,
+    /// mode, duration and `revoked_at`, and gets one change-log entry with
+    /// the whole row and the mark; a `local` row and a row already marked
+    /// get no write and no entry. A second run marks nothing.
+    #[tokio::test]
+    async fn the_mark_on_every_expiring_row_marks_only_those() {
+        let (store, local, actor, data_dir) = store_with_lease().await;
+        let node_id = local.holder_node_id.clone();
+        for (id, app, unsettled, revoked_at) in [
+            ("lse_exp_b", "app_b", 0, None),
+            (
+                "lse_exp_a_revoked",
+                "app_a",
+                0,
+                Some("2026-11-13T10:00:00.000Z"),
+            ),
+            ("lse_exp_c_marked", "app_c", 1, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+                 fencing_token, duration_ms, granted_at, revoked_at, unsettled) \
+                 VALUES (?, 'app', ?, ?, 'expiring', 7, 5000, '2026-11-13T09:00:00.000Z', ?, ?)",
+            )
+            .bind(id)
+            .bind(app)
+            .bind(&node_id)
+            .bind(revoked_at)
+            .bind(unsettled)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        let before = log_len(&store).await;
+        let (before_rows, local) = {
+            let mut conn = store.pool().acquire().await.unwrap();
+            let mut rows = Vec::new();
+            for id in ["lse_exp_a_revoked", "lse_exp_b"] {
+                rows.push(super::by_id(&mut conn, id).await.unwrap().unwrap());
+            }
+            let local = super::by_id(&mut conn, &local.id).await.unwrap().unwrap();
+            (rows, local)
+        };
+
+        let mut w = store.begin_write().await.unwrap();
+        let marked = super::mark_expiring_rows(&mut w.tx, &actor).await.unwrap();
+        w.commit().await.unwrap();
+        let ids: Vec<&str> = marked.iter().map(|lease| lease.id.as_str()).collect();
+        assert_eq!(ids, ["lse_exp_a_revoked", "lse_exp_b"]);
+        for (lease, before) in marked.iter().zip(&before_rows) {
+            let expected = Lease {
+                unsettled: true,
+                ..before.clone()
+            };
+            assert_eq!(lease, &expected);
+        }
+        assert_eq!(
+            log_len(&store).await,
+            before + 2,
+            "one entry per marked row"
+        );
+
+        let mut conn = store.pool().acquire().await.unwrap();
+        for lease in &marked {
+            assert_eq!(
+                super::by_id(&mut conn, &lease.id).await.unwrap().as_ref(),
+                Some(lease)
+            );
+        }
+        let entries: Vec<(String, String)> =
+            sqlx::query_as("SELECT entity_id, payload FROM change_log WHERE seq > ? ORDER BY seq")
+                .bind(before)
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap();
+        let payloads: Vec<(String, serde_json::Value)> = entries
+            .into_iter()
+            .map(|(id, payload)| (id, serde_json::from_str(&payload).unwrap()))
+            .collect();
+        assert_eq!(
+            payloads,
+            marked
+                .iter()
+                .map(|lease| (lease.id.clone(), lease.payload()))
+                .collect::<Vec<_>>()
+        );
+        let untouched = super::by_id(&mut conn, &local.id).await.unwrap().unwrap();
+        assert_eq!(untouched, local, "a local row is not touched");
+        drop(conn);
+
+        let mut w = store.begin_write().await.unwrap();
+        assert!(
+            super::mark_expiring_rows(&mut w.tx, &actor)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        w.commit().await.unwrap();
+        assert_eq!(log_len(&store).await, before + 2);
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
