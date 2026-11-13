@@ -414,7 +414,8 @@ fn remove_database(path: &Path) {
 /// Moves the closed database at `temporary` to `path`: it checks that no
 /// `-wal` page is left, removes the empty sidecars, syncs the file, links
 /// it at `path`, which fails when `path` exists, removes the temporary
-/// name and syncs the directory.
+/// name and syncs the directory. When a step after the link fails, it
+/// removes the link it made, so the build's error leaves no file at `path`.
 fn settle(temporary: &Path, path: &Path) -> Result<(), BuildError> {
     let [wal, shm] = sidecars(temporary);
     match std::fs::metadata(&wal) {
@@ -436,9 +437,17 @@ fn settle(temporary: &Path, path: &Path) -> Result<(), BuildError> {
         }
         Err(error) => return Err(error.into()),
     }
-    std::fs::remove_file(temporary)?;
-    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        std::fs::File::open(dir)?.sync_all()?;
+    let linked = std::fs::remove_file(temporary).and_then(|()| {
+        match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            Some(dir) => std::fs::File::open(dir)?.sync_all(),
+            None => Ok(()),
+        }
+    });
+    if let Err(error) = linked {
+        if let Err(unlink) = std::fs::remove_file(path) {
+            tracing::warn!(error = %unlink, path = %path.display(), "cannot remove a stopped rebuild");
+        }
+        return Err(error.into());
     }
     Ok(())
 }
