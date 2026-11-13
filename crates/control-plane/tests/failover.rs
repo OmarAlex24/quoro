@@ -11,14 +11,14 @@
 mod common;
 
 use base64::Engine as _;
-use common::{Server, start_with_patient_node_session};
+use common::{Server, TestDir, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::authority::VoterSupport;
 use quoro_control_plane::changelog::{self, Actor, Op};
 use quoro_control_plane::keys::SIGNING_KEY_FILE;
 use quoro_control_plane::restore_pending::{self, Marker};
 use quoro_control_plane::session::Fault;
-use quoro_control_plane::store::{Store, random_secret};
+use quoro_control_plane::store::Store;
 use quoro_proto::wire::{
     self, Capacity as WireCapacity, Kvm as WireKvm, NodeMessage, StatusReport, WarmRole, WarmStatus,
 };
@@ -882,7 +882,7 @@ async fn settle(server: &Server) {
 /// file only, so the marker always names the head of the restored database.
 /// Returns the new server and that head.
 async fn restored_server(server: &Server) -> (Server, restore_pending::Head) {
-    let dir = std::env::temp_dir().join(format!("quoro-test-restored-{}", &random_secret()[..16]));
+    let dir = TestDir::new("quoro-test-restored");
     let keys = dir.join("keys");
     std::fs::create_dir_all(&keys).unwrap();
     std::fs::copy(
@@ -908,7 +908,7 @@ async fn restored_server(server: &Server) -> (Server, restore_pending::Head) {
     )
     .unwrap();
     let mut config = (*server.state.config).clone();
-    config.data_dir = dir.clone();
+    config.data_dir = dir.to_path_buf();
     let state = quoro_control_plane::AppState::open(
         store,
         config,
@@ -917,20 +917,7 @@ async fn restored_server(server: &Server) -> (Server, restore_pending::Head) {
     )
     .await
     .unwrap();
-    let app = common::served(&state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (
-        Server {
-            base,
-            data_dir: dir,
-            state,
-        },
-        head,
-    )
+    (common::serve_in(dir, state).await, head)
 }
 
 /// Section 8.4: a source that is not connected holds a `local` lease until

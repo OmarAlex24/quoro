@@ -327,6 +327,24 @@ async fn start_at(
     }
 }
 
+/// Serves `state`, which a test opened itself on `dir` (as on a data
+/// directory a restore installed), as the other starts serve theirs. `dir` is
+/// removed once this server and every other clone of it drop.
+pub async fn serve_in(dir: TestDir, state: AppState) -> Server {
+    let app = served(&state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Server {
+        base,
+        data_dir: dir.to_path_buf(),
+        state,
+        dir,
+    }
+}
+
 /// Starts a second control-plane process on `server`'s database, as after a
 /// restart: a new `AppState` with empty in-memory caches that resolves image
 /// references with `resolver`. Stop the first process's node sessions first.

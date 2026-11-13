@@ -9,18 +9,18 @@
 mod common;
 
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use common::{Server, start_in};
+use common::{Server, TestDir, start_in};
 use quoro_control_plane::backups::{Backups, Bucket, BucketFactory, BucketStore, RepositoryTarget};
 use quoro_control_plane::changelog::{self, Actor, Op};
 use quoro_control_plane::crypto::DataKey;
 use quoro_control_plane::driver::{self, Capacity, Kvm, LocalNode};
 use quoro_control_plane::primary_status;
 use quoro_control_plane::restore_pending::{self, Applied, Head, Marker};
-use quoro_control_plane::store::{Store, now_rfc3339, random_secret};
+use quoro_control_plane::store::{Store, now_rfc3339};
 use quoro_control_plane::{AppState, NodeNetwork, ReferenceAsDigest, ServerConfig};
 use quoro_providers::object_store::{MemoryStore, ObjectInfo, ObjectStore, ObjectStoreError};
 use serde_json::{Value, json};
@@ -65,18 +65,17 @@ fn local_node() -> LocalNode {
     }
 }
 
-/// A new, empty directory under the system's temporary directory.
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("quoro-test-{name}-{}", &random_secret()[..16]));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A new, empty directory under the system's temporary directory, removed
+/// when the test ends.
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("quoro-test-{name}"))
 }
 
 /// A data directory with the database `quoro restore` installed: the old
 /// host's primary node, the new host's node, the leases' holder and the rows
 /// of [`LEASES`]. Returns the directory, the open store, the old primary's id
 /// and the log's head, which the restore's marker names.
-async fn restored() -> (PathBuf, Store, String, Head) {
+async fn restored() -> (TestDir, Store, String, Head) {
     let dir = temp_dir("restored");
     let store = Store::open(&dir.join("quoro.db")).await.unwrap();
     let old = populate(&store).await;
@@ -822,7 +821,7 @@ async fn create_repository(owner: &reqwest::Client, server: &Server) {
 /// directory, with the key files. `server` keeps running in the test, so the
 /// copy is taken with `VACUUM INTO`, and its head is read from the copy.
 /// Returns the new directory and that head.
-async fn installed_copy(server: &Server) -> (PathBuf, Head) {
+async fn installed_copy(server: &Server) -> (TestDir, Head) {
     let dir = temp_dir("installed");
     let keys = dir.join("keys");
     std::fs::create_dir_all(&keys).unwrap();
