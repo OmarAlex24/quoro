@@ -66,6 +66,7 @@ These are on `main`:
 - Change-log follow, with `Node.log_seq` and `Node.log_lag`.
 - The warm copy's progress in `App.warm`.
 - The returning source's hand-over and its quarantined copies, on the node ([#763](https://github.com/OmarAlex24/quoro/pull/763)) and on the primary ([#738](https://github.com/OmarAlex24/quoro/pull/738)).
+- `restoreBackupRepositoryKey`, and the refusals of backup work while a promoted primary does not hold the repository key ([#797](https://github.com/OmarAlex24/quoro/issues/797)).
 
 The panel on `main` has no switchover action. Until it does, step 5's panel action has an API call that does the same thing, and the API answer is the evidence.
 
@@ -78,7 +79,7 @@ The panel on `main` has no switchover action. Until it does, step 5's panel acti
 - **One build on every lab.** All three labs run the same `quoro` binary. Run `quoro version` on each and keep the output; the three must match. Keep the previous binary on each lab for rollback.
 - **The warm policy.** Until the last warm PR merges, only a test-lab build made with the dev-only `dev-warm-policy` feature accepts `ha_policy: warm` ([ADR 0223](../adr/0223-expiring-leases-in-dev-builds-before-the-warm-policy-ships.md), [ADR 0277](../adr/0277-warm-turns-on-at-the-end-of-its-chain-until-then-updateapp.md)). Check `quoro version`: such a build says so in its output. If the warm chain has merged by the demo, the release build is enough and the version shows no dev feature.
 - **lab-1's volume pool.** lab-1 and lab-2 snapshot volumes with `reflink`: a warm node must ([`WarmCopy.node_id`](https://github.com/OmarAlex24/quoro/blob/main/docs/contracts/openapi.yaml)). The API reports no snapshot method per node, so the check is the answer to `updateApp` in [step 2b](#2b-turn-on-warm): without `reflink` it refuses `warm` with `validation_failed`.
-- **A human token.** `$TOKEN` is a human's API token (`tok_...`) with the owner or operator role. `updateNodeRoles`, `declareNodeLost`, `ackNodeFence` and `deleteVolumeQuarantine` are human-only, and an agent is refused with `forbidden`. API tokens are replicated, so the same token works after the promotion in step 6. Panel sessions are not replicated, so the panel asks for a new login after a promotion.
+- **A human token.** `$TOKEN` is a human's API token (`tok_...`) with the owner or operator role. `updateNodeRoles`, `declareNodeLost`, `ackNodeFence` and `deleteVolumeQuarantine` are human-only, and an agent is refused with `forbidden`. The end of step 6 calls `restoreBackupRepositoryKey`, which is owner-only: it needs the owner's token, `$OWNER_TOKEN`, and the owner's backup recovery key. When `$TOKEN` is the owner's, `$OWNER_TOKEN` is the same token. API tokens are replicated, so the same token works after the promotion in step 6. Panel sessions are not replicated, so the panel asks for a new login after a promotion.
 - **The demo app.** A stateful HTTP app with one volume, 256 MiB of memory, that:
   - writes a record to its volume when asked over HTTP, and
   - serves the records it holds, with the instance that answered.
@@ -94,6 +95,7 @@ Every API call goes to the primary. Until step 6, the primary is lab-2.
 ```sh
 export QUORO="https://<lab-2 address>:8443"     # the primary's base URL
 export TOKEN="tok_..."                           # a human token, never echoed
+export OWNER_TOKEN="tok_..."                     # the owner's token, for step 6c only
 # QUORO_TLS holds the curl options that trust the primary's pinned certificate.
 # A promotion keeps the same certificate. Whether the same options work against
 # lab-1's address depends on how they check the name (see Open points).
@@ -532,17 +534,40 @@ The roadmap's step 6 ends by promoting lab-2 back. The demo uses option A. Optio
 4. Wait at least 15 s, then on lab-2: `quoro cluster promote`. Expected: it waits as in 6b, then lab-2 is the primary at the next term. As in 6b, lab-1 fences the demo app once its control plane stops, and lab-2 gives the lease back to lab-1 once it holds majority support.
 5. On lab-1: `quoro node rejoin`. Its control plane was stopped by hand in step 3 and never learned of the newer term, but its agent has seen lab-2's higher term, so lab-1 counts as demoted and no `--force` is needed. If it refuses, lab-1's agent has not reached lab-2 yet: check that lab-1 is `connected` and run it again. Do not use `--force`. lab-1 is a node again.
 6. Check: `GET /api/v1/cluster` against lab-2 shows `primary_node_id` lab-2. Every machine is connected, and the demo app runs.
+7. Restore the backup repository key on lab-2, with `$QUORO` pointing at lab-2 again. The repository key never travels in the change log, so a promoted primary rebuilds the backup repository without it. Until the owner gives the recovery key back, lab-2 takes no backup, restores none and runs no garbage collection, and each scheduled backup fails with `repository key absent` ([ADR 0322](../adr/0322-how-a-promoted-primary-gets-the-backup-repository-key-back.md), [protocol section 7.3](../contracts/node-agent-protocol.md#73-promotion) step 4). The call is owner-only: it runs with `$OWNER_TOKEN`. Type the recovery key in rather than putting it on a command line: `printf` is a shell builtin, so the key reaches `jq` on its standard input and appears in no process's arguments.
+
+   ```sh
+   REPO=$(q "$QUORO/api/v1/backup-repositories" | jq -r '.items[0].id')
+   q "$QUORO/api/v1/backup-repositories/$REPO" | jq '{recovery_key_fingerprint, repository_key_present}'
+   read -rs QRK    # the owner's recovery key, qrk1-..., not echoed
+   printf '%s' "$QRK" | jq -Rs '{recovery_key: .}' |
+     TOKEN=$OWNER_TOKEN q -X POST "$QUORO/api/v1/backup-repositories/$REPO/repository-key" \
+       -H 'Content-Type: application/json' --data-binary @- |
+     jq '{id, repository_key_present, status, code, reason, detail}'
+   unset QRK
+   ```
+
+   Expected: before the call, `repository_key_present: false`. The call answers `200` with `repository_key_present: true`, and `status`, `code`, `reason` and `detail` are `null`. lab-2 checks the key's fingerprint against `recovery_key_fingerprint`, unwraps the repository key from the newest config object in the bucket, and writes it on lab-2 only ([backup format section 4](../contracts/backup-format.md#4-config-object)). The audit log has the call with `params` `{"recovery_key": "[redacted]"}`. Any other answer is a problem, with `id` and `repository_key_present` `null`:
+
+   - `403 forbidden` with `reason: scope_missing`: the token is not the owner's, for example an operator's. Set `OWNER_TOKEN` to the owner's token and run the call again.
+   - `422 validation_failed`: the `detail` says which. The key is not the repository's current recovery key (its fingerprint differs, or it opens no config object), or the bucket cannot be read. Check the fingerprint the owner holds and the bucket.
+   - `409 conflict`: lab-2 already holds the key.
+
+   If `GET /api/v1/backup-repositories` lists no repository, skip this step.
 
 This is the state the demo started from, with a higher term and two quarantined control-plane directories, one on each host.
+
+The key is also absent on lab-1 while lab-1 is the primary, from 6b until lab-2 is promoted back in step 4. The demo restores it only at the end, on lab-2: a restored key stays on the primary that received it, so a key restored on lab-1 would be absent again on lab-2 after the promotion back. Scheduled backups that fall due while lab-1 is the primary fail with `repository key absent`; that is expected.
 
 **Option B: leave lab-1 as the primary.**
 
 1. On lab-2: `quoro node rejoin`, as in option A step 1.
-2. Stop there. lab-1 is the primary and a node, and lab-2 is a node.
+2. Restore the backup repository key on lab-1, as in option A step 7, with `$QUORO` pointing at lab-1.
+3. Stop there. lab-1 is the primary and a node, and lab-2 is a node.
 
 Option B is shorter and does not run a second promotion. Every later lab session then uses lab-1's address. Option A proves promotion twice. It also leaves the lab as every other runbook expects it.
 
-**Evidence:** the outputs of each command, and `GET /api/v1/cluster` and `GET /api/v1/nodes` at the end.
+**Evidence:** the outputs of each command, the backup repository before and after the key is restored, the audit record of the restore, and `GET /api/v1/cluster` and `GET /api/v1/nodes` at the end. Never save the recovery key.
 
 ## Cleanup
 

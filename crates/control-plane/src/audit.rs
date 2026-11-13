@@ -85,7 +85,7 @@ pub struct Record {
 }
 
 /// Keys whose values are replaced at any depth (section 4).
-const REDACTED_KEYS: [&str; 8] = [
+const REDACTED_KEYS: [&str; 9] = [
     "value",
     "values",
     "secret",
@@ -94,6 +94,7 @@ const REDACTED_KEYS: [&str; 8] = [
     "new_password",
     "token",
     "key",
+    "recovery_key",
 ];
 
 /// Replaces the values of the redacted keys by `"[redacted]"`, at any depth.

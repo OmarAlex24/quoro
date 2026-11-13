@@ -10,6 +10,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::{Error, RecoveryKey, RepoKey, Result, aead};
 
@@ -80,16 +81,21 @@ pub fn unwrap_repo_key(
     let mut object = Vec::with_capacity(nonce.len() + ciphertext.len());
     object.extend_from_slice(&nonce);
     object.extend_from_slice(&ciphertext);
-    let plaintext = aead::decrypt(
+    // The plaintext is the repository key: both buffers that hold it here
+    // are wiped when they drop.
+    let plaintext = Zeroizing::new(aead::decrypt(
         recovery.wrap_key().as_bytes(),
         repository_id.as_bytes(),
         &object,
-    )?;
-    let bytes: [u8; 32] = plaintext
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::Corrupt("the wrapped repo key is not 32 bytes".into()))?;
-    Ok(RepoKey::from_bytes(bytes))
+    )?);
+    if plaintext.len() != 32 {
+        return Err(Error::Corrupt(
+            "the wrapped repo key is not 32 bytes".into(),
+        ));
+    }
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    bytes.copy_from_slice(&plaintext);
+    Ok(RepoKey::from_bytes(*bytes))
 }
 
 #[cfg(test)]

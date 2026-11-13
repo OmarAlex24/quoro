@@ -9,7 +9,7 @@ use common::{Server, problem, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_backup::{
     BackupWriter, ChunkId, Chunker, FORMAT, Manifest, RecoveryKey, RepoConfig, RepoKey, SourceKind,
-    layout, unwrap_repo_key,
+    layout, unwrap_repo_key, wrap_repo_key,
 };
 use quoro_control_plane::backups::{Bucket, BucketFactory, BucketStore, RepositoryTarget};
 use quoro_control_plane::deploy;
@@ -21,7 +21,8 @@ use quoro_providers::object_store::{MemoryStore, ObjectInfo, ObjectStore, Object
 use serde_json::{Value, json};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -576,6 +577,8 @@ struct Setup {
     volume_id: String,
     repo_id: String,
     repo_key: RepoKey,
+    /// The recovery key `createBackupRepository` answered once.
+    recovery: String,
 }
 
 async fn setup() -> Setup {
@@ -655,7 +658,7 @@ async fn setup() -> Setup {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let (repo_id, _recovery, repo_key) = create_repository(&owner, &server).await;
+    let (repo_id, recovery, repo_key) = create_repository(&owner, &server).await;
     Setup {
         server,
         owner,
@@ -665,6 +668,7 @@ async fn setup() -> Setup {
         volume_id,
         repo_id,
         repo_key,
+        recovery,
     }
 }
 
@@ -1662,6 +1666,990 @@ async fn a_scheduled_backup_without_the_repository_key_fails_at_once() {
         rows.last().unwrap(),
         &("volume".to_string(), "queued".to_string(), None)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Restoring the repository key (ADR 0322)
+// ---------------------------------------------------------------------------
+
+/// The audit operation of `restoreBackupRepositoryKey`.
+const RESTORE_KEY_OPERATION: &str =
+    "POST /api/v1/backup-repositories/{repository_id}/repository-key";
+
+/// A `MemoryStore` bucket that counts its listings and reads, and can refuse
+/// every listing or every read, so a test sees whether and how the bucket was
+/// read. With [`CountingBuckets::write_first`], its next read first writes
+/// `repo_key_enc`, as a concurrent call that restored the key would.
+#[derive(Clone)]
+struct CountingBuckets {
+    memory: Arc<MemoryStore>,
+    lists: Arc<AtomicUsize>,
+    gets: Arc<AtomicUsize>,
+    list_fails: Arc<AtomicBool>,
+    get_fails: Arc<AtomicBool>,
+    written_first: Arc<Mutex<Option<KeyWrittenFirst>>>,
+}
+
+/// A `repo_key_enc` that lands while a `restoreBackupRepositoryKey` call
+/// reads the bucket.
+struct KeyWrittenFirst {
+    pool: sqlx::SqlitePool,
+    repo_id: String,
+    blob: Vec<u8>,
+}
+
+impl CountingBuckets {
+    fn new(memory: Arc<MemoryStore>) -> Self {
+        Self {
+            memory,
+            lists: Arc::new(AtomicUsize::new(0)),
+            gets: Arc::new(AtomicUsize::new(0)),
+            list_fails: Arc::new(AtomicBool::new(false)),
+            get_fails: Arc::new(AtomicBool::new(false)),
+            written_first: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Before the next read returns, `blob` is written into `repo_id`'s
+    /// `repo_key_enc`, straight into the database and with no change-log
+    /// entry.
+    fn write_first(&self, server: &Server, repo_id: &str, blob: Vec<u8>) {
+        *self.written_first.lock().unwrap() = Some(KeyWrittenFirst {
+            pool: server.state.store.pool().clone(),
+            repo_id: repo_id.to_string(),
+            blob,
+        });
+    }
+
+    /// `(listings, reads)` so far.
+    fn reads(&self) -> (usize, usize) {
+        (
+            self.lists.load(Ordering::SeqCst),
+            self.gets.load(Ordering::SeqCst),
+        )
+    }
+}
+
+impl BucketStore for CountingBuckets {
+    fn put_new<'a>(
+        &'a self,
+        key: &'a str,
+        body: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ObjectStoreError>> + Send + 'a>> {
+        Box::pin(async move { self.memory.put_new(key, body, None).await.map(|_| ()) })
+    }
+
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ObjectStoreError>> + Send + 'a>> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        let fails = self.get_fails.load(Ordering::SeqCst);
+        let written_first = self.written_first.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(write) = written_first {
+                sqlx::query("UPDATE backup_repositories SET repo_key_enc = ? WHERE id = ?")
+                    .bind(&write.blob)
+                    .bind(&write.repo_id)
+                    .execute(&write.pool)
+                    .await
+                    .unwrap();
+            }
+            if fails {
+                return Err(ObjectStoreError::Denied("reads are refused".to_string()));
+            }
+            self.memory.get(key).await
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ObjectInfo>, ObjectStoreError>> + Send + 'a>> {
+        self.lists.fetch_add(1, Ordering::SeqCst);
+        let fails = self.list_fails.load(Ordering::SeqCst);
+        Box::pin(async move {
+            if fails {
+                return Err(ObjectStoreError::Transport(
+                    "the bucket is down".to_string(),
+                ));
+            }
+            self.memory.list(prefix).await
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ObjectStoreError>> + Send + 'a>> {
+        Box::pin(self.memory.delete(key))
+    }
+}
+
+impl BucketFactory for CountingBuckets {
+    fn open(
+        &self,
+        _target: &RepositoryTarget,
+    ) -> Result<Bucket, quoro_control_plane::error::ApiError> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+
+/// `restoreBackupRepositoryKey` with `body`, as `client` sends it.
+async fn restore_repository_key_with(
+    client: &reqwest::Client,
+    server: &Server,
+    repo_id: &str,
+    body: Value,
+) -> reqwest::Response {
+    client
+        .post(server.url(&format!(
+            "/api/v1/backup-repositories/{repo_id}/repository-key"
+        )))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// `restoreBackupRepositoryKey` with `body` as raw bytes, and `content_type`
+/// when one is given.
+async fn restore_repository_key_raw(
+    client: &reqwest::Client,
+    server: &Server,
+    repo_id: &str,
+    content_type: Option<&str>,
+    body: String,
+) -> reqwest::Response {
+    let mut request = client.post(server.url(&format!(
+        "/api/v1/backup-repositories/{repo_id}/repository-key"
+    )));
+    if let Some(content_type) = content_type {
+        request = request.header("Content-Type", content_type);
+    }
+    request.body(body).send().await.unwrap()
+}
+
+/// `restoreBackupRepositoryKey` with `recovery_key`.
+async fn restore_repository_key(
+    client: &reqwest::Client,
+    server: &Server,
+    repo_id: &str,
+    recovery_key: &str,
+) -> reqwest::Response {
+    restore_repository_key_with(
+        client,
+        server,
+        repo_id,
+        json!({ "recovery_key": recovery_key }),
+    )
+    .await
+}
+
+/// The status, `code` and whole body of a problem answer.
+async fn problem_text(res: reqwest::Response) -> (u16, String, String) {
+    let status = res.status().as_u16();
+    let text = res.text().await.unwrap();
+    let body: Value = serde_json::from_str(&text).unwrap();
+    (
+        status,
+        body["code"].as_str().unwrap_or_default().to_string(),
+        text,
+    )
+}
+
+/// The 32 bytes `repo_key_enc` holds.
+async fn held_repository_key(server: &Server, repo_id: &str) -> [u8; 32] {
+    let blob: Vec<u8> =
+        sqlx::query_scalar("SELECT repo_key_enc FROM backup_repositories WHERE id = ?")
+            .bind(repo_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    let secret = server
+        .state
+        .data_key
+        .decrypt("backup_repositories.repo_key_enc", repo_id, &blob)
+        .unwrap();
+    decode_hex32(secret.expose())
+}
+
+/// Whether `repo_key_enc` is empty.
+async fn key_is_absent(server: &Server, repo_id: &str) -> bool {
+    let length: i64 =
+        sqlx::query_scalar("SELECT length(repo_key_enc) FROM backup_repositories WHERE id = ?")
+            .bind(repo_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    length == 0
+}
+
+/// The newest change-log `seq`.
+async fn log_head(server: &Server) -> i64 {
+    sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM change_log")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
+/// `(entity_type, entity_id)` of every change-log entry after `seq`.
+async fn log_entries_after(server: &Server, seq: i64) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT entity_type, entity_id FROM change_log WHERE seq > ? ORDER BY seq")
+        .bind(seq)
+        .fetch_all(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
+/// One audit record of `restoreBackupRepositoryKey`.
+#[derive(Debug)]
+struct RestoreKeyRecord {
+    actor_type: String,
+    result: String,
+    result_detail: Option<String>,
+    scope: Option<String>,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    params: String,
+    change_seq: Option<i64>,
+}
+
+/// Every audit record of `restoreBackupRepositoryKey`, oldest first.
+async fn restore_key_records(server: &Server) -> Vec<RestoreKeyRecord> {
+    type Row = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<i64>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT actor_type, result, result_detail, scope, target_type, target_id, params, \
+         change_seq FROM audit_log WHERE operation = ? ORDER BY seq",
+    )
+    .bind(RESTORE_KEY_OPERATION)
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(
+            |(
+                actor_type,
+                result,
+                result_detail,
+                scope,
+                target_type,
+                target_id,
+                params,
+                change_seq,
+            )| {
+                RestoreKeyRecord {
+                    actor_type,
+                    result,
+                    result_detail,
+                    scope,
+                    target_type,
+                    target_id,
+                    params,
+                    change_seq,
+                }
+            },
+        )
+        .collect()
+}
+
+/// Asserts that no change-log payload, audit record, event or answer in
+/// `texts` holds any of `recovery_keys`, in upper or lower case, or the
+/// repository key, in hex or in standard base64.
+async fn assert_no_key_anywhere(
+    server: &Server,
+    recovery_keys: &[&str],
+    repo_key: &RepoKey,
+    texts: &[String],
+) {
+    let repo_hex: String = repo_key
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let repo_base64 = base64_of(repo_key.as_bytes());
+    let recovery_forms: Vec<String> = recovery_keys
+        .iter()
+        .flat_map(|key| [key.to_string(), key.to_lowercase()])
+        .collect();
+    let pool = server.state.store.pool();
+    let mut all: Vec<String> = texts.to_vec();
+    all.extend(
+        sqlx::query_scalar::<_, String>("SELECT payload FROM change_log")
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+    );
+    let audits: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT params, result_detail, justification FROM audit_log")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    all.extend(
+        audits
+            .into_iter()
+            .map(|(params, detail, justification)| format!("{params}{detail:?}{justification:?}")),
+    );
+    all.extend(
+        sqlx::query_scalar::<_, String>("SELECT data FROM events")
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+    );
+    for text in &all {
+        for recovery in &recovery_forms {
+            assert!(!text.contains(recovery), "a recovery key leaked: {text}");
+        }
+        assert!(
+            !text.contains(&repo_hex) && !text.contains(&repo_base64),
+            "the repository key leaked: {text}"
+        );
+    }
+}
+
+/// An access token of a new agent the owner owns.
+async fn agent_token(owner: &reqwest::Client, server: &Server) -> String {
+    let me: Value = owner
+        .get(server.url("/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let agent: Value = owner
+        .post(server.url("/api/v1/agents"))
+        .json(&json!({
+            "name": "backup-keys",
+            "model": "test-model",
+            "owner_user_id": me["user"]["id"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let key: Value = owner
+        .post(server.url(&format!(
+            "/api/v1/agents/{}/keys",
+            agent["id"].as_str().unwrap()
+        )))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token: Value = reqwest::Client::new()
+        .post(server.url("/api/v1/auth/agent-token"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", key["key"].as_str().unwrap()),
+        )
+        .header("Quoro-Justification", "tests need a token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    token["access_token"].as_str().unwrap().to_string()
+}
+
+/// `backup-format.md` section 4, "Restoring the key on a primary" (ADR 0322):
+/// on a primary without the key, the owner's recovery key puts the same
+/// repository key back on this primary. The call appends no change-log entry
+/// but the audit record's own, whose `params` are
+/// `{"recovery_key": "[redacted]"}`. Backups run again, and a second call
+/// answers `conflict`.
+#[tokio::test]
+async fn the_recovery_key_restores_the_repository_key_and_backups_run_again() {
+    let mut setup = setup().await;
+    let recovery = setup.recovery.clone();
+    drop_repository_key(&setup.server, &setup.repo_id).await;
+    key_absent_conflict(
+        setup
+            .owner
+            .post(
+                setup
+                    .server
+                    .url(&format!("/api/v1/apps/{}/backups", setup.app_id)),
+            )
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mut texts = Vec::new();
+
+    let head = log_head(&setup.server).await;
+    let res = restore_repository_key(&setup.owner, &setup.server, &setup.repo_id, &recovery).await;
+    let status = res.status();
+    let text = res.text().await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    texts.push(text);
+    assert_eq!(body["id"], setup.repo_id.as_str());
+    assert_eq!(body["repository_key_present"], true);
+    assert!(body.get("recovery_key").is_none(), "{body}");
+
+    // The same key, wrapped under the data key on this primary.
+    assert_eq!(
+        &held_repository_key(&setup.server, &setup.repo_id).await,
+        setup.repo_key.as_bytes()
+    );
+    // One change-log entry: the audit record's own. No entry for the row.
+    let entries = log_entries_after(&setup.server, head).await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].0, "audit", "{entries:?}");
+    let records = restore_key_records(&setup.server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record.actor_type, "user");
+    assert_eq!(record.result, "ok");
+    assert_eq!(record.result_detail, None);
+    assert_eq!(record.scope.as_deref(), Some("backup:manage"));
+    assert_eq!(record.target_type.as_deref(), Some("backup_repository"));
+    assert_eq!(record.target_id.as_deref(), Some(setup.repo_id.as_str()));
+    assert_eq!(
+        serde_json::from_str::<Value>(&record.params).unwrap(),
+        json!({ "recovery_key": "[redacted]" })
+    );
+    assert_eq!(record.change_seq, None);
+
+    let res = setup
+        .owner
+        .get(
+            setup
+                .server
+                .url(&format!("/api/v1/backup-repositories/{}", setup.repo_id)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.json::<Value>().await.unwrap()["repository_key_present"],
+        true
+    );
+
+    // `createBackup` is accepted again and the backup seals.
+    run_backup(&mut setup, &vec![7u8; 300 * 1024]).await;
+
+    // A second call: this primary holds the key.
+    let blob: Vec<u8> =
+        sqlx::query_scalar("SELECT repo_key_enc FROM backup_repositories WHERE id = ?")
+            .bind(&setup.repo_id)
+            .fetch_one(setup.server.state.store.pool())
+            .await
+            .unwrap();
+    let (status, code, text) = problem_text(
+        restore_repository_key(&setup.owner, &setup.server, &setup.repo_id, &recovery).await,
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{text}");
+    texts.push(text);
+    let after: Vec<u8> =
+        sqlx::query_scalar("SELECT repo_key_enc FROM backup_repositories WHERE id = ?")
+            .bind(&setup.repo_id)
+            .fetch_one(setup.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(after, blob);
+    let records = restore_key_records(&setup.server).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1].result, "error");
+    assert_eq!(records[1].result_detail.as_deref(), Some("conflict"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&records[1].params).unwrap(),
+        json!({ "recovery_key": "[redacted]" })
+    );
+
+    assert_no_key_anywhere(&setup.server, &[&recovery], &setup.repo_key, &texts).await;
+}
+
+/// Step 1 is checked before the bucket is read. A malformed key, a key that
+/// matches the fingerprint but opens no config object, a bucket that cannot
+/// be listed and an unknown repository are refused too. Until the right call,
+/// the key stays absent, only audit records enter the change log, and each
+/// call is audited with the recovery key redacted.
+#[tokio::test]
+async fn restoring_the_repository_key_refuses_what_does_not_open_it() {
+    let server = start_with_patient_node_session().await;
+    let memory = Arc::new(MemoryStore::new());
+    let buckets = CountingBuckets::new(Arc::clone(&memory));
+    server.state.backups.set_factory(Arc::new(buckets.clone()));
+    let owner = server.owner().await;
+    let (repo_id, recovery, repo_key) = create_repository(&owner, &server).await;
+    drop_repository_key(&server, &repo_id).await;
+    let head = log_head(&server).await;
+    let mut texts = Vec::new();
+    let mut audited = 0;
+
+    // A well-formed key of another repository: its fingerprint differs, and
+    // the bucket is not read.
+    let other = RecoveryKey::generate().to_text();
+    let reads = buckets.reads();
+    let (status, code, text) =
+        problem_text(restore_repository_key(&owner, &server, &repo_id, &other).await).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (422, "validation_failed"),
+        "{text}"
+    );
+    assert!(text.contains("fingerprint"), "{text}");
+    assert_eq!(buckets.reads(), reads, "the bucket was read");
+    texts.push(text);
+    audited += 1;
+
+    // Keys that do not match the request pattern or have nonzero padding
+    // bits (`backup-format.md` section 3), and bodies without a key.
+    let malformed = [
+        recovery.to_lowercase(),
+        recovery[..recovery.len() - 1].to_string(),
+        recovery.replace('-', ""),
+        format!("qrk1-Z{}", &recovery[6..]),
+        format!(" {recovery}"),
+        String::new(),
+    ];
+    for bad in &malformed {
+        let (status, code, text) =
+            problem_text(restore_repository_key(&owner, &server, &repo_id, bad).await).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (422, "validation_failed"),
+            "{bad}: {text}"
+        );
+        texts.push(text);
+        audited += 1;
+    }
+    // Bodies that are not a JSON object with a `recovery_key` string. Each
+    // answer has the same fixed detail, which quotes nothing of the body:
+    // a bare JSON string (`jq -R .`) or an array holds the key itself. As on
+    // every operation, a body that is not read as the request is refused
+    // before the call is authorized, so it has no audit record.
+    let fixed = "the body must be a JSON object with a recovery_key string, \
+                 sent as application/json";
+    let json_bodies = [
+        json!({}),
+        json!({ "recovery_key": 5 }),
+        json!({ "recovery_key": [recovery] }),
+        json!({ "recovery": recovery }),
+        // The key as a field name.
+        Value::Object(serde_json::Map::from_iter([(
+            recovery.clone(),
+            json!("recovery_key"),
+        )])),
+        json!(recovery),
+        json!([recovery]),
+        json!([recovery, recovery]),
+    ];
+    let mut answers = Vec::new();
+    for body in json_bodies {
+        let shown = body.to_string();
+        answers.push((
+            shown,
+            restore_repository_key_with(&owner, &server, &repo_id, body).await,
+        ));
+    }
+    for (content_type, body) in [
+        // Not JSON at all: the key as plain text, or cut short.
+        (Some("application/json"), recovery.clone()),
+        (Some("application/json"), format!("\"{recovery}")),
+        (
+            Some("application/json"),
+            format!("{{\"recovery_key\": \"{recovery}"),
+        ),
+        // A JSON body sent without its media type.
+        (
+            Some("text/plain"),
+            json!({ "recovery_key": recovery }).to_string(),
+        ),
+        (None, json!(recovery).to_string()),
+        // The same key twice in one object.
+        (
+            Some("application/json"),
+            format!("{{\"recovery_key\": \"{recovery}\", \"recovery_key\": \"{recovery}\"}}"),
+        ),
+    ] {
+        let shown = format!("{content_type:?} {body}");
+        answers.push((
+            shown,
+            restore_repository_key_raw(&owner, &server, &repo_id, content_type, body).await,
+        ));
+    }
+    for (shown, res) in answers {
+        let (status, code, text) = problem_text(res).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (422, "validation_failed"),
+            "{shown}: {text}"
+        );
+        let problem: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(problem["detail"], fixed, "{shown}: {text}");
+        assert!(!text.contains(&recovery[5..]), "{shown}: {text}");
+        texts.push(text);
+    }
+    assert_eq!(buckets.reads(), reads, "the bucket was read");
+    assert_eq!(
+        restore_key_records(&server).await.len(),
+        audited,
+        "a refused body was audited"
+    );
+
+    // The fingerprint matches, but config-1 holds a repository key wrapped
+    // under another key.
+    let config_key = format!("{}config-1.json", root(&server));
+    let original = memory.get(&config_key).await.unwrap();
+    let mut config: RepoConfig = serde_json::from_slice(&original).unwrap();
+    config.wrapped_repo_key =
+        wrap_repo_key(&RepoKey::generate(), &RecoveryKey::generate(), &repo_id);
+    memory
+        .put_overwrite(&config_key, serde_json::to_vec(&config).unwrap())
+        .await
+        .unwrap();
+    let (status, code, text) =
+        problem_text(restore_repository_key(&owner, &server, &repo_id, &recovery).await).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (422, "validation_failed"),
+        "{text}"
+    );
+    assert!(text.contains("opens no config object"), "{text}");
+    assert_eq!(buckets.reads(), (reads.0 + 1, reads.1 + 1));
+    texts.push(text);
+    audited += 1;
+
+    // No config object at all.
+    memory.delete(&config_key).await.unwrap();
+    let (status, code, text) =
+        problem_text(restore_repository_key(&owner, &server, &repo_id, &recovery).await).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (422, "validation_failed"),
+        "{text}"
+    );
+    assert!(text.contains("opens no config object"), "{text}");
+    texts.push(text);
+    audited += 1;
+
+    // The bucket cannot be listed.
+    memory
+        .put_overwrite(&config_key, original.clone())
+        .await
+        .unwrap();
+    buckets.list_fails.store(true, Ordering::SeqCst);
+    let (status, code, text) =
+        problem_text(restore_repository_key(&owner, &server, &repo_id, &recovery).await).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (422, "validation_failed"),
+        "{text}"
+    );
+    assert!(text.contains("cannot read the bucket"), "{text}");
+    texts.push(text);
+    audited += 1;
+    buckets.list_fails.store(false, Ordering::SeqCst);
+
+    // The listing names config-1, but it cannot be read: the bucket is not
+    // readable, which is not a key that opens nothing.
+    buckets.get_fails.store(true, Ordering::SeqCst);
+    let (status, code, text) =
+        problem_text(restore_repository_key(&owner, &server, &repo_id, &recovery).await).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (422, "validation_failed"),
+        "{text}"
+    );
+    let problem: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        problem["detail"],
+        "cannot read the bucket: a config object could not be read: denied: reads are refused",
+        "{text}"
+    );
+    texts.push(text);
+    audited += 1;
+    buckets.get_fails.store(false, Ordering::SeqCst);
+
+    // Unknown repositories.
+    for unknown in ["brp_01JCA0A2B3C4D5E6F7G8H9J0KM", "brp_nope"] {
+        assert_ne!(unknown, repo_id);
+        let (status, code, text) =
+            problem_text(restore_repository_key(&owner, &server, unknown, &recovery).await).await;
+        assert_eq!((status, code.as_str()), (404, "not_found"), "{text}");
+        texts.push(text);
+        audited += 1;
+    }
+
+    // Nothing changed: the key is absent, and only audit records were
+    // appended to the change log.
+    assert!(key_is_absent(&server, &repo_id).await);
+    let entries = log_entries_after(&server, head).await;
+    assert_eq!(entries.len(), audited, "{entries:?}");
+    assert!(
+        entries.iter().all(|(kind, _)| kind == "audit"),
+        "{entries:?}"
+    );
+    let records = restore_key_records(&server).await;
+    assert_eq!(records.len(), audited, "{records:?}");
+    for record in &records {
+        assert_eq!(record.result, "error", "{record:?}");
+        assert_eq!(record.scope.as_deref(), Some("backup:manage"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&record.params).unwrap(),
+            json!({ "recovery_key": "[redacted]" })
+        );
+    }
+
+    // With the config object back and the bucket readable, the same key
+    // restores the repository key.
+    let res = restore_repository_key(&owner, &server, &repo_id, &recovery).await;
+    let status = res.status();
+    let text = res.text().await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    texts.push(text);
+    assert_eq!(
+        &held_repository_key(&server, &repo_id).await,
+        repo_key.as_bytes()
+    );
+
+    assert_no_key_anywhere(&server, &[&recovery, &other], &repo_key, &texts).await;
+}
+
+/// Step 3's write is guarded: when another call writes `repo_key_enc` after
+/// this one found it empty, here while it reads config-1, this call answers
+/// `409 conflict`. The key the other call wrote stays as it was, and the one
+/// change-log entry is this call's audit record, an `error` with the
+/// recovery key redacted.
+#[tokio::test]
+async fn a_key_written_while_the_call_reads_the_bucket_answers_conflict() {
+    let server = start_with_patient_node_session().await;
+    let memory = Arc::new(MemoryStore::new());
+    let buckets = CountingBuckets::new(Arc::clone(&memory));
+    server.state.backups.set_factory(Arc::new(buckets.clone()));
+    let owner = server.owner().await;
+    let (repo_id, recovery, repo_key) = create_repository(&owner, &server).await;
+    let blob = drop_repository_key(&server, &repo_id).await;
+    buckets.write_first(&server, &repo_id, blob.clone());
+    let head = log_head(&server).await;
+    let reads = buckets.reads();
+
+    let (status, code, text) =
+        problem_text(restore_repository_key(&owner, &server, &repo_id, &recovery).await).await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{text}");
+    // The call found the key absent and read the bucket: the guarded write,
+    // not the first check, refused it.
+    assert_eq!(buckets.reads(), (reads.0 + 1, reads.1 + 1));
+    assert!(buckets.written_first.lock().unwrap().is_none());
+
+    let after: Vec<u8> =
+        sqlx::query_scalar("SELECT repo_key_enc FROM backup_repositories WHERE id = ?")
+            .bind(&repo_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(after, blob, "the key written first was replaced");
+
+    let entries = log_entries_after(&server, head).await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].0, "audit", "{entries:?}");
+    let records = restore_key_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record.actor_type, "user");
+    assert_eq!(record.result, "error");
+    assert_eq!(record.result_detail.as_deref(), Some("conflict"));
+    assert_eq!(record.scope.as_deref(), Some("backup:manage"));
+    assert_eq!(record.target_type.as_deref(), Some("backup_repository"));
+    assert_eq!(record.target_id.as_deref(), Some(repo_id.as_str()));
+    assert_eq!(
+        serde_json::from_str::<Value>(&record.params).unwrap(),
+        json!({ "recovery_key": "[redacted]" })
+    );
+    assert_eq!(record.change_seq, None);
+
+    assert_no_key_anywhere(&server, &[&recovery], &repo_key, &[text]).await;
+}
+
+/// `backup:manage` is human-only and owner-only (permission-model.md
+/// sections 3 and 4.2): an agent is refused with `human_only`, an operator
+/// with `forbidden`. Neither reads the bucket, and the key stays absent.
+#[tokio::test]
+async fn only_an_owner_restores_the_repository_key() {
+    let server = start_with_patient_node_session().await;
+    let memory = Arc::new(MemoryStore::new());
+    let buckets = CountingBuckets::new(Arc::clone(&memory));
+    server.state.backups.set_factory(Arc::new(buckets.clone()));
+    let owner = server.owner().await;
+    let (repo_id, recovery, repo_key) = create_repository(&owner, &server).await;
+    drop_repository_key(&server, &repo_id).await;
+    let reads = buckets.reads();
+    let mut texts = Vec::new();
+
+    let token = agent_token(&owner, &server).await;
+    let res = reqwest::Client::new()
+        .post(server.url(&format!(
+            "/api/v1/backup-repositories/{repo_id}/repository-key"
+        )))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Quoro-Justification", "restore the backup key")
+        .json(&json!({ "recovery_key": recovery }))
+        .send()
+        .await
+        .unwrap();
+    let (status, code, text) = problem_text(res).await;
+    assert_eq!((status, code.as_str()), (403, "forbidden"), "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["reason"], "human_only", "{text}");
+    texts.push(text);
+
+    server
+        .insert_user("operator@example.com", "operator password one", "operator")
+        .await;
+    let operator = server.client();
+    server
+        .login(&operator, "operator@example.com", "operator password one")
+        .await;
+    let (status, code, text) =
+        problem_text(restore_repository_key(&operator, &server, &repo_id, &recovery).await).await;
+    assert_eq!((status, code.as_str()), (403, "forbidden"), "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["reason"], "scope_missing", "{text}");
+    texts.push(text);
+
+    assert_eq!(buckets.reads(), reads, "the bucket was read");
+    assert!(key_is_absent(&server, &repo_id).await);
+    let records = restore_key_records(&server).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].actor_type, "agent");
+    assert_eq!(records[1].actor_type, "user");
+    for record in &records {
+        assert_eq!(record.result, "refused", "{record:?}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&record.params).unwrap(),
+            json!({ "recovery_key": "[redacted]" })
+        );
+    }
+    assert_eq!(records[0].result_detail.as_deref(), Some("human_only"));
+    assert_eq!(records[1].result_detail.as_deref(), Some("scope_missing"));
+
+    assert_no_key_anywhere(&server, &[&recovery], &repo_key, &texts).await;
+}
+
+/// After `rotateBackupRecoveryKey` wrote config-2, the test removes the older
+/// config to check the fingerprint refusal: the new recovery key restores the
+/// key and the old one is refused by its fingerprint. The restored key
+/// rotates again: config-3 opens to the same repository key.
+#[tokio::test]
+async fn the_rotated_recovery_key_restores_the_repository_key() {
+    let server = start_with_patient_node_session().await;
+    let memory = Arc::new(MemoryStore::new());
+    server
+        .state
+        .backups
+        .set_factory(Arc::new(MemoryBuckets(Arc::clone(&memory))));
+    let owner = server.owner().await;
+    let (repo_id, old, repo_key) = create_repository(&owner, &server).await;
+    let rotate = |client: reqwest::Client, url: String| async move {
+        let res = client.post(url).send().await.unwrap();
+        assert_eq!(res.status(), 200, "rotate: {}", res.text().await.unwrap());
+        res.json::<Value>().await.unwrap()["recovery_key"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let rotate_url = server.url(&format!(
+        "/api/v1/backup-repositories/{repo_id}/recovery-key"
+    ));
+    let new = rotate(owner.clone(), rotate_url.clone()).await;
+    memory
+        .delete(&format!("{}config-1.json", root(&server)))
+        .await
+        .unwrap();
+    drop_repository_key(&server, &repo_id).await;
+    let mut texts = Vec::new();
+
+    let (status, code, text) =
+        problem_text(restore_repository_key(&owner, &server, &repo_id, &old).await).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (422, "validation_failed"),
+        "{text}"
+    );
+    assert!(text.contains("fingerprint"), "{text}");
+    texts.push(text);
+    assert!(key_is_absent(&server, &repo_id).await);
+
+    let res = restore_repository_key(&owner, &server, &repo_id, &new).await;
+    let status = res.status();
+    let text = res.text().await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    texts.push(text);
+    assert_eq!(
+        &held_repository_key(&server, &repo_id).await,
+        repo_key.as_bytes()
+    );
+
+    let newer = rotate(owner.clone(), rotate_url).await;
+    let bytes = memory
+        .get(&format!("{}config-3.json", root(&server)))
+        .await
+        .unwrap();
+    let config: RepoConfig = serde_json::from_slice(&bytes).unwrap();
+    let opened = unwrap_repo_key(
+        &config.wrapped_repo_key,
+        &RecoveryKey::parse(&newer).unwrap(),
+        &repo_id,
+    )
+    .unwrap();
+    assert_eq!(opened.as_bytes(), repo_key.as_bytes());
+
+    assert_no_key_anywhere(&server, &[&old, &new], &repo_key, &texts).await;
+}
+
+/// `audit-log-format.md` section 4: `recovery_key` is redacted at any depth,
+/// and the request's `Debug` prints no key.
+#[test]
+fn a_recovery_key_is_redacted_in_the_audit_and_in_debug_output() {
+    let key = RecoveryKey::generate().to_text();
+    let redacted = quoro_control_plane::audit::redact(&json!({
+        "recovery_key": key,
+        "nested": [{ "recovery_key": key }],
+        "name": "kept",
+    }));
+    assert_eq!(
+        redacted,
+        json!({
+            "recovery_key": "[redacted]",
+            "nested": [{ "recovery_key": "[redacted]" }],
+            "name": "kept",
+        })
+    );
+    let request: quoro_control_plane::api::backups::RestoreBackupRepositoryKeyRequest =
+        serde_json::from_value(json!({ "recovery_key": key })).unwrap();
+    let printed = format!("{request:?}");
+    assert!(!printed.contains(&key), "{printed}");
+    assert_eq!(request.recovery_key.expose(), key);
+    // Only an object is the request: an array, which a derived
+    // `Deserialize` reads into a struct, and a bare string are not.
+    type Request = quoro_control_plane::api::backups::RestoreBackupRepositoryKeyRequest;
+    assert!(serde_json::from_value::<Request>(json!([key])).is_err());
+    assert!(serde_json::from_value::<Request>(json!(key)).is_err());
+    assert!(serde_json::from_str::<Request>(&format!("[\"{key}\"]")).is_err());
+    let extra: Request =
+        serde_json::from_value(json!({ "recovery_key": key, "note": [1, { "a": null }] })).unwrap();
+    assert_eq!(extra.recovery_key.expose(), key);
+    let parsed = RecoveryKey::parse(&key).unwrap();
+    assert!(!format!("{parsed:?}").contains(&key));
 }
 
 #[tokio::test]

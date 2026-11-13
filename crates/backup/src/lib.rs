@@ -11,7 +11,8 @@
 //! Nothing here talks to object storage. The node or primary that took a
 //! backup feeds snapshot bytes through [`chunks`] and [`BackupWriter`] and
 //! uploads the objects it returns; a restore reads them back and feeds them to
-//! [`Restorer`].
+//! [`Restorer`]. [`open_newest_config`] reads the config objects through a
+//! callback its caller gives, so it too stays off any object-store client.
 
 use std::fmt;
 
@@ -33,7 +34,7 @@ mod writer;
 
 pub use chunk::{ChunkId, chunk_id, open_chunk, seal_chunk};
 pub use chunking::{Chunk, chunks};
-pub use config::RepoConfig;
+pub use config::{OpenConfigError, RepoConfig, config_keys_newest_first, open_newest_config};
 pub use key::{Key, RepoKey, SourceKeys};
 pub use manifest::{
     Chunker, Manifest, ManifestChunk, SourceKind, decrypt_manifest, encrypt_manifest,

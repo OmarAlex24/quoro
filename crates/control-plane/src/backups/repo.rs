@@ -7,7 +7,9 @@
 //! repository key and the owner's recovery key, writes `config-1.json` with
 //! the repository key wrapped under the recovery key, and stores the same
 //! repository key under the cluster data-encryption key. The recovery key is
-//! answered once and never stored; rotating it writes `config-<n+1>.json`.
+//! answered once and never stored; rotating it writes `config-<n+1>.json`. A
+//! primary that does not hold the repository key, as after a promotion, gets
+//! it back from the recovery key with [`restore_key`] (ADR 0322).
 
 use crate::AppState;
 use crate::api::apps::BackupSchedule;
@@ -589,6 +591,156 @@ pub(crate) async fn rotate(
     .await?;
     w.commit().await?;
     Ok((repository, recovery.to_text()))
+}
+
+/// `RestoreBackupRepositoryKeyRequest.recovery_key`'s pattern,
+/// `^qrk1(-[0-9A-HJKMNP-TV-Z]{4}){13}$`: the text form of section 3 exactly as
+/// `createBackupRepository` and `rotateBackupRecoveryKey` answer it.
+fn is_recovery_key_text(text: &str) -> bool {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let Some(groups) = text.strip_prefix("qrk1") else {
+        return false;
+    };
+    groups.len() == 13 * 5
+        && groups.as_bytes().chunks(5).all(|group| {
+            group[0] == b'-' && group[1..].iter().all(|symbol| ALPHABET.contains(symbol))
+        })
+}
+
+/// The recovery key of a `restoreBackupRepositoryKey` request, parsed into
+/// its zeroizing form. Neither the text nor any part of it reaches the error.
+///
+/// # Errors
+///
+/// `validation_failed` when the text does not match the request pattern or
+/// has nonzero padding bits (`backup-format.md` section 3).
+pub(crate) fn parse_recovery_key(text: &str) -> Result<RecoveryKey, ApiError> {
+    if !is_recovery_key_text(text) {
+        return Err(ApiError::validation(
+            "recovery_key is not a recovery key: qrk1- and 13 groups of 4 symbols",
+        ));
+    }
+    RecoveryKey::parse(text)
+        .map_err(|_| ApiError::validation("recovery_key is not a valid recovery key"))
+}
+
+/// Restores the repository key on this primary from the recovery key
+/// (`openapi.yaml` `restoreBackupRepositoryKey`, `backup-format.md` section
+/// 4, "Restoring the key on a primary", ADR 0322):
+///
+/// 1. the recovery key's fingerprint must equal the row's
+///    `recovery_key_fingerprint`, checked before the bucket is read;
+/// 2. `repo_key` is unwrapped from the newest config object of this
+///    repository the recovery key opens, with the reader `quoro restore`
+///    uses ([`quoro_backup::open_newest_config`]);
+/// 3. `repo_key_enc` is written on this primary's row only, and only while it
+///    is still empty. The write appends no change-log entry, so no follower
+///    and no later primary receives the key; the audit record, whose
+///    `params` are `{"recovery_key": "[redacted]"}`, is the call's one entry.
+///
+/// No error carries the recovery key, the repository key or the content of a
+/// config object.
+///
+/// # Errors
+///
+/// `not_found` for an unknown repository, `conflict` when this primary
+/// already holds the key (also when a concurrent call wrote it first),
+/// `validation_failed` when the fingerprint differs, the bucket cannot be
+/// read or no config object opens with the key, or a database error.
+pub(crate) async fn restore_key(
+    state: &AppState,
+    ctx: &CallCtx,
+    repository_id: &str,
+    recovery: &RecoveryKey,
+    params: &Value,
+) -> Result<Repository, ApiError> {
+    if !crate::deploy::is_id_with_prefix("brp", repository_id) {
+        return Err(ApiError::not_found("backup repository"));
+    }
+    let mut repository = by_id(&state.store, repository_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("backup repository"))?;
+    if repository.holds_key() {
+        return Err(key_present_conflict());
+    }
+    // Step 1, before the bucket is read.
+    if recovery.fingerprint() != repository.recovery_key_fingerprint {
+        return Err(ApiError::validation(
+            "the recovery key's fingerprint differs from the repository's recovery_key_fingerprint",
+        ));
+    }
+    // Step 2.
+    let target = target(&state.store, &state.data_key, &repository).await?;
+    let bucket = state.backups.open_bucket(&target).map_err(|_| {
+        ApiError::validation("cannot read the bucket: the object-store client cannot be built")
+    })?;
+    let listed = bucket
+        .list(&object_key(&target.root, "config-"))
+        .await
+        .map_err(|error| {
+            ApiError::validation(format!(
+                "cannot read the bucket: cannot list the config objects: {}",
+                short(&error)
+            ))
+        })?;
+    let (_, repo_key) = quoro_backup::open_newest_config(
+        &target.root,
+        listed.into_iter().map(|object| object.key),
+        &state.cluster_id,
+        Some(repository_id),
+        recovery,
+        |key| {
+            let bucket = std::sync::Arc::clone(&bucket);
+            async move { bucket.get(&key).await }
+        },
+    )
+    .await
+    .map_err(|error| {
+        if matches!(error, quoro_backup::OpenConfigError::Unreadable(_)) {
+            // A listed config object could not be read, and none read opened.
+            let reason: String = error.to_string().chars().take(200).collect();
+            ApiError::validation(format!("cannot read the bucket: {reason}"))
+        } else {
+            ApiError::validation(error.to_string())
+        }
+    })?;
+
+    // Step 3: this row only, with no change-log entry, and only while no other
+    // call restored the key first.
+    let repo_key_enc = encrypt_repo_key(&state.data_key, repository_id, &repo_key);
+    drop(repo_key);
+    let mut w = state.store.begin_write().await?;
+    let written = sqlx::query(
+        "UPDATE backup_repositories SET repo_key_enc = ? \
+         WHERE id = ? AND length(repo_key_enc) = 0",
+    )
+    .bind(&repo_key_enc)
+    .bind(repository_id)
+    .execute(&mut *w.tx)
+    .await?
+    .rows_affected();
+    if written == 0 {
+        // The transaction rolls back when `w` drops.
+        return Err(key_present_conflict());
+    }
+    ctx.append_ok(
+        &mut w.tx,
+        Some(quoro_types::Scope::BackupManage),
+        Some(&repository_target(repository_id)),
+        None,
+        params,
+        None,
+    )
+    .await?;
+    w.commit().await?;
+    repository.repo_key_enc = repo_key_enc;
+    Ok(repository)
+}
+
+/// The `conflict` of `restoreBackupRepositoryKey` on a primary that holds
+/// the key.
+fn key_present_conflict() -> ApiError {
+    ApiError::conflict("this primary already holds the backup repository key")
 }
 
 /// The highest existing `config-<n>.json` counter, or 0.
