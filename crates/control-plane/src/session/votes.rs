@@ -11,7 +11,9 @@
 //!   that says so. No request goes to a machine that is not a voter.
 //! - **What.** `term` is the cluster term, `primary_node_id` the one this
 //!   session's `welcome` carried, `support_ms` is `S`, `max_lease_ms` is `D`,
-//!   and `voters_version` the version read when the request is built.
+//!   or `W` while a maintenance window is opening or open (section 8.11), and
+//!   `voters_version` the version read when the request is built. A window
+//!   that starts opening, fails or ends sends every voter a request at once.
 //! - **Answers.** A `support_grant` goes to the tracker
 //!   ([`crate::support::SupportTracker`]), which counts it or ignores it. An
 //!   `error` that answers a request is logged and counts nothing. A
@@ -19,7 +21,6 @@
 //!   primary (sections 7.4 and 8.8, "Terms").
 
 use super::{NodeHub, Session, cluster_term, new_msg_id};
-use crate::authority::DEFAULT_DURATION_MS;
 use crate::error::ApiError;
 use crate::support::{Answer, REQUEST_INTERVAL, SUPPORT_MS};
 use quoro_proto::wire::{self, ControlMessage};
@@ -421,7 +422,9 @@ impl Session {
             term,
             primary_node_id,
             support_ms: SUPPORT_MS,
-            max_lease_ms: DEFAULT_DURATION_MS,
+            // `D`, or `W` while a maintenance window is opening or open
+            // (sections 5.27 and 8.11).
+            max_lease_ms: self.hub.support_lease_ms(),
             voters_version: set.version,
         };
         let msg_id = new_msg_id();

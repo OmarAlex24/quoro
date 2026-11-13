@@ -7,11 +7,13 @@
 //! so the `match` below is less code than a parser. Every other command line
 //! goes to the client CLI (`quoro_cli`), which talks to a primary's API; the
 //! hand-offs are the unknown-command arm, `mcp` other than `mcp stdio`, `audit`
-//! other than `verify`, and `--help`.
+//! other than `verify`, `cluster` other than `cluster maintenance`, and
+//! `--help`.
 
 mod advertise;
 mod audit_cli;
 mod config;
+mod control;
 mod mcp_stdio;
 mod node;
 mod null_engine;
@@ -53,6 +55,12 @@ commands:
                                         as root on a demoted primary: move its
                                         control plane aside into a copy and
                                         make the host a node again
+  cluster maintenance [--duration SECONDS]
+  cluster maintenance --end             as root on the primary's host, before
+                                        a planned restart: answer expiring
+                                        leases with SECONDS (15 to 600,
+                                        default 180) so warm apps survive it;
+                                        --end goes back to the default
   mcp stdio --context NAME [--url URL] [--fingerprint FINGERPRINT]
             [--key-file PATH] [--justification TEXT]
   mcp stdio --url URL --fingerprint FINGERPRINT --key-file PATH
@@ -128,6 +136,12 @@ async fn main() -> ExitCode {
         "setup-token" => issue_token(rest).await,
         "join" => join_command(rest).await,
         "node" => node_command(rest).await,
+        // `cluster maintenance` reaches the primary on this host over its
+        // control socket (section 8.11); every other `cluster` command is
+        // the client's.
+        "cluster" if rest.first().is_some_and(|word| word == "maintenance") => {
+            control::maintenance_command(&rest[1..]).await
+        }
         "audit" => audit_cli::run(rest).await,
         "vuln" => vuln_cli::run(rest).await,
         "restore" => {

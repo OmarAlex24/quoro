@@ -482,6 +482,15 @@ impl Authority {
         (now < open).then(|| open - now)
     }
 
+    /// Whether this process holds a gate for `lease_id`: one seeded at its
+    /// start ([`Authority::seed`]) or recorded by a grant since. A lease
+    /// without one is lowered by nothing that needs [`Authority::may_lower`]
+    /// to be sure no longer grant is still running (section 8.11).
+    #[must_use]
+    pub fn has_gate(&self, lease_id: &str) -> bool {
+        self.gates().contains_key(lease_id)
+    }
+
     /// Whether the stored `duration_ms` of `lease_id` may be lowered to
     /// `to_ms`: the gate of every grant longer than that has passed (ADR
     /// 0203). A lease with no gate had no `expiring` grant in this process

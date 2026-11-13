@@ -10,6 +10,10 @@
 //! with this listener over loopback through the same join token and session
 //! as any other node (one code path for every node). The privilege split
 //! (ADR 0089) turns that off and runs the agent as its own service.
+//!
+//! A primary also opens its local control socket, `/run/quoro/control.sock`,
+//! for `quoro cluster maintenance` (`node-agent-protocol.md` section 8.11,
+//! [`crate::control`]). A demoted primary opens none.
 
 use crate::config::{Config, EngineKind};
 use crate::node::{self, EX_CONFIG};
@@ -161,6 +165,20 @@ pub async fn run(config: Config, skip_upgrade_backup: bool) -> Result<i32, Strin
         ensure_local_join(&config.data_dir, &loopback, &material.fingerprint)
             .map_err(|e| format!("cannot write the local node's join file: {e}"))?;
     }
+    // Section 8.11: `quoro cluster maintenance` reaches this primary over its
+    // local control socket. Without it the primary serves on, and the command
+    // fails, which the installer reports and goes past. After a window, the
+    // stored lease durations go back to `D` once the longer gates passed.
+    let control = match crate::control::listen(&crate::control::socket_path(), state.hub.clone()) {
+        Ok(control) => Some(control),
+        Err(e) => {
+            warn!(
+                "no control socket, so 'quoro cluster maintenance' cannot reach this primary: {e}"
+            );
+            None
+        }
+    };
+    state.hub.spawn_duration_lowering();
     let local_node = start_local_node(&config, stop_rx);
     let served = serve_until_stopped(
         listener,
@@ -170,6 +188,7 @@ pub async fn run(config: Config, skip_upgrade_backup: bool) -> Result<i32, Strin
         local_node,
     )
     .await;
+    drop(control);
     // A demotion whose record is still being retried gets one last attempt,
     // so a clean stop does not come back as a primary
     // (`node-agent-protocol.md` section 7.4).
