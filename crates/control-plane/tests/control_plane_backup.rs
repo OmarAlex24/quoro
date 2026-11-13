@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Server, start, start_in};
+use common::{Server, TestDir, start, start_in};
 use quoro_backup::{
     ChunkId, RepoKey, Restorer, Seal, SourceKind, layout, open_manifest, sign_seal, verify_seal,
 };
@@ -1046,11 +1046,7 @@ fn extra_migrations() -> &'static [&'static str] {
 /// A database the previous release left behind: the newest shipped schema, a
 /// data directory that persists its keys, a repository and a primary node.
 async fn previous_release(bucket: &Arc<MemoryStore>, keep: i64) -> Server {
-    let dir = std::env::temp_dir().join(format!(
-        "quoro-upgrade-{}",
-        &quoro_control_plane::store::random_secret()[..16]
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("quoro-upgrade");
     let server = start_in(dir).await;
     server
         .state
@@ -1376,11 +1372,7 @@ async fn the_skip_flag_migrates_without_a_backup_and_records_the_skip() {
 
 #[tokio::test]
 async fn a_start_with_nothing_pending_takes_no_backup_with_or_without_the_flag() {
-    let dir = std::env::temp_dir().join(format!(
-        "quoro-upgrade-{}",
-        &quoro_control_plane::store::random_secret()[..16]
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("quoro-upgrade");
     let path = dir.join("quoro.db");
     let store = Store::open(&path).await.unwrap();
     let data_key = Arc::new(DataKey::load_or_create(&dir).unwrap());
@@ -1406,7 +1398,6 @@ async fn a_start_with_nothing_pending_takes_no_backup_with_or_without_the_flag()
     .await
     .unwrap();
     assert_eq!(skipped, 0, "the flag with nothing pending skips nothing");
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[tokio::test]
@@ -1419,11 +1410,7 @@ async fn pending_migrations_with_no_repository_migrate_without_a_backup() {
 /// One start of a database with a pending migration and no repository, with
 /// or without the operator's flag: it migrates and writes no backup.
 async fn no_repository_upgrade(skip: bool) {
-    let dir = std::env::temp_dir().join(format!(
-        "quoro-upgrade-{}",
-        &quoro_control_plane::store::random_secret()[..16]
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("quoro-upgrade");
     let path = dir.join("quoro.db");
     // The previous release's database: newest shipped schema, no repository.
     drop(Store::open(&path).await.unwrap());
@@ -1459,7 +1446,6 @@ async fn no_repository_upgrade(skip: bool) {
         .await
         .unwrap();
     assert_eq!(backups, 0, "there is nothing to write to");
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 // ---------------------------------------------------------------------------

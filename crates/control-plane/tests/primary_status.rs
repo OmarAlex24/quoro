@@ -5,12 +5,12 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use common::start_in;
+use common::{TestDir, start_in};
 use quoro_control_plane::driver::{self, Capacity, Kvm, LocalNode};
 use quoro_control_plane::primary_status::MARKER_FILE;
-use quoro_control_plane::store::{Store, now_rfc3339, random_secret};
+use quoro_control_plane::store::{Store, now_rfc3339};
 use serde_json::{Value, json};
 
 /// The node on the new host, enrolled before the backup was taken.
@@ -40,10 +40,9 @@ fn local_node() -> LocalNode {
 
 /// A data directory whose database holds the old host's primary node, the new
 /// host's node and a removed node, as a restored database would. Returns the
-/// directory and the old primary's id.
-async fn restored_data_dir() -> (PathBuf, String) {
-    let dir = std::env::temp_dir().join(format!("quoro-primary-{}", &random_secret()[..16]));
-    std::fs::create_dir_all(&dir).unwrap();
+/// directory, removed when the test ends, and the old primary's id.
+async fn restored_data_dir() -> (TestDir, String) {
+    let dir = TestDir::new("quoro-primary");
     let store = Store::open(&dir.join("quoro.db")).await.unwrap();
     let old = driver::register_local_node(&store, &local_node())
         .await
