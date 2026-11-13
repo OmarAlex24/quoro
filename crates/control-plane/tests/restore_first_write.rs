@@ -1069,25 +1069,38 @@ async fn an_accept_loss_first_write_removes_every_other_node() {
     assert_eq!(record.justification.as_deref(), Some(STATEMENT));
 
     // Every entry after the restored head is this write's: the marks, the
-    // raises, the declarations and removals, the seal deletions, the move and
-    // the entries that carry the two records.
+    // raises, the removals, the seal deletions, the move and the entries that
+    // carry the two records.
     let entries = entries_after(&store, head.seq).await;
-    let removal = entries
+    // Each machine's removal is its first entry that reads `removed`: the
+    // move's later entry, which clears the old primary's `cp_status`, reads
+    // `removed` too. `change_seq` is the last machine's removal, in id order.
+    let removals: Vec<i64> = removed
         .iter()
-        .rfind(|(_, kind, id, _, _, payload)| {
-            kind == "node" && removed.contains(id) && payload["status"] == "removed"
-        })
-        .map(|(seq, _, _, _, _, _)| *seq);
-    assert_eq!(record.change_seq, removal, "{entries:?}");
-    for id in &removed {
-        assert!(
+        .map(|id| {
             entries
                 .iter()
-                .any(|(_, kind, entity, _, _, payload)| kind == "node"
-                    && entity == id
-                    && payload["status"] == "removed"),
-            "the removal entry of {id}: {entries:?}"
-        );
+                .find(|(_, kind, entity, _, _, payload)| {
+                    kind == "node" && entity == id && payload["status"] == "removed"
+                })
+                .map(|(seq, _, _, _, _, _)| *seq)
+                .unwrap_or_else(|| panic!("the removal entry of {id}: {entries:?}"))
+        })
+        .collect();
+    assert!(removals.is_sorted(), "{removals:?}");
+    assert_eq!(record.change_seq, removals.last().copied(), "{entries:?}");
+    let move_entry = entries
+        .iter()
+        .find(|(_, kind, entity, _, _, payload)| {
+            kind == "node" && *entity == old && payload["cp_status"].is_null()
+        })
+        .map(|(seq, _, _, _, _, _)| *seq)
+        .expect("the move's entry of the old primary");
+    assert!(
+        move_entry > *removals.last().unwrap(),
+        "the move comes after the removals: {entries:?}"
+    );
+    for id in &removed {
         assert!(
             entries
                 .iter()
