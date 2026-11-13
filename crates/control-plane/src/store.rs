@@ -5,6 +5,7 @@
 //! numbered migrations in `docs/contracts/migrations/`, compiled into the
 //! binary so the database and the contract cannot drift (D-0015).
 
+use quoro_proto::wire::MAX_TERM;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
@@ -771,6 +772,11 @@ impl Store {
 /// as a number. Otherwise `meta.term + 1` (a missing `meta.term` reads as 1),
 /// logged at `error` because the `stale_term` carried no usable term. With
 /// neither usable there is no term, and nothing is recorded.
+///
+/// No term above [`MAX_TERM`] is recorded (section 8.8 "The term ceiling"):
+/// a `node_term` above it is not usable (a session never passes one: such an
+/// `error` is malformed and demotes nothing), and `meta.term + 1` stops at
+/// it.
 async fn demotion_term(
     tx: &mut Transaction<'_, Sqlite>,
     node_term: Option<u64>,
@@ -782,6 +788,14 @@ async fn demotion_term(
         None => Some(1),
         Some(value) => value.parse::<u64>().ok(),
     };
+    if let Some(term) = node_term.filter(|term| *term > MAX_TERM) {
+        tracing::error!(
+            node_term = term,
+            max_term = MAX_TERM,
+            "the stale_term's term is above the term ceiling; it is not recorded"
+        );
+    }
+    let node_term = node_term.filter(|term| *term <= MAX_TERM);
     match (node_term, current) {
         (Some(term), Some(current)) if term > current => Ok(term),
         (Some(term), None) => {
@@ -798,7 +812,7 @@ async fn demotion_term(
                 meta_term = current,
                 "the stale_term carried no term above this primary's; recording meta.term + 1"
             );
-            Ok(current.saturating_add(1))
+            Ok(current.saturating_add(1).min(MAX_TERM))
         }
         (None, None) => Err(sqlx::Error::Protocol(format!(
             "the stale_term carried no term and meta.term {stored:?} is not a number: no term to record"

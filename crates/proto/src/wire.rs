@@ -1638,6 +1638,26 @@ pub struct SupportGrant {
     pub voters_version: u64,
 }
 
+/// The term ceiling (section 8.8): 2^53 - 1, the highest integer the change
+/// log's canonical JSON carries. No machine sends, stores or adopts a higher
+/// term, whether it arrives in a `welcome`, a `desired_state`, a
+/// `support_request`, a `support_grant`, the `term` of an `error` or a vote.
+pub const MAX_TERM: u64 = (1 << 53) - 1;
+
+/// Whether the `term` member of the JSON object `body` is a number above
+/// [`MAX_TERM`] (section 8.8 "The term ceiling"). It reads the raw body, so a
+/// term that a typed `u64` field cannot hold counts as well: an integer above
+/// `u64::MAX`, which `serde_json` reads as a float, or a float of any size.
+/// A number counts when the double nearest to it is above 2^53 - 1. Every
+/// integer up to 2^53 is exact as a double, so every integer above the
+/// ceiling counts and none at or below it does.
+#[must_use]
+pub fn term_above_ceiling(body: &Value) -> bool {
+    body.get("term")
+        .and_then(Value::as_f64)
+        .is_some_and(|term| term > MAX_TERM as f64)
+}
+
 /// The floor of `support_request.support_ms` (sections 5.27 and 8.8).
 pub const MIN_SUPPORT_MS: u64 = 3_000;
 
@@ -2640,5 +2660,38 @@ mod tests {
         assert_eq!(raw.body["error"]["code"], "replication_failed");
         assert!(raw.body.get("snapshot_seq").is_none(), "{}", raw.body);
         assert_eq!(NodeMessage::from_raw(&raw).unwrap(), failed);
+    }
+
+    /// Section 8.8 "The term ceiling": [`term_above_ceiling`] reads the raw
+    /// `term`, a number above 2^53 - 1 whether `serde_json` holds it as a
+    /// `u64` or, past `u64::MAX` or with a fraction or exponent, as a float.
+    #[test]
+    fn term_above_ceiling_reads_the_raw_term() {
+        for text in [
+            "9007199254740992",
+            "18446744073709551615",
+            "18446744073709551616",
+            "1e20",
+            "1e300",
+            "9007199254740992.0",
+        ] {
+            let body: Value = serde_json::from_str(&format!("{{\"term\": {text}}}")).unwrap();
+            assert!(term_above_ceiling(&body), "{text}");
+        }
+        assert!(term_above_ceiling(&json!({"term": MAX_TERM + 1})));
+        assert!(term_above_ceiling(&json!({"term": u64::MAX})));
+        for body in [
+            json!({"term": MAX_TERM}),
+            json!({"term": 9_007_199_254_740_991.0}),
+            json!({"term": 1}),
+            json!({"term": -1}),
+            json!({"term": -1e300}),
+            json!({"term": "9007199254740992"}),
+            json!({"term": null}),
+            json!({}),
+            json!(null),
+        ] {
+            assert!(!term_above_ceiling(&body), "{body}");
+        }
     }
 }

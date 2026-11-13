@@ -12,8 +12,8 @@ use common::machine::{Machine, echo, enroll, manual_clock, ok_result};
 use common::{Server, start_with_patient_node_session};
 use quoro_control_plane::changelog::{self, Actor, Op};
 use quoro_proto::wire::{
-    Capacity as WireCapacity, Heartbeat, NodeMessage, StatusReport, VolumeState as WireVolumeState,
-    VolumeStatus,
+    Capacity as WireCapacity, Heartbeat, MAX_TERM, NodeMessage, StatusReport,
+    VolumeState as WireVolumeState, VolumeStatus,
 };
 use quoro_proto::{ErrorCode, LeaseId, LeaseRenew, ProtocolError};
 use serde_json::{Value, json};
@@ -345,6 +345,46 @@ async fn an_answer_counts_only_when_it_pairs_echoes_and_carries_the_current_vers
     let (_, request) = on_a.request().await;
     on_a.grant(&request).await;
     assert!(supports(&server, D), "1 of 1");
+}
+
+/// Sections 5.27, 5.28 and 8.8 "The term ceiling": a voter's answer whose
+/// term is above 2^53 - 1 counts for nothing. A `support_grant` above it
+/// echoes no request, so it is not counted. A `bad_message` carrying such a
+/// term is a malformed `error`: the primary does not demote itself on it
+/// and records nothing from it, not even that it answered its request, so
+/// a valid grant of that request still counts.
+#[tokio::test]
+async fn a_voter_answer_above_the_term_ceiling_counts_for_nothing() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let mut on_a = Machine::connect(&server, &a).await;
+    let version = on_a.version();
+
+    let (_, request) = on_a.request().await;
+    let mut above = echo(&request, version);
+    above.term = MAX_TERM + 1;
+    on_a.answer(above, request["id"].as_str()).await;
+    assert!(!supports(&server, D), "a grant above the ceiling");
+
+    let (_, request) = on_a.request().await;
+    let re = request["id"].as_str().unwrap().to_string();
+    on_a.send(
+        NodeMessage::Error(ProtocolError {
+            code: ErrorCode::BadMessage,
+            message: "this voter voted in this term for another candidate".to_string(),
+            fatal: false,
+            term: Some(MAX_TERM + 1),
+        }),
+        Some(&re),
+    )
+    .await;
+    on_a.settle().await;
+    assert!(!server.state.store.is_demoted());
+    assert!(!supports(&server, D));
+    on_a.answer(echo(&request, version), Some(&re)).await;
+    assert!(supports(&server, D), "the malformed error answered nothing");
 }
 
 /// Section 8.8 and ADR 0263: support is measured from `p_send` on

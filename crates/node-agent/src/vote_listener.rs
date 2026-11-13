@@ -52,7 +52,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use quoro_proto::wire::{SpecVotes, VOTE_PATH, VoteRequest};
+use quoro_proto::wire::{MAX_TERM, SpecVotes, VOTE_PATH, VoteRequest};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
@@ -73,10 +73,6 @@ use crate::vote::{
 pub const BODY_LIMIT: usize = 4 << 10;
 /// Connections served at once, as the warm receiver's listener.
 pub const MAX_CONNECTIONS: usize = 16;
-/// The highest `term` a vote request may ask for: 2^53 - 1, the highest
-/// integer the change log and RFC 8785 carry exactly. A request above it is
-/// answered `400`, and nothing is decided or written.
-pub const MAX_TERM: u64 = (1 << 53) - 1;
 /// The longest error text of a `503` or `4xx` answer.
 const ERROR_CHARS: usize = 300;
 /// How often a bind that keeps failing is logged again at `warn`.

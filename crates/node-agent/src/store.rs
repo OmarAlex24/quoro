@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use quoro_proto::wire::{
-    BackupState, BuildPhase, BuildState, FailedStep, SnapshotMethod, VolumeState,
+    BackupState, BuildPhase, BuildState, FailedStep, MAX_TERM, SnapshotMethod, VolumeState,
+    term_above_ceiling,
 };
 use quoro_proto::{FenceReason, LeaseId, LeaseMode, ResourceType};
 use serde_json::Value;
@@ -928,7 +929,8 @@ impl NodeStore {
     ///
     /// # Errors
     ///
-    /// [`AgentError::Store`] on a SQLite failure.
+    /// [`AgentError::Store`] on a SQLite failure, and for a `term` above
+    /// [`MAX_TERM`], which is never stored (section 8.8 "The term ceiling").
     pub async fn raise_term(&self, term: u64) -> Result<(), AgentError> {
         let mut conn = self.pool.acquire().await.map_err(store_error)?;
         raise_term_on(&mut conn, term).await
@@ -990,10 +992,15 @@ impl NodeStore {
     /// handed back only once the transaction committed, so an answer built
     /// from it goes out after what it promises is durable.
     ///
+    /// No term above [`MAX_TERM`] is written (section 8.8 "The term
+    /// ceiling"): a write that carries one, as the highest term, the
+    /// support's or the vote's, fails before anything is written.
+    ///
     /// # Errors
     ///
     /// [`AgentError::Store`] when the state cannot be read or parsed, or the
-    /// writes or the commit fail; nothing is written then.
+    /// writes or the commit fail, or a term to write is above [`MAX_TERM`];
+    /// nothing is written then.
     pub async fn update_vote_state<T>(
         &self,
         decide: impl FnOnce(&crate::vote::VoteState) -> (T, crate::vote::VoteWrite),
@@ -1021,6 +1028,18 @@ impl NodeStore {
             support,
         };
         let (decided, write) = decide(&state);
+        for (what, term) in [
+            ("highest", write.term),
+            (
+                "support's",
+                write.support.as_ref().map(|support| support.term),
+            ),
+            ("vote's", write.vote.as_ref().map(|vote| vote.term)),
+        ] {
+            if let Some(term) = term.filter(|term| *term > MAX_TERM) {
+                return Err(above_ceiling(what, Some(&Value::from(term))));
+            }
+        }
         if let Some(term) = write.term {
             raise_term_on(&mut tx, term).await?;
         }
@@ -1079,11 +1098,16 @@ impl NodeStore {
     ///
     /// # Errors
     ///
-    /// [`AgentError::Store`] on a SQLite failure.
+    /// [`AgentError::Store`] on a SQLite failure, and for a support whose
+    /// term is above [`MAX_TERM`], which is never stored (section 8.8 "The
+    /// term ceiling").
     pub async fn save_support(
         &self,
         support: &crate::vote::StoredSupport,
     ) -> Result<(), AgentError> {
+        if support.term > MAX_TERM {
+            return Err(above_ceiling("support's", Some(&Value::from(support.term))));
+        }
         let text = serde_json::to_string(support)
             .map_err(|e| AgentError::Store(format!("could not encode the support: {e}")))?;
         self.set_meta(SUPPORT, &text).await
@@ -1140,8 +1164,13 @@ impl NodeStore {
     ///
     /// # Errors
     ///
-    /// [`AgentError::Store`] when the body cannot be encoded or SQLite fails.
+    /// [`AgentError::Store`] when the body cannot be encoded or SQLite fails,
+    /// and for a body whose `term` is above [`MAX_TERM`], which is never
+    /// stored (section 8.8 "The term ceiling").
     pub async fn store_desired(&self, rev: u64, body: &Value) -> Result<(), AgentError> {
+        if term_above_ceiling(body) {
+            return Err(above_ceiling("desired_state's", body.get("term")));
+        }
         let text = serde_json::to_string(body)
             .map_err(|e| AgentError::Store(format!("could not encode desired state: {e}")))?;
         let sealed = self.key.seal(rev, text.as_bytes());
@@ -3417,8 +3446,13 @@ async fn set_refollowing_on(
 }
 
 /// Stores `term` as the highest term seen when it is above the stored one,
-/// in one statement on `conn`, so a term is never lowered (section 8.8).
+/// in one statement on `conn`, so a term is never lowered (section 8.8). A
+/// term above [`MAX_TERM`] is refused and nothing is written (section 8.8
+/// "The term ceiling").
 async fn raise_term_on(conn: &mut sqlx::SqliteConnection, term: u64) -> Result<(), AgentError> {
+    if term > MAX_TERM {
+        return Err(above_ceiling("highest", Some(&Value::from(term))));
+    }
     sqlx::query(
         "INSERT INTO node_meta (key, value) VALUES (?, ?) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value \
@@ -3430,6 +3464,15 @@ async fn raise_term_on(conn: &mut sqlx::SqliteConnection, term: u64) -> Result<(
     .await
     .map_err(store_error)
     .map(|_| ())
+}
+
+/// The refusal to store the `what` term `term`, which is above [`MAX_TERM`]
+/// (section 8.8 "The term ceiling").
+fn above_ceiling(what: &str, term: Option<&Value>) -> AgentError {
+    let term = term.map_or_else(|| "?".to_owned(), Value::to_string);
+    AgentError::Store(format!(
+        "the {what} term {term} is above the term ceiling {MAX_TERM}; it is not stored"
+    ))
 }
 
 /// A stored term ([`HIGHEST_TERM`]).
@@ -4766,6 +4809,22 @@ mod tests {
         assert!(sealed.is_some());
         let (_, loaded) = store.latest_desired().await.unwrap().unwrap();
         assert_eq!(loaded["signature"], "old");
+    }
+
+    /// Section 8.8 "The term ceiling": no `desired_state` whose term is
+    /// above 2^53 - 1 is stored, whatever reached the store.
+    #[tokio::test]
+    async fn a_desired_state_above_the_term_ceiling_is_not_stored() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        for term in [json!(MAX_TERM + 1), json!(u64::MAX)] {
+            let body = json!({"rev": 9, "issued_at": "2026-11-02T10:15:31Z", "term": term, "signature": "x"});
+            assert!(store.store_desired(9, &body).await.is_err(), "{term}");
+            assert_eq!(store.latest_desired().await.unwrap(), None, "{term}");
+        }
+        let body = json!({"rev": 9, "issued_at": "2026-11-02T10:15:31Z", "term": MAX_TERM, "signature": "x"});
+        store.store_desired(9, &body).await.unwrap();
+        assert_eq!(store.latest_desired().await.unwrap().unwrap().0, 9);
     }
 
     #[tokio::test]
