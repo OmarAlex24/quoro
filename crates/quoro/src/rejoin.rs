@@ -15,19 +15,29 @@
 //! before anything else, then a forced run's `rejoin-statement`; the unit is
 //! stopped, disabled and confirmed inactive; the data directory is renamed
 //! into the copy, then the unit file and its drop-in directory; `rejoin-done`
-//! is written last. A unit file that is a symbolic link is copied into the
-//! copy after the stop and before the disable, which removes such a link.
-//! When `[node] local` is true, the control-plane unit also runs this host's
-//! node agent: the command warns, before anything changes, that stopping the
-//! unit stops the agent and that `quoro-node.service` must be started
-//! afterwards, and goes on. A run interrupted on the way leaves the copy
-//! without `rejoin-done`, and the next run finds it and finishes the moves
-//! into it.
+//! is written last, listing every move, those of an earlier run included. A
+//! unit file that is a symbolic link is copied into the copy after the stop
+//! and before the disable, which removes such a link. When
+//! `quoro-node.service` is not enabled and active, the control-plane unit may
+//! also run this host's node agent (`[node] local`): the command warns,
+//! before anything changes, that stopping the unit stops the agent and that
+//! `quoro-node.service` must be started afterwards, and goes on. A run
+//! interrupted on the way leaves the copy without `rejoin-done`, and the next
+//! run finds it and finishes the moves into it.
+//!
+//! Before anything changes, the command also refuses (issue #881): a unit
+//! file or drop-in of the unit that systemd loads from outside the places it
+//! moves, or a configuration of the unit that names another data directory,
+//! since the unit would stay and could start a fresh, empty control plane;
+//! on a host with no control-plane unit, a database a process holds open;
+//! and a forced run with no database. A lock on the data directory's parent
+//! keeps two runs apart, no rename replaces an existing name, and the unit
+//! counts as stopped only when it reads `inactive` or `failed`.
 //!
 //! The systemd calls go through [`Systemd`] and the file-system calls the
 //! tests replace through [`Fs`], so the tests drive every failure with
-//! fakes; the unit directory, the journal socket and the clock are fields of
-//! [`Options`].
+//! fakes; the unit directory, the journal socket, `/proc` and the clock are
+//! fields of [`Options`].
 
 use sqlx::Connection as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
@@ -58,8 +68,11 @@ const STATEMENT: &str = "rejoin-statement";
 const DONE: &str = "rejoin-done";
 /// The highest term any machine stores (section 8.8, "The term ceiling").
 const TERM_CEILING: u64 = (1 << 53) - 1;
-/// The states of `systemctl is-active` in which the unit still runs.
-const RUNNING_STATES: [&str; 4] = ["active", "activating", "deactivating", "reloading"];
+/// The states of `systemctl is-active` in which the unit counts as stopped.
+/// Any other state, one a later systemd adds included, refuses the moves.
+const STOPPED_STATES: [&str; 2] = ["inactive", "failed"];
+/// The node agent's unit.
+const NODE_UNIT: &str = "quoro-node.service";
 
 /// The command line of `quoro node rejoin`, read by [`parse_args`].
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -141,6 +154,16 @@ pub trait Systemd {
     ///
     /// A message when the reload failed.
     fn daemon_reload(&self) -> Result<(), String>;
+    /// What `systemctl show` prints of the unit's `FragmentPath`,
+    /// `DropInPaths`, `Environment` and `ExecStart`, as `KEY=value` lines.
+    ///
+    /// # Errors
+    ///
+    /// A message when systemd could not be asked.
+    fn show(&self) -> Result<String, String>;
+    /// Whether `quoro-node.service` is enabled and active, so this host's
+    /// node agent runs in its own unit.
+    fn node_agent_runs(&self) -> bool;
 }
 
 /// The host's `systemctl`.
@@ -203,6 +226,33 @@ impl Systemd for RealSystemd {
     fn daemon_reload(&self) -> Result<(), String> {
         Self::check(&["daemon-reload"])
     }
+
+    fn show(&self) -> Result<String, String> {
+        let args = [
+            "show",
+            "--property=FragmentPath",
+            "--property=DropInPaths",
+            "--property=Environment",
+            "--property=ExecStart",
+            UNIT,
+        ];
+        let output = Self::run(&args)?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(format!(
+                "systemctl {}: {}: {}",
+                args.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    fn node_agent_runs(&self) -> bool {
+        Self::check(&["is-enabled", "--quiet", NODE_UNIT]).is_ok()
+            && Self::check(&["is-active", "--quiet", NODE_UNIT]).is_ok()
+    }
 }
 
 /// The file-system calls a test replaces: the moves of the unit file and
@@ -210,7 +260,8 @@ impl Systemd for RealSystemd {
 /// the device of a directory, and a point between two reads of a database.
 #[derive(Clone, Copy)]
 pub struct Fs {
-    /// Renames a file, a symbolic link or a directory.
+    /// Renames a file, a symbolic link or a directory, never over an
+    /// existing name.
     pub rename: fn(&Path, &Path) -> io::Result<()>,
     /// Removes a file or a symbolic link, after its copy is in place.
     pub remove_file: fn(&Path) -> io::Result<()>,
@@ -226,7 +277,7 @@ pub struct Fs {
 impl Fs {
     /// The real calls.
     pub const REAL: Self = Self {
-        rename: real_rename,
+        rename: rename_noreplace,
         remove_file: real_remove_file,
         remove_tree: real_remove_tree,
         device: real_device,
@@ -240,8 +291,42 @@ fn real_device(path: &Path) -> io::Result<u64> {
 
 fn no_hook(_: &Path) {}
 
-fn real_rename(from: &Path, to: &Path) -> io::Result<()> {
+/// Renames `from` to `to` and fails with `AlreadyExists` when `to` exists:
+/// `renameat2` with `RENAME_NOREPLACE`, so no rename replaces a name, even
+/// one that appears after a check.
+#[cfg(target_os = "linux")]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(io::Error::from)
+}
+
+/// Elsewhere, for a build that compiles: the command runs on Linux only.
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    if exists(to) {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
     fs::rename(from, to)
+}
+
+/// Takes an exclusive lock on the data directory's parent, without waiting,
+/// and keeps it as long as the returned file lives, so two runs never
+/// interleave.
+fn lock(parent: &Path) -> Result<fs::File, String> {
+    use rustix::fs::{FlockOperation, flock};
+    let directory =
+        fs::File::open(parent).map_err(|e| format!("cannot open {}: {e}", parent.display()))?;
+    match flock(&directory, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(directory),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(format!(
+            "another quoro node rejoin holds the lock on {}; wait until it ends and run this again. Nothing was changed",
+            parent.display()
+        )),
+        Err(e) => Err(format!(
+            "cannot lock {}: {e}; nothing was changed",
+            parent.display()
+        )),
+    }
 }
 
 fn real_remove_file(path: &Path) -> io::Result<()> {
@@ -266,15 +351,16 @@ pub struct Options {
     /// `/proc/self/mountinfo`, to tell whether the data directory is a mount
     /// point.
     pub mountinfo: PathBuf,
+    /// `/proc`, to find a process that holds the database open.
+    pub proc_dir: PathBuf,
+    /// The configuration `quoro serve` reads without `--config`.
+    pub default_config: PathBuf,
     /// The effective uid of this process, when it could be read.
     pub euid: Option<u32>,
     /// The clock.
     pub now: fn() -> SystemTime,
     /// The command line `rejoin-started` records, without the statement.
     pub command_line: String,
-    /// `[node] local`: the control-plane unit also runs this host's node
-    /// agent, so stopping it stops the agent; the command warns and goes on.
-    pub local_agent: bool,
     /// The file-system calls the tests replace.
     pub fs: Fs,
 }
@@ -352,10 +438,11 @@ pub async fn command(args: &[String]) -> ExitCode {
         unit_dir: PathBuf::from("/etc/systemd/system"),
         journal_socket: PathBuf::from("/run/systemd/journal/socket"),
         mountinfo: PathBuf::from("/proc/self/mountinfo"),
+        proc_dir: PathBuf::from("/proc"),
+        default_config: PathBuf::from(crate::config::DEFAULT_PATH),
         euid,
         now: SystemTime::now,
         command_line: command_line(&request),
-        local_agent: config.node.local,
         fs: Fs::REAL,
     };
     match rejoin(&request, &options, &RealSystemd, &mut Out::printing()).await {
@@ -662,6 +749,226 @@ fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+/// What `systemctl show` reports of the control-plane unit.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UnitReport {
+    /// `FragmentPath`: the unit file systemd loaded, when it has one.
+    fragment: Option<PathBuf>,
+    /// `DropInPaths`.
+    drop_ins: Vec<PathBuf>,
+    /// `Environment`, as `NAME=value` words.
+    environment: Vec<String>,
+    /// The `argv[]` of each `ExecStart`.
+    exec_start: Vec<Vec<String>>,
+}
+
+/// Reads the `KEY=value` lines of [`Systemd::show`].
+fn parse_show(text: &str) -> UnitReport {
+    let mut report = UnitReport::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "FragmentPath" if !value.is_empty() => report.fragment = Some(PathBuf::from(value)),
+            "DropInPaths" => {
+                report.drop_ins = split_words(value).into_iter().map(PathBuf::from).collect();
+            }
+            "Environment" => report.environment = split_words(value),
+            // `{ path=... ; argv[]=quoro serve ... ; ignore_errors=no ; ... }`,
+            // once for each command.
+            "ExecStart" => {
+                for command in value.split("argv[]=").skip(1) {
+                    let end = command.find(" ;").unwrap_or(command.len());
+                    report.exec_start.push(split_words(&command[..end]));
+                }
+            }
+            _ => {}
+        }
+    }
+    report
+}
+
+/// The words of a value `systemctl show` prints: separated by spaces, with
+/// double or single quotes around a word that holds a space, and a
+/// backslash before a character that would otherwise end it.
+fn split_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(open), c) if c == open => quote = None,
+            (Some('"') | None, '\\') => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+                in_word = true;
+            }
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Whether `path` is one of `places`, or the same file once links are
+/// followed.
+fn is_one_of(path: &Path, places: &[&Path]) -> bool {
+    let resolved = fs::canonicalize(path).ok();
+    places.iter().any(|place| {
+        *place == path || (resolved.is_some() && fs::canonicalize(place).ok() == resolved)
+    })
+}
+
+/// Refuses a control-plane unit this command would leave behind (issue
+/// #881): a unit file systemd loads from anywhere but `units`, the unit file
+/// in place and in the copy; a drop-in in a `quoro.service.d` other than
+/// `drop_ins`, that directory in place and in the copy; or a configuration
+/// of the unit that names another data directory than `data_dir`. The unit
+/// would otherwise end only disabled, and a later start would create a
+/// fresh, empty control plane. A drop-in for every service (`service.d`) is
+/// not the unit's own and stays.
+///
+/// The unit's configuration is the `--config` of its `ExecStart`, or
+/// `default_config` without one, as `quoro serve` reads it, and the file its
+/// `QUORO_CONFIG` names.
+fn check_unit(
+    report: &UnitReport,
+    data_dir: &Path,
+    default_config: &Path,
+    units: [&Path; 2],
+    drop_ins: [&Path; 2],
+) -> Result<(), String> {
+    if let Some(fragment) = &report.fragment
+        && !is_one_of(fragment, &units)
+    {
+        return Err(format!(
+            "systemd loads {UNIT} from {}, and this command moves only {}: the unit would stay and could start a fresh, empty control plane. Move that unit file there or remove it, run systemctl daemon-reload, and run this again; nothing was changed",
+            fragment.display(),
+            units[0].display()
+        ));
+    }
+    for drop_in in &report.drop_ins {
+        let Some(directory) = drop_in.parent() else {
+            continue;
+        };
+        if directory.file_name() == Some(std::ffi::OsStr::new(DROP_IN))
+            && !is_one_of(directory, &drop_ins)
+        {
+            return Err(format!(
+                "systemd reads the drop-in {} of {UNIT}, and this command moves only {}: the drop-in would stay with the unit. Move it there or remove it, run systemctl daemon-reload, and run this again; nothing was changed",
+                drop_in.display(),
+                drop_ins[0].display()
+            ));
+        }
+    }
+    let mut configs = Vec::new();
+    for argv in &report.exec_start {
+        if let Some(pair) = argv.windows(2).rev().find(|pair| pair[0] == "--config") {
+            configs.push((PathBuf::from(&pair[1]), "the --config of its ExecStart"));
+        }
+    }
+    if configs.is_empty() {
+        configs.push((
+            default_config.to_path_buf(),
+            "the configuration quoro serve reads without --config",
+        ));
+    }
+    if let Some(path) = report
+        .environment
+        .iter()
+        .rev()
+        .find_map(|word| word.strip_prefix("QUORO_CONFIG="))
+    {
+        configs.push((PathBuf::from(path), "its QUORO_CONFIG"));
+    }
+    for (path, origin) in configs {
+        let named = crate::config::Config::load(&path)
+            .map_err(|e| {
+                format!(
+                    "cannot read {} ({origin} of {UNIT}): {e}; nothing was changed",
+                    path.display()
+                )
+            })?
+            .data_dir;
+        if normalized(&named, "data directory").ok().as_deref() != Some(data_dir) {
+            return Err(format!(
+                "{} ({origin} of {UNIT}) names the data directory {}, not {}: this command would move one and leave the unit with the other. Run it with --config naming the unit's configuration; nothing was changed",
+                path.display(),
+                named.display(),
+                data_dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The processes other than this one that hold one of `files` open, read
+/// from `<proc_dir>/<pid>/fd`: each one's pid and name. A process whose
+/// descriptors cannot be read, as one that just exited, is skipped; root
+/// reads every other one.
+fn holders(proc_dir: &Path, files: &[PathBuf]) -> Result<Vec<(u32, String)>, String> {
+    let wanted: Vec<(u64, u64)> = files
+        .iter()
+        .filter_map(|file| fs::metadata(file).ok())
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries =
+        fs::read_dir(proc_dir).map_err(|e| format!("cannot read {}: {e}", proc_dir.display()))?;
+    let this = std::process::id();
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == this {
+            continue;
+        }
+        let Ok(descriptors) = fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        // `metadata` follows each descriptor's link to the open file.
+        let holds = descriptors.flatten().any(|descriptor| {
+            fs::metadata(descriptor.path())
+                .is_ok_and(|metadata| wanted.contains(&(metadata.dev(), metadata.ino())))
+        });
+        if holds {
+            let name = fs::read_to_string(entry.path().join("comm"))
+                .map(|name| name.trim().to_string())
+                .unwrap_or_default();
+            found.push((pid, name));
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 /// The moved-aside copies next to the data directory, by name.
 struct Copies {
     unfinished: Vec<PathBuf>,
@@ -892,7 +1199,7 @@ fn send_to_journal(socket: &Path, message: &str) -> io::Result<()> {
         ("MESSAGE", message),
         ("PRIORITY", "5"),
         ("SYSLOG_IDENTIFIER", "quoro"),
-        ("OBJECT_SYSTEMD_UNIT", "quoro-node.service"),
+        ("OBJECT_SYSTEMD_UNIT", NODE_UNIT),
     ] {
         entry.extend_from_slice(key.as_bytes());
         if value.contains('\n') {
@@ -942,18 +1249,19 @@ fn move_entry(fs_calls: &Fs, source: &Path, target: &Path) -> Result<(), String>
                 )
             })?;
             sync_dir(target_parent)?;
-            if exists(target) {
-                return Err(format!(
-                    "{} appeared during the copy; nothing is overwritten",
-                    target.display()
-                ));
-            }
-            fs::rename(&temporary, target).map_err(|e| {
-                format!(
-                    "cannot rename {} to {}: {e}",
-                    temporary.display(),
-                    target.display()
-                )
+            rename_noreplace(&temporary, target).map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    format!(
+                        "{} appeared during the copy; nothing is overwritten",
+                        target.display()
+                    )
+                } else {
+                    format!(
+                        "cannot rename {} to {}: {e}",
+                        temporary.display(),
+                        target.display()
+                    )
+                }
             })?;
             sync_dir(target_parent)?;
             remove_source(fs_calls, source)
@@ -1086,6 +1394,8 @@ pub async fn rejoin(
             data_dir.display()
         ));
     }
+    // Two runs never interleave: the lock holds until this function returns.
+    let _lock = lock(parent)?;
 
     // Step 3: an unfinished copy first.
     let copies = find_copies(parent, &basename)?;
@@ -1175,6 +1485,16 @@ pub async fn rejoin(
         .filter(|path| exists(path));
     let demoted = readings.demoted_by_term();
     let ahead = readings.agent_ahead();
+    if (earlier_statement.is_some() || request.statement.is_some()) && readings.database.is_none() {
+        let looked_in = match &moved_data {
+            Some(moved) if !data_in_place => moved,
+            _ => data_dir,
+        };
+        return Err(format!(
+            "--force moves a control plane aside only with its database, and {} holds no {DATABASE}; check data_dir in quoro.toml. Nothing was changed",
+            looked_in.display()
+        ));
+    }
     if let Some(path) = &earlier_statement {
         out.say(format!(
             "the statement of the earlier forced run stands ({}); the check is skipped",
@@ -1198,9 +1518,9 @@ pub async fn rejoin(
         .statement
         .as_deref()
         .filter(|_| earlier_statement.is_none());
-    if options.local_agent && has_unit {
+    if has_unit && !systemd.node_agent_runs() {
         out.say(format!(
-            "warning: quoro.toml has [node] local = true (the default when it is not set), so {UNIT} also runs this host's node agent: stopping {UNIT} stops that agent too. After this command, start quoro-node.service (systemctl enable --now quoro-node.service) so the agent runs again"
+            "warning: {NODE_UNIT} is not enabled and active, so this host's node agent may run inside {UNIT} ([node] local = true in quoro.toml): stopping {UNIT} stops that agent too. After this command, start it with systemctl enable --now {NODE_UNIT}"
         ));
     }
 
@@ -1277,6 +1597,37 @@ pub async fn rejoin(
     }
     let unit_plan = plan(&unit_file, &unit_target)?;
     let drop_in_plan = plan(&drop_in, &drop_in_target)?;
+    if has_unit {
+        let report = systemd
+            .show()
+            .map_err(|e| format!("cannot read {UNIT} from systemd: {e}; nothing was changed"))?;
+        check_unit(
+            &parse_show(&report),
+            data_dir,
+            &options.default_config,
+            [unit_file.as_path(), unit_target.as_path()],
+            [drop_in.as_path(), drop_in_target.as_path()],
+        )?;
+    } else if let Some(database) = &readings.database {
+        // No unit to stop: a control plane may still run by hand.
+        let files = [
+            database.clone(),
+            side_file(database, "-wal"),
+            side_file(database, "-shm"),
+        ];
+        let held = holders(&options.proc_dir, &files)?;
+        if !held.is_empty() {
+            let held: Vec<String> = held
+                .iter()
+                .map(|(pid, name)| format!("{pid} ({name})"))
+                .collect();
+            return Err(format!(
+                "this host has no control-plane unit, but process {} holds {} open, as a quoro serve started by hand would: stop it and run this again. Nothing was changed",
+                held.join(", "),
+                database.display()
+            ));
+        }
+    }
 
     // Step 6: the statement in the journal, before anything changes.
     if let Some(statement) = record_statement {
@@ -1363,7 +1714,7 @@ pub async fn rejoin(
                 copy_tree(&unit_file, &temporary)
             };
             copied
-                .and_then(|()| fs::rename(&temporary, &unit_target))
+                .and_then(|()| rename_noreplace(&temporary, &unit_target))
                 .map_err(|e| {
                     interrupted(&format!(
                         "cannot copy the link {} into {}: {e}",
@@ -1388,16 +1739,19 @@ pub async fn rejoin(
         let state = systemd
             .state()
             .map_err(|e| interrupted(&format!("cannot tell whether {UNIT} stopped: {e}")))?;
-        if RUNNING_STATES.contains(&state.as_str()) {
-            return Err(interrupted(&format!("{UNIT} is still {state}")));
+        if !STOPPED_STATES.contains(&state.as_str()) {
+            return Err(interrupted(&format!(
+                "{UNIT} reads {state}, and only inactive or failed counts as stopped"
+            )));
         }
         out.say(format!("stopped and disabled {UNIT} ({state})"));
     }
 
-    // The data directory: one rename, never a copy.
+    // The data directory: one rename, never a copy. Each move is kept with
+    // whether an earlier run made it, for `rejoin-done`.
     let mut moves = Vec::new();
     if data_in_place {
-        fs::rename(data_dir, &data_target).map_err(|e| {
+        rename_noreplace(data_dir, &data_target).map_err(|e| {
             interrupted(&format!(
                 "cannot rename {} to {}: {e}",
                 data_dir.display(),
@@ -1406,7 +1760,9 @@ pub async fn rejoin(
         })?;
         sync_dir(&copy)?;
         sync_dir(parent)?;
-        moves.push((data_dir.clone(), data_target.clone()));
+        moves.push((data_dir.clone(), data_target.clone(), false));
+    } else if exists(&data_target) {
+        moves.push((data_dir.clone(), data_target.clone(), true));
     }
 
     // The unit file, then its drop-ins.
@@ -1415,11 +1771,12 @@ pub async fn rejoin(
         (&drop_in, &drop_in_target, &drop_in_plan),
     ] {
         match step {
-            Plan::Absent | Plan::Moved => {}
+            Plan::Absent => {}
+            Plan::Moved => moves.push((source.clone(), target.clone(), true)),
             Plan::Move => {
                 make_dir(&systemd_dir, &copy)?;
                 move_entry(&options.fs, source, target).map_err(|e| interrupted(&e))?;
-                moves.push((source.clone(), target.clone()));
+                moves.push((source.clone(), target.clone(), false));
             }
             Plan::RemoveSource if !exists(source) => {
                 out.say(format!(
@@ -1427,7 +1784,7 @@ pub async fn rejoin(
                     source.display(),
                     target.display()
                 ));
-                moves.push((source.clone(), target.clone()));
+                moves.push((source.clone(), target.clone(), false));
             }
             Plan::RemoveSource => {
                 remove_source(&options.fs, source).map_err(|e| interrupted(&e))?;
@@ -1436,7 +1793,7 @@ pub async fn rejoin(
                     source.display(),
                     target.display()
                 ));
-                moves.push((source.clone(), target.clone()));
+                moves.push((source.clone(), target.clone(), false));
             }
         }
     }
@@ -1444,13 +1801,17 @@ pub async fn rejoin(
     if let Err(e) = systemd.daemon_reload() {
         out.say(format!("warning: systemctl daemon-reload failed: {e}"));
     }
+    let moved = |(from, to, earlier): &(PathBuf, PathBuf, bool)| {
+        let by = if *earlier { " (by an earlier run)" } else { "" };
+        format!("{} -> {}{by}", from.display(), to.display())
+    };
     let mut done = format!("done: {}\n", rfc3339((options.now)()));
-    for (from, to) in &moves {
-        done.push_str(&format!("moved: {} -> {}\n", from.display(), to.display()));
+    for each in &moves {
+        done.push_str(&format!("moved: {}\n", moved(each)));
     }
     write_new(&copy, DONE, &done)?;
-    for (from, to) in &moves {
-        out.say(format!("moved {} -> {}", from.display(), to.display()));
+    for each in &moves {
+        out.say(format!("moved {}", moved(each)));
     }
     out.say(format!(
         "this host is a node again; its control plane is kept in {}, and nothing was deleted. It can be promoted later like any machine with the node role",
