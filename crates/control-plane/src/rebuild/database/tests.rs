@@ -92,7 +92,9 @@ async fn followed(store: &Store) -> Vec<FollowedEntry> {
         .collect()
 }
 
-/// A new, empty directory for a build's target, removed on drop.
+/// A new, empty directory for a build's target, removed with everything in
+/// it on drop, including when the test panics (as `tests/common`'s
+/// `TestDir`).
 struct Dir(PathBuf);
 
 impl Dir {
@@ -120,7 +122,21 @@ impl Dir {
 
 impl Drop for Dir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // A file written into the directory while it is being removed, as by
+        // a connection of a dropped `Store` still closing, fails the removal;
+        // a later try, after a short wait, removes that file too.
+        for attempt in 0..3_u32 {
+            match std::fs::remove_dir_all(&self.0) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    if attempt == 2 {
+                        eprintln!("cannot remove the test directory {}: {e}", self.0.display());
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+                }
+                _ => return,
+            }
+        }
     }
 }
 
@@ -524,6 +540,7 @@ async fn each_column_round_trips_as_its_writer_encodes_it() {
     assert_eq!(built.rows["audit_log"], 2);
     assert_eq!(built.rows["apps"], 1);
     assert_eq!(built.rows["grants"], 0);
+    rebuilt.pool().close().await;
 }
 
 /// A value that does not fit its column stops the build with the entity,
@@ -890,6 +907,7 @@ async fn a_build_removes_the_rows_a_cascade_removed_and_keeps_the_re_created_par
         .unwrap();
     assert_eq!(env_rows, 0);
     assert_eq!(built.rows["apps"], 1);
+    rebuilt.pool().close().await;
 }
 
 /// A row that references a row the log never created stops the build with
@@ -1199,6 +1217,7 @@ async fn audit_records_are_inserted_in_their_own_seq_order() {
             (3, "test.three".to_owned()),
         ]
     );
+    rebuilt.pool().close().await;
 }
 
 /// Each build first removes what a build of the same target left when it

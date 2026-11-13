@@ -1633,15 +1633,6 @@ async fn the_start_up_entries_hold_no_private_key_and_only_credential_hashes() {
     }
 }
 
-/// A directory removed with everything in it on drop.
-struct Removed(std::path::PathBuf);
-
-impl Drop for Removed {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// The DER of the first PEM block of `pem`, whatever its label.
 fn pem_der(pem: &str) -> Vec<u8> {
     let body: String = pem
@@ -1710,14 +1701,10 @@ async fn a_promotion_build_keeps_the_custody_rows_the_log_leaves_and_no_private_
     let owner = server.owner().await;
     let node = enrolled(&server, &owner, "node-a", &["node"]).await;
     let _socket = bind(&server, &node, &new_key()).await;
-    let dir = Removed(std::env::temp_dir().join(format!(
-        "quoro-custody-build-{}",
-        &quoro_control_plane::store::random_secret()[..12]
-    )));
-    std::fs::create_dir_all(&dir.0).unwrap();
+    let dir = TestDir::new("quoro-custody-build");
     let cluster_id = server.state.cluster_id.clone();
 
-    let target = dir.0.join("rebuilt.db");
+    let target = dir.join("rebuilt.db");
     let built = database::build(
         &replay::followed(&server.state.store).await,
         &cluster_id,
@@ -1811,7 +1798,7 @@ async fn a_promotion_build_keeps_the_custody_rows_the_log_leaves_and_no_private_
     ] {
         last = append_entry(&source, "node_credential", node_id, op, payload).await;
     }
-    let target = dir.0.join("credentials.db");
+    let target = dir.join("credentials.db");
     let built = database::build(&replay::followed(&source).await, &cluster_id, 2, &target)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
@@ -1858,7 +1845,7 @@ async fn a_promotion_build_keeps_the_custody_rows_the_log_leaves_and_no_private_
         let refused = Store::open_in_memory().await.unwrap();
         append_entry(&refused, "node", deleted, Op::Create, node_row(deleted)).await;
         let first_seq = append_entry(&refused, "node_credential", deleted, op, payload).await;
-        let target = dir.0.join("refused.db");
+        let target = dir.join("refused.db");
         let error = database::build(&replay::followed(&refused).await, &cluster_id, 2, &target)
             .await
             .unwrap_err();

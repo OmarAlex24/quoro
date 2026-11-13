@@ -10,7 +10,7 @@ use axum::Router;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
-use common::{Server, replay};
+use common::{Server, TestDir, replay};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::api::audit_exports::CreateAuditExportRequest;
 use quoro_control_plane::audit_export;
@@ -20,7 +20,7 @@ use quoro_control_plane::changelog::{self, Actor, Op};
 use quoro_control_plane::deploy;
 use quoro_control_plane::rebuild::database::{self, Built};
 use quoro_control_plane::request::CallCtx;
-use quoro_control_plane::store::{Store, random_secret};
+use quoro_control_plane::store::Store;
 use quoro_control_plane::vulns::osv::{Affected, Event, Range, Record, Severity};
 use quoro_control_plane::vulns::subjects;
 use quoro_proto::custody::{self, CustodyKey};
@@ -34,7 +34,7 @@ use quoro_types::{Prefix, Role, new_id};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -523,15 +523,6 @@ async fn count(store: &Store, table: &str) -> i64 {
         .fetch_one(store.pool())
         .await
         .unwrap()
-}
-
-/// A directory under the test's temporary directory, removed on drop.
-struct Dir(PathBuf);
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 /// A copy of `server`'s database as it stands, taken at one instant:
@@ -1072,10 +1063,8 @@ async fn the_built_database_holds_every_replicated_row_of_the_primary() {
     );
 
     // The primary as it stands, and the database built from its log.
-    let dir =
-        Dir(std::env::temp_dir().join(format!("quoro-test-build-{}", &random_secret()[..12])));
-    std::fs::create_dir_all(&dir.0).unwrap();
-    let primary = snapshot(&server, &dir.0).await;
+    let dir = TestDir::new("quoro-test-build");
+    let primary = snapshot(&server, &dir).await;
     let entries = replay::followed(&primary).await;
     let term: String =
         sqlx::query_scalar("SELECT IFNULL((SELECT value FROM meta WHERE key = 'term'), '1')")
@@ -1083,7 +1072,7 @@ async fn the_built_database_holds_every_replicated_row_of_the_primary() {
             .await
             .unwrap();
     let promoted_term = term.parse::<u64>().unwrap() + 1;
-    let target = dir.0.join("rebuilt.db");
+    let target = dir.join("rebuilt.db");
     let built: Built = database::build(&entries, &server.state.cluster_id, promoted_term, &target)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
