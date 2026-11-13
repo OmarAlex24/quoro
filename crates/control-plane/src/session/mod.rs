@@ -738,6 +738,10 @@ pub enum RemovalStep {
     /// After the removal's transaction committed, before the node's session
     /// is told to end.
     Committed,
+    /// In the fence's check of a lease the node holds, before the check
+    /// reads whether the lease's revoke waits for an answer and whether the
+    /// node is connected.
+    LeaseCheck,
 }
 
 /// A test seam that holds one `removeNode` at one step

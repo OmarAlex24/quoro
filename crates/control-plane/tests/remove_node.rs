@@ -285,6 +285,21 @@ async fn entries_after(server: &Server, after: i64) -> Vec<(i64, String, String,
         .collect()
 }
 
+/// The entries after `after` that a removal of `node_id` could have written:
+/// every entry but the whole-row `node` entries of other machines, which the
+/// primary writes for them at any time, for example a new `desired_rev`.
+async fn removal_writes_after(
+    server: &Server,
+    after: i64,
+    node_id: &str,
+) -> Vec<(i64, String, String, String, Value)> {
+    entries_after(server, after)
+        .await
+        .into_iter()
+        .filter(|(_, kind, id, _, _)| kind != "node" || id == node_id)
+        .collect()
+}
+
 /// `(result, scope, params, change_seq, actor_type, target_type, target_id)`
 /// of each `removeNode` record, oldest first.
 type RemoveRecord = (
@@ -966,6 +981,44 @@ async fn a_session_that_ends_before_its_answer_removes_nothing() {
     assert_eq!(entries[0].4["fencing_token"], 2);
 }
 
+/// A session that ends while the fence checks a lease, after the call found
+/// the node connected, is reported as ended, never as a refused revoke: the
+/// check reads whether the node is connected after whether the lease's
+/// revoke still waits for its answer (#941). Nothing is removed and the
+/// lease stays revoked at its token.
+#[tokio::test]
+async fn a_session_that_ends_during_the_fence_check_is_reported_as_ended() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, mut socket, _app_id, _vm_id, _volume_id, lease_id) =
+        node_with_lease(&server, &owner).await;
+    let node_id = node.node_id.clone();
+    common::settle_voters(&server).await;
+
+    let hold = server
+        .state
+        .hub
+        .hold_next_removal(&node_id, RemovalStep::LeaseCheck);
+    let call = tokio::spawn({
+        let owner = owner.clone();
+        let url = server.url(&format!("/api/v1/nodes/{node_id}"));
+        async move { owner.delete(url).send().await.unwrap() }
+    });
+    recv_until(&mut socket, &["lease_revoke"]).await;
+    hold.reached().await;
+    drop(socket);
+    wait_disconnected(&server, &node_id).await;
+    hold.release();
+    let (status, code, _, detail) = problem(call.await.unwrap()).await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(detail.contains("session ended"), "{detail}");
+    assert_ne!(node_status(&server, &node_id).await, "removed");
+    let (token, revoked_at, holder) = lease_row(&server, &lease_id).await;
+    assert_eq!(token, 1);
+    assert!(revoked_at.is_some());
+    assert_eq!(holder, node_id);
+}
+
 /// A session that has attached but not said `hello` yet counts as
 /// connected: the node holds no lease, so nothing is revoked, and once the
 /// removal commits the session ends with `node_removed`, its `hello`
@@ -1170,7 +1223,8 @@ async fn a_repair_counts_its_majority_over_the_logs_voters() {
     let (status, code, _, detail) = problem(remove(&owner, &server, &x.node_id).await).await;
     assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
     assert!(detail.contains("majority"), "{detail}");
-    assert!(entries_after(&server, before).await.is_empty());
+    let written = removal_writes_after(&server, before, &x.node_id).await;
+    assert!(written.is_empty(), "{written:?}");
     assert_ne!(node_status(&server, &x.node_id).await, "removed");
 
     machine_c.start_acking().await;
