@@ -1956,7 +1956,9 @@ impl Engine for FakeEngine {
         // a volume's live file first, then the base. A file missing from the
         // volume directory is `NotFound`, and a path that is not a regular
         // file is `Conflict`. Without a volume directory the fake keeps no
-        // files, so the records are all there is to check.
+        // files, so the records are all there is to check. Unlike the real
+        // engine, the fake does not open a newer snapshot's own file: receiver
+        // tests rely on a recorded snapshot answering from its record alone.
         if state.volume_dir.is_some() {
             if matches!(newer, RangesOf::Volume(_)) {
                 check_regular_file(&newer_path)?;
