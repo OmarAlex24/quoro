@@ -622,7 +622,9 @@ async fn a_demotion_never_records_a_term_above_the_ceiling() {
     for (meta_term, node_term, recorded) in [
         (ceiling.as_str(), None, Some(ceiling.as_str())),
         (ceiling.as_str(), Some(MAX_TERM), Some(ceiling.as_str())),
-        ("18446744073709551615", Some(5), Some(ceiling.as_str())),
+        // A meta.term above the ceiling holds no term (read_term), so the
+        // node's usable term is recorded.
+        ("18446744073709551615", Some(5), Some("5")),
         ("3", Some(MAX_TERM + 1), Some("4")),
         ("bad", Some(MAX_TERM + 1), None),
     ] {
