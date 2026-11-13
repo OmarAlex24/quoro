@@ -1625,6 +1625,15 @@ async fn a_scheduled_backup_without_the_repository_key_fails_at_once() {
             .await
             .unwrap();
     assert_eq!(events, 5);
+    // Failed at once by the schedule, not by a task that started: no
+    // key-absent row ever ran.
+    let started: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM backups WHERE \"trigger\" = 'schedule' AND started_at IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(started, 0);
     assert_eq!(bucket_keys(&setup.memory).await, objects);
 
     // With the key back, the volume's next interval queues a real backup.

@@ -47,8 +47,9 @@ const TEMP_PREFIX: &str = "cp-backup-";
 const TEMP_SUFFIX: &str = ".sqlite";
 
 /// Queues a control-plane backup when the repository's schedule says one is
-/// due, and returns the `queued` row as the API shows it
-/// (`backup-format.md` section 7.2).
+/// due, and returns the `queued` row, or the row failed at once while the
+/// repository key is absent, as the API shows it (`backup-format.md`
+/// section 7.2).
 ///
 /// Due means: a repository exists, no control-plane backup is `queued` or
 /// `running`, and the newest `succeeded` or `failed` one is older than
@@ -660,9 +661,10 @@ async fn run(state: &AppState, backup: &BackupRecord, now: OffsetDateTime) -> Re
         .await
         .map_err(|error| reason_of(&error))?
         .ok_or_else(|| "the backup's repository is missing".to_string())?;
-    // A backup queued before the key went absent fails with the same reason
-    // as one the schedule fails at once (`node-agent-protocol.md` section
-    // 7.3, step 4).
+    // A defensive check: the schedule never queues a backup while the key is
+    // absent, and the key never goes absent inside a running process. Should
+    // one get here, it fails with the reason the schedule records
+    // (`node-agent-protocol.md` section 7.3, step 4).
     if !repository.holds_key() {
         return Err(super::KEY_ABSENT.to_string());
     }
