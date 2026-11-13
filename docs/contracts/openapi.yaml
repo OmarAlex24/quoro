@@ -1100,9 +1100,10 @@ components:
           format: date-time
           description: |
             When an operator declared this node lost (ADR 0183,
-            `POST /api/v1/nodes/{node_id}/declare-lost`), or null. Its leases
-            were revoked with new tokens at that time. Cleared once the node
-            returns and has answered the revokes of those leases
+            `POST /api/v1/nodes/{node_id}/declare-lost`), or null. The
+            declaration raised and revoked the node's leases at that time.
+            Cleared once the node returns and has answered the revokes the
+            primary then sends with reason `declared_lost`
             (node-agent-protocol.md sections 8.3 and 9).
         created_at:
           type: string
@@ -6936,8 +6937,10 @@ paths:
         stays enrolled and stays a voter. Leases listed in its `fence_failure`
         stay ungrantable until that fence is acknowledged, and an `expiring`
         lease still waits for its gate. When the node returns, the primary
-        revokes those leases on its session before anything else. The scope is
-        human-only: an agent is refused with `forbidden` and
+        revokes on its session, before anything else and with reason
+        `declared_lost`, the leases node-agent-protocol.md section 8.3 names,
+        and clears `lost_at` once they are answered. The scope is human-only:
+        an agent is refused with `forbidden` and
         `reason: human_only`. A connected or removed node is refused with
         `conflict`. When a lease the node holds is already at 2^53 - 1, the
         token cap, nothing is written and the call answers `conflict` with
