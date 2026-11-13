@@ -728,13 +728,24 @@ mod tests {
     };
     use super::{ConvertFacts, ConvertStep, convert_step};
     use crate::AppState;
-    use crate::authority::DEFAULT_DURATION_MS;
+    use crate::authority::{DEFAULT_DURATION_MS, VoterSupport};
     use quoro_proto::{ErrorCode, LeaseMode};
     use serde_json::Value;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     const D: u64 = DEFAULT_DURATION_MS;
+
+    /// Support for the first question only, none after it.
+    #[derive(Debug, Default)]
+    struct SupportOnce(AtomicBool);
+
+    impl VoterSupport for SupportOnce {
+        fn supports(&self, _duration_ms: u64) -> bool {
+            !self.0.swap(true, Ordering::SeqCst)
+        }
+    }
 
     /// The conversion grants among `frames`: `lease_grant`s of the lease
     /// with `mode` `expiring`.
@@ -944,7 +955,8 @@ mod tests {
 
     /// Test 2: no conversion goes while the row's newest write is not
     /// acknowledged by a machine of the required set, nor without majority
-    /// support for `D`. Then it goes, `expiring` at the row's token for `D`
+    /// support for `D`, also when support goes between the attempt's first
+    /// read and its send. Then it goes, `expiring` at the row's token for `D`
     /// with no `re`, recorded on the session in flight, with its message id,
     /// and the row is not written. Before the barrier passed, the hold of the
     /// sessions lock that queues it refuses it.
@@ -969,6 +981,19 @@ mod tests {
         ack(&f.state, &f, &on).await;
         hub.attempt_held().await;
         assert!(conversions(&queued(&mut on)).is_empty(), "no support");
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+
+        // Support lost between the attempt's first read and its send under
+        // the writer gate: the send asks again, and nothing goes.
+        hub.set_voter_support(Arc::new(SupportOnce::default()));
+        hub.attempt_held().await;
+        assert!(
+            conversions(&queued(&mut on)).is_empty(),
+            "support lost before the send"
+        );
         assert_eq!(
             hub.conversion_in_flight(&f.node_id, generation, LEASE),
             None
