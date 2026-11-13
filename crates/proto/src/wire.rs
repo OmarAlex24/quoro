@@ -39,8 +39,13 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 /// Default session timeout without any frame (section 4.3).
 pub const SESSION_TIMEOUT_MS: u64 = 15_000;
 
-/// Most entries a `welcome.primary_urls` list may carry (section 5.10).
-pub const MAX_PRIMARY_URLS: usize = 8;
+/// Most entries a `welcome.primary_urls` list may carry, and that a node
+/// keeps (section 5.10, ADR 0235).
+pub const MAX_PRIMARY_URLS: usize = 16;
+
+/// Most entries a `hello.control_plane_urls` list may carry (section 5.1,
+/// ADR 0235).
+pub const MAX_CONTROL_PLANE_URLS: usize = 4;
 
 /// Status report interval (section 4.3).
 pub const STATUS_REPORT_INTERVAL_MS: u64 = 30_000;
@@ -300,6 +305,38 @@ pub struct Hello {
         deserialize_with = "mesh_rules_version"
     )]
     pub mesh_rules: Option<u64>,
+    /// From M5b, on a machine with the `node` role: the base URLs where this
+    /// machine's control-plane listener would answer if it were promoted,
+    /// best first, at most [`MAX_CONTROL_PLANE_URLS`] (section 5.1, ADR
+    /// 0235). The primary lists them in `welcome.primary_urls` (section
+    /// 5.10). Optional: an absent or empty list is valid, and an empty list
+    /// is not serialized. A value that is not an array of strings, or a list
+    /// longer than [`MAX_CONTROL_PLANE_URLS`], fails the decoding of the
+    /// `hello`, which the primary answers `bad_message` as it does any other
+    /// malformed body (section 5.18).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "control_plane_urls"
+    )]
+    pub control_plane_urls: Vec<String>,
+}
+
+/// Reads a present `hello.control_plane_urls`: an array of at most
+/// [`MAX_CONTROL_PLANE_URLS`] strings. `null` or any value that is not an
+/// array of strings fails as a `Vec<String>` would; a longer list fails
+/// here.
+fn control_plane_urls<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let urls = Vec::<String>::deserialize(deserializer)?;
+    if urls.len() > MAX_CONTROL_PLANE_URLS {
+        return Err(serde::de::Error::custom(format!(
+            "control_plane_urls has {} entries, more than {MAX_CONTROL_PLANE_URLS}",
+            urls.len()
+        )));
+    }
+    Ok(urls)
 }
 
 /// The highest `hello.mesh_rules` (section 5.1): 2^53 - 1.
@@ -883,7 +920,9 @@ pub struct Welcome {
     pub session_timeout_ms: u64,
     pub primary_node_id: String,
     /// Other base URLs where this primary's listener can be reached, best
-    /// first (section 5.10). Optional: an absent or empty list is valid.
+    /// first, and from M5b the `hello.control_plane_urls` of the machines a
+    /// promotion could choose, at most [`MAX_PRIMARY_URLS`] (section 5.10,
+    /// ADR 0235). Optional: an absent or empty list is valid.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub primary_urls: Vec<String>,
     /// From M5b: the schema version of the primary's database (`meta`
@@ -1953,6 +1992,97 @@ mod tests {
             "null",
         ] {
             let raw = hello_with_mesh_rules(Some(text));
+            let error = NodeMessage::from_raw(&raw).unwrap_err();
+            assert!(
+                matches!(&error, DecodeError::BadBody { kind, .. } if kind == "hello"),
+                "{text}: {error:?}"
+            );
+            assert_eq!(error.code(), crate::ErrorCode::BadMessage, "{text}");
+            assert!(!error.is_fatal(), "{text}");
+            assert_eq!(error.message_id(), Some("msg_1"), "{text}");
+        }
+    }
+
+    /// A `hello` body with `control_plane_urls` set to the JSON text
+    /// `value`, or without the field.
+    fn hello_with_control_plane_urls(value: Option<&str>) -> RawFrame {
+        let field = value.map_or_else(String::new, |value| {
+            format!(r#","control_plane_urls":{value}"#)
+        });
+        let text = format!(
+            r#"{{"v":1,"type":"hello","id":"msg_1","body":{{
+            "node_id":"nod_1","agent_version":"0.1.0","engine_version":"fake",
+            "boot_id":"8f1c","stored_rev":0,"applied_rev":0,"log_seq":0,
+            "log_hash":"0000","leases":[],"capacity":{{"cpus":1,"memory_mb":1,"disk_gb":1}},
+            "allocated":{{"cpus":0,"memory_mb":0,"disk_gb":0}},
+            "kvm":{{"available":true,"kernel":"6.11.2"}},"dropped_events":0{field}}}}}"#
+        );
+        RawFrame::parse(&text).unwrap()
+    }
+
+    /// Section 5.1 (ADR 0235): `control_plane_urls` is optional and
+    /// additive. A list of up to 4 strings round-trips, a `hello` without it
+    /// or with an empty list reads as empty and is sent without the member,
+    /// as `welcome.primary_urls` is.
+    #[test]
+    fn hello_control_plane_urls_is_optional_and_an_empty_list_is_not_serialized() {
+        for urls in [
+            vec!["https://192.0.2.21:8443"],
+            vec![
+                "https://192.0.2.21:8443",
+                "https://[2001:db8::21]:8443",
+                "https://node-b.local:8443",
+                "https://198.51.100.21:8443",
+            ],
+        ] {
+            let raw = hello_with_control_plane_urls(Some(&json!(urls).to_string()));
+            let message = NodeMessage::from_raw(&raw).unwrap();
+            let NodeMessage::Hello(hello) = &message else {
+                panic!("not a hello");
+            };
+            assert_eq!(hello.control_plane_urls, urls);
+            let again = message.to_frame(&raw.id, None);
+            assert_eq!(again.body["control_plane_urls"], json!(urls));
+            assert_eq!(NodeMessage::from_raw(&again).unwrap(), message);
+        }
+
+        for value in [None, Some("[]")] {
+            let raw = hello_with_control_plane_urls(value);
+            let message = NodeMessage::from_raw(&raw).unwrap();
+            let NodeMessage::Hello(hello) = &message else {
+                panic!("not a hello");
+            };
+            assert!(hello.control_plane_urls.is_empty(), "{value:?}");
+            let again = message.to_frame(&raw.id, None);
+            assert!(
+                again.body.get("control_plane_urls").is_none(),
+                "{value:?}: {}",
+                again.body
+            );
+        }
+    }
+
+    /// Section 5.1: at most 4 entries, each a string. Anything else fails
+    /// the body, which section 5.18 answers `bad_message`, non-fatal.
+    #[test]
+    fn a_malformed_hello_control_plane_urls_fails_the_body() {
+        let five = json!([
+            "https://192.0.2.1:8443",
+            "https://192.0.2.2:8443",
+            "https://192.0.2.3:8443",
+            "https://192.0.2.4:8443",
+            "https://192.0.2.5:8443"
+        ])
+        .to_string();
+        for text in [
+            five.as_str(),
+            "null",
+            "\"https://192.0.2.1:8443\"",
+            "[1]",
+            "[\"https://192.0.2.1:8443\",null]",
+            "{}",
+        ] {
+            let raw = hello_with_control_plane_urls(Some(text));
             let error = NodeMessage::from_raw(&raw).unwrap_err();
             assert!(
                 matches!(&error, DecodeError::BadBody { kind, .. } if kind == "hello"),

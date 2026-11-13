@@ -42,6 +42,7 @@ pub mod warm;
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use agent::{run, run_with_mesh};
@@ -114,6 +115,58 @@ pub struct AgentConfig {
     /// store as tracking every snapshot once each of them is recorded
     /// ([`kept::start_tracking`]).
     pub snapshots_at_start: Option<std::collections::BTreeSet<String>>,
+    /// Where this machine's control-plane listener would answer if it were
+    /// promoted, for `hello.control_plane_urls` (node-agent-protocol.md
+    /// section 5.1, ADR 0235). Only a machine with the `node` role sends
+    /// them; the default source lists nothing.
+    pub control_plane_urls: ControlPlaneUrls,
+}
+
+/// The source of `hello.control_plane_urls` (node-agent-protocol.md section
+/// 5.1, ADR 0235): the base URLs where this machine's control-plane listener
+/// would answer if it were promoted, best first. The binary installs one
+/// built from the host's own addresses and the listener port of the
+/// installed configuration. It is asked again for every `hello`, so an
+/// address that changes while the agent runs reaches the primary with the
+/// next session. The default source lists nothing.
+#[derive(Clone, Default)]
+pub struct ControlPlaneUrls(Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>);
+
+impl ControlPlaneUrls {
+    /// A source that asks `urls` for the list.
+    #[must_use]
+    pub fn new(urls: impl Fn() -> Vec<String> + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(urls)))
+    }
+
+    /// What `hello.control_plane_urls` carries: the source's `https://`
+    /// entries in order, without duplicates, at most
+    /// [`quoro_proto::wire::MAX_CONTROL_PLANE_URLS`].
+    #[must_use]
+    pub fn urls(&self) -> Vec<String> {
+        let Some(source) = &self.0 else {
+            return Vec::new();
+        };
+        let mut urls: Vec<String> = Vec::new();
+        for url in source() {
+            if !url.starts_with("https://") || urls.contains(&url) {
+                continue;
+            }
+            urls.push(url);
+            if urls.len() == quoro_proto::wire::MAX_CONTROL_PLANE_URLS {
+                break;
+            }
+        }
+        urls
+    }
+}
+
+impl fmt::Debug for ControlPlaneUrls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ControlPlaneUrls")
+            .field(&if self.0.is_some() { "source" } else { "none" })
+            .finish()
+    }
 }
 
 /// Whether `roles` include `node`. Only such a machine keeps a custody key

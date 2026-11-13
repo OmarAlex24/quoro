@@ -353,6 +353,9 @@ pub async fn run_with_mesh<E: Engine + 'static, D: MeshDriver + 'static>(
     // With the `node` role the session keeps the custody key, generating it
     // before the first `hello` of a machine upgraded to M5b (section 7.2).
     .with_roles(&config.roles)
+    // Section 5.1 (ADR 0235): where this machine's control plane would
+    // answer if it were promoted, sent with the `node` role only.
+    .with_control_plane_urls(config.control_plane_urls.clone())
     .with_interactive(interactive)
     .with_inventory(inventory);
     let outcome = session.run(stop_rx).await;

@@ -17,7 +17,7 @@ use quoro_node_agent::identity::{CUSTODY_KEY_FILE, IdentityHandle};
 use quoro_node_agent::session::{Session, SessionSetup};
 use quoro_node_agent::store::NodeStore;
 use quoro_node_agent::tls::cert_fingerprint;
-use quoro_node_agent::{AgentConfig, AgentError, Identity, JoinTarget, join};
+use quoro_node_agent::{AgentConfig, AgentError, ControlPlaneUrls, Identity, JoinTarget, join};
 use quoro_proto::custody::CustodyKey;
 use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -110,6 +110,7 @@ fn config(dir: &TempDir) -> AgentConfig {
         acme_directory_url: quoro_node_agent::DEFAULT_ACME_DIRECTORY.to_owned(),
         acme_contact: Vec::new(),
         snapshots_at_start: None,
+        control_plane_urls: ControlPlaneUrls::default(),
     }
 }
 

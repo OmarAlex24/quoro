@@ -108,6 +108,7 @@ fn hello(node_id: &str, mesh_seed: u8) -> NodeMessage {
         volume_snapshot: Some(wire::SnapshotMethod::Reflink),
         custody_public_key: None,
         mesh_rules: None,
+        control_plane_urls: Vec::new(),
     })
 }
 

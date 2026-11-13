@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The base URLs the primary advertises in `welcome.primary_urls`
-//! (`node-agent-protocol.md` section 5.10).
+//! (`node-agent-protocol.md` section 5.10), and those a machine with the
+//! `node` role reports in `hello.control_plane_urls` (section 5.1, ADR 0235).
 //!
 //! A node that cannot dial the primary's public address gets to try the
 //! addresses listed here with the same certificate pin and credential. The
 //! list is built on every call, because an address can appear or disappear
 //! while the primary runs: the configured `public_url` first, then the host's
 //! non-loopback addresses, then `<host name>.local` when that name resolves.
+//! A node's `control_plane_urls` are built the same way from its own
+//! addresses and the listener port of its installed configuration, without
+//! `public_url`, and capped at 4: where its control plane would answer if it
+//! were promoted.
 //!
 //! The addresses come from `/proc/net/fib_trie` (IPv4) and `/proc/net/if_inet6`
 //! (IPv6), not from `getifaddrs`: `quoro.service` may open only `AF_INET`,
@@ -16,7 +21,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use quoro_proto::wire::MAX_PRIMARY_URLS;
+use quoro_proto::wire::{MAX_CONTROL_PLANE_URLS, MAX_PRIMARY_URLS};
 use tracing::warn;
 
 use crate::config::Config;
@@ -72,32 +77,77 @@ impl AdvertisedUrls {
     /// while the primary runs is picked up by the next `welcome`.
     #[must_use]
     pub fn urls(&self) -> Vec<String> {
-        let mut interfaces = Vec::new();
-        match std::fs::read_to_string("/proc/net/fib_trie") {
-            Ok(text) => interfaces.extend(
-                local_ipv4(&text)
-                    .into_iter()
-                    .map(|ip| (String::new(), IpAddr::V4(ip))),
-            ),
-            Err(e) => warn!(error = %e, "cannot read /proc/net/fib_trie for primary_urls"),
-        }
-        // A host without IPv6 has no if_inet6; that is not worth a warning.
-        if let Ok(text) = std::fs::read_to_string("/proc/net/if_inet6") {
-            interfaces.extend(
-                inet6_addresses(&text)
-                    .into_iter()
-                    .map(|(name, ip)| (name, IpAddr::V6(ip))),
-            );
-        }
         compose(
             self.public_url.as_deref(),
             self.listen,
-            &interfaces,
+            &interfaces(),
             &self.bridge,
             self.subnet,
             self.local_name.as_deref(),
         )
     }
+
+    /// The `hello.control_plane_urls` of a machine with the `node` role
+    /// (section 5.1, ADR 0235): where this host's control-plane listener
+    /// would answer if the machine were promoted, built like
+    /// [`AdvertisedUrls::urls`] from the host's own addresses but without
+    /// `public_url`, at most [`MAX_CONTROL_PLANE_URLS`].
+    ///
+    /// Interface enumeration runs on every call, so an address that changes
+    /// while the agent runs is picked up by the next `hello`.
+    #[must_use]
+    pub fn control_plane_urls(&self) -> Vec<String> {
+        control_plane_urls(
+            self.listen,
+            &interfaces(),
+            &self.bridge,
+            self.subnet,
+            self.local_name.as_deref(),
+        )
+    }
+}
+
+/// The host's interface addresses: IPv4 from `/proc/net/fib_trie`, whose
+/// lines name no interface, then IPv6 from `/proc/net/if_inet6` with theirs.
+fn interfaces() -> Vec<(String, IpAddr)> {
+    let mut interfaces = Vec::new();
+    match std::fs::read_to_string("/proc/net/fib_trie") {
+        Ok(text) => interfaces.extend(
+            local_ipv4(&text)
+                .into_iter()
+                .map(|ip| (String::new(), IpAddr::V4(ip))),
+        ),
+        Err(e) => warn!(error = %e, "cannot read /proc/net/fib_trie for the advertised URLs"),
+    }
+    // A host without IPv6 has no if_inet6; that is not worth a warning.
+    if let Ok(text) = std::fs::read_to_string("/proc/net/if_inet6") {
+        interfaces.extend(
+            inet6_addresses(&text)
+                .into_iter()
+                .map(|(name, ip)| (name, IpAddr::V6(ip))),
+        );
+    }
+    interfaces
+}
+
+/// Builds `hello.control_plane_urls` from the fixed inputs, as [`compose`]
+/// does without a `public_url`, and keeps the first
+/// [`MAX_CONTROL_PLANE_URLS`]. A listener bound to one address that no other
+/// machine can reach (loopback, link-local, the node subnet) would answer
+/// nobody after a promotion, so it lists nothing.
+fn control_plane_urls(
+    listen: SocketAddr,
+    interfaces: &[(String, IpAddr)],
+    bridge: &str,
+    subnet: Option<(Ipv4Addr, u8)>,
+    local_name: Option<&str>,
+) -> Vec<String> {
+    if !listen.ip().is_unspecified() && !is_reachable(listen.ip(), subnet) {
+        return Vec::new();
+    }
+    let mut urls = compose(None, listen, interfaces, bridge, subnet, local_name);
+    urls.truncate(MAX_CONTROL_PLANE_URLS);
+    urls
 }
 
 /// Builds the list from the fixed inputs: the configured `public_url`, the
@@ -153,7 +203,13 @@ fn is_advertised(
     bridge: &str,
     subnet: Option<(Ipv4Addr, u8)>,
 ) -> bool {
-    if ip.is_unspecified() || ip.is_loopback() || interface == bridge {
+    interface != bridge && is_reachable(ip, subnet)
+}
+
+/// Whether another host can reach `ip`: not unspecified, loopback or
+/// link-local, and outside the node subnet.
+fn is_reachable(ip: IpAddr, subnet: Option<(Ipv4Addr, u8)>) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() {
         return false;
     }
     match ip {
@@ -404,13 +460,114 @@ fe80000000000000be2411fffe51ab01 02 40 20 80     eth0
             vec!["https://192.168.1.20:8443", "https://192.168.1.21:8443"]
         );
 
-        let many: Vec<(String, IpAddr)> = (1..=12)
+        // Section 5.10 (ADR 0235): at most 16.
+        let many: Vec<(String, IpAddr)> = (1..=20)
             .map(|last| interface("en0", &format!("192.168.2.{last}")))
             .collect();
+        assert_eq!(MAX_PRIMARY_URLS, 16);
         assert_eq!(
             compose(None, "0.0.0.0:8443".parse().unwrap(), &many, "", None, None).len(),
             MAX_PRIMARY_URLS
         );
+    }
+
+    /// Section 5.1 (ADR 0235): a node's `control_plane_urls` are its own
+    /// addresses with the configured listener port, best first, as
+    /// `welcome.primary_urls` is built: no `public_url`, no loopback,
+    /// link-local, bridge or node-subnet address, IPv6 in brackets, then
+    /// `<host name>.local`, at most 4.
+    #[test]
+    fn a_node_lists_its_own_addresses_with_the_listener_port_at_most_4() {
+        let interfaces = vec![
+            interface("lo0", "127.0.0.1"),
+            interface("en0", "192.168.1.21"),
+            interface("en0", "169.254.10.1"),
+            interface("en0", "fe80::1"),
+            interface("quoro0", "10.42.0.1"),
+            interface("en2", "10.42.0.9"),
+            interface("en1", "2001:db8::21"),
+            interface("lo0", "::1"),
+        ];
+        let subnet = Some((Ipv4Addr::new(10, 42, 0, 0), 24));
+        assert_eq!(
+            control_plane_urls(
+                "[::]:8443".parse().unwrap(),
+                &interfaces,
+                "quoro0",
+                subnet,
+                Some("node-b"),
+            ),
+            vec![
+                "https://192.168.1.21:8443",
+                "https://[2001:db8::21]:8443",
+                "https://node-b.local:8443",
+            ]
+        );
+        // The port is the configured listener's.
+        assert_eq!(
+            control_plane_urls(
+                "0.0.0.0:9443".parse().unwrap(),
+                &interfaces,
+                "quoro0",
+                subnet,
+                None,
+            ),
+            vec!["https://192.168.1.21:9443"]
+        );
+
+        let many: Vec<(String, IpAddr)> = (1..=6)
+            .map(|last| interface("en0", &format!("192.168.2.{last}")))
+            .collect();
+        assert_eq!(
+            control_plane_urls(
+                "0.0.0.0:8443".parse().unwrap(),
+                &many,
+                "quoro0",
+                None,
+                Some("node-b"),
+            ),
+            vec![
+                "https://192.168.2.1:8443",
+                "https://192.168.2.2:8443",
+                "https://192.168.2.3:8443",
+                "https://192.168.2.4:8443",
+            ]
+        );
+    }
+
+    /// A listener bound to one address lists that address, and nothing when
+    /// no other machine could reach it there.
+    #[test]
+    fn a_node_listener_on_one_address_lists_it_only_when_reachable() {
+        let interfaces = vec![interface("en0", "192.168.1.21")];
+        assert_eq!(
+            control_plane_urls(
+                "192.168.1.21:8443".parse().unwrap(),
+                &interfaces,
+                "quoro0",
+                None,
+                Some("node-b"),
+            ),
+            vec!["https://192.168.1.21:8443", "https://node-b.local:8443"]
+        );
+        for listen in [
+            "127.0.0.1:8443",
+            "[::1]:8443",
+            "169.254.1.1:8443",
+            "10.42.0.9:8443",
+        ] {
+            assert_eq!(
+                control_plane_urls(
+                    listen.parse().unwrap(),
+                    &interfaces,
+                    "quoro0",
+                    Some((Ipv4Addr::new(10, 42, 0, 0), 24)),
+                    Some("node-b"),
+                ),
+                Vec::<String>::new(),
+                "{listen}"
+            );
+        }
     }
 
     #[test]

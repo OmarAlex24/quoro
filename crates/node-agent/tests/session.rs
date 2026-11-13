@@ -26,7 +26,9 @@ use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::session::{Session, SessionEnd, SessionSetup};
 use quoro_node_agent::store::{FreezeChecked, NodeStore, PROMOTION_FREEZE, Refollowing, VOTE};
 use quoro_node_agent::tls;
-use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, ManualHostClock, start_local_leases};
+use quoro_node_agent::{
+    ControlPlaneUrls, FenceTimers, LeaseConfig, LeaseState, ManualHostClock, start_local_leases,
+};
 use quoro_proto::custody::CustodyKey;
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
@@ -482,14 +484,16 @@ async fn a_welcome_with_primary_urls_persists_the_sanitized_list() {
     let mut advertised = vec!["http://plain.test:9000".to_owned()];
     advertised.push("https://reachable.test:9000".to_owned());
     advertised.push("https://reachable.test:9000".to_owned());
-    for index in 0..10 {
+    for index in 0..20 {
         advertised.push(format!("https://host{index}.test:9000"));
     }
     serve_one_welcome(&dir, &identity, advertised).await;
 
+    // Section 5.10 (ADR 0235): the node keeps the first 16.
     let expected: Vec<String> = std::iter::once("https://reachable.test:9000".to_owned())
-        .chain((0..7).map(|index| format!("https://host{index}.test:9000")))
+        .chain((0..15).map(|index| format!("https://host{index}.test:9000")))
         .collect();
+    assert_eq!(expected.len(), 16);
     assert_eq!(identity.get().primary_urls, expected);
     assert_eq!(
         quoro_node_agent::identity::load_identity(dir.path())
@@ -3547,6 +3551,104 @@ async fn only_a_machine_with_the_node_role_keeps_and_reports_a_custody_key() {
     }
 }
 
+/// A source of `hello.control_plane_urls` that lists what `urls` holds when
+/// it is asked.
+fn control_plane_source(urls: &Arc<std::sync::Mutex<Vec<String>>>) -> ControlPlaneUrls {
+    let urls = Arc::clone(urls);
+    ControlPlaneUrls::new(move || urls.lock().unwrap().clone())
+}
+
+/// Section 5.1 (ADR 0235): a machine with the `node` role lists where its
+/// control plane would answer if it were promoted: the source's `https://`
+/// entries, best first, without duplicates, at most 4. The source is asked
+/// again for every `hello`, and an empty list leaves the member out.
+#[tokio::test]
+async fn a_node_s_hello_lists_at_most_4_control_plane_urls() {
+    let urls = Arc::new(std::sync::Mutex::new(
+        [
+            "https://192.0.2.21:8443",
+            "http://192.0.2.22:8443",
+            "https://192.0.2.21:8443",
+            "https://[2001:db8::21]:8443",
+            "https://node-b.local:8443",
+            "https://198.51.100.21:8443",
+            "https://198.51.100.22:8443",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+    ));
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let session = Session::new(setup)
+        .with_roles(&node_roles())
+        .with_control_plane_urls(control_plane_source(&urls));
+    let (ws, hello, serving) = open_session(session).await;
+    assert_eq!(
+        hello["body"]["control_plane_urls"],
+        json!([
+            "https://192.0.2.21:8443",
+            "https://[2001:db8::21]:8443",
+            "https://node-b.local:8443",
+            "https://198.51.100.21:8443"
+        ]),
+        "{hello}"
+    );
+    let session = end_session(ws, serving).await;
+
+    // An address changed while the agent ran: the next `hello` carries it.
+    *urls.lock().unwrap() = vec!["https://192.0.2.23:8443".to_owned()];
+    let (ws, hello, serving) = open_session(session).await;
+    assert_eq!(
+        hello["body"]["control_plane_urls"],
+        json!(["https://192.0.2.23:8443"]),
+        "{hello}"
+    );
+    let session = end_session(ws, serving).await;
+
+    // Nothing to list: the member is left out.
+    urls.lock().unwrap().clear();
+    let (ws, hello, serving) = open_session(session).await;
+    assert!(hello["body"].get("control_plane_urls").is_none(), "{hello}");
+    end_session(ws, serving).await;
+}
+
+/// Section 5.1: only a machine with the `node` role, one a promotion could
+/// choose, sends `control_plane_urls`. An edge-only or witness-only machine
+/// sends none, whatever its source lists.
+#[tokio::test]
+async fn only_a_machine_with_the_node_role_lists_control_plane_urls() {
+    let urls = Arc::new(std::sync::Mutex::new(vec![
+        "https://192.0.2.21:8443".to_owned(),
+    ]));
+    for (roles, lists) in [
+        (vec!["edge"], false),
+        (vec!["witness"], false),
+        (vec!["edge", "witness"], false),
+        (vec!["edge", "node"], true),
+    ] {
+        let roles: Vec<String> = roles.into_iter().map(str::to_owned).collect();
+        let dir = TempDir::new();
+        let (setup, _observed) = follow_node(&dir).await;
+        let session = Session::new(setup)
+            .with_roles(&roles)
+            .with_control_plane_urls(control_plane_source(&urls));
+        let (ws, hello, serving) = open_session(session).await;
+        if lists {
+            assert_eq!(
+                hello["body"]["control_plane_urls"],
+                json!(["https://192.0.2.21:8443"]),
+                "{roles:?}: {hello}"
+            );
+        } else {
+            assert!(
+                hello["body"].get("control_plane_urls").is_none(),
+                "{roles:?}: {hello}"
+            );
+        }
+        end_session(ws, serving).await;
+    }
+}
+
 /// Section 7.2, ADR 0231: the primary binds the first custody key it sees,
 /// so a `custody.key` that cannot be read or is not 32 bytes is never
 /// replaced or overwritten: it is kept byte for byte. The custody key guards
@@ -4183,6 +4285,122 @@ async fn a_freeze_ends_a_dial_attempt_under_way() {
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
     hung_listener.abort();
     listener.abort();
+}
+
+/// Section 4.4 and ADR 0235: one deadline, the dial's connect timeout,
+/// bounds TCP, TLS and the WebSocket upgrade. `primary_url` refuses the
+/// connection, so after about 2 s the attempt reaches the advertised
+/// addresses, with the 2 s timeout of the first attempt. The first completes
+/// TLS, reads the upgrade request and never answers it. The dial gives up on
+/// it within that timeout, closes the connection and dials the next stored
+/// address, which gets the `hello`.
+#[tokio::test]
+async fn an_upgrade_that_is_never_answered_ends_within_the_connect_timeout() {
+    use tokio::io::AsyncReadExt as _;
+
+    let dir = TempDir::new();
+    let (cert, key) = self_signed();
+    let pin = tls::cert_fingerprint(cert.as_ref());
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+    let (events, mut seen) = mpsc::unbounded_channel::<(&'static str, Instant)>();
+
+    // A port nothing listens on: bound once, then released.
+    let refused = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("https://127.0.0.1:{}", probe.local_addr().unwrap().port())
+    };
+
+    let stalled = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let stalled_url = format!("https://127.0.0.1:{}", stalled.local_addr().unwrap().port());
+    let stalled_task = {
+        let acceptor = acceptor.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = stalled.accept().await {
+                let acceptor = acceptor.clone();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    // Reads the upgrade request, answers nothing, and reports
+                    // when the agent closes the connection.
+                    let mut request: Vec<u8> = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    while let Ok(read) = stream.read(&mut buf).await
+                        && read > 0
+                    {
+                        let complete = request.windows(4).any(|end| end == b"\r\n\r\n");
+                        request.extend_from_slice(&buf[..read]);
+                        if !complete && request.windows(4).any(|end| end == b"\r\n\r\n") {
+                            let _ = events.send(("upgrade", Instant::now()));
+                        }
+                    }
+                    let _ = events.send(("closed", Instant::now()));
+                });
+            }
+        })
+    };
+
+    let reachable = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let reachable_url = format!(
+        "https://127.0.0.1:{}",
+        reachable.local_addr().unwrap().port()
+    );
+    let reachable_task = tokio::spawn(async move {
+        while let Ok((tcp, _)) = reachable.accept().await {
+            let acceptor = acceptor.clone();
+            let events = events.clone();
+            tokio::spawn(async move {
+                if let Ok(stream) = acceptor.accept(tcp).await
+                    && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+                {
+                    while let Some(Ok(message)) = ws.next().await {
+                        if let Message::Text(text) = message
+                            && serde_json::from_str::<Value>(text.as_str())
+                                .is_ok_and(|frame| frame["type"] == "hello")
+                        {
+                            let _ = events.send(("hello", Instant::now()));
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let (_store, stop, running) =
+        dialing_agent(&dir, &refused, &pin, &[stalled_url, reachable_url]).await;
+
+    let limit = Duration::from_secs(20);
+    let deadline = Instant::now() + limit;
+    let (mut upgrade, mut closed, mut hello) = (None, None, None);
+    while closed.is_none() || hello.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let (event, at) = tokio::time::timeout(left, seen.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the unanswered upgrade did not end, or the next address got no hello, within {limit:?}")
+            })
+            .expect("the servers run");
+        match event {
+            "upgrade" => upgrade = upgrade.or(Some(at)),
+            "closed" => closed = closed.or(Some(at)),
+            _ => hello = hello.or(Some(at)),
+        }
+    }
+    let upgrade =
+        upgrade.expect("the first advertised address completed TLS and got the upgrade request");
+    let waited = hello.unwrap().duration_since(upgrade);
+    assert!(
+        waited < Duration::from_secs(4),
+        "the next address got hello {waited:?} after the unanswered upgrade; the connect timeout is 2 s"
+    );
+    assert!(!running.is_finished(), "an unanswered upgrade is not fatal");
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    stalled_task.abort();
+    reachable_task.abort();
 }
 
 /// Section 7.3 "The freeze" (ADR 0261): a `log_diverged` handled after a

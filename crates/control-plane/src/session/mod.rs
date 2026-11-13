@@ -518,6 +518,12 @@ struct SessionHandle {
     /// The `local` grants that end renewals, their barrier `ping`s, and
     /// what the session's `hello` and renewals showed ([`local_end`]).
     local_end: local_end::SessionState,
+    /// The `https://` entries of this session's `hello.control_plane_urls`,
+    /// in order and each once: where the machine's control plane would
+    /// answer if it were promoted (section 5.1, ADR 0235). Empty until the
+    /// `hello` is recorded. Kept with the session only, since
+    /// `welcome.primary_urls` lists connected machines alone (section 5.10).
+    control_plane_urls: Vec<String>,
 }
 
 /// A follower's position in the change log, kept in memory for its live
@@ -1967,8 +1973,11 @@ impl NodeHub {
         *self.0.advertised_urls.lock().expect("advertised urls lock") = Some(provider);
     }
 
-    /// The `welcome.primary_urls` this primary hands out: `https://` entries
-    /// only, deduplicated, at most [`wire::MAX_PRIMARY_URLS`] (section 5.10).
+    /// This primary's own URLs, which open its `welcome.primary_urls`:
+    /// `https://` entries only, deduplicated, at most
+    /// [`wire::MAX_PRIMARY_URLS`] (section 5.10). The URLs of the machines a
+    /// promotion could choose follow them in the `welcome`
+    /// ([`welcome_primary_urls`]).
     #[must_use]
     pub(crate) fn advertised_urls(&self) -> Vec<String> {
         let provider = self
@@ -1991,6 +2000,49 @@ impl NodeHub {
             }
         }
         urls
+    }
+
+    /// Keeps the `hello.control_plane_urls` of `node_id`'s session
+    /// `generation` (section 5.1, ADR 0235) for the `welcome.primary_urls`
+    /// of the sessions that start while it lasts (section 5.10): its
+    /// `https://` entries, in order and each once. A superseded generation
+    /// is left alone.
+    fn set_control_plane_urls(&self, node_id: &str, generation: u64, urls: &[String]) {
+        let mut kept: Vec<String> = Vec::new();
+        for url in urls {
+            if url.starts_with("https://") && !kept.contains(url) {
+                kept.push(url.clone());
+            }
+        }
+        let mut sessions = self.0.sessions.lock().expect("session lock");
+        if let Some(handle) = sessions
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+        {
+            handle.control_plane_urls = kept;
+        }
+    }
+
+    /// The `control_plane_urls` each connected machine reported, for the
+    /// machines that reported any. A node `removeNode` marked removed is
+    /// left out, as [`NodeHub::is_connected`] leaves it out.
+    fn reported_control_plane_urls(&self) -> HashMap<String, Vec<String>> {
+        let removed = self
+            .0
+            .removed_nodes
+            .lock()
+            .expect("removed nodes lock")
+            .clone();
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .iter()
+            .filter(|(node_id, handle)| {
+                !handle.control_plane_urls.is_empty() && !removed.contains(node_id.as_str())
+            })
+            .map(|(node_id, handle)| (node_id.clone(), handle.control_plane_urls.clone()))
+            .collect()
     }
 
     /// Remembers a DNS-01 record this primary created for `node_id`.
@@ -2246,6 +2298,7 @@ impl NodeHub {
                 local_sent: HashMap::new(),
                 settles: conversion::Settles::default(),
                 local_end: local_end::SessionState::default(),
+                control_plane_urls: Vec::new(),
             },
         );
         (generation, rx, closed_rx, changed)
@@ -3502,6 +3555,15 @@ impl Session {
                 }
             };
             self.connected = true;
+            // Section 5.10 (ADR 0235): where this machine's control plane
+            // would answer if it were promoted goes into the
+            // `welcome.primary_urls` of every session that starts while this
+            // one lasts, this session's own included.
+            self.hub.set_control_plane_urls(
+                &self.node_id,
+                self.generation,
+                &hello.control_plane_urls,
+            );
             // Change-log follow starts from this position once the first
             // desired state has been sent (section 7.1).
             self.follow = follow::Follow::Waiting {
@@ -3522,6 +3584,7 @@ impl Session {
                     None
                 }
             };
+            let primary_urls = welcome_primary_urls(&self.hub).await;
             // Everything the session start queues from here on goes out only
             // if its pass over the leases is complete.
             let start_frames = outbox.len();
@@ -3533,7 +3596,7 @@ impl Session {
                     heartbeat_interval_ms: self.hub.0.config.heartbeat_interval_ms,
                     session_timeout_ms: self.hub.0.config.session_timeout_ms,
                     primary_node_id,
-                    primary_urls: self.hub.advertised_urls(),
+                    primary_urls,
                     schema_version,
                 })
                 .to_frame(&new_msg_id(), Some(&raw.id))
@@ -6436,6 +6499,83 @@ async fn cluster_term(hub: &NodeHub) -> Result<u64, String> {
         .map_err(|e| format!("cannot read the cluster term: {e}"))
 }
 
+/// `welcome.primary_urls` (section 5.10, ADR 0235): this primary's own
+/// URLs, then the `control_plane_urls` of every other connected machine
+/// whose `Node.custody` is `sealed`, oldest enrolled first, merged by
+/// [`primary_urls`]. When those machines cannot be read, the list holds the
+/// primary's own URLs only.
+async fn welcome_primary_urls(hub: &NodeHub) -> Vec<String> {
+    let own = hub.advertised_urls();
+    let reported = hub.reported_control_plane_urls();
+    if reported.is_empty() {
+        return primary_urls(&own, &[]);
+    }
+    let node_ids: Vec<&str> = reported.keys().map(String::as_str).collect();
+    match promotable_machines(hub, &node_ids).await {
+        Ok(machines) => {
+            let lists: Vec<&[String]> = machines
+                .iter()
+                .filter_map(|node_id| reported.get(node_id).map(Vec::as_slice))
+                .collect();
+            primary_urls(&own, &lists)
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "cannot read which connected machines a promotion could choose; welcome lists the primary's own URLs only");
+            primary_urls(&own, &[])
+        }
+    }
+}
+
+/// The machines among `node_ids` a promotion could choose (sections 5.10
+/// and 7.2), oldest enrolled first: every one that does not hold the
+/// primary status, is not removed, and whose `Node.custody` is `sealed`, as
+/// `getNode` reports it.
+async fn promotable_machines(hub: &NodeHub, node_ids: &[&str]) -> Result<Vec<String>, ApiError> {
+    use crate::api::nodes::{NODE_COLUMNS, NodeCustody, attach_custody, node_from_row};
+
+    let placeholders = vec!["?"; node_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id IN ({placeholders}) \
+         AND n.status <> 'removed' AND (n.cp_status IS NULL OR n.cp_status <> 'primary') \
+         ORDER BY n.created_at, n.id"
+    );
+    let mut query = sqlx::query(&sql);
+    for node_id in node_ids {
+        query = query.bind(*node_id);
+    }
+    let rows = query.fetch_all(hub.0.store.pool()).await?;
+    let mut nodes = rows
+        .iter()
+        .map(node_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    attach_custody(hub.0.store.pool(), &hub.keyring(), &mut nodes).await?;
+    Ok(nodes
+        .into_iter()
+        .filter(|node| node.custody == Some(Some(NodeCustody::Sealed)))
+        .map(|node| node.id)
+        .collect())
+}
+
+/// Section 5.10 (ADR 0235): `own` first, then the first URL of each list in
+/// `machines`, then the second of each, and so on. `https://` entries only,
+/// each once, at most [`wire::MAX_PRIMARY_URLS`].
+fn primary_urls(own: &[String], machines: &[&[String]]) -> Vec<String> {
+    let rounds = machines.iter().map(|urls| urls.len()).max().unwrap_or(0);
+    let merged = own.iter().chain(
+        (0..rounds).flat_map(|round| machines.iter().filter_map(move |urls| urls.get(round))),
+    );
+    let mut urls: Vec<String> = Vec::new();
+    for url in merged {
+        if urls.len() == wire::MAX_PRIMARY_URLS {
+            break;
+        }
+        if url.starts_with("https://") && !urls.contains(url) {
+            urls.push(url.clone());
+        }
+    }
+    urls
+}
+
 /// The node that holds the primary status, or `node_id` when nobody does.
 async fn primary_node_id(hub: &NodeHub, node_id: &str) -> Result<String, String> {
     let row: Option<(String,)> =
@@ -6465,6 +6605,84 @@ mod tests {
             revoked_at: revoked.then(|| "2026-11-07T10:01:00Z".to_string()),
             unsettled: false,
         }
+    }
+
+    fn owned(urls: &[&str]) -> Vec<String> {
+        urls.iter().map(|url| (*url).to_string()).collect()
+    }
+
+    /// Section 5.10 (ADR 0235): the primary's own URLs first, then the
+    /// first URL of each machine in the order given (oldest enrolled first),
+    /// then the second of each, and so on; `https://` only, each once.
+    #[test]
+    fn primary_urls_lists_its_own_then_each_machine_s_first_url_then_its_second() {
+        let own = owned(&["https://primary.example:8443", "https://192.0.2.10:8443"]);
+        let oldest = owned(&["https://192.0.2.21:8443", "https://[2001:db8::21]:8443"]);
+        let middle = owned(&["https://192.0.2.22:8443"]);
+        let newest = owned(&[
+            "http://192.0.2.23:8443",
+            "https://192.0.2.10:8443",
+            "https://192.0.2.23:8443",
+            "https://node-c.local:8443",
+        ]);
+        assert_eq!(
+            primary_urls(
+                &own,
+                &[oldest.as_slice(), middle.as_slice(), newest.as_slice()]
+            ),
+            owned(&[
+                "https://primary.example:8443",
+                "https://192.0.2.10:8443",
+                "https://192.0.2.21:8443",
+                "https://192.0.2.22:8443",
+                "https://[2001:db8::21]:8443",
+                "https://192.0.2.23:8443",
+                "https://node-c.local:8443",
+            ])
+        );
+        assert_eq!(primary_urls(&own, &[]), own);
+        assert_eq!(primary_urls(&[], &[middle.as_slice()]), middle);
+    }
+
+    /// Section 5.10 (ADR 0235): at most 16 entries, the primary's own first,
+    /// so the machines enrolled last are the ones left out.
+    #[test]
+    fn primary_urls_keeps_the_first_16() {
+        let own = owned(&["https://primary.example:8443"]);
+        let machines: Vec<Vec<String>> = (1..=6)
+            .map(|machine| {
+                (1..=4)
+                    .map(|url| format!("https://192.0.{url}.{machine}:8443"))
+                    .collect()
+            })
+            .collect();
+        let lists: Vec<&[String]> = machines.iter().map(Vec::as_slice).collect();
+        let urls = primary_urls(&own, &lists);
+        assert_eq!(wire::MAX_PRIMARY_URLS, 16);
+        assert_eq!(urls.len(), 16, "{urls:?}");
+        assert_eq!(urls[0], "https://primary.example:8443");
+        assert_eq!(
+            urls[1..7],
+            machines
+                .iter()
+                .map(|urls| urls[0].clone())
+                .collect::<Vec<_>>()[..]
+        );
+        assert_eq!(
+            urls[7..13],
+            machines
+                .iter()
+                .map(|urls| urls[1].clone())
+                .collect::<Vec<_>>()[..]
+        );
+        assert_eq!(
+            urls[13..],
+            owned(&[
+                "https://192.0.3.1:8443",
+                "https://192.0.3.2:8443",
+                "https://192.0.3.3:8443"
+            ])[..]
+        );
     }
 
     /// Sections 5.5 and 9: a lease the node no longer holds is revoked at a
@@ -6681,6 +6899,7 @@ mod tests {
             volume_snapshot: None,
             custody_public_key: None,
             mesh_rules: None,
+            control_plane_urls: Vec::new(),
         }
     }
 

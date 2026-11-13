@@ -120,6 +120,7 @@ fn hello(node_id: &str) -> NodeMessage {
         volume_snapshot: None,
         custody_public_key: None,
         mesh_rules: None,
+        control_plane_urls: Vec::new(),
     })
 }
 
@@ -995,6 +996,9 @@ async fn a_restarted_primary_does_not_keep_nodes_connected() {
     assert_eq!(events, 1);
 }
 
+/// Section 5.10 (ADR 0235): the primary's own URLs open `welcome.primary_urls`
+/// in order, `https://` entries only, each once, and the list holds at most
+/// 16. Here the primary advertises 18 distinct `https://` URLs.
 #[tokio::test]
 async fn the_welcome_carries_the_advertised_urls() {
     let server = start().await;
@@ -1002,7 +1006,7 @@ async fn the_welcome_carries_the_advertised_urls() {
     advertised.push("https://primary.example:8443".to_string());
     advertised.push("https://a.example:8443".to_string());
     advertised.push("https://a.example:8443".to_string());
-    for index in 0..10 {
+    for index in 0..16 {
         advertised.push(format!("https://h{index}.example:8443"));
     }
     // The provider lives on the shared hub, so setting it on a clone reaches
@@ -1023,9 +1027,10 @@ async fn the_welcome_carries_the_advertised_urls() {
         .unwrap_or_else(|| panic!("no primary_urls: {welcome}"));
     let expected: Vec<Value> = std::iter::once("https://primary.example:8443".to_string())
         .chain(std::iter::once("https://a.example:8443".to_string()))
-        .chain((0..6).map(|index| format!("https://h{index}.example:8443")))
+        .chain((0..14).map(|index| format!("https://h{index}.example:8443")))
         .map(Value::String)
         .collect();
+    assert_eq!(expected.len(), 16);
     assert_eq!(urls, &expected, "{welcome}");
 }
 

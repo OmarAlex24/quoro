@@ -12,7 +12,7 @@ use agent_common::{
 };
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::store::NodeStore;
-use quoro_node_agent::{AgentConfig, AgentError, run};
+use quoro_node_agent::{AgentConfig, AgentError, ControlPlaneUrls, run};
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::DesiredStatus;
 use serde_json::Value;
@@ -29,6 +29,7 @@ fn config(dir: &TempDir) -> AgentConfig {
         acme_directory_url: quoro_node_agent::DEFAULT_ACME_DIRECTORY.to_owned(),
         acme_contact: Vec::new(),
         snapshots_at_start: None,
+        control_plane_urls: ControlPlaneUrls::default(),
     }
 }
 

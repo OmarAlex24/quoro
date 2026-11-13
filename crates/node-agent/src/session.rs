@@ -56,7 +56,7 @@ use crate::reconcile::Snapshot;
 use crate::store::{BatchStored, FreezeChecked, LogQuarantine, NodeStore, Refollowing};
 use crate::tls::{self, Endpoint};
 use crate::vote::{self, Received, SupportAnswer, TermCheck};
-use crate::{AgentError, FatalReason, NodeFacts, util};
+use crate::{AgentError, ControlPlaneUrls, FatalReason, NodeFacts, util};
 use crate::{follow, freeze};
 
 /// Path of the session endpoint (section 3.1).
@@ -283,9 +283,12 @@ pub struct Session {
     mesh_public_key: Option<String>,
     /// Whether this machine has the `node` role, so that it keeps a custody
     /// key in its data directory and reports it in every `hello` while the
-    /// key can be read (section 7.2). Set by [`Session::with_roles`]; off by
-    /// default.
+    /// key can be read (section 7.2), and lists its `control_plane_urls`
+    /// (section 5.1). Set by [`Session::with_roles`]; off by default.
     custody: bool,
+    /// The source of `hello.control_plane_urls`, sent only with the `node`
+    /// role (section 5.1, ADR 0235). Lists nothing by default.
+    control_plane_urls: ControlPlaneUrls,
     /// The engine handles behind `terminal` and `console` streams (M4), when
     /// the agent runs one.
     interactive: Option<Interactive>,
@@ -486,6 +489,7 @@ impl Session {
             metrics: None,
             mesh_public_key: None,
             custody: false,
+            control_plane_urls: ControlPlaneUrls::default(),
             interactive: None,
             builds,
             edge: None,
@@ -637,6 +641,17 @@ impl Session {
     #[must_use]
     pub fn with_roles(mut self, roles: &[String]) -> Self {
         self.custody = crate::has_node_role(roles);
+        self
+    }
+
+    /// Sets the source of `hello.control_plane_urls`: where this machine's
+    /// control-plane listener would answer if it were promoted (section 5.1,
+    /// ADR 0235). Only a machine with the `node` role ([`Session::with_roles`])
+    /// sends them; an edge-only or witness-only machine sends none whatever
+    /// the source lists.
+    #[must_use]
+    pub fn with_control_plane_urls(mut self, urls: ControlPlaneUrls) -> Self {
+        self.control_plane_urls = urls;
         self
     }
 
@@ -2568,7 +2583,9 @@ impl Session {
     /// machine with the `node` role it carries the custody key's public
     /// half, which is generated first when the data directory has none,
     /// and leaves it out while `custody.key` cannot be read, which leaves
-    /// the file as it is (section 7.2, [`custody_public_key`]).
+    /// the file as it is (section 7.2, [`custody_public_key`]). It also
+    /// lists where this machine's control plane would answer if it were
+    /// promoted, at most 4 (section 5.1, ADR 0235).
     ///
     /// # Errors
     ///
@@ -2580,6 +2597,13 @@ impl Session {
             custody_public_key(self.store.data_dir()).await
         } else {
             None
+        };
+        // Section 5.1 (ADR 0235): only a machine with the `node` role, one a
+        // promotion could choose, says where its control plane would answer.
+        let control_plane_urls = if self.custody {
+            self.control_plane_urls.urls()
+        } else {
+            Vec::new()
         };
         let stored_rev = self
             .store
@@ -2612,6 +2636,7 @@ impl Session {
             custody_public_key,
             // This agent applies every rule of section 6.9 (section 5.1).
             mesh_rules: Some(crate::mesh::MESH_RULES),
+            control_plane_urls,
         }))
     }
 
@@ -3460,10 +3485,11 @@ fn advertised_timeout(failed_attempts: u32) -> Duration {
 }
 
 /// Dials `primary_url`, the address that last worked, with the full
-/// [`tls::CONNECT_TIMEOUT`]. While it refuses the TCP connection, the dial is
-/// repeated every [`REFUSED_RETRY_STEP`] for [`REFUSED_RETRY_WINDOW`]: a
-/// restarting primary refuses for a fraction of a second, and walking its
-/// other addresses meanwhile only delays the reconnect (issue #359).
+/// [`tls::CONNECT_TIMEOUT`] for each dial, upgrade included ([`dial_one`]).
+/// While it refuses the TCP connection, the dial is repeated every
+/// [`REFUSED_RETRY_STEP`] for [`REFUSED_RETRY_WINDOW`]: a restarting primary
+/// refuses for a fraction of a second, and walking its other addresses
+/// meanwhile only delays the reconnect (issue #359).
 async fn dial_known(
     base_url: &str,
     credential: &str,
@@ -3490,8 +3516,11 @@ fn is_refused(error: &AgentError) -> bool {
     )
 }
 
-/// Opens one pinned TLS connection to `base_url` within `timeout` and upgrades
-/// it to the node protocol (section 3.1).
+/// Opens one pinned TLS connection to `base_url` and upgrades it to the node
+/// protocol (section 3.1). One deadline, `timeout` from the start of the
+/// dial, bounds the TCP connection, the TLS handshake and the WebSocket
+/// upgrade together (ADR 0235), so an address that completes TLS and never
+/// answers the upgrade is a failed dial too.
 async fn dial_one(
     base_url: &str,
     credential: &str,
@@ -3499,6 +3528,7 @@ async fn dial_one(
     timeout: Duration,
 ) -> Result<WebSocketStream<TlsStream<tokio::net::TcpStream>>, AgentError> {
     let url = session_url(base_url)?;
+    let deadline = Instant::now() + timeout;
     let stream = tls::connect_with_timeout(&url, fingerprint, timeout).await?;
 
     let mut request = url
@@ -3513,21 +3543,31 @@ async fn dial_one(
     let config = WebSocketConfig::default()
         .max_message_size(Some(wire::MAX_MESSAGE_BYTES))
         .max_frame_size(Some(wire::MAX_MESSAGE_BYTES));
-    match client_async_with_config(request, stream, Some(config)).await {
-        Ok((ws, _response)) => Ok(ws),
-        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+    // The upgrade gets what is left of the deadline after TCP and TLS.
+    let upgraded = tokio::time::timeout_at(
+        deadline,
+        client_async_with_config(request, stream, Some(config)),
+    )
+    .await;
+    match upgraded {
+        Ok(Ok((ws, _response))) => Ok(ws),
+        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response)))
             if matches!(response.status().as_u16(), 401 | 403) =>
         {
             Err(AgentError::Fatal(FatalReason::Unauthenticated))
         }
-        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
             Err(AgentError::Protocol(format!(
                 "the primary answered the upgrade with HTTP {}",
                 response.status()
             )))
         }
-        Err(e) => Err(AgentError::Protocol(format!(
+        Ok(Err(e)) => Err(AgentError::Protocol(format!(
             "the WebSocket upgrade failed: {e}"
+        ))),
+        Err(_) => Err(AgentError::Protocol(format!(
+            "the primary at {url} did not answer the WebSocket upgrade within the {}s connect timeout",
+            timeout.as_secs_f64()
         ))),
     }
 }
