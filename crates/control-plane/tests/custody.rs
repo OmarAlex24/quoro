@@ -131,6 +131,7 @@ fn hello(node_id: &str, custody_public_key: Option<String>) -> NodeMessage {
         volume_snapshot: None,
         custody_public_key,
         mesh_rules: None,
+        control_plane_urls: Vec::new(),
     })
 }
 

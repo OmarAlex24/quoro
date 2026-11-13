@@ -891,6 +891,7 @@ pub(super) mod tests {
             volume_snapshot: None,
             custody_public_key: None,
             mesh_rules: None,
+            control_plane_urls: Vec::new(),
         }
     }
 

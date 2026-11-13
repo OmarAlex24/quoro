@@ -56,7 +56,7 @@ use crate::reconcile::Snapshot;
 use crate::store::{BatchStored, FreezeChecked, LogQuarantine, NodeStore, Refollowing};
 use crate::tls::{self, Endpoint};
 use crate::vote::{self, Received, SupportAnswer, TermCheck};
-use crate::{AgentError, FatalReason, NodeFacts, util};
+use crate::{AgentError, ControlPlaneUrls, FatalReason, NodeFacts, util};
 use crate::{follow, freeze};
 
 /// Path of the session endpoint (section 3.1).
@@ -283,9 +283,12 @@ pub struct Session {
     mesh_public_key: Option<String>,
     /// Whether this machine has the `node` role, so that it keeps a custody
     /// key in its data directory and reports it in every `hello` while the
-    /// key can be read (section 7.2). Set by [`Session::with_roles`]; off by
-    /// default.
+    /// key can be read (section 7.2), and lists its `control_plane_urls`
+    /// (section 5.1). Set by [`Session::with_roles`]; off by default.
     custody: bool,
+    /// The source of `hello.control_plane_urls`, sent only with the `node`
+    /// role (section 5.1, ADR 0235). Lists nothing by default.
+    control_plane_urls: ControlPlaneUrls,
     /// The engine handles behind `terminal` and `console` streams (M4), when
     /// the agent runs one.
     interactive: Option<Interactive>,
@@ -486,6 +489,7 @@ impl Session {
             metrics: None,
             mesh_public_key: None,
             custody: false,
+            control_plane_urls: ControlPlaneUrls::default(),
             interactive: None,
             builds,
             edge: None,
@@ -637,6 +641,17 @@ impl Session {
     #[must_use]
     pub fn with_roles(mut self, roles: &[String]) -> Self {
         self.custody = crate::has_node_role(roles);
+        self
+    }
+
+    /// Sets the source of `hello.control_plane_urls`: where this machine's
+    /// control-plane listener would answer if it were promoted (section 5.1,
+    /// ADR 0235). Only a machine with the `node` role ([`Session::with_roles`])
+    /// sends them; an edge-only or witness-only machine sends none whatever
+    /// the source lists.
+    #[must_use]
+    pub fn with_control_plane_urls(mut self, urls: ControlPlaneUrls) -> Self {
+        self.control_plane_urls = urls;
         self
     }
 
@@ -2568,7 +2583,9 @@ impl Session {
     /// machine with the `node` role it carries the custody key's public
     /// half, which is generated first when the data directory has none,
     /// and leaves it out while `custody.key` cannot be read, which leaves
-    /// the file as it is (section 7.2, [`custody_public_key`]).
+    /// the file as it is (section 7.2, [`custody_public_key`]). It also
+    /// lists where this machine's control plane would answer if it were
+    /// promoted, at most 4 (section 5.1, ADR 0235).
     ///
     /// # Errors
     ///
@@ -2580,6 +2597,13 @@ impl Session {
             custody_public_key(self.store.data_dir()).await
         } else {
             None
+        };
+        // Section 5.1 (ADR 0235): only a machine with the `node` role, one a
+        // promotion could choose, says where its control plane would answer.
+        let control_plane_urls = if self.custody {
+            self.control_plane_urls.urls()
+        } else {
+            Vec::new()
         };
         let stored_rev = self
             .store
@@ -2612,6 +2636,7 @@ impl Session {
             custody_public_key,
             // This agent applies every rule of section 6.9 (section 5.1).
             mesh_rules: Some(crate::mesh::MESH_RULES),
+            control_plane_urls,
         }))
     }
 

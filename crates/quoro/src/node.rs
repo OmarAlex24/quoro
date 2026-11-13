@@ -17,7 +17,7 @@
 use crate::config::{Config, EngineKind};
 use crate::null_engine::NullEngine;
 use quoro_engine::{Engine, FakeEngine};
-use quoro_node_agent::{AgentConfig, JoinTarget, NodeFacts};
+use quoro_node_agent::{AgentConfig, ControlPlaneUrls, JoinTarget, NodeFacts};
 use quoro_proto::wire::{Capacity, Kvm};
 use std::fmt;
 use std::future::Future;
@@ -162,7 +162,21 @@ fn agent_config(config: &Config, role: Role) -> AgentConfig {
         acme_directory_url: config.ingress.acme_directory_url.clone(),
         acme_contact: config.ingress.acme_contact.clone(),
         snapshots_at_start: None,
+        control_plane_urls: ControlPlaneUrls::default(),
     }
+}
+
+/// The source of `hello.control_plane_urls` for a machine that enrolled as
+/// `role` (`node-agent-protocol.md` section 5.1, ADR 0235). On a node it
+/// lists the host's own addresses with the port of `listen` in `quoro.toml`,
+/// 8443 by default, where the control plane would answer if this machine
+/// were promoted. An edge or a witness lists none.
+async fn control_plane_urls(config: &Config, role: Role) -> ControlPlaneUrls {
+    if role != Role::Node {
+        return ControlPlaneUrls::default();
+    }
+    let advertised = crate::advertise::AdvertisedUrls::discover(config, config.listen).await;
+    ControlPlaneUrls::new(move || advertised.control_plane_urls())
 }
 
 /// `quoro join <url> --token --fingerprint [--role node|edge|witness]`: enrolls this
@@ -455,6 +469,7 @@ async fn run_with<E: Engine + 'static>(
 ) -> Result<i32, String> {
     let mut agent = agent_config(config, role);
     agent.snapshots_at_start = snapshots_at_start;
+    agent.control_plane_urls = control_plane_urls(config, role).await;
     let facts = facts_of(&engine).await;
     let dns = &agent.dns;
     if dns.is_empty() {
@@ -635,6 +650,31 @@ mod tests {
             "nft is missing".to_string(),
         )));
         assert_eq!(code, EX_CONFIG);
+    }
+
+    /// Section 5.1 (ADR 0235): a node lists where the listener of its
+    /// `quoro.toml` would answer, with that listener's port; an edge or a
+    /// witness lists nothing.
+    #[tokio::test]
+    async fn only_a_node_lists_control_plane_urls_with_the_configured_port() {
+        let config = Config {
+            listen: "192.0.2.21:9443".parse().unwrap(),
+            ..Config::default()
+        };
+        for role in [Role::Edge, Role::Witness] {
+            assert!(
+                control_plane_urls(&config, role).await.urls().is_empty(),
+                "{role}"
+            );
+        }
+        let urls = control_plane_urls(&config, Role::Node).await.urls();
+        assert_eq!(
+            urls.first().map(String::as_str),
+            Some("https://192.0.2.21:9443"),
+            "{urls:?}"
+        );
+        assert!(urls.len() <= 4, "{urls:?}");
+        assert!(urls.iter().all(|url| url.ends_with(":9443")), "{urls:?}");
     }
 
     #[test]
