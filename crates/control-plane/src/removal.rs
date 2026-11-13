@@ -27,10 +27,12 @@
 //!    every lease row that names it and that it has not released at its
 //!    token goes up by one and the row is recorded revoked, as declaring the
 //!    node lost does for the rows it covers ([`crate::leases::bump_tokens`],
-//!    section 8.3); a connected node must hold no lease it has not released
-//!    by then. The node turns `removed`, its change-log entry is the removal
-//!    entry the voter set and the required set of section 8.4 read, the
-//!    records of the quarantined copies it keeps are dropped
+//!    section 8.3), except a row already revoked at the token cap, which is
+//!    left as it is; a connected node must hold no lease it has not released
+//!    by then. The node turns `removed`; its change-log entry is the removal
+//!    entry the voter set and the required set of section 8.4 read, and it
+//!    carries the failed fences written above. The records of the
+//!    quarantined copies it keeps are dropped
 //!    ([`crate::quarantines::drop_node_copies`]), its custody seals are
 //!    deleted ([`crate::custody::delete_seals`]), and the call's audit
 //!    record names the removal entry. Right before the commit the hub marks
@@ -51,7 +53,7 @@
 
 use crate::AppState;
 use crate::api::nodes::{Node, node_view};
-use crate::changelog::{self, Actor, ActorType, Op};
+use crate::changelog::{self, Op};
 use crate::error::{ApiError, Target};
 use crate::leases::{self, LEASE_COLUMNS, Lease, lease_from_row};
 use crate::request::CallCtx;
@@ -374,10 +376,21 @@ async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result
         let unrecorded = hub.unrecorded_failures().of_node(node_id, lease_id);
         let unanswered = hub.revoke_unanswered(node_id, lease_id);
         let listing = crate::fences::nodes_listing(&mut conn, lease_id).await?;
-        if unrecorded || listing.iter().any(|id| id == node_id) || (unanswered && !connected) {
+        if listing.iter().any(|id| id == node_id) {
             return Err(ApiError::conflict(format!(
                 "the node could not confirm that the VMs of {lease_id} stopped (fence_failed): \
                  acknowledge the failed fence first"
+            )));
+        }
+        // Not in `fence_failure` yet, so `ackNodeFence` would find nothing
+        // to acknowledge. A retry sends the revoke again: the node's next
+        // `fence_failed` answer records the failure, and a removal of the
+        // node once it is not connected writes it ([`record_unrecorded`]).
+        if unrecorded {
+            return Err(ApiError::conflict(format!(
+                "the node could not confirm that the VMs of {lease_id} stopped (fence_failed), \
+                 and the primary has not recorded that failure yet, so there is no failed fence \
+                 to acknowledge; retry the removal"
             )));
         }
         // Section 8.5: a lease another node's failed fence lists is granted
@@ -414,13 +427,21 @@ async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result
 /// The node's failed fences that the primary could not record
 /// ([`crate::fences::UnrecordedFailures`]), written into its
 /// `fence_failure` on `conn`, the removal's transaction, as the session
-/// records a `fence_failed` answer: the lease and its app, no VM, with the
-/// node as the actor. Until now they lived only in memory, and a restart of
-/// the primary after the removal would lose them and let
-/// [`leases::is_released`] free a lease whose VMs may still run (section
-/// 8.5 step 1). A failed write fails the removal: nothing is removed.
-/// Returns the leases written, which the caller notes recorded once the
-/// transaction committed.
+/// records a `fence_failed` answer: the lease and its app, no VM. Until now
+/// they lived only in memory, and a restart of the primary after the
+/// removal would lose them and let [`leases::is_released`] free a lease
+/// whose VMs may still run (section 8.5 step 1). A failed write fails the
+/// removal: nothing is removed. Returns the leases written, which the caller
+/// notes recorded once the transaction committed.
+///
+/// Only the row is written here ([`crate::fences::write_failure`]); the
+/// removal entry, the whole row, carries the failure into the change log.
+/// One entry for both means that no prefix of the log, which a promoted
+/// follower may hold, has the node removed without its failure. It also
+/// keeps the voter-set version on the removal entry: a separate whole-row
+/// entry before it would already carry the `status` or `roles` the rows
+/// hold in the repair of ADR 0321 item 4, and move the version itself
+/// ([`crate::session::NodeHub::voter_removal_landed`]).
 ///
 /// # Errors
 ///
@@ -447,11 +468,7 @@ async fn record_unrecorded(
             app_ids.push(lease.resource_id);
         }
     }
-    let actor = Actor {
-        kind: ActorType::Node,
-        id: node_id.to_string(),
-    };
-    crate::fences::record_failure(
+    crate::fences::write_failure(
         conn,
         node_id,
         &crate::fences::Failed {
@@ -459,7 +476,6 @@ async fn record_unrecorded(
             app_ids: &app_ids,
             vm_ids: &[],
         },
-        &actor,
     )
     .await?;
     Ok(lease_ids)
@@ -499,12 +515,20 @@ async fn remove(
         // token ([`unreleased`]), a revoked one included: a revoke of an
         // earlier attempt that its session ended before answering left the
         // row revoked at the token the node may still run under.
-        // `bump_tokens` skips a row another node holds. The token cap of
-        // ADR 0325 applies here once PR #903 has added its check to
+        // `bump_tokens` skips a row another node holds.
+        //
+        // A row already revoked at the cap ([`leases::MAX_TOKEN`]) is left
+        // as it is: no grant ever issues a token past the cap, so no other
+        // holder can come after the node, and the row is never granted
+        // again (section 8.6, "The cap"). Raising it could never succeed,
+        // and would block the removal of a dead node on every retry. An
+        // unrevoked row at the cap is still raised: the token cap of ADR
+        // 0325 refuses that removal once PR #903 has added its check to
         // `bump_tokens`.
         let held: Vec<String> = unreleased(state, &mut w.tx, node_id)
             .await?
             .into_iter()
+            .filter(|lease| !(lease.is_revoked() && lease.fencing_token >= leases::MAX_TOKEN))
             .map(|lease| lease.id)
             .collect();
         leases::bump_tokens(&mut w.tx, &held, node_id, &actor).await?;

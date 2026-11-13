@@ -34,7 +34,10 @@ type Socket = WebSocketStream<TcpStream>;
 const IMAGE: &str =
     "ghcr.io/example/web@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const OTHER_LEASE: &str = "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0E";
+const CAPPED_LEASE: &str = "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0C";
 const QUARANTINE: &str = "qrn_01JC9Z6Q5W8N3K4T7R2M1XHB0Q";
+/// The highest token any primary issues (section 8.6, "The cap").
+const MAX_TOKEN: i64 = (1 << 53) - 1;
 const OPERATION: &str = "DELETE /api/v1/nodes/{node_id}";
 
 struct Enrolled {
@@ -727,6 +730,66 @@ async fn removing_a_disconnected_node_raises_its_tokens_and_drops_its_records() 
     assert_eq!(status, 403);
 }
 
+/// Sections 8.6 ("The cap") and 10: a node that is not connected, with a
+/// row already revoked at the token cap and an ordinary unreleased one. No
+/// grant ever goes past the cap, so no other holder can follow the node on
+/// the capped row, and the removal leaves it as it is instead of failing on
+/// it at every retry. The other row is raised as usual.
+#[tokio::test]
+async fn a_row_revoked_at_the_token_cap_does_not_block_removing_a_dead_node() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, socket, _app_id, _vm_id, _volume_id, lease_id) =
+        node_with_lease(&server, &owner).await;
+    let node_id = node.node_id.clone();
+    let revoked_at = "2026-11-12T10:15:32Z";
+    sqlx::query(
+        "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+         fencing_token, granted_at, revoked_at) \
+         VALUES (?, 'app', 'app_01JC9Z6Q5W8N3K4T7R2M1XHB0C', ?, 'local', ?, ?, ?)",
+    )
+    .bind(CAPPED_LEASE)
+    .bind(&node_id)
+    .bind(MAX_TOKEN)
+    .bind(quoro_control_plane::store::now_rfc3339())
+    .bind(revoked_at)
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
+    drop(socket);
+    wait_disconnected(&server, &node_id).await;
+    wait_status(&server, &node_id, "disconnected").await;
+    common::settle_voters(&server).await;
+
+    let before = log_head(&server).await;
+    let res = remove(&owner, &server, &node_id).await;
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    assert_eq!(node_status(&server, &node_id).await, "removed");
+    assert_eq!(
+        lease_row(&server, CAPPED_LEASE).await,
+        (MAX_TOKEN, Some(revoked_at.to_string()), node_id.clone()),
+        "the capped row is left as it is"
+    );
+    let (token, revoked, holder) = lease_row(&server, &lease_id).await;
+    assert_eq!(token, 2, "the other row is raised");
+    assert!(revoked.is_some());
+    assert_eq!(holder, node_id);
+    let entries = entries_after(&server, before).await;
+    let kinds: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|(_, kind, id, _, _)| (kind.as_str(), id.as_str()))
+        .collect();
+    assert_eq!(
+        kinds[..2],
+        [("lease", lease_id.as_str()), ("node", node_id.as_str())],
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.iter().all(|(_, id)| *id != CAPPED_LEASE),
+        "no entry for the capped row: {kinds:?}"
+    );
+}
+
 /// Section 10 for a connected node: the primary first revokes its lease in
 /// its own view and sends `lease_revoke`, and the node is not removed while
 /// the revoke waits for its answer. Once the node answers `ok`, it turns
@@ -1069,6 +1132,54 @@ async fn removing_the_machine_the_rows_and_the_log_disagree_on_repairs_the_gate(
     assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
 }
 
+/// Section 8.10 rule 2 in the repair of ADR 0321 item 4, where the rows and
+/// the log name sets of different sizes: the rows {A, B, C}, the log
+/// {A, B, C, X}. The majority is counted over the log's voters, the current
+/// voters at the log's version, so the acknowledgements of A and B alone (two
+/// of four) refuse the removal of X; counted over the rows (two of three)
+/// they would pass it. Once C acknowledges too, three of four pass it.
+#[tokio::test]
+async fn a_repair_counts_its_majority_over_the_logs_voters() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let a = machine::enroll(&server, &owner, "node-a", &["node"]).await;
+    let mut machine_a = Machine::connect(&server, &a).await;
+    machine_a.settle().await;
+    let b = machine::enroll(&server, &owner, "node-b", &["node"]).await;
+    let mut machine_b = Machine::connect(&server, &b).await;
+    holds_voters(&mut machine_a, 2).await;
+    holds_voters(&mut machine_b, 2).await;
+    let c = machine::enroll(&server, &owner, "node-c", &["node"]).await;
+    let mut machine_c = Machine::connect_acking(&server, &c, false).await;
+    holds_voters(&mut machine_a, 3).await;
+    holds_voters(&mut machine_b, 3).await;
+    let x = machine::enroll(&server, &owner, "edge-x", &["edge", "witness"]).await;
+    holds_voters(&mut machine_a, 4).await;
+    holds_voters(&mut machine_b, 4).await;
+    machine_c.settle().await;
+    assert!(!machine_c.unacked.is_empty(), "C acknowledges nothing yet");
+
+    // X's row loses its vote with no change-log entry.
+    sqlx::query("UPDATE nodes SET roles = '[\"edge\"]' WHERE id = ?")
+        .bind(&x.node_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+
+    let before = log_head(&server).await;
+    let (status, code, _, detail) = problem(remove(&owner, &server, &x.node_id).await).await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(detail.contains("majority"), "{detail}");
+    assert!(entries_after(&server, before).await.is_empty());
+    assert_ne!(node_status(&server, &x.node_id).await, "removed");
+
+    machine_c.start_acking().await;
+    holds_voters(&mut machine_c, 4).await;
+    let res = remove(&owner, &server, &x.node_id).await;
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    assert_eq!(node_status(&server, &x.node_id).await, "removed");
+}
+
 /// ADR 0321 item 4, a row turned `removed` with no change-log entry: the
 /// log still counts the machine as a voter, so every voter change waits.
 /// Removing it again is not refused as already removed: it writes the
@@ -1356,10 +1467,12 @@ async fn fence_failure(server: &Server, node_id: &str) -> Option<String> {
 
 /// Section 8.5 step 1 and section 10: a revoke answered `fence_failed` that
 /// the primary could not record lives in memory only. The call answers
-/// `conflict` at once. A retry once the node is gone writes that failure
-/// into the node's `fence_failure` in the removal's own transaction, so it
-/// outlives a restart of the primary and the lease stays ungrantable until
-/// an operator acknowledges it. When that write fails, nothing is removed.
+/// `conflict` at once, and does not ask for an acknowledgement that
+/// `ackNodeFence` could not take. A retry once the node is gone writes that
+/// failure into the node's `fence_failure` in the removal's own
+/// transaction, carried by the removal entry itself, so it outlives a
+/// restart of the primary and the lease stays ungrantable until an operator
+/// acknowledges it. When that write fails, nothing is removed.
 #[tokio::test]
 async fn an_unrecorded_failed_fence_is_written_before_the_node_is_removed() {
     let server = start_with_patient_node_session().await;
@@ -1383,6 +1496,8 @@ async fn an_unrecorded_failed_fence_is_written_before_the_node_is_removed() {
     let (status, code, _, detail) = problem(call.await.unwrap()).await;
     assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
     assert!(detail.contains("fence_failed"), "{detail}");
+    assert!(detail.contains("not recorded"), "{detail}");
+    assert!(!detail.contains("acknowledge the failed fence"), "{detail}");
     assert_eq!(fence_failure(&server, &node_id).await, None, "unrecorded");
     drop(socket);
     wait_disconnected(&server, &node_id).await;
@@ -1415,15 +1530,132 @@ async fn an_unrecorded_failed_fence_is_written_before_the_node_is_removed() {
         .map(|(_, kind, id, _, _)| (kind.as_str(), id.as_str()))
         .collect();
     assert_eq!(
-        kinds[..3],
-        [
-            ("node", node_id.as_str()),
-            ("lease", lease_id.as_str()),
-            ("node", node_id.as_str()),
-        ],
+        kinds[..2],
+        [("lease", lease_id.as_str()), ("node", node_id.as_str())],
         "{kinds:?}"
     );
-    assert_eq!(entries[2].4["status"], "removed");
+    assert!(
+        kinds[2..].iter().all(|(kind, _)| *kind != "node"),
+        "one node entry: {kinds:?}"
+    );
+    // The removal entry carries the failure: no prefix of the log has the
+    // node removed without it.
+    let removal = &entries[1].4;
+    assert_eq!(removal["status"], "removed", "{removal}");
+    assert_eq!(
+        removal["fence_failure"]["lease_ids"],
+        json!([lease_id]),
+        "{removal}"
+    );
+}
+
+/// ADR 0321 item 4 with an unrecorded failed fence of the machine being
+/// repaired. X, a voter, answers its revoke `fence_failed` and the primary
+/// cannot record it; a retry while X is still connected gets the same
+/// answer at once and is not told to acknowledge a failure that is not
+/// recorded. X goes away and its row turns `removed` with no change-log
+/// entry. Removing X then writes the failure, raises the token and lands the
+/// voter-set version on the removal entry, which carries the failure: a
+/// separate entry for the failure before it would already carry the row's
+/// `removed`, move the version itself, and fail the removal at every retry.
+#[tokio::test]
+async fn a_repair_carries_an_unrecorded_failed_fence_in_its_removal_entry() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let a = machine::enroll(&server, &owner, "node-a", &["node"]).await;
+    let mut machine_a = Machine::connect(&server, &a).await;
+    machine_a.settle().await;
+    let b = machine::enroll(&server, &owner, "node-b", &["node"]).await;
+    let mut machine_b = Machine::connect(&server, &b).await;
+    holds_voters(&mut machine_a, 2).await;
+    holds_voters(&mut machine_b, 2).await;
+    let x = enrolled_node(&server, &owner, "node-x").await;
+    holds_voters(&mut machine_a, 3).await;
+    holds_voters(&mut machine_b, 3).await;
+    let mut socket = connect(&server, &x.credential).await;
+    send(&mut socket, hello(&x.node_id)).await;
+    recv_until(&mut socket, &["welcome", "desired_state"]).await;
+    heartbeat(&mut socket).await;
+    settle_socket(&mut socket).await;
+    sqlx::query(
+        "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+         fencing_token, granted_at) \
+         VALUES (?, 'app', 'app_01JC9Z6Q5W8N3K4T7R2M1XHB0E', ?, 'local', 1, ?)",
+    )
+    .bind(OTHER_LEASE)
+    .bind(&x.node_id)
+    .bind(quoro_control_plane::store::now_rfc3339())
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
+    server.state.hub.inject_fault(Fault::FailureRecord {
+        node_id: x.node_id.clone(),
+    });
+
+    let call = tokio::spawn({
+        let owner = owner.clone();
+        let url = server.url(&format!("/api/v1/nodes/{}", x.node_id));
+        async move { owner.delete(url).send().await.unwrap() }
+    });
+    let frames = recv_until(&mut socket, &["lease_revoke"]).await;
+    let revoke = of_type(&frames, "lease_revoke")[0].clone();
+    reply(&mut socket, fence_failed_result(), revoke["id"].as_str()).await;
+    let (status, code, _, detail) = problem(call.await.unwrap()).await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(detail.contains("not recorded"), "{detail}");
+    assert_eq!(fence_failure(&server, &x.node_id).await, None, "unrecorded");
+
+    // The retry, X still connected: the failure is still not recorded.
+    let (status, code, _, detail) = problem(remove(&owner, &server, &x.node_id).await).await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(detail.contains("fence_failed"), "{detail}");
+    assert!(detail.contains("not recorded"), "{detail}");
+    assert!(detail.contains("retry"), "{detail}");
+    assert!(!detail.contains("acknowledge the failed fence"), "{detail}");
+    drop(socket);
+    wait_disconnected(&server, &x.node_id).await;
+    wait_status(&server, &x.node_id, "disconnected").await;
+
+    // X's row turns `removed` with no change-log entry: the log still counts
+    // it, the rows do not.
+    sqlx::query("UPDATE nodes SET status = 'removed' WHERE id = ?")
+        .bind(&x.node_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    let before = log_head(&server).await;
+    let res = remove(&owner, &server, &x.node_id).await;
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let entries = entries_after(&server, before).await;
+    let kinds: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|(_, kind, id, _, _)| (kind.as_str(), id.as_str()))
+        .collect();
+    assert_eq!(
+        kinds[..2],
+        [("lease", OTHER_LEASE), ("node", x.node_id.as_str())],
+        "{kinds:?}"
+    );
+    let (removal, _, _, _, payload) = &entries[1];
+    assert_eq!(payload["status"], "removed", "{payload}");
+    assert_eq!(
+        payload["fence_failure"]["lease_ids"],
+        json!([OTHER_LEASE]),
+        "{payload}"
+    );
+    assert_eq!(lease_row(&server, OTHER_LEASE).await.0, 2);
+    let failure = fence_failure(&server, &x.node_id).await;
+    assert!(
+        failure.as_deref().is_some_and(|f| f.contains(OTHER_LEASE)),
+        "{failure:?}"
+    );
+
+    // The removal entry is the new voter-set version.
+    holds_voters(&mut machine_a, 2).await;
+    holds_voters(&mut machine_b, 2).await;
+    let removal = u64::try_from(*removal).unwrap();
+    assert_eq!(machine_a.version(), removal);
+    assert_eq!(machine_b.version(), removal);
 }
 
 async fn machine_heartbeat(machine: &mut Machine) {

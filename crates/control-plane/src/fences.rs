@@ -213,6 +213,28 @@ pub(crate) async fn record_failure(
     failed: &Failed<'_>,
     actor: &Actor,
 ) -> Result<bool, ApiError> {
+    if !write_failure(conn, node_id, failed).await? {
+        return Ok(false);
+    }
+    let payload = driver::node_payload(conn, node_id).await?;
+    changelog::append(conn, actor, "node", node_id, Op::Update, payload).await?;
+    Ok(true)
+}
+
+/// [`record_failure`]'s write of the node's row, without its change-log
+/// entry. For `removeNode` only, which writes the node's whole-row removal
+/// entry later in the same transaction: that one entry then carries the
+/// failure and the removal together (`crate::removal`). Returns whether the
+/// row changed.
+///
+/// # Errors
+///
+/// A database error, or a stored value that does not parse.
+pub(crate) async fn write_failure(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    failed: &Failed<'_>,
+) -> Result<bool, ApiError> {
     if failed.lease_ids.is_empty() {
         return Ok(false);
     }
@@ -252,8 +274,6 @@ pub(crate) async fn record_failure(
         .bind(node_id)
         .execute(&mut *conn)
         .await?;
-    let payload = driver::node_payload(conn, node_id).await?;
-    changelog::append(conn, actor, "node", node_id, Op::Update, payload).await?;
     Ok(true)
 }
 
