@@ -82,6 +82,29 @@ pub(crate) fn voter_removal(set: &crate::voters::SetOnWrite, node_id: &str) -> V
     }
 }
 
+/// Rule 2 of section 8.10 for a removal classified `removal` against `set`:
+/// whether more than half of the current voters has acknowledged the current
+/// version. The current voters are those the change log gives at that
+/// version ([`crate::voters::SetOnWrite::log_voters`]), not the rows': in a
+/// repair where only the log names the machine, the machine counts in the
+/// denominator although it never acknowledges, and where only the rows name
+/// it, it does not count at all. When the two agree they are the same
+/// machines. A machine that is no voter changes nothing and passes; a
+/// blocked removal never does.
+pub(crate) fn removal_allowed(
+    set: &crate::voters::SetOnWrite,
+    removal: VoterRemoval,
+    acked: impl Fn(&str) -> Option<u64>,
+) -> bool {
+    match removal {
+        VoterRemoval::NotVoter => true,
+        VoterRemoval::Blocked => false,
+        VoterRemoval::Changes | VoterRemoval::Repairs { .. } => {
+            crate::voters::majority_holds(set.version, &set.log_voters(), acked)
+        }
+    }
+}
+
 impl NodeHub {
     /// Records that `node_id` acknowledged, with `command_result` `ok`, a
     /// `desired_state` carrying voter-set version `version`. The version
@@ -182,9 +205,28 @@ impl NodeHub {
             .map_err(|e| ApiError::internal(&e))
     }
 
-    /// Section 8.10 for `removeNode` (section 10), read on the removal's own
-    /// write transaction `conn`, as [`NodeHub::voter_change_gate`] does for
-    /// the other voter changes:
+    /// The voter set as the removal's own write transaction `conn` sees it
+    /// ([`crate::voters::VoterLog::read_on`]), for
+    /// [`voter_removal`] and [`NodeHub::voter_removal_gate`].
+    ///
+    /// # Errors
+    ///
+    /// `internal` when the set cannot be read.
+    pub(crate) async fn voter_set_on_write(
+        &self,
+        conn: &mut SqliteConnection,
+    ) -> Result<crate::voters::SetOnWrite, ApiError> {
+        self.0
+            .voters
+            .read_on(conn)
+            .await
+            .map_err(|e| ApiError::internal(&e))
+    }
+
+    /// Section 8.10 for `removeNode` (section 10), over `set` as the
+    /// removal's own write transaction read it
+    /// ([`NodeHub::voter_set_on_write`]), as [`NodeHub::voter_change_gate`]
+    /// does for the other voter changes:
     ///
     /// - a machine that is no voter changes nothing and passes;
     /// - while the rows and the log disagree on another machine, the removal
@@ -193,8 +235,8 @@ impl NodeHub {
     ///   change the gate lets through, because its removal entry ends the
     ///   disagreement (ADR 0321 item 4). It still needs rule 2's majority:
     ///   there is no other bypass;
-    /// - otherwise rule 2: a majority of the current voters (the rows'
-    ///   voters) must have acknowledged the current version.
+    /// - rule 2 counts a majority of the current voters, those the change
+    ///   log gives at the current version ([`removal_allowed`]).
     ///
     /// Removal is never refused for leaving fewer than three voters, and has
     /// no `force` (section 10). Returns what the removal does, never
@@ -202,37 +244,27 @@ impl NodeHub {
     ///
     /// # Errors
     ///
-    /// `conflict` as above; `internal` when the set cannot be read.
-    pub(crate) async fn voter_removal_gate(
+    /// `conflict` as above.
+    pub(crate) fn voter_removal_gate(
         &self,
-        conn: &mut SqliteConnection,
+        set: &crate::voters::SetOnWrite,
         node_id: &str,
     ) -> Result<VoterRemoval, ApiError> {
-        let set = self
-            .0
-            .voters
-            .read_on(conn)
-            .await
-            .map_err(|e| ApiError::internal(&e))?;
-        let removal = voter_removal(&set, node_id);
-        match removal {
-            VoterRemoval::NotVoter => return Ok(removal),
-            VoterRemoval::Blocked => {
-                if let Some(differs) = &set.disagreement {
-                    tracing::warn!(
-                        version = set.version,
-                        only_in_rows = ?differs.only_in_rows,
-                        only_in_log = ?differs.only_in_log,
-                        node_id,
-                        "the removal of a voter waits: the voters in the nodes rows and those the change log replays differ on another machine"
-                    );
-                }
-                return Err(ApiError::conflict(VOTERS_DISAGREE));
+        let removal = voter_removal(set, node_id);
+        if removal == VoterRemoval::Blocked {
+            if let Some(differs) = &set.disagreement {
+                tracing::warn!(
+                    version = set.version,
+                    only_in_rows = ?differs.only_in_rows,
+                    only_in_log = ?differs.only_in_log,
+                    node_id,
+                    "the removal of a voter waits: the voters in the nodes rows and those the change log replays differ on another machine"
+                );
             }
-            VoterRemoval::Changes | VoterRemoval::Repairs { .. } => {}
+            return Err(ApiError::conflict(VOTERS_DISAGREE));
         }
         let acks = self.0.votes_acks.lock().expect("votes acks lock");
-        if crate::voters::change_allowed(set.version, &set.voters, |id| acks.get(id).copied()) {
+        if removal_allowed(set, removal, |id| acks.get(id).copied()) {
             Ok(removal)
         } else {
             Err(ApiError::conflict(VOTERS_CHANGING))
@@ -465,7 +497,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{VoterRemoval, voter_removal};
+    use super::{VoterRemoval, removal_allowed, voter_removal};
     use crate::voters::{Disagreement, SetOnWrite, Voter};
 
     fn set(rows: &[&str], only_in_rows: &[&str], only_in_log: &[&str]) -> SetOnWrite {
@@ -520,5 +552,55 @@ mod tests {
         assert_eq!(voter_removal(&two, "nod_x"), VoterRemoval::Blocked);
         assert_eq!(voter_removal(&two, "nod_y"), VoterRemoval::Blocked);
         assert_eq!(voter_removal(&two, "nod_e"), VoterRemoval::NotVoter);
+    }
+
+    /// Whether rule 2 lets `node_id`'s removal through with `acked` holding
+    /// the set's version and every other machine holding none.
+    fn passes(set: &SetOnWrite, node_id: &str, acked: &[&str]) -> bool {
+        removal_allowed(set, voter_removal(set, node_id), |id| {
+            acked.contains(&id).then_some(set.version)
+        })
+    }
+
+    /// Section 8.10 rule 2 for a removal: the majority is counted over the
+    /// voters the change log gives at the current version, not the rows'.
+    #[test]
+    fn a_removal_counts_the_majority_over_the_logs_voters() {
+        // They agree, an even set: two of four is not a majority.
+        let agree = set(&["nod_a", "nod_b", "nod_c", "nod_d"], &[], &[]);
+        assert!(!passes(&agree, "nod_d", &["nod_a", "nod_b"]));
+        assert!(passes(&agree, "nod_d", &["nod_a", "nod_b", "nod_c"]));
+
+        // Only the log has X: the current set is {A, B, C, X}, four voters,
+        // and X never acknowledges. Two of the rows' three would be a
+        // majority of the rows, not of the set: three are needed.
+        let in_log = set(&["nod_a", "nod_b", "nod_c"], &[], &["nod_x"]);
+        assert_eq!(
+            voter_removal(&in_log, "nod_x"),
+            VoterRemoval::Repairs { in_log: true }
+        );
+        assert!(!passes(&in_log, "nod_x", &["nod_a", "nod_b"]));
+        assert!(passes(&in_log, "nod_x", &["nod_a", "nod_b", "nod_c"]));
+
+        // Only the rows have X: the current set is {A, B}, and X's own
+        // acknowledgement does not count. A and X are two of the rows'
+        // three, but only one of the set's two.
+        let in_rows = set(&["nod_a", "nod_b", "nod_x"], &["nod_x"], &[]);
+        assert_eq!(
+            voter_removal(&in_rows, "nod_x"),
+            VoterRemoval::Repairs { in_log: false }
+        );
+        assert!(!passes(&in_rows, "nod_x", &["nod_a", "nod_x"]));
+        assert!(passes(&in_rows, "nod_x", &["nod_a", "nod_b"]));
+        // Rows {A, B, C, X}, log {A, B, C}: two of the log's three pass,
+        // though they are only half of the rows.
+        let in_rows_even = set(&["nod_a", "nod_b", "nod_c", "nod_x"], &["nod_x"], &[]);
+        assert!(passes(&in_rows_even, "nod_x", &["nod_a", "nod_b"]));
+        assert!(!passes(&in_rows_even, "nod_x", &["nod_a", "nod_x"]));
+
+        // A non-voter changes nothing; a blocked removal never passes.
+        assert!(passes(&agree, "nod_e", &[]));
+        let two = set(&["nod_a", "nod_y"], &["nod_y"], &["nod_x"]);
+        assert!(!passes(&two, "nod_x", &["nod_a", "nod_y", "nod_x"]));
     }
 }

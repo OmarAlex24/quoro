@@ -9,33 +9,41 @@
 //!    removed, the node that holds the primary status, a node that still
 //!    hosts running instances, and a voter change the voter-set gate refuses
 //!    (section 8.10, [`crate::session::NodeHub::voter_removal_gate`]) are
-//!    `conflict`.
+//!    `conflict`, in that order.
 //! 2. **The fence, for a connected node** ([`fence`]). Every lease row that
 //!    names the node and that the node has not released at its token is
 //!    revoked in the primary's view, with its change-log entry and its
 //!    `lease.revoke` system record, in one transaction. Then a `lease_revoke`
 //!    goes out for each on the node's session, and the call waits for each
 //!    answer ([`wait_fenced`]). Only an `ok` answer at the row's token
-//!    releases a lease. A `fence_failed` answer, a refused revoke, a session
-//!    that ends first, or no answer in time answers `conflict` and removes
-//!    nothing; the rows stay revoked, so a retry goes on from there.
-//! 3. **The removal**, one transaction ([`remove`]): for a node that is not
-//!    connected, the token of every lease it holds goes up by one and the row
-//!    is recorded revoked, exactly as declaring the node lost does
-//!    ([`crate::leases::bump_tokens`], section 8.3); a connected node must
-//!    hold no lease it has not released by then. The node turns `removed`,
-//!    its change-log entry is the removal entry the voter set and the
-//!    required set of section 8.4 read, the records of the quarantined copies
-//!    it keeps are dropped ([`crate::quarantines::drop_node_copies`]), its
-//!    custody seals are deleted ([`crate::custody::delete_seals`]), and the
-//!    call's audit record names the removal entry. After the commit its
+//!    releases a lease. A `fence_failed` answer, recorded or not, a refused
+//!    revoke, a session that ends first, or no answer in time answers
+//!    `conflict` and removes nothing; the rows stay revoked, so a retry goes
+//!    on from there.
+//! 3. **The removal**, one transaction ([`remove`]): the failed fences the
+//!    node reported that the primary could not record are written into its
+//!    `fence_failure` first ([`record_unrecorded`]), so they outlive a
+//!    restart of the primary. For a node that is not connected, the token of
+//!    every lease row that names it and that it has not released at its
+//!    token goes up by one and the row is recorded revoked, as declaring the
+//!    node lost does for the rows it covers ([`crate::leases::bump_tokens`],
+//!    section 8.3); a connected node must hold no lease it has not released
+//!    by then. The node turns `removed`, its change-log entry is the removal
+//!    entry the voter set and the required set of section 8.4 read, the
+//!    records of the quarantined copies it keeps are dropped
+//!    ([`crate::quarantines::drop_node_copies`]), its custody seals are
+//!    deleted ([`crate::custody::delete_seals`]), and the call's audit
+//!    record names the removal entry. Right before the commit the hub marks
+//!    the node removed, so it reads not connected from the commit on
+//!    ([`crate::session::NodeHub::mark_removed`]); after the commit its
 //!    session, if any, ends with the fatal `error` `node_removed`
 //!    ([`crate::session::NodeHub::node_removed`]).
 //!
 //! The node turns `removed` before its session ends, not after: from the
 //! commit on, a `hello` of the node is refused under the writer gate, so a
 //! node that dials again between the two cannot be written back to
-//! `connected` (`session::connect_node`).
+//! `connected` (`session::connect_node`), and every check of whether it is
+//! connected answers no.
 //!
 //! Releasing what a removed node held is [`crate::leases::is_released`]'s,
 //! unchanged: a removed holder reads as gone, and an `expiring` lease still
@@ -43,11 +51,11 @@
 
 use crate::AppState;
 use crate::api::nodes::{Node, node_view};
-use crate::changelog::{self, Op};
+use crate::changelog::{self, Actor, ActorType, Op};
 use crate::error::{ApiError, Target};
 use crate::leases::{self, LEASE_COLUMNS, Lease, lease_from_row};
 use crate::request::CallCtx;
-use crate::session::VoterRemoval;
+use crate::session::{Fault, RemovalStep, VoterRemoval};
 use quoro_proto::RevokeReason;
 use quoro_proto::wire::ControlMessage;
 use quoro_types::{Prefix, Scope, is_id};
@@ -71,7 +79,8 @@ pub(crate) const REVOKE_REASON: RevokeReason = RevokeReason::DeclaredLost;
 const REVOKE_REASON_TEXT: &str = "declared_lost";
 
 /// How long the call waits for a connected node to answer its revokes, as a
-/// failover waits for its source (`crate::failover`).
+/// failover waits for its source (`crate::failover`). A test shortens it to
+/// one second with [`Fault::ShortRemovalWait`].
 const REVOKE_WAIT: Duration = Duration::from_secs(180);
 
 /// How often the wait checks again when nothing wakes it.
@@ -104,6 +113,9 @@ pub(crate) async fn run(
     } else {
         false
     };
+    if let Some(hold) = state.hub.take_removal_hold(node_id, RemovalStep::Checked) {
+        hold.hold().await;
+    }
     match remove(state, ctx, node_id, params).await {
         Ok(node) => Ok(node),
         Err(mut error) if revoked => {
@@ -124,7 +136,8 @@ pub(crate) async fn run(
 /// - `conflict` for a node already removed, unless the change log still
 ///   counts it as a voter and disagrees with the rows on it alone: removing
 ///   it again writes the removal entry that ends the disagreement (ADR 0321
-///   item 4).
+///   item 4). Checked before the voter-set gate, so an already removed node
+///   answers so whatever the gate would say.
 /// - `conflict` for the node that holds the primary status: the contract
 ///   does not say what removing it means, so it is refused, the side that
 ///   changes less. Pending a decision.
@@ -146,8 +159,10 @@ async fn refuse(
     let Some((status, cp_status)) = row else {
         return Err(ApiError::not_found("node"));
     };
-    let gate = state.hub.voter_removal_gate(conn, node_id).await;
-    if status == "removed" && !matches!(gate, Ok(VoterRemoval::Repairs { in_log: true })) {
+    let set = state.hub.voter_set_on_write(conn).await?;
+    if status == "removed"
+        && crate::session::voter_removal(&set, node_id) != (VoterRemoval::Repairs { in_log: true })
+    {
         return Err(ApiError::conflict("the node is already removed"));
     }
     if cp_status.as_deref() == Some("primary") {
@@ -168,7 +183,7 @@ async fn refuse(
             "the node still hosts running instances; stop or move them first",
         ));
     }
-    gate
+    state.hub.voter_removal_gate(&set, node_id)
 }
 
 /// Every lease row that names `node_id` and that the node has not released
@@ -293,7 +308,15 @@ async fn wait_fenced(
     node_id: &str,
     lease_ids: &[String],
 ) -> Result<(), ApiError> {
-    let deadline = Instant::now() + REVOKE_WAIT;
+    // Test seam: a wait a test can outlast.
+    let wait = if state.hub.take_fault(&Fault::ShortRemovalWait {
+        node_id: node_id.to_owned(),
+    }) {
+        Duration::from_secs(1)
+    } else {
+        REVOKE_WAIT
+    };
+    let deadline = Instant::now() + wait;
     loop {
         // Registered before the checks, so an answer between a check and
         // the wait still wakes it.
@@ -327,15 +350,15 @@ async fn wait_fenced(
 ///
 /// # Errors
 ///
-/// `conflict` when a lease's fence failed (`fence_failed`, recorded or
-/// not), when the session ended before the node answered, or when the node
-/// refused a revoke or holds a lease again.
+/// `conflict` when a lease's fence failed on this node (`fence_failed`,
+/// recorded or not), when another node's failed fence lists the lease (the
+/// refusal names that node), when the session ended before the node
+/// answered, or when the node refused a revoke or holds a lease again.
 async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result<bool, ApiError> {
     let hub = &state.hub;
     let mut conn = state.store.pool().acquire().await?;
-    let listed = crate::fences::listed_leases(&mut conn).await?;
-    // Read with the rows, the session first: a revoke still pending on a
-    // session that ends after this read is not taken for a refusal.
+    // Read before the rows: a revoke still pending on a session that ends
+    // after this read is not taken for a refusal.
     let connected = hub.is_connected(node_id);
     let mut waiting = false;
     for lease_id in lease_ids {
@@ -345,11 +368,25 @@ async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result
         if lease.holder_node_id != node_id {
             continue;
         }
+        // The in-memory failures before the rows, as
+        // `fences::failed_leases` reads them: one recorded in between is in
+        // one of the two.
+        let unrecorded = hub.unrecorded_failures().of_node(node_id, lease_id);
         let unanswered = hub.revoke_unanswered(node_id, lease_id);
-        if listed.contains(lease_id) || (unanswered && !connected) {
+        let listing = crate::fences::nodes_listing(&mut conn, lease_id).await?;
+        if unrecorded || listing.iter().any(|id| id == node_id) || (unanswered && !connected) {
             return Err(ApiError::conflict(format!(
                 "the node could not confirm that the VMs of {lease_id} stopped (fence_failed): \
                  acknowledge the failed fence first"
+            )));
+        }
+        // Section 8.5: a lease another node's failed fence lists is granted
+        // to no node until an operator acknowledges it; the removal waits
+        // for that too, the side that changes less.
+        if let Some(other) = listing.first() {
+            return Err(ApiError::conflict(format!(
+                "{lease_id} is listed in the failed fence of node {other} (fence_failed): \
+                 acknowledge that failed fence first"
             )));
         }
         if lease.is_revoked()
@@ -374,6 +411,60 @@ async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result
     Ok(!waiting)
 }
 
+/// The node's failed fences that the primary could not record
+/// ([`crate::fences::UnrecordedFailures`]), written into its
+/// `fence_failure` on `conn`, the removal's transaction, as the session
+/// records a `fence_failed` answer: the lease and its app, no VM, with the
+/// node as the actor. Until now they lived only in memory, and a restart of
+/// the primary after the removal would lose them and let
+/// [`leases::is_released`] free a lease whose VMs may still run (section
+/// 8.5 step 1). A failed write fails the removal: nothing is removed.
+/// Returns the leases written, which the caller notes recorded once the
+/// transaction committed.
+///
+/// # Errors
+///
+/// A database error, or the test seam [`Fault::RemovalFailureRecord`].
+async fn record_unrecorded(
+    state: &AppState,
+    conn: &mut SqliteConnection,
+    node_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let lease_ids = state.hub.unrecorded_failures().leases_of_node(node_id);
+    if lease_ids.is_empty() {
+        return Ok(lease_ids);
+    }
+    if state.hub.take_fault(&Fault::RemovalFailureRecord {
+        node_id: node_id.to_owned(),
+    }) {
+        return Err(ApiError::internal(&"a test seam failed the record"));
+    }
+    let mut app_ids = Vec::new();
+    for lease_id in &lease_ids {
+        if let Some(lease) = leases::by_id(conn, lease_id).await?
+            && lease.resource_type == "app"
+        {
+            app_ids.push(lease.resource_id);
+        }
+    }
+    let actor = Actor {
+        kind: ActorType::Node,
+        id: node_id.to_string(),
+    };
+    crate::fences::record_failure(
+        conn,
+        node_id,
+        &crate::fences::Failed {
+            lease_ids: &lease_ids,
+            app_ids: &app_ids,
+            vm_ids: &[],
+        },
+        &actor,
+    )
+    .await?;
+    Ok(lease_ids)
+}
+
 /// The removal, in one transaction (step 3 of the [module docs](self)).
 /// The refusals run first, under the writer. Returns the node as `getNode`
 /// shows it.
@@ -386,6 +477,7 @@ async fn remove(
     let mut w = state.store.begin_write().await?;
     let removal = refuse(state, &mut w.tx, node_id).await?;
     let actor = ctx.identity.actor();
+    let recorded = record_unrecorded(state, &mut w.tx, node_id).await?;
     // The predicate `failoverApp` and `declareNodeLost` use for a
     // connected node, read under the writer: a session that attaches after
     // it cannot record its `hello` before this commits, and is then
@@ -401,10 +493,16 @@ async fn remove(
             )));
         }
     } else {
-        // Section 10: exactly like declaring the node lost (section 8.3),
-        // with the same function, so the token cap applies here too (ADR
-        // 0325).
-        let held: Vec<String> = leases::held_by_node(&mut w.tx, node_id)
+        // Section 10: a node that is not connected has the token of each of
+        // its leases raised, as declaring it lost does (section 8.3). That
+        // is every row that names it and that it has not released at its
+        // token ([`unreleased`]), a revoked one included: a revoke of an
+        // earlier attempt that its session ended before answering left the
+        // row revoked at the token the node may still run under.
+        // `bump_tokens` skips a row another node holds. The token cap of
+        // ADR 0325 applies here once PR #903 has added its check to
+        // `bump_tokens`.
+        let held: Vec<String> = unreleased(state, &mut w.tx, node_id)
             .await?
             .into_iter()
             .map(|lease| lease.id)
@@ -442,7 +540,20 @@ async fn remove(
     )
     .await?;
     let node = node_view(&mut w.tx, state, node_id).await?;
-    w.commit().await?;
+    // Still under the writer: a check that waits on it behind this removal
+    // reads the node not connected, although its session ends only after
+    // the commit. Undone if the commit fails.
+    state.hub.mark_removed(node_id);
+    if let Err(error) = w.commit().await {
+        state.hub.unmark_removed(node_id);
+        return Err(error.into());
+    }
+    for lease_id in &recorded {
+        state.hub.note_failure_recorded(node_id, lease_id, true);
+    }
+    if let Some(hold) = state.hub.take_removal_hold(node_id, RemovalStep::Committed) {
+        hold.hold().await;
+    }
     crate::quarantines::forget_listed(&state.hub, node_id);
     state.hub.node_removed(node_id);
     Ok(node)

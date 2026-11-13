@@ -25,7 +25,7 @@ pub mod serving;
 mod votes;
 
 pub(crate) use local_end::{LeftStopped, PolicyChange};
-pub(crate) use votes::VoterRemoval;
+pub(crate) use votes::{VoterRemoval, voter_removal};
 
 use crate::AppState;
 use crate::changelog::{self, Actor, ActorType, Op};
@@ -650,9 +650,20 @@ struct HubInner {
     /// acknowledges again on its next session, whose first `desired_state`
     /// carries `spec.votes`.
     votes_acks: Mutex<HashMap<String, u64>>,
+    /// The nodes `removeNode` turned `removed` in this process, from just
+    /// before the removal's commit on ([`NodeHub::mark_removed`]).
+    /// [`NodeHub::is_connected`] answers `false` for them while their last
+    /// session, if any, is still ending, so a check that waited on the
+    /// writer behind the removal never sees the removed node connected
+    /// (section 10). In memory only: after a restart a removed node has no
+    /// session, since its credential no longer opens one.
+    removed_nodes: Mutex<HashSet<String>>,
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
+    /// Test seam: removals to hold at one of their steps
+    /// ([`NodeHub::hold_next_removal`]).
+    removal_holds: Mutex<HashMap<(String, RemovalStep), Arc<RemovalHold>>>,
     /// Test seam: failures to inject, each once ([`NodeHub::inject_fault`]).
     faults: Mutex<Vec<Fault>>,
     /// Test seam: pauses the next check of a held grant at a session start
@@ -703,6 +714,53 @@ pub enum Fault {
     /// source's answer to `switchover_freeze`, and at most one second for the
     /// warm node to report the final snapshot.
     ShortSwitchoverWaits { app_id: String },
+    /// The next `removeNode` of `node_id` waits at most one second for the
+    /// answers to its `lease_revoke`s instead of 180 s.
+    ShortRemovalWait { node_id: String },
+    /// The next `removeNode` of `node_id` cannot write the failed fences
+    /// the node reported that the primary could not record
+    /// ([`crate::fences::UnrecordedFailures`]).
+    RemovalFailureRecord { node_id: String },
+}
+
+/// Test seam: where [`NodeHub::hold_next_removal`] holds a `removeNode`.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RemovalStep {
+    /// After the call read whether the node is connected, before the
+    /// removal's transaction begins.
+    Checked,
+    /// After the removal's transaction committed, before the node's session
+    /// is told to end.
+    Committed,
+}
+
+/// A test seam that holds one `removeNode` at one step
+/// ([`NodeHub::hold_next_removal`]), so a test can act in that window.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct RemovalHold {
+    reached: Notify,
+    release: Notify,
+}
+
+impl RemovalHold {
+    /// Waits until the removal reached the held step.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the held removal go on.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+
+    /// The removal's side: says the step is reached, then waits to be let
+    /// go.
+    pub(crate) async fn hold(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
 }
 
 /// A test seam that holds one node's next snapshot after it is built and
@@ -803,8 +861,10 @@ impl NodeHub {
             voters,
             support,
             votes_acks: Mutex::new(HashMap::new()),
+            removed_nodes: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
+            removal_holds: Mutex::new(HashMap::new()),
             faults: Mutex::new(Vec::new()),
             #[cfg(test)]
             held_start_pause: Mutex::new(None),
@@ -847,6 +907,34 @@ impl NodeHub {
             .expect("snapshot hold lock")
             .insert(node_id.to_string(), Arc::clone(&hold));
         hold
+    }
+
+    /// Test seam: holds the next `removeNode` of `node_id` at `step` until
+    /// the returned hold is released.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hold_next_removal(&self, node_id: &str, step: RemovalStep) -> Arc<RemovalHold> {
+        let hold = Arc::new(RemovalHold::default());
+        self.0
+            .removal_holds
+            .lock()
+            .expect("removal hold lock")
+            .insert((node_id.to_string(), step), Arc::clone(&hold));
+        hold
+    }
+
+    /// The hold [`NodeHub::hold_next_removal`] set for `node_id` at `step`,
+    /// taken so it holds once.
+    pub(crate) fn take_removal_hold(
+        &self,
+        node_id: &str,
+        step: RemovalStep,
+    ) -> Option<Arc<RemovalHold>> {
+        self.0
+            .removal_holds
+            .lock()
+            .expect("removal hold lock")
+            .remove(&(node_id.to_string(), step))
     }
 
     /// Test seam: injects `fault` once, at the next place it names.
@@ -984,14 +1072,48 @@ impl NodeHub {
         self.0.drains.set_window(window);
     }
 
-    /// Whether `node_id` has a live session.
+    /// Whether `node_id` has a live session. A node `removeNode` marked
+    /// removed never has one ([`NodeHub::mark_removed`]), even while its
+    /// last session is still ending.
     #[must_use]
     pub fn is_connected(&self, node_id: &str) -> bool {
+        if self
+            .0
+            .removed_nodes
+            .lock()
+            .expect("removed nodes lock")
+            .contains(node_id)
+        {
+            return false;
+        }
         self.0
             .sessions
             .lock()
             .expect("session lock")
             .contains_key(node_id)
+    }
+
+    /// Marks `node_id` removed for [`NodeHub::is_connected`]. `removeNode`
+    /// calls it under the writer right before its transaction commits, so a
+    /// check that waited on the writer behind the removal reads the node
+    /// not connected, although its session ends only after the commit
+    /// ([`NodeHub::node_removed`], section 10).
+    pub(crate) fn mark_removed(&self, node_id: &str) {
+        self.0
+            .removed_nodes
+            .lock()
+            .expect("removed nodes lock")
+            .insert(node_id.to_string());
+    }
+
+    /// Undoes [`NodeHub::mark_removed`] when the removal's commit failed:
+    /// the node is not removed, and its session goes on.
+    pub(crate) fn unmark_removed(&self, node_id: &str) {
+        self.0
+            .removed_nodes
+            .lock()
+            .expect("removed nodes lock")
+            .remove(node_id);
     }
 
     /// Tells the session of `vm_id`'s node to rebuild its snapshot. Runs in
@@ -1063,7 +1185,7 @@ impl NodeHub {
 
     /// Notes whether the failed fence of `lease_id` that `node_id` reported
     /// is recorded ([`HubInner::unrecorded_failures`]).
-    fn note_failure_recorded(&self, node_id: &str, lease_id: &str, recorded: bool) {
+    pub(crate) fn note_failure_recorded(&self, node_id: &str, lease_id: &str, recorded: bool) {
         self.0.unrecorded_failures.note(node_id, lease_id, recorded);
     }
 
@@ -6686,6 +6808,126 @@ mod tests {
             status_and_disconnects(&state, &node_id).await,
             ("removed".to_string(), 0)
         );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// Section 10: from the removal's commit on, the removed node reads not
+    /// connected, although its session is still attached until its loop
+    /// ends; a removal whose commit failed is undone, and the node reads
+    /// connected again.
+    #[tokio::test]
+    async fn a_removed_node_reads_not_connected_while_its_session_ends() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (generation, _rx, _closed, _) = hub.attach(&node_id);
+        assert!(hub.is_connected(&node_id));
+        hub.mark_removed(&node_id);
+        assert!(
+            hub.is_current(&node_id, generation),
+            "the session is attached"
+        );
+        assert!(!hub.is_connected(&node_id));
+        hub.unmark_removed(&node_id);
+        assert!(hub.is_connected(&node_id));
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// Section 10 and section 8.4: removing a node that is not connected
+    /// raises the token of the `expiring` lease it holds and records it
+    /// revoked, and the lease is still not released until its gate has
+    /// passed on the authority's clock, although its holder is removed.
+    #[tokio::test]
+    async fn an_expiring_lease_of_a_removed_holder_waits_for_its_gate() {
+        use crate::authority::{ManualClock, MonotonicClock};
+        let (state, _primary, data_dir) = hub_with_node().await;
+        let clock = Arc::new(ManualClock::default());
+        state
+            .hub
+            .authority()
+            .set_test_clock(Arc::clone(&clock) as Arc<dyn MonotonicClock>);
+        let node_id = "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0E";
+        let lease_id = "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0E";
+        let now = crate::store::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, \
+             behind_nat, labels, capacity, allocated, kvm, engine_version, agent_version, \
+             desired_rev, applied_rev, log_seq, last_seen_at, created_at) \
+             VALUES (?, 'edge-b', '[\"edge\"]', NULL, 'disconnected', '', NULL, 1, '{}', ?, ?, \
+             ?, 'engine', 'agent', 0, 0, 0, NULL, ?)",
+        )
+        .bind(node_id)
+        .bind(json!({ "cpus": 2, "memory_mb": 2048, "disk_gb": 10 }).to_string())
+        .bind(json!({ "cpus": 0, "memory_mb": 0, "disk_gb": 0 }).to_string())
+        .bind(json!({ "available": true, "kernel": "6.12.0" }).to_string())
+        .bind(&now)
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+             fencing_token, duration_ms, granted_at) \
+             VALUES (?, 'app', 'app_01JC9Z6Q5W8N3K4T7R2M1XHB0E', ?, 'expiring', 1, 15000, ?)",
+        )
+        .bind(lease_id)
+        .bind(node_id)
+        .bind(&now)
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+        // The holder's last grant, as a restarted primary counts it: the
+        // gate opens 15 s plus twice the margin from now.
+        state.hub.authority().seed(lease_id, node_id, Some(15_000));
+
+        let ctx = crate::request::CallCtx::new(
+            crate::auth::Identity {
+                principal: crate::auth::Principal::User(crate::auth::UserIdentity {
+                    user_id: "usr_01JC9Z6Q5W8N3K4T7R2M1XHB0D".into(),
+                    email: "owner@example.com".into(),
+                    name: "Owner".into(),
+                    role: quoro_types::Role::Owner,
+                }),
+                credential: crate::auth::Credential::Session {
+                    session_id: "ses_1".into(),
+                },
+            },
+            "req_1".to_string(),
+            "DELETE /api/v1/nodes/{node_id}",
+            &axum::http::HeaderMap::new(),
+        );
+        let params = serde_json::json!({ "node_id": node_id });
+        let node = crate::removal::run(&state, &ctx, node_id, &params)
+            .await
+            .unwrap();
+        assert_eq!(node.id, node_id);
+
+        let mut conn = state.store.pool().acquire().await.unwrap();
+        let lease = leases::by_id(&mut conn, lease_id).await.unwrap().unwrap();
+        assert_eq!(lease.fencing_token, 2, "the token goes up by one");
+        assert!(lease.is_revoked());
+        async fn released(
+            state: &AppState,
+            conn: &mut sqlx::SqliteConnection,
+            lease: &leases::Lease,
+        ) -> bool {
+            leases::is_released(
+                conn,
+                state.hub.releases(),
+                state.hub.authority(),
+                false,
+                lease,
+            )
+            .await
+            .unwrap()
+        }
+        assert!(
+            !released(&state, &mut conn, &lease).await,
+            "the removed holder may run the app until its gate has passed"
+        );
+        clock.advance(Duration::from_millis(17_999));
+        assert!(!released(&state, &mut conn, &lease).await);
+        clock.advance(Duration::from_millis(1));
+        assert!(released(&state, &mut conn, &lease).await);
+        drop(conn);
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 

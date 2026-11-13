@@ -293,6 +293,31 @@ pub(crate) async fn listed_leases(
     Ok(listed)
 }
 
+/// The nodes whose `fence_failure` lists `lease_id`, sorted.
+///
+/// # Errors
+///
+/// A database error, or a stored value that does not parse.
+pub(crate) async fn nodes_listing(
+    conn: &mut SqliteConnection,
+    lease_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, fence_failure FROM nodes WHERE fence_failure IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut listing = Vec::new();
+    for (node_id, text) in rows {
+        if parse::<FenceFailure>(Some(text))?
+            .is_some_and(|failure| failure.lease_ids.iter().any(|id| id == lease_id))
+        {
+            listing.push(node_id);
+        }
+    }
+    Ok(listing)
+}
+
 /// Each `(node, lease)` whose failed fence the node reported in a
 /// `lease_revoke` answered `fence_failed` while this primary could not record
 /// it in `fence_failure` (section 8.5 step 1, issue #392). In memory only: an
@@ -332,6 +357,23 @@ impl UnrecordedFailures {
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .any(|(failed_on, _)| failed_on == node_id)
+    }
+
+    /// Every lease `node_id` reported a failed fence of that is not
+    /// recorded, sorted: what `removeNode` writes into the node's
+    /// `fence_failure` before the node is removed, so the failures outlive a
+    /// restart of the primary (`crate::removal`).
+    pub(crate) fn leases_of_node(&self, node_id: &str) -> Vec<String> {
+        let mut leases: Vec<String> = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(failed_on, _)| failed_on == node_id)
+            .map(|(_, failed)| failed.clone())
+            .collect();
+        leases.sort_unstable();
+        leases
     }
 
     /// Every lease some node reported a failed fence of that is not
