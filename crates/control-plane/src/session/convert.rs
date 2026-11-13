@@ -1303,6 +1303,12 @@ mod tests {
             "no barrier and no conversion over a marked row"
         );
         assert_eq!(entry(&f.state).map(|held| held.kind), Some(Kind::Convert));
+        // The waiting conversion is no wait, on a marked row too: the row
+        // shows `local_pending`, as any marked `local` row does, but no
+        // `grant_pending` and nothing in `grant_waiting_on`.
+        assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
+        assert!(!hub.row_grant_pending(&f.row().await));
+        assert!(!hub.grant_pending(LEASE));
         drop(on);
 
         let mut next = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
