@@ -7,7 +7,7 @@
 use super::super::conversion::tests::{
     APP, EverySupport, Fixture, LEASE, assert_answer, fixture, frames, hello, restart,
 };
-use super::{Ending, MaintenanceError, Opened, Phase, step_bound};
+use super::{Ending, MaintenanceError, Opened, Phase, Uncovered, Why, step_bound};
 use crate::AppState;
 use crate::authority::{DEFAULT_DURATION_MS, VoterSupport};
 use crate::session::{NodeHub, Session};
@@ -22,6 +22,11 @@ const D: u64 = DEFAULT_DURATION_MS;
 /// The second lease of [`two_leases`], on the same node.
 const LEASE_2: &str = "lse_01JC9Z8K2M4P6R8T0V2X4Z6B9E";
 const APP_2: &str = "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9F";
+/// A third lease, on the same node.
+const LEASE_3: &str = "lse_01JC9Z8K2M4P6R8T0V2X4Z6B9F";
+const APP_3: &str = "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9G";
+/// A `revoked_at` for [`set_row`].
+const REVOKED: &str = "2026-11-12T00:00:00.000Z";
 
 /// Supports a grant of at most `.0` ms (section 8.8).
 #[derive(Debug)]
@@ -62,18 +67,21 @@ async fn append_row(state: &AppState, lease_id: &str) {
     w.commit().await.unwrap();
 }
 
-/// A second `warm` app on the fixture's node, its lease `expiring` at token
-/// 3 for `D`.
-async fn two_leases(f: &Fixture) {
+/// Another `warm` app on the fixture's node, `app_id`, its lease `lease_id`
+/// reading `mode` at token 3 and storing `stored_ms`, with its change-log
+/// entry.
+async fn add_lease(f: &Fixture, lease_id: &str, app_id: &str, mode: &str, stored_ms: u64) {
     let pool = f.state.store.pool();
     let now = crate::store::now_rfc3339();
     sqlx::query(
         "INSERT INTO apps (id, project_id, name, ha_policy, image, port, health_check, \
          resources, placement, status, created_at, updated_at) \
-         VALUES (?, 'prj_c', 'c2', 'warm', 'img', 80, '{}', '{}', '{\"node_ids\":[]}', \
+         VALUES (?, 'prj_c', ?, 'warm', 'img', 80, '{}', '{}', '{\"node_ids\":[]}', \
          'stopped', ?, ?)",
     )
-    .bind(APP_2)
+    .bind(app_id)
+    // A name of `[a-z0-9-]`: the id without its prefix.
+    .bind(app_id.trim_start_matches("app_").to_lowercase())
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -82,17 +90,45 @@ async fn two_leases(f: &Fixture) {
     sqlx::query(
         "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
          fencing_token, duration_ms, granted_at, unsettled) \
-         VALUES (?, 'app', ?, ?, 'expiring', 3, ?, ?, 0)",
+         VALUES (?, 'app', ?, ?, ?, 3, ?, ?, 0)",
     )
-    .bind(LEASE_2)
-    .bind(APP_2)
+    .bind(lease_id)
+    .bind(app_id)
     .bind(&f.node_id)
-    .bind(i64::try_from(D).unwrap())
+    .bind(mode)
+    .bind(i64::try_from(stored_ms).unwrap())
     .bind(&now)
     .execute(pool)
     .await
     .unwrap();
-    append_row(&f.state, LEASE_2).await;
+    append_row(&f.state, lease_id).await;
+}
+
+/// A second `warm` app on the fixture's node, its lease `expiring` at token
+/// 3 for `D`.
+async fn two_leases(f: &Fixture) {
+    add_lease(f, LEASE_2, APP_2, "expiring", D).await;
+}
+
+/// Runs `update`, whose one parameter is the lease id, on `lease_id`'s row
+/// and appends the row's change-log entry, as every write of the primary
+/// does.
+async fn set_row(state: &AppState, lease_id: &str, update: &str) {
+    sqlx::query(update)
+        .bind(lease_id)
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    append_row(state, lease_id).await;
+}
+
+/// The row of `lease_id` as it stands.
+async fn row_of(state: &AppState, lease_id: &str) -> crate::leases::Lease {
+    let mut conn = state.store.pool().acquire().await.unwrap();
+    crate::leases::by_id(&mut conn, lease_id)
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 /// A session of `node_id` on `state`'s hub whose `hello` lists `leases`
@@ -107,7 +143,12 @@ async fn session_on(state: &AppState, node_id: &str, leases: &[&str]) -> Session
         .map(|lease_id| wire::HelloLease {
             lease_id: (*lease_id).to_string(),
             resource_type: quoro_proto::ResourceType::App,
-            resource_id: if *lease_id == LEASE { APP } else { APP_2 }.to_string(),
+            resource_id: match *lease_id {
+                LEASE => APP,
+                LEASE_2 => APP_2,
+                _ => APP_3,
+            }
+            .to_string(),
             mode: LeaseMode::Expiring,
             fencing_token: 3,
             state: "held".to_string(),
@@ -171,12 +212,7 @@ fn is_idle(hub: &NodeHub) -> bool {
 
 /// The stored `duration_ms` of `lease_id`.
 async fn stored(state: &AppState, lease_id: &str) -> Option<i64> {
-    let mut conn = state.store.pool().acquire().await.unwrap();
-    crate::leases::by_id(&mut conn, lease_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .duration_ms
+    row_of(state, lease_id).await.duration_ms
 }
 
 /// Waits until the raise of `lease_id` to `w_ms` committed.
@@ -200,6 +236,14 @@ async fn ack_head(f: &Fixture, session: &Session) {
     f.state
         .hub
         .count_log_ack(&f.node_id, session.generation, u64::try_from(head).unwrap());
+}
+
+/// The result of `task`, which ends without the clock moving.
+async fn ended<T>(task: JoinHandle<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the opening ends without the clock moving")
+        .unwrap()
 }
 
 /// Moves the clock by one step's bound until `task` ends, and returns its
@@ -397,11 +441,24 @@ async fn once_replicated_every_renewal_gets_w_and_the_command_succeeds() {
     until("the window to open", || is_open(hub)).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(!task.is_finished(), "not before the holder renewed");
+    let before = time::OffsetDateTime::now_utc();
     let answer = renew_lease(&mut session, "msg_r1", LEASE).await;
+    let after = time::OffsetDateTime::now_utc();
     assert_answer(&answer, "msg_r1", 3, 30_000);
     let opened = task.await.unwrap().unwrap();
     assert_eq!((opened.duration_s, opened.leases), (30, 1));
-    assert!(opened.covered_until.is_some());
+    // `T_grant + W - 2M(W)`: 30 s - 2 x 3 s after the answer went out, one
+    // margin earlier than the holder's own `W - M(W)` from its send time.
+    let covered = time::OffsetDateTime::parse(
+        opened.covered_until.as_deref().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let valid = time::Duration::seconds(24);
+    assert!(
+        covered >= before + valid - time::Duration::milliseconds(1) && covered <= after + valid,
+        "{covered} is not 24 s after the answer ({before} to {after})"
+    );
     assert_eq!(
         hub.authority().gate_remaining(LEASE),
         Some(Duration::from_secs(36)),
@@ -448,13 +505,20 @@ async fn a_holder_that_does_not_renew_fails_the_command_and_the_others_keep_w() 
         60_000
     );
     let result = run_out(&f, task).await;
-    let Err(MaintenanceError::NotRenewed {
-        missing, answered, ..
+    let Err(MaintenanceError::NotCovered {
+        leases, answered, ..
     }) = result
     else {
         panic!("{result:?}");
     };
-    assert_eq!(missing, vec![(LEASE_2.to_string(), f.node_id.clone())]);
+    assert_eq!(
+        leases,
+        vec![Uncovered {
+            lease_id: LEASE_2.to_string(),
+            holder: f.node_id.clone(),
+            why: Why::NotRenewed,
+        }]
+    );
     assert_eq!(answered, 1);
     assert!(is_open(hub), "the window stays open");
     assert_eq!(
@@ -551,10 +615,19 @@ async fn a_restart_closes_the_window_and_counts_w_from_its_start() {
         answered_ms(&renew_lease(&mut again, "msg_r1", LEASE).await),
         D
     );
+    assert_eq!(after.hub.lower_durations().await, 0, "the seeded W gate");
     clock.advance(Duration::from_secs(35));
     assert!(!after.hub.authority().passed(LEASE));
+    assert_eq!(
+        after.hub.lower_durations().await,
+        0,
+        "not before start + 36 s"
+    );
+    assert_eq!(stored(&after, LEASE).await, Some(30_000));
     clock.advance(Duration::from_secs(1));
     assert!(after.hub.authority().passed(LEASE));
+    assert_eq!(after.hub.lower_durations().await, 1);
+    assert_eq!(stored(&after, LEASE).await, Some(15_000));
     f.done();
 }
 
@@ -622,7 +695,7 @@ async fn no_lowering_while_a_window_is_open() {
     assert_eq!(stored(&f.state, LEASE).await, Some(60_000));
     assert!(matches!(
         task.await.unwrap(),
-        Err(MaintenanceError::NotRenewed { .. })
+        Err(MaintenanceError::NotCovered { .. })
     ));
     assert_eq!(hub.end_maintenance().await, Ok(Ending::Ended));
     assert_eq!(hub.lower_durations().await, 1);
@@ -667,20 +740,25 @@ fn the_support_requests_ask_for_w_only_while_a_window_opens_or_is_open() {
     assert!(watched.has_changed().unwrap());
     assert_eq!(*watched.borrow_and_update(), 30_000);
     assert_eq!(window.begin(60_000, at(0)), None, "busy");
-    window.abort(first);
+    window.close(first);
     assert_eq!(window.support_ms(at(0)), D);
     assert_eq!(*watched.borrow_and_update(), D);
 
     let second = window.begin(30_000, at(1)).unwrap();
     assert!(second > first);
-    window.abort(first);
+    window.close(first);
     assert_eq!(
         window.support_ms(at(1)),
         30_000,
-        "an older opening aborts nothing"
+        "an older opening closes nothing"
     );
     let now_wall = time::OffsetDateTime::UNIX_EPOCH;
     assert!(window.open(second, at(1), now_wall, std::collections::BTreeMap::new()));
+    window.close(first);
+    assert!(
+        window.still(second, at(1)),
+        "nor does it close a later window that is open"
+    );
     assert_eq!(window.support_ms(at(30)), 30_000);
     assert_eq!(window.support_ms(at(31)), D, "W after it opened");
     assert!(window.is_idle(at(31)));
@@ -691,4 +769,433 @@ fn the_support_requests_ask_for_w_only_while_a_window_opens_or_is_open() {
     assert!(!window.open(third, at(40), now_wall, std::collections::BTreeMap::new()));
     assert_eq!(window.support_ms(at(40)), D);
     assert_eq!(window.end(at(40)), Ending::NothingOpen);
+}
+
+/// Section 8.11: a `W` answer needs a majority for `W` at the moment it goes
+/// out. When support for `W` is lost after the window opened, the holder's
+/// renewal is answered with `D`, which a majority still supports, not left
+/// unanswered; once `W` is supported again, the answer carries `W` again.
+#[tokio::test]
+async fn support_for_w_lost_after_the_window_opened_answers_with_d() {
+    let f = window_fixture().await;
+    let hub = &f.state.hub;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE]).await;
+    open_window(&f, &mut session, 30).await;
+    hub.set_voter_support(Arc::new(UpTo(D)));
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r1", LEASE).await),
+        D
+    );
+    hub.set_voter_support(Arc::new(EverySupport));
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r2", LEASE).await),
+        30_000
+    );
+    f.done();
+}
+
+/// A lease of the window whose row is marked during the window is answered
+/// with `D`: a marked lease is between modes (section 8.4, "The mark"), and
+/// the window covers only unmarked `expiring` rows.
+#[tokio::test]
+async fn a_lease_marked_during_the_window_is_answered_with_d() {
+    let f = window_fixture().await;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE]).await;
+    open_window(&f, &mut session, 30).await;
+    set_row(
+        &f.state,
+        LEASE,
+        "UPDATE leases SET unsettled = 1 WHERE id = ?",
+    )
+    .await;
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r1", LEASE).await),
+        D
+    );
+    f.done();
+}
+
+/// A lease of the window granted again during the window, its stored
+/// duration back at `D`, is answered with `D`: a `W` answer goes out only
+/// over a row whose replicated stored duration already covers `W` (ADR
+/// 0268).
+#[tokio::test]
+async fn a_lease_stored_back_at_d_during_the_window_is_answered_with_d() {
+    let f = window_fixture().await;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE]).await;
+    open_window(&f, &mut session, 30).await;
+    set_row(
+        &f.state,
+        LEASE,
+        "UPDATE leases SET duration_ms = 15000 WHERE id = ?",
+    )
+    .await;
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r1", LEASE).await),
+        D
+    );
+    assert_eq!(
+        stored(&f.state, LEASE).await,
+        Some(15_000),
+        "nothing raised"
+    );
+    f.done();
+}
+
+/// A lease of the window revoked during the window gets no `W`: its renewal
+/// is answered with a revoke, and the window's answer for its row is `D`
+/// whatever path reads it.
+#[tokio::test]
+async fn a_lease_revoked_during_the_window_gets_no_w() {
+    let f = window_fixture().await;
+    let hub = &f.state.hub;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE]).await;
+    open_window(&f, &mut session, 30).await;
+    let unrevoked = row_of(&f.state, LEASE).await;
+    assert_eq!(hub.window_answer_ms(&unrevoked, &f.node_id), Some(30_000));
+    set_row(
+        &f.state,
+        LEASE,
+        &format!("UPDATE leases SET revoked_at = '{REVOKED}' WHERE id = ?"),
+    )
+    .await;
+    let answer = renew_lease(&mut session, "msg_r1", LEASE).await;
+    assert!(
+        !answer.iter().any(|frame| frame["type"] == "lease_grant"),
+        "{answer:?}"
+    );
+    assert!(
+        answer.iter().any(|frame| frame["type"] == "lease_revoke"),
+        "{answer:?}"
+    );
+    let revoked = row_of(&f.state, LEASE).await;
+    assert_eq!(hub.window_answer_ms(&revoked, &f.node_id), None);
+    f.done();
+}
+
+/// Section 8.11 step 2: the raise skips a marked row and a revoked one. The
+/// window covers the other lease, and the command fails naming the marked
+/// lease and why (a revoked one needs no cover); the window stays open for
+/// the lease it covers, and its `ok` record stands.
+#[tokio::test]
+async fn the_raise_skips_marked_and_revoked_rows_and_the_command_names_the_marked_one() {
+    let f = fixture("warm", "expiring", Some(i64::try_from(D).unwrap()), true).await;
+    add_lease(&f, LEASE_2, APP_2, "expiring", D).await;
+    add_lease(&f, LEASE_3, APP_3, "expiring", D).await;
+    set_row(
+        &f.state,
+        LEASE_3,
+        &format!("UPDATE leases SET revoked_at = '{REVOKED}' WHERE id = ?"),
+    )
+    .await;
+    let hub = &f.state.hub;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE_2]).await;
+    let task = open(hub, 30);
+    until_raised(&f.state, LEASE_2, 30_000).await;
+    ack_head(&f, &session).await;
+    until("the window to open", || is_open(hub)).await;
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r1", LEASE_2).await),
+        30_000
+    );
+    let result = ended(task).await;
+    let Err(error @ MaintenanceError::NotCovered { .. }) = result else {
+        panic!("{result:?}");
+    };
+    let MaintenanceError::NotCovered {
+        leases, answered, ..
+    } = &error
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        leases,
+        &vec![Uncovered {
+            lease_id: LEASE.to_string(),
+            holder: f.node_id.clone(),
+            why: Why::Marked,
+        }]
+    );
+    assert_eq!(*answered, 1);
+    let printed = error.to_string();
+    assert!(
+        printed.contains(&format!(
+            "\n  {LEASE} on {}: it carries the unsettled mark",
+            f.node_id
+        )),
+        "{printed}"
+    );
+    assert!(
+        is_open(hub),
+        "the window stays open for the lease it covers"
+    );
+    assert_eq!(stored(&f.state, LEASE).await, Some(15_000), "marked");
+    assert_eq!(stored(&f.state, LEASE_3).await, Some(15_000), "revoked");
+    let records = records(&f.state).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].result, "ok", "the window opened");
+    f.done();
+}
+
+/// Section 8.11: a lease that turns `expiring` after the raise gets only `D`
+/// from this window, so the command does not succeed while it exists, even
+/// once every lease of the window was answered with `W`.
+#[tokio::test]
+async fn a_lease_that_turns_expiring_during_the_window_fails_the_command() {
+    let f = window_fixture().await;
+    add_lease(&f, LEASE_2, APP_2, "local", D).await;
+    let hub = &f.state.hub;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE]).await;
+    let task = open(hub, 30);
+    until_raised(&f.state, LEASE, 30_000).await;
+    assert_eq!(stored(&f.state, LEASE_2).await, Some(15_000), "a local row");
+    set_row(
+        &f.state,
+        LEASE_2,
+        "UPDATE leases SET mode = 'expiring' WHERE id = ?",
+    )
+    .await;
+    ack_head(&f, &session).await;
+    until("the window to open", || is_open(hub)).await;
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r1", LEASE).await),
+        30_000
+    );
+    let result = ended(task).await;
+    let Err(MaintenanceError::NotCovered {
+        leases, answered, ..
+    }) = result
+    else {
+        panic!("{result:?}");
+    };
+    assert_eq!(
+        leases,
+        vec![Uncovered {
+            lease_id: LEASE_2.to_string(),
+            holder: f.node_id.clone(),
+            why: Why::NotRaised,
+        }]
+    );
+    assert_eq!(answered, 1);
+    assert!(is_open(hub));
+    // Its renewals get no `W` from this window. (The row turned `expiring`
+    // here by hand, without the conversion grant that records its gate, so
+    // the authority itself answers none of them.)
+    let row = row_of(&f.state, LEASE_2).await;
+    assert_eq!(hub.window_answer_ms(&row, &f.node_id), None);
+    f.done();
+}
+
+/// A holder counts its validity from its newest answer, so a lease whose
+/// `W` answer was followed by a `D` answer is not covered: the command fails
+/// naming it, even though it was answered with `W` once.
+#[tokio::test]
+async fn a_lease_whose_newest_answer_carried_d_is_not_covered() {
+    let f = window_fixture().await;
+    two_leases(&f).await;
+    let hub = &f.state.hub;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE, LEASE_2]).await;
+    let task = open(hub, 30);
+    until_raised(&f.state, LEASE_2, 30_000).await;
+    ack_head(&f, &session).await;
+    until("the window to open", || is_open(hub)).await;
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r1", LEASE).await),
+        30_000
+    );
+    hub.set_voter_support(Arc::new(UpTo(D)));
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r2", LEASE).await),
+        D
+    );
+    hub.set_voter_support(Arc::new(EverySupport));
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r3", LEASE_2).await),
+        30_000
+    );
+    let result = run_out(&f, task).await;
+    let Err(MaintenanceError::NotCovered {
+        leases, answered, ..
+    }) = result
+    else {
+        panic!("{result:?}");
+    };
+    assert_eq!(
+        leases,
+        vec![Uncovered {
+            lease_id: LEASE.to_string(),
+            holder: f.node_id.clone(),
+            why: Why::AnsweredWithD,
+        }]
+    );
+    assert_eq!(answered, 1);
+    f.done();
+}
+
+/// An `expiring` row the change log has no entry of, and that already stores
+/// at least `W`, is left out of the raise: the command names it with that
+/// reason.
+#[tokio::test]
+async fn a_row_with_no_change_log_entry_is_named_as_not_covered() {
+    let f = fixture("warm", "expiring", Some(60_000), false).await;
+    let result = f.state.hub.open_maintenance(30).await;
+    let Err(MaintenanceError::NotCovered {
+        leases, answered, ..
+    }) = result
+    else {
+        panic!("{result:?}");
+    };
+    assert_eq!(
+        leases,
+        vec![Uncovered {
+            lease_id: LEASE.to_string(),
+            holder: f.node_id.clone(),
+            why: Why::NoLogEntry,
+        }]
+    );
+    assert_eq!(answered, 0);
+    f.done();
+}
+
+/// The lowering skips a marked row, a revoked one and one this process has
+/// no gate of, whatever they store: only an unmarked, unrevoked `expiring`
+/// row whose every longer gate this process knows has passed goes back to
+/// `D`.
+#[tokio::test]
+async fn the_lowering_skips_marked_revoked_and_gate_less_rows() {
+    let f = window_fixture().await;
+    let hub = &f.state.hub;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE]).await;
+    open_window(&f, &mut session, 60).await;
+    assert_eq!(hub.end_maintenance().await, Ok(Ending::Ended));
+    f.clock.advance(Duration::from_secs(72));
+    // Written after this process started and granted nothing since: no gate.
+    add_lease(&f, LEASE_2, APP_2, "expiring", 60_000).await;
+    assert!(!hub.authority().has_gate(LEASE_2));
+
+    set_row(
+        &f.state,
+        LEASE,
+        "UPDATE leases SET unsettled = 1 WHERE id = ?",
+    )
+    .await;
+    assert_eq!(hub.lower_durations().await, 0, "marked, and no gate");
+    set_row(
+        &f.state,
+        LEASE,
+        &format!("UPDATE leases SET unsettled = 0, revoked_at = '{REVOKED}' WHERE id = ?"),
+    )
+    .await;
+    assert_eq!(hub.lower_durations().await, 0, "revoked, and no gate");
+    assert_eq!(stored(&f.state, LEASE).await, Some(60_000));
+    assert_eq!(stored(&f.state, LEASE_2).await, Some(60_000));
+
+    set_row(
+        &f.state,
+        LEASE,
+        "UPDATE leases SET revoked_at = NULL WHERE id = ?",
+    )
+    .await;
+    assert_eq!(hub.lower_durations().await, 1);
+    assert_eq!(stored(&f.state, LEASE).await, Some(15_000));
+    assert_eq!(stored(&f.state, LEASE_2).await, Some(60_000), "no gate");
+    f.done();
+}
+
+/// `--end` while the window waits for a majority: the opening stops at once,
+/// with an `error` record that says so, and `--end` writes its own record.
+#[tokio::test]
+async fn end_while_the_window_waits_for_a_majority_records_an_error_and_the_end() {
+    let f = window_fixture().await;
+    let hub = &f.state.hub;
+    hub.set_voter_support(Arc::new(UpTo(D)));
+    let task = open(hub, 30);
+    until("the opening", || !is_idle(hub)).await;
+    assert_eq!(hub.end_maintenance().await, Ok(Ending::Ended));
+    assert_eq!(
+        ended(task).await,
+        Err(MaintenanceError::Ended { opened: false })
+    );
+    assert_eq!(hub.support_lease_ms(), D);
+    assert_eq!(stored(&f.state, LEASE).await, Some(15_000));
+    assert_opening_ended(&f.state).await;
+    f.done();
+}
+
+/// `--end` while the window waits for its raise to be replicated: the
+/// opening stops at once, nothing is answered with `W`, the raised duration
+/// stays stored, and the records are the same as above.
+#[tokio::test]
+async fn end_while_the_raise_is_replicated_records_an_error_and_the_end() {
+    let f = window_fixture().await;
+    let hub = &f.state.hub;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE]).await;
+    let task = open(hub, 30);
+    until_raised(&f.state, LEASE, 30_000).await;
+    assert_eq!(hub.end_maintenance().await, Ok(Ending::Ended));
+    assert_eq!(
+        ended(task).await,
+        Err(MaintenanceError::Ended { opened: false })
+    );
+    assert!(is_idle(hub));
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r1", LEASE).await),
+        D
+    );
+    assert_eq!(stored(&f.state, LEASE).await, Some(30_000));
+    assert_opening_ended(&f.state).await;
+    f.done();
+}
+
+/// The records of an opening that `--end` ended: one `error` with
+/// `{duration_s}` that says the window did not open, and one `ok` with
+/// `{end: true}`, in either order.
+async fn assert_opening_ended(state: &AppState) {
+    let records = records(state).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    let error = records
+        .iter()
+        .find(|record| record.result == "error")
+        .expect("an error record");
+    assert_eq!(error.params, serde_json::json!({ "duration_s": 30 }));
+    let detail = error.detail.as_deref().unwrap();
+    assert!(
+        detail.contains("ended with --end while it was opening"),
+        "{detail}"
+    );
+    let end = records
+        .iter()
+        .find(|record| record.result == "ok")
+        .expect("the end record");
+    assert_eq!(end.params, serde_json::json!({ "end": true }));
+}
+
+/// The `ok` record's `change_seq` is a write of this raise: a window whose
+/// lease already stores at least `W` raises nothing, and its record carries
+/// no `change_seq`.
+#[tokio::test]
+async fn a_window_that_raises_nothing_records_no_change_seq() {
+    let f = window_fixture().await;
+    let hub = &f.state.hub;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE]).await;
+    open_window(&f, &mut session, 60).await;
+    assert_eq!(hub.end_maintenance().await, Ok(Ending::Ended));
+    let writes = f.writes().await;
+    let task = open(hub, 30);
+    until("the window to open", || is_open(hub)).await;
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_r1", LEASE).await),
+        30_000
+    );
+    task.await.unwrap().unwrap();
+    assert_eq!(f.writes().await, writes, "nothing raised");
+    let records = records(&f.state).await;
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert!(records[0].change_seq.is_some(), "the first window raised");
+    assert_eq!(records[2].params, serde_json::json!({ "duration_s": 30 }));
+    assert_eq!(
+        (records[2].result.as_str(), records[2].change_seq),
+        ("ok", None)
+    );
+    f.done();
 }

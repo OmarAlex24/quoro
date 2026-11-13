@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::Command;
 use tokio::time::{Instant, sleep, timeout};
 
@@ -45,6 +45,23 @@ async fn maintenance(socket: &Path, args: &[&str]) -> Output {
         .output()
         .await
         .expect("run quoro cluster maintenance")
+}
+
+/// Sends one raw request line to the socket and returns the answer line.
+async fn raw_request(socket: &Path, request: &str) -> serde_json::Value {
+    let mut stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .expect("connect to the control socket");
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("send the request");
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .await
+        .expect("read the answer");
+    serde_json::from_str(line.trim()).expect("the answer is JSON")
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -122,6 +139,25 @@ async fn the_command_reaches_the_primary_over_its_control_socket() {
         assert_eq!(mode & 0o777, 0o600, "only its owner and root may open it");
     }
 
+    // The socket's lines are versioned: a request of another version, or of
+    // none, is refused with an error that says so, and changes nothing.
+    for (request, expected) in [
+        (
+            r#"{"v":2,"op":"maintenance","end":true}"#,
+            "serves version 1 of the control socket, and the request is version 2",
+        ),
+        (
+            r#"{"op":"maintenance","duration_s":30}"#,
+            "the request carries no version",
+        ),
+    ] {
+        let answer = raw_request(&socket, request).await;
+        assert_eq!(answer["v"], 1, "{answer}");
+        assert_eq!(answer["ok"], false, "{answer}");
+        let message = answer["message"].as_str().unwrap_or_default();
+        assert!(message.contains(expected), "{message}");
+    }
+
     let nothing = maintenance(&socket, &["--end"]).await;
     assert_eq!(nothing.status.code(), Some(0), "{}", text(&nothing.stderr));
     assert!(
@@ -156,6 +192,7 @@ async fn the_command_reaches_the_primary_over_its_control_socket() {
     ))
     .await
     .expect("open the database");
+    // The refused requests wrote nothing: one record, the failed opening's.
     let records: Vec<(String, String, String, String)> = sqlx::query_as(
         "SELECT actor_id, channel, params, result FROM audit_log \
          WHERE operation = 'cluster.maintenance' ORDER BY seq",

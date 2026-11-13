@@ -1315,16 +1315,18 @@ start_unit() {
 # (node-agent-protocol.md section 8.11): for a while it answers the renewals of
 # every expiring lease with a longer duration, so warm apps keep running
 # through the restart. The binary just installed talks to the primary still
-# running, over its local control socket. A failure does not stop the upgrade:
-# warm apps then fence if the restart takes longer than about D, which is the
-# safe outcome.
+# running, over its local control socket. The command fails both when no
+# window opened and when a window opened but does not cover every lease; it
+# prints which, and the leases it did cover keep their longer validity. A
+# failure does not stop the upgrade: a warm app the window does not cover
+# fences if the restart takes longer than about D, which is the safe outcome.
 open_maintenance_window() {
     systemctl is-active --quiet quoro.service 2>/dev/null || return 0
     log 'asking the running primary for a maintenance window before restarting quoro.service'
     if /usr/local/bin/quoro cluster maintenance; then
         return 0
     fi
-    log 'warning: no maintenance window opened: warm apps fence if quoro.service takes longer than about D (15 s) to restart; going on with the upgrade'
+    log 'warning: the maintenance window does not cover every warm app (see the message above): a warm app it does not cover fences if quoro.service takes longer than about D (15 s) to restart; going on with the upgrade'
 }
 
 start_services() {

@@ -23,15 +23,30 @@
 //!    answered with `D`.
 //! 4. **The renewals.** While it is open, the answer to a renewal of one of
 //!    its leases by that lease's holder carries `W`
-//!    ([`NodeHub::window_answer_ms`]). The command succeeds once every one of
-//!    them had such an answer, and fails when a holder has not renewed in
-//!    time; the window then stays open, so the leases already answered keep
-//!    their longer validity.
+//!    ([`NodeHub::window_answer_ms`]), as long as the row still reads
+//!    `expiring`, unmarked, unrevoked and storing at least `W`, and a majority
+//!    still supports `W`; otherwise it carries `D`.
+//!
+//! **Success.** The command succeeds once the newest answer to every one of
+//! the window's leases carried `W` (a holder counts its validity from its
+//! newest answer, so a later `D` answer takes the cover away again), and no
+//! other unrevoked lease reads `expiring` or carries the unsettled mark. Such
+//! a lease gets only `D` from this window: one that was marked at the raise,
+//! one that became `expiring` after it, or one granted again since
+//! ([`Why`]). The command fails, naming each lease it does not cover and why,
+//! when a holder has not renewed within [`step_bound`] or when such a lease
+//! exists. The window then stays open, so the leases already answered keep
+//! their longer validity (section 8.11). It waits for the window's own
+//! leases before it fails for another one, so that the installer does not
+//! restart the primary before they are covered.
 //!
 //! The primary writes one `cluster.maintenance` audit record per window it
 //! tries to open: `ok` once the window opens, `error` with the reason when it
-//! does not (`audit-log-format.md` section 3.7). `--end` writes another,
-//! with `params` `{end: true}`.
+//! does not (`audit-log-format.md` section 3.7). A window that opened but does
+//! not cover every lease still records `ok`, as the contract defines it. The
+//! `ok` record's `change_seq` is the newest change-log write of the raise,
+//! absent when the raise wrote nothing. `--end` writes another record, with
+//! `params` `{end: true}`.
 //!
 //! **Closing.** The window closes `W` after it opened, with `--end`, or at
 //! the primary's next start, since it lives in memory only; whichever comes
@@ -63,7 +78,8 @@ use crate::authority::{DEFAULT_DURATION_MS, MAX_DURATION_MS, margin_ms};
 use crate::changelog::Actor;
 use crate::leases::{self, Lease};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use sqlx::SqliteConnection;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -109,18 +125,20 @@ pub enum MaintenanceError {
     /// The raise was not replicated within [`step_bound`]; `waiting` lists
     /// the machines of the required set that had not acknowledged it.
     NotReplicated { waiting: Vec<String> },
-    /// The window opened, but these leases' holders did not renew within
-    /// [`step_bound`]. The window stays open until it closes.
-    NotRenewed {
-        /// `(lease_id, holder)` of each lease not answered with `W`.
-        missing: Vec<(String, String)>,
-        /// How many leases were answered with `W`.
+    /// The window opened, but it does not cover these leases. The window
+    /// stays open until it closes.
+    NotCovered {
+        /// Each lease not covered, and why.
+        leases: Vec<Uncovered>,
+        /// How many leases had their newest renewal answered with `W`.
         answered: usize,
         /// When the window closes, RFC 3339.
         closes_at: String,
     },
-    /// `--end` ended the window before the command's work was done.
-    Ended,
+    /// `--end` ended the window before the command's work was done: while it
+    /// was opening (`opened` false), or once it was open, before every lease
+    /// was covered.
+    Ended { opened: bool },
     /// A database or audit write failed.
     Internal(String),
 }
@@ -156,26 +174,101 @@ impl std::fmt::Display for MaintenanceError {
                     waiting.join(", ")
                 }
             ),
-            Self::NotRenewed {
-                missing,
+            Self::NotCovered {
+                leases,
                 answered,
                 closes_at,
-            } => write!(
-                f,
-                "the window is open until {closes_at}, but {} expiring lease(s) had no renewal \
-                 answered with it within {bound} ms ({}); {answered} lease(s) answered keep their \
-                 longer validity",
-                missing.len(),
-                missing
-                    .iter()
-                    .map(|(lease, holder)| format!("{lease} on {holder}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Self::Ended => {
-                f.write_str("the window was ended with --end before every lease was covered")
+            } => {
+                write!(
+                    f,
+                    "the window is open until {closes_at}, but it does not cover {} lease(s); the \
+                     {answered} lease(s) answered with it keep their longer validity:",
+                    leases.len()
+                )?;
+                for lease in leases {
+                    write!(
+                        f,
+                        "\n  {} on {}: {}",
+                        lease.lease_id, lease.holder, lease.why
+                    )?;
+                }
+                Ok(())
             }
+            Self::Ended { opened: false } => {
+                f.write_str("the window was ended with --end while it was opening; it did not open")
+            }
+            Self::Ended { opened: true } => f.write_str(
+                "the window was ended with --end before every lease had a renewal answered with it",
+            ),
             Self::Internal(message) => f.write_str(message),
+        }
+    }
+}
+
+/// A lease the window does not cover ([`MaintenanceError::NotCovered`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Uncovered {
+    pub lease_id: String,
+    /// The holder the row names, or, for one of the window's leases its
+    /// holder has not renewed, the holder the window raised it for.
+    pub holder: String,
+    pub why: Why,
+}
+
+/// Why the window does not cover a lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// One of the window's leases whose holder has not renewed within
+    /// [`step_bound`].
+    NotRenewed,
+    /// One of the window's leases whose newest renewal was answered with
+    /// `D`, which its holder counts its validity from: no majority supported
+    /// `W` at that moment, or its row changed as the variants below say.
+    AnsweredWithD,
+    /// It carries the unsettled mark, so its renewals are answered with `D`.
+    Marked,
+    /// It was not an unmarked `expiring` lease when the window raised the
+    /// durations, so its renewals are answered with `D`.
+    NotRaised,
+    /// Its row had no change-log entry at the raise, so no successor could
+    /// count a longer gate, and its renewals are answered with `D`.
+    NoLogEntry,
+    /// Its row names another holder than the one the window raised it for.
+    OtherHolder,
+    /// Its stored duration went back below `W`, so its renewals are answered
+    /// with `D`.
+    StoredBelowW,
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRenewed => write!(
+                f,
+                "its holder did not renew within {} ms",
+                step_bound().as_millis()
+            ),
+            Self::AnsweredWithD => f.write_str(
+                "its newest renewal was answered with D, which its holder counts its validity from",
+            ),
+            Self::Marked => {
+                f.write_str("it carries the unsettled mark, so its renewals are answered with D")
+            }
+            Self::NotRaised => f.write_str(
+                "it was not an unmarked expiring lease when the window raised the durations, so \
+                 its renewals are answered with D",
+            ),
+            Self::NoLogEntry => {
+                f.write_str("its row has no change-log entry, so its renewals are answered with D")
+            }
+            Self::OtherHolder => f.write_str(
+                "it was granted to another node after the window raised it, so its renewals are \
+                 answered with D",
+            ),
+            Self::StoredBelowW => f.write_str(
+                "its stored duration went back below the window's, so its renewals are answered \
+                 with D",
+            ),
         }
     }
 }
@@ -188,8 +281,11 @@ pub struct Opened {
     /// How many `expiring` leases the window covers.
     pub leases: usize,
     /// Until about when every one of them is valid on its holder without
-    /// another answer: the earliest `T_grant + W - M(W)` of their `W`
-    /// answers, RFC 3339. `None` when there was no lease to cover.
+    /// another answer: the earliest `T_grant + W - 2M(W)` of their `W`
+    /// answers, RFC 3339. The holder counts `W - M(W)` from the moment it
+    /// sent the renewal, which is before `T_grant`; the second margin keeps
+    /// the printed time on the early side. `None` when there was no lease to
+    /// cover.
     pub covered_until: Option<String>,
     /// When the window closes, RFC 3339.
     pub closes_at: String,
@@ -208,8 +304,23 @@ pub enum Ending {
 #[derive(Clone, Debug)]
 struct Target {
     holder: String,
-    /// The wall-clock time of the newest `W` answer.
+    /// The wall-clock time of the newest answer to its holder's renewal,
+    /// when that answer carried `W`.
     answered: Option<time::OffsetDateTime>,
+    /// Whether the newest answer carried less than `W`: the holder counts
+    /// its validity from its newest answer (section 8.4), so the lease is not
+    /// covered until another answer carries `W`.
+    short: bool,
+}
+
+impl Target {
+    fn new(holder: String) -> Self {
+        Self {
+            holder,
+            answered: None,
+            short: false,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -238,8 +349,12 @@ struct State {
 
 /// Where the progress of an open window stands.
 struct Progress {
-    missing: Vec<(String, String)>,
+    /// The window's leases whose newest answer did not carry `W`.
+    missing: Vec<Uncovered>,
+    /// The time of each `W` answer that is its lease's newest answer.
     answered: Vec<time::OffsetDateTime>,
+    /// Each of the window's leases and the holder it was raised for.
+    holders: BTreeMap<String, String>,
     w_ms: u64,
     closes_wall: time::OffsetDateTime,
 }
@@ -325,10 +440,11 @@ impl Window {
         state.epoch == epoch && !matches!(state.phase, Phase::Idle)
     }
 
-    /// The opening `epoch` failed: no window opens.
-    fn abort(&self, epoch: u64) {
+    /// Closes the window of `epoch`, opening or open: its opening failed, or
+    /// its `ok` record could not be written. A later window is left as it is.
+    fn close(&self, epoch: u64) {
         let mut state = self.state();
-        if state.epoch == epoch && matches!(state.phase, Phase::Opening { .. }) {
+        if state.epoch == epoch && !matches!(state.phase, Phase::Idle) {
             state.phase = Phase::Idle;
             self.lease.send_replace(DEFAULT_DURATION_MS);
         }
@@ -375,27 +491,25 @@ impl Window {
     }
 
     /// Records that a renewal of `lease_id` by `holder` was answered with
-    /// `w_ms` at `wall`.
+    /// `duration_ms` at `wall`. An answer with `W` covers the lease; any other
+    /// takes the cover of an earlier one away.
     fn answered(
         &self,
         lease_id: &str,
         holder: &str,
-        w_ms: u64,
+        duration_ms: u64,
         wall: time::OffsetDateTime,
         now: Duration,
     ) {
         let mut state = self.state();
         self.expire(&mut state, now);
-        if let Phase::Open {
-            w_ms: open_ms,
-            leases,
-            ..
-        } = &mut state.phase
-            && *open_ms == w_ms
+        if let Phase::Open { w_ms, leases, .. } = &mut state.phase
             && let Some(target) = leases.get_mut(lease_id)
             && target.holder == holder
         {
-            target.answered = Some(wall);
+            let covers = duration_ms == *w_ms;
+            target.answered = covers.then_some(wall);
+            target.short = !covers;
         }
     }
 
@@ -418,15 +532,25 @@ impl Window {
         let mut progress = Progress {
             missing: Vec::new(),
             answered: Vec::new(),
+            holders: BTreeMap::new(),
             w_ms: *w_ms,
             closes_wall: *closes_wall,
         };
         for (lease_id, target) in leases {
+            progress
+                .holders
+                .insert(lease_id.clone(), target.holder.clone());
             match target.answered {
                 Some(wall) => progress.answered.push(wall),
-                None => progress
-                    .missing
-                    .push((lease_id.clone(), target.holder.clone())),
+                None => progress.missing.push(Uncovered {
+                    lease_id: lease_id.clone(),
+                    holder: target.holder.clone(),
+                    why: if target.short {
+                        Why::AnsweredWithD
+                    } else {
+                        Why::NotRenewed
+                    },
+                }),
             }
         }
         Some(progress)
@@ -455,10 +579,94 @@ fn rfc3339(wall: time::OffsetDateTime) -> String {
     crate::store::format_rfc3339(wall)
 }
 
+/// What the raise of an opening found ([`NodeHub::raise_for_window`]).
+struct Raised {
+    /// The window's leases.
+    targets: BTreeMap<String, Target>,
+    /// The newest change-log write among them, the raise included: the one
+    /// that must be replicated before any `W` answer.
+    newest: Option<u64>,
+    /// The newest change-log write the raise itself made, the `ok` record's
+    /// `change_seq`; `None` when every row already stored at least `W`.
+    wrote: Option<u64>,
+    /// The `expiring` rows left out for having no change-log entry.
+    unlogged: BTreeSet<String>,
+}
+
+/// Why the window does not answer the renewals of `row`, one of its leases,
+/// with `W`, as far as the row decides it: it carries the unsettled mark, or
+/// it stores less than `W`. `None` when the row lets the answer carry `W`.
+fn row_short_of_w(row: &Lease, w_ms: u64) -> Option<Why> {
+    if row.unsettled {
+        return Some(Why::Marked);
+    }
+    let stored = row.duration_ms.and_then(|ms| u64::try_from(ms).ok());
+    if !stored.is_some_and(|stored| stored >= w_ms) {
+        return Some(Why::StoredBelowW);
+    }
+    None
+}
+
+/// The leases a window of `w_ms` does not cover, as `conn` reads them: every
+/// unrevoked row that reads `expiring` or carries the unsettled mark and whose
+/// renewals the window does not answer with `W` (section 8.11: the command
+/// succeeds once every `expiring` lease had a `W` answer). `holders` maps each
+/// of the window's leases to the holder it was raised for; `unlogged` names
+/// the rows the raise left out for having no change-log entry. A revoked row,
+/// and an unmarked `local` one, need no cover.
+async fn uncovered(
+    conn: &mut SqliteConnection,
+    holders: &BTreeMap<String, String>,
+    unlogged: &BTreeSet<String>,
+    w_ms: u64,
+) -> Result<Vec<Uncovered>, String> {
+    let rows = sqlx::query(&format!(
+        "SELECT {} FROM leases WHERE revoked_at IS NULL \
+         AND (mode = 'expiring' OR unsettled = 1) ORDER BY id",
+        leases::LEASE_COLUMNS
+    ))
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| format!("cannot read the leases the window must cover: {e}"))?;
+    let mut found = Vec::new();
+    for row in &rows {
+        let row = leases::lease_from_row(row)
+            .map_err(|e| format!("cannot read the leases the window must cover: {e:?}"))?;
+        let why = match holders.get(&row.id) {
+            Some(holder) if *holder != row.holder_node_id => Some(Why::OtherHolder),
+            Some(_) => row_short_of_w(&row, w_ms),
+            None if row.unsettled => Some(Why::Marked),
+            None if unlogged.contains(&row.id) => Some(Why::NoLogEntry),
+            None => Some(Why::NotRaised),
+        };
+        if let Some(why) = why {
+            found.push(Uncovered {
+                lease_id: row.id,
+                holder: row.holder_node_id,
+                why,
+            });
+        }
+    }
+    Ok(found)
+}
+
+/// Whether `row`'s stored duration may go back to `D`, as far as the row
+/// decides it: it reads `expiring`, carries no unsettled mark, is not revoked
+/// and stores more than `D`. A marked or revoked row keeps its longer
+/// duration, the side that only waits longer.
+fn lowerable(row: &Lease) -> bool {
+    let d = i64::try_from(DEFAULT_DURATION_MS).unwrap_or(i64::MAX);
+    row.mode == "expiring"
+        && !row.unsettled
+        && !row.is_revoked()
+        && row.duration_ms.is_some_and(|stored| stored > d)
+}
+
 impl NodeHub {
     /// `quoro cluster maintenance --duration <duration_s>` ([module
-    /// docs](self)). Returns once every `expiring` lease of the window had a
-    /// renewal answered with `W`, or with the reason the command fails.
+    /// docs](self)). Returns once the newest answer to every lease of the
+    /// window carried `W` and no other lease needs cover, or with the reason
+    /// the command fails.
     ///
     /// # Errors
     ///
@@ -486,13 +694,15 @@ impl NodeHub {
         let asked = authority.now();
         loop {
             if !window.still(epoch, authority.now()) {
-                return self.not_opened(&params, MaintenanceError::Ended).await;
+                return self
+                    .not_opened(&params, MaintenanceError::Ended { opened: false })
+                    .await;
             }
             if authority.supports(w_ms) {
                 break;
             }
             if authority.now() >= asked + bound {
-                window.abort(epoch);
+                window.close(epoch);
                 return self
                     .not_opened(&params, MaintenanceError::NoMajority { duration_s })
                     .await;
@@ -501,31 +711,43 @@ impl NodeHub {
         }
 
         // 2. The raise.
-        let (leases, seq) = match self.raise_for_window(epoch, w_ms).await {
+        let raised = match self.raise_for_window(epoch, w_ms).await {
             Ok(Some(raised)) => raised,
-            Ok(None) => return self.not_opened(&params, MaintenanceError::Ended).await,
+            Ok(None) => {
+                return self
+                    .not_opened(&params, MaintenanceError::Ended { opened: false })
+                    .await;
+            }
             Err(message) => {
-                window.abort(epoch);
+                window.close(epoch);
                 return self
                     .not_opened(&params, MaintenanceError::Internal(message))
                     .await;
             }
         };
+        let Raised {
+            targets,
+            newest,
+            wrote,
+            unlogged,
+        } = raised;
 
         // 3. The raise is replicated over the required set (ADR 0268, ADR
         //    0289).
-        if let Some(seq) = seq {
-            let raised = authority.now();
+        if let Some(seq) = newest {
+            let raised_at = authority.now();
             loop {
                 if !window.still(epoch, authority.now()) {
-                    return self.not_opened(&params, MaintenanceError::Ended).await;
+                    return self
+                        .not_opened(&params, MaintenanceError::Ended { opened: false })
+                        .await;
                 }
                 let waiting = match self.raise_replicated(seq).await {
                     Ok(()) => break,
                     Err(waiting) => waiting,
                 };
-                if authority.now() >= raised + bound {
-                    window.abort(epoch);
+                if authority.now() >= raised_at + bound {
+                    window.close(epoch);
                     return self
                         .not_opened(&params, MaintenanceError::NotReplicated { waiting })
                         .await;
@@ -534,56 +756,90 @@ impl NodeHub {
             }
         }
 
-        // 4. Open, and record it.
-        if !window.open(
-            epoch,
-            authority.now(),
-            time::OffsetDateTime::now_utc(),
-            leases,
-        ) {
-            return self.not_opened(&params, MaintenanceError::Ended).await;
+        // 4. Open, and record it. The holders' bound counts from this moment,
+        //    not from after the record.
+        let opened = authority.now();
+        if !window.open(epoch, opened, time::OffsetDateTime::now_utc(), targets) {
+            return self
+                .not_opened(&params, MaintenanceError::Ended { opened: false })
+                .await;
         }
-        let change_seq = seq.and_then(|seq| i64::try_from(seq).ok());
+        let change_seq = wrote.and_then(|seq| i64::try_from(seq).ok());
         if let Err(message) = self
             .audit_maintenance(params, Outcome::Ok, None, change_seq)
             .await
         {
             // No record, no window: the command fails and renewals go back
-            // to `D`; the leases already answered keep their gates.
-            window.end(authority.now());
+            // to `D`; the leases already answered keep their gates. Only
+            // this window is closed, never a later one.
+            window.close(epoch);
             return Err(MaintenanceError::Internal(message));
         }
         tracing::info!(duration_s, "the maintenance window is open");
 
-        // 5. Every lease of the window had a renewal answered with `W`.
-        let opened = authority.now();
+        // 5. The newest answer to every lease of the window carried `W`, and
+        //    no other lease needs cover. The window's own leases are waited
+        //    for first, so a failure for another lease does not let the
+        //    restart start before they are covered.
         loop {
             let Some(progress) = window.progress(epoch, authority.now()) else {
-                return Err(MaintenanceError::Ended);
+                return Err(MaintenanceError::Ended { opened: true });
             };
-            if progress.missing.is_empty() {
-                let w = Duration::from_millis(progress.w_ms);
-                let valid = w.saturating_sub(Duration::from_millis(margin_ms(progress.w_ms)));
-                return Ok(Opened {
-                    duration_s,
-                    leases: progress.answered.len(),
-                    covered_until: progress
-                        .answered
-                        .iter()
-                        .min()
-                        .map(|first| rfc3339(*first + valid)),
-                    closes_at: rfc3339(progress.closes_wall),
-                });
-            }
-            if authority.now() >= opened + bound {
-                return Err(MaintenanceError::NotRenewed {
-                    missing: progress.missing,
+            let timed_out = authority.now() >= opened + bound;
+            if progress.missing.is_empty() || timed_out {
+                let mut not_covered = BTreeMap::new();
+                for lease in self
+                    .uncovered_now(&progress.holders, &unlogged, progress.w_ms)
+                    .await
+                    .map_err(MaintenanceError::Internal)?
+                {
+                    not_covered.insert(lease.lease_id.clone(), lease);
+                }
+                for lease in progress.missing {
+                    not_covered.entry(lease.lease_id.clone()).or_insert(lease);
+                }
+                if not_covered.is_empty() {
+                    let w = Duration::from_millis(progress.w_ms);
+                    let margin = Duration::from_millis(margin_ms(progress.w_ms));
+                    let valid = w.saturating_sub(margin * 2);
+                    return Ok(Opened {
+                        duration_s,
+                        leases: progress.answered.len(),
+                        covered_until: progress
+                            .answered
+                            .iter()
+                            .min()
+                            .map(|first| rfc3339(*first + valid)),
+                        closes_at: rfc3339(progress.closes_wall),
+                    });
+                }
+                let error = MaintenanceError::NotCovered {
+                    leases: not_covered.into_values().collect(),
                     answered: progress.answered.len(),
                     closes_at: rfc3339(progress.closes_wall),
-                });
+                };
+                tracing::warn!(%error, "the maintenance window does not cover every lease");
+                return Err(error);
             }
             tokio::time::sleep(POLL).await;
         }
+    }
+
+    /// The leases the open window does not cover now ([`uncovered`]).
+    async fn uncovered_now(
+        &self,
+        holders: &BTreeMap<String, String>,
+        unlogged: &BTreeSet<String>,
+        w_ms: u64,
+    ) -> Result<Vec<Uncovered>, String> {
+        let mut conn = self
+            .0
+            .store
+            .pool()
+            .acquire()
+            .await
+            .map_err(|e| format!("cannot read the leases the window must cover: {e}"))?;
+        uncovered(&mut conn, holders, unlogged, w_ms).await
     }
 
     /// `quoro cluster maintenance --end`: closes a window that is opening or
@@ -672,18 +928,17 @@ impl NodeHub {
 
     /// Step 2: raises `leases.duration_ms` to `w_ms` for every row that reads
     /// `expiring`, unmarked and not revoked, in one single-writer
-    /// transaction. Returns those rows' holders and the newest change-log
-    /// write among them, which must be replicated before any `W` answer;
-    /// `None` when `--end` ended the opening first.
+    /// transaction. Returns those rows' holders, the newest change-log write
+    /// among them, which must be replicated before any `W` answer, and the
+    /// newest write the raise made; `None` when `--end` ended the opening
+    /// first. In the same transaction it counts the leases the window will
+    /// not cover ([`uncovered`]) and logs each one; the command fails for
+    /// them once the window's own leases are answered.
     ///
     /// A row the change log has no entry of, which only a database written
     /// outside the primary can hold, is left out: no successor could count
     /// its gate, so it gets no `W`.
-    async fn raise_for_window(
-        &self,
-        epoch: u64,
-        w_ms: u64,
-    ) -> Result<Option<(BTreeMap<String, Target>, Option<u64>)>, String> {
+    async fn raise_for_window(&self, epoch: u64, w_ms: u64) -> Result<Option<Raised>, String> {
         let read = |e: crate::error::ApiError| format!("cannot raise the lease durations: {e:?}");
         let mut w = self
             .0
@@ -697,8 +952,7 @@ impl NodeHub {
             return Ok(None);
         }
         let rows = sqlx::query(&format!(
-            "SELECT {} FROM leases WHERE mode = 'expiring' AND unsettled = 0 \
-             AND revoked_at IS NULL ORDER BY id",
+            "SELECT {} FROM leases WHERE revoked_at IS NULL ORDER BY id",
             leases::LEASE_COLUMNS
         ))
         .fetch_all(&mut *w.tx)
@@ -710,12 +964,24 @@ impl NodeHub {
             .collect::<Result<_, _>>()
             .map_err(read)?;
         let stored = i64::try_from(w_ms).unwrap_or(i64::MAX);
-        let mut targets = BTreeMap::new();
-        let mut newest: Option<u64> = None;
-        for row in rows {
-            leases::raise_duration(&mut w, &row.id, stored, &actor())
+        let newer = |seq: Option<u64>, other: u64| Some(seq.map_or(other, |seq| seq.max(other)));
+        let mut raised = Raised {
+            targets: BTreeMap::new(),
+            newest: None,
+            wrote: None,
+            unlogged: BTreeSet::new(),
+        };
+        // Only an unmarked `expiring` row is one of the window's leases: a
+        // marked one is between modes (section 8.4, "The mark"), and its
+        // renewals keep getting `D`.
+        for row in rows
+            .into_iter()
+            .filter(|row| row.mode == "expiring" && !row.unsettled)
+        {
+            let wrote = leases::raise_duration(&mut w, &row.id, stored, &actor())
                 .await
-                .map_err(read)?;
+                .map_err(read)?
+                .is_some();
             let Some(seq) = leases::newest_write_seq(&mut w.tx, &row.id)
                 .await
                 .map_err(read)?
@@ -724,21 +990,34 @@ impl NodeHub {
                     lease_id = %row.id,
                     "an expiring lease has no change-log entry; the maintenance window does not cover it"
                 );
+                raised.unlogged.insert(row.id);
                 continue;
             };
-            newest = Some(newest.map_or(seq, |newest| newest.max(seq)));
-            targets.insert(
-                row.id,
-                Target {
-                    holder: row.holder_node_id,
-                    answered: None,
-                },
+            raised.newest = newer(raised.newest, seq);
+            if wrote {
+                raised.wrote = newer(raised.wrote, seq);
+            }
+            raised
+                .targets
+                .insert(row.id, Target::new(row.holder_node_id));
+        }
+        let holders = raised
+            .targets
+            .iter()
+            .map(|(id, target)| (id.clone(), target.holder.clone()))
+            .collect();
+        for lease in uncovered(&mut w.tx, &holders, &raised.unlogged, w_ms).await? {
+            tracing::warn!(
+                lease_id = %lease.lease_id,
+                holder = %lease.holder,
+                why = %lease.why,
+                "the maintenance window does not cover this lease"
             );
         }
         w.commit()
             .await
             .map_err(|e| format!("cannot raise the lease durations: {e}"))?;
-        Ok(Some((targets, newest)))
+        Ok(Some(raised))
     }
 
     /// Step 3: whether `seq` is replicated over the required set, or the
@@ -763,23 +1042,28 @@ impl NodeHub {
     /// The `duration_ms` an ordinary answer to `holder`'s renewal of `lease`
     /// carries while a window is open: `W` when the lease is one of the
     /// window's, held by `holder`, its row as the answer's transaction reads
-    /// it still `expiring`, unmarked, unrevoked and storing at least `W`,
-    /// and a majority supports `W` now. `None` means `D`.
+    /// it still `expiring`, unmarked, unrevoked and storing at least `W`
+    /// ([`row_short_of_w`]), and a majority supports `W` now. `None` means
+    /// `D`.
     pub(super) fn window_answer_ms(&self, lease: &Lease, holder: &str) -> Option<u64> {
-        if lease.mode != "expiring" || lease.unsettled || lease.is_revoked() {
+        if lease.mode != "expiring" || lease.is_revoked() {
             return None;
         }
         let w_ms = self
             .0
             .maintenance
             .answer_ms(&lease.id, holder, self.0.authority.now())?;
-        let stored = lease.duration_ms.and_then(|ms| u64::try_from(ms).ok())?;
-        (stored >= w_ms && self.0.authority.supports(w_ms)).then_some(w_ms)
+        if row_short_of_w(lease, w_ms).is_some() {
+            return None;
+        }
+        self.0.authority.supports(w_ms).then_some(w_ms)
     }
 
     /// Records that `holder`'s renewal of `lease_id` was answered with
     /// `duration_ms` at `sent_wall`, after the answer's transaction
-    /// committed. Only a `W` answer counts toward the command's success.
+    /// committed. A `W` answer to one of the window's leases covers it; any
+    /// other answer to it takes that cover away, since the holder counts its
+    /// validity from its newest answer.
     pub(super) fn window_answered(
         &self,
         lease_id: &str,
@@ -787,15 +1071,13 @@ impl NodeHub {
         duration_ms: u64,
         sent_wall: time::OffsetDateTime,
     ) {
-        if duration_ms > DEFAULT_DURATION_MS {
-            self.0.maintenance.answered(
-                lease_id,
-                holder,
-                duration_ms,
-                sent_wall,
-                self.0.authority.now(),
-            );
-        }
+        self.0.maintenance.answered(
+            lease_id,
+            holder,
+            duration_ms,
+            sent_wall,
+            self.0.authority.now(),
+        );
     }
 
     /// The `max_lease_ms` a `support_request` carries now (section 5.27).
@@ -804,32 +1086,38 @@ impl NodeHub {
     }
 
     /// Lowers the stored `duration_ms` back to `D` for every row that reads
-    /// `expiring`, unmarked and unrevoked, stores more, has a gate in this
-    /// process, and whose every grant longer than `D` has passed its gate
-    /// ([`crate::authority::Authority::may_lower`]); only while no window is
-    /// opening or open. Each row is checked again and lowered in its own
-    /// single-writer transaction, where every `W` answer records its gate
-    /// too. Returns how many rows were lowered.
+    /// `expiring`, unmarked and unrevoked, stores more ([`lowerable`]), has a
+    /// gate in this process, and whose every grant longer than `D` has passed
+    /// its gate ([`crate::authority::Authority::may_lower`]); only while no
+    /// window is opening or open. Each row is checked again and lowered in
+    /// its own single-writer transaction, where every `W` answer records its
+    /// gate too. Returns how many rows were lowered.
     pub async fn lower_durations(&self) -> usize {
         let authority = &self.0.authority;
         if !self.0.maintenance.is_idle(authority.now()) {
             return 0;
         }
         let d = i64::try_from(DEFAULT_DURATION_MS).unwrap_or(i64::MAX);
-        let ids: Vec<String> = match sqlx::query_scalar(
-            "SELECT id FROM leases WHERE mode = 'expiring' AND unsettled = 0 \
-             AND revoked_at IS NULL AND duration_ms > ? ORDER BY id",
-        )
+        let rows = match sqlx::query(&format!(
+            "SELECT {} FROM leases WHERE duration_ms > ? ORDER BY id",
+            leases::LEASE_COLUMNS
+        ))
         .bind(d)
         .fetch_all(self.0.store.pool())
         .await
         {
-            Ok(ids) => ids,
+            Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(%e, "cannot read the lease durations to lower");
                 return 0;
             }
         };
+        let ids: Vec<String> = rows
+            .iter()
+            .filter_map(|row| leases::lease_from_row(row).ok())
+            .filter(lowerable)
+            .map(|row| row.id)
+            .collect();
         let mut lowered = 0;
         for id in ids {
             if !authority.has_gate(&id) || !authority.may_lower(&id, DEFAULT_DURATION_MS) {
@@ -853,7 +1141,7 @@ impl NodeHub {
                     continue;
                 }
             };
-            if row.mode != "expiring" || row.unsettled || row.is_revoked() {
+            if !lowerable(&row) || !authority.has_gate(&id) {
                 continue;
             }
             match leases::lower_duration(&mut w, authority, &id, d, &actor()).await {

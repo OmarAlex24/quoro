@@ -12,10 +12,18 @@
 //! One request per connection, one JSON line each way, both written by this
 //! binary only:
 //!
-//! - `{"op": "maintenance", "duration_s": 180}` opens a window, and
-//!   `{"op": "maintenance", "end": true}` ends it;
-//! - the answer is `{"ok": true|false, "message": "..."}`, where `message`
-//!   is what the command prints.
+//! - `{"v": 1, "op": "maintenance", "duration_s": 180}` opens a window, and
+//!   `{"v": 1, "op": "maintenance", "end": true}` ends it;
+//! - the answer is `{"v": 1, "ok": true|false, "message": "..."}`, where
+//!   `message` is what the command prints.
+//!
+//! These lines are an interface between releases, not within one: the
+//! installer runs the binary it has just installed against the primary that
+//! is still running the release before it. `v` is the version of the lines
+//! ([`VERSION`]). A primary refuses a request whose `v` it does not know, or
+//! that has none, with an error that says so, rather than guess at its
+//! meaning; a change to the meaning of either line takes a new version. Every
+//! answer keeps `ok` and `message`, so any client can print it.
 //!
 //! `QUORO_CONTROL_SOCKET` names another path, for tests.
 
@@ -36,6 +44,10 @@ pub const DEFAULT_SOCKET: &str = "/run/quoro/control.sock";
 
 /// Names another socket path, for tests.
 pub const SOCKET_VARIABLE: &str = "QUORO_CONTROL_SOCKET";
+
+/// The version of the socket's JSON lines (module docs): the only one this
+/// primary serves, and the one this command sends.
+pub const VERSION: u64 = 1;
 
 /// The longest request line the primary reads.
 const MAX_REQUEST: u64 = 4_096;
@@ -140,21 +152,15 @@ pub fn listen(path: &Path, hub: NodeHub) -> Result<Control, String> {
     })
 }
 
-/// The effective uid of this process: `/proc/self` belongs to it.
-#[cfg(target_os = "linux")]
-fn own_uid() -> Option<u32> {
-    use std::os::unix::fs::MetadataExt as _;
-    std::fs::metadata("/proc/self").ok().map(|meta| meta.uid())
-}
-
-/// Whether the peer may use the socket: root or the service user, the same
-/// users the file mode lets in (section 8.11).
+/// Whether the peer may use the socket: root or the service user, which is
+/// this process's effective uid, the same users the file mode lets in
+/// (section 8.11).
 #[cfg(target_os = "linux")]
 fn peer_allowed(stream: &UnixStream) -> bool {
-    match (stream.peer_cred(), own_uid()) {
-        (Ok(peer), Some(own)) => peer.uid() == 0 || peer.uid() == own,
-        _ => false,
-    }
+    let own = rustix::process::geteuid().as_raw();
+    stream
+        .peer_cred()
+        .is_ok_and(|peer| peer.uid() == 0 || peer.uid() == own)
 }
 
 /// Elsewhere the file mode alone decides.
@@ -192,24 +198,45 @@ async fn read_request(stream: &mut UnixStream) -> Result<Value, String> {
 }
 
 fn refusal(message: &str) -> Value {
-    json!({ "ok": false, "message": message })
+    json!({ "v": VERSION, "ok": false, "message": message })
+}
+
+fn success(message: &str) -> Value {
+    json!({ "v": VERSION, "ok": true, "message": message })
+}
+
+/// Whether this primary serves the request's version ([`VERSION`]); the
+/// reason it refuses the request otherwise.
+fn check_version(request: &Value) -> Result<(), String> {
+    match request.get("v").map(Value::as_u64) {
+        Some(Some(VERSION)) => Ok(()),
+        Some(Some(version)) => Err(format!(
+            "this primary serves version {VERSION} of the control socket, and the request is \
+             version {version}: the quoro binary that sent it and the running primary are from \
+             releases that do not share one"
+        )),
+        Some(None) | None => Err(format!(
+            "the request carries no version; this primary serves version {VERSION} of the \
+             control socket"
+        )),
+    }
 }
 
 /// Runs one request on the primary.
 async fn answer(hub: &NodeHub, request: &Value) -> Value {
+    if let Err(message) = check_version(request) {
+        warn!(%message, "a control-socket request of another version was refused");
+        return refusal(&message);
+    }
     if request["op"] != "maintenance" {
         return refusal("unknown request");
     }
     if request["end"] == true {
         return match hub.end_maintenance().await {
-            Ok(Ending::Ended) => json!({
-                "ok": true,
-                "message": "the maintenance window is closed: renewals are answered with D again",
-            }),
-            Ok(Ending::NothingOpen) => json!({
-                "ok": true,
-                "message": "no maintenance window is open; nothing to end",
-            }),
+            Ok(Ending::Ended) => {
+                success("the maintenance window is closed: renewals are answered with D again")
+            }
+            Ok(Ending::NothingOpen) => success("no maintenance window is open; nothing to end"),
             Err(e) => refusal(&e.to_string()),
         };
     }
@@ -218,7 +245,7 @@ async fn answer(hub: &NodeHub, request: &Value) -> Value {
     };
     info!(duration_s, "quoro cluster maintenance");
     match hub.open_maintenance(duration_s).await {
-        Ok(opened) => json!({ "ok": true, "message": opened_message(&opened) }),
+        Ok(opened) => success(&opened_message(&opened)),
         Err(e) => refusal(&e.to_string()),
     }
 }
@@ -286,8 +313,10 @@ pub async fn maintenance_command(args: &[String]) -> ExitCode {
         Err(message) => return crate::usage_error(&format!("cluster maintenance: {message}")),
     };
     let body = match request {
-        Request::Open { duration_s } => json!({ "op": "maintenance", "duration_s": duration_s }),
-        Request::End => json!({ "op": "maintenance", "end": true }),
+        Request::Open { duration_s } => {
+            json!({ "v": VERSION, "op": "maintenance", "duration_s": duration_s })
+        }
+        Request::End => json!({ "v": VERSION, "op": "maintenance", "end": true }),
     };
     let path = socket_path();
     match call(&path, &body).await {
@@ -379,6 +408,29 @@ mod tests {
             &["--force"],
         ] {
             assert!(parse(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The socket's lines are an interface between releases: the primary
+    /// serves version 1 only, and refuses another version, or none, saying
+    /// so.
+    #[test]
+    fn the_primary_serves_only_the_version_it_knows() {
+        assert_eq!(
+            check_version(&json!({ "v": 1, "op": "maintenance", "end": true })),
+            Ok(())
+        );
+        let newer = check_version(&json!({ "v": 2, "op": "maintenance", "end": true }))
+            .expect_err("version 2 is refused");
+        assert!(newer.contains("serves version 1"), "{newer}");
+        assert!(newer.contains("version 2"), "{newer}");
+        for unknown in [
+            json!({ "op": "maintenance", "end": true }),
+            json!({ "v": "1", "op": "maintenance", "end": true }),
+            json!({ "v": null, "op": "maintenance", "end": true }),
+        ] {
+            let refused = check_version(&unknown).expect_err("no version is refused");
+            assert!(refused.contains("carries no version"), "{refused}");
         }
     }
 }
