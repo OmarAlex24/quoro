@@ -577,7 +577,7 @@ components:
             (`not_warm`, `no_copy`, `not_in_sync`, `node_disconnected`,
             `fence_failed`, `no_support`, `lease_held`, `in_progress`,
             `lease_revoked`; each operation says when), by `updateApp` leaving
-            `warm` (`in_progress`, `lease_revoked`), by `deleteApp` and `deleteVolume`
+            `warm` (`in_progress`, `lease_revoked`, `fence_failed`), by `deleteApp` and `deleteVolume`
             (`has_quarantines`), by `rotateSigningKey` (`in_progress`), or by
             an operation that would raise a lease's token past 2^53 - 1
             (`token_exhausted`, ADR 0325): `ackNodeFence`, `declareNodeLost`,
@@ -7699,7 +7699,12 @@ paths:
         or a grant of its lease waits (`App.lease.grant_pending`), and with `reason: lease_revoked` while
         the app's lease is revoked in the primary's own view
         (`App.lease.revoked_at` is set), since `failoverApp` needs the policy
-        `warm` to complete the move (node-agent-protocol.md section 6.13).
+        `warm` to complete the move (node-agent-protocol.md section 6.13),
+        and with `reason: fence_failed` while a failed fence covers the
+        app's lease (a node's `fence_failure` lists it, or a node reported a
+        failed fence of it that the primary could not record), since the
+        warm copy is then the app's way back (node-agent-protocol.md
+        sections 5.17 and 8.5).
         Otherwise leaving `warm` deletes
         the warm copy and, in the same transaction, writes the lease `local`
         with the unsettled mark (`Lease.unsettled`); `Lease.local_pending`
