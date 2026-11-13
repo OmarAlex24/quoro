@@ -206,7 +206,7 @@ If the transaction rolls back, none of the three exists. An audit record with a 
 
 ### 3.2 Replication of audit records
 
-The audit chain is separate from the change-log chain, but audit records travel on the change log: each audit record is also replicated to replica nodes as a change-log entry of `entity_type` `audit` (D-0013). A replica node therefore verifies two chains, and the audit chain reaches replicas only through a verified change-log stream (D-0013; [node-agent-protocol.md](node-agent-protocol.md)).
+The audit chain is separate from the change-log chain, but audit records travel on the change log: each audit record is also replicated to replica nodes as a change-log entry of `entity_type` `audit` (D-0013). The audit chain reaches replicas only through a verified change-log stream (D-0013; [node-agent-protocol.md](node-agent-protocol.md)). A replica node verifies the change-log chain as entries arrive; it checks the audit chain only in `quoro cluster promote`, in audit `seq` order: over the folded rows before its votes and on the frozen log, and over the rebuilt `audit_log` in its step 4, whatever order the audit entries arrived in (node-agent-protocol.md sections 7.1 and 7.3).
 
 The `audit_log` table itself is the primary's copy; it is not a local table (see the "local" markings in [db-schema.sql](db-schema.sql)).
 
