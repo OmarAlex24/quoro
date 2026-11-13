@@ -1661,6 +1661,40 @@ mod tests {
         f.done().await;
     }
 
+    /// The swap of [`NodeHub::conversion_off_warm`] happens only while the
+    /// registry still holds the conversion the attempt read: a conversion
+    /// held since, as a later change back to `warm` holds, stays, and R's
+    /// `local` grant does not replace it.
+    #[tokio::test]
+    async fn the_swap_leaves_a_conversion_held_after_the_attempts_read() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let _on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        let entering = f.row().await;
+        hub.hold_conversion(&entering);
+        let read = entry(&f.state).expect("the conversion is held");
+        assert_eq!(read.kind, Kind::Convert);
+        // R marks the row and holds its `local` grant; a later change back
+        // to `warm` holds a new conversion after the attempt's read.
+        r(&f).await;
+        set_policy(&f, "warm").await;
+        hub.hold_conversion(&entering);
+        let later = entry(&f.state).expect("a conversion is held");
+        assert_eq!(later.kind, Kind::Convert);
+        assert_ne!(later.registration, read.registration);
+
+        let row = f.row().await;
+        assert!(row.unsettled, "R marked the row");
+        let mut conn = f.state.store.pool().acquire().await.unwrap();
+        hub.conversion_off_warm(&mut conn, LEASE, &read, &row)
+            .await
+            .unwrap();
+        drop(conn);
+        assert_eq!(entry(&f.state), Some(later));
+        f.done().await;
+    }
+
     /// Test 13: no conversion, and no barrier `local` grant, is queued on a
     /// session before its start's grants are: the start's same-token
     /// `local` repeat goes on the outbox, which goes out before the
