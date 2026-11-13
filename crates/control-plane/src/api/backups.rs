@@ -5,8 +5,10 @@
 //!
 //! No key material is ever in a response except the recovery key of
 //! `createBackupRepository` and `rotateBackupRecoveryKey`, which appears once
-//! and is then forgotten. The repository key stays encrypted in
-//! `backup_repositories.repo_key_enc`; backups are listed and read without it.
+//! and is then forgotten. `restoreBackupRepositoryKey` takes the recovery key
+//! in, holds it only for the call and answers no key. The repository key
+//! stays encrypted in `backup_repositories.repo_key_enc`; backups are listed
+//! and read without it.
 //! A control-plane backup is listed only to a caller whose selector is
 //! `{all: true}`.
 
@@ -44,6 +46,9 @@ const CREATE_REPOSITORY: &str = "POST /api/v1/backup-repositories";
 const UPDATE_REPOSITORY: &str = "PATCH /api/v1/backup-repositories/{repository_id}";
 /// The audit operation of `rotateBackupRecoveryKey`.
 const ROTATE_RECOVERY_KEY: &str = "POST /api/v1/backup-repositories/{repository_id}/recovery-key";
+/// The audit operation of `restoreBackupRepositoryKey`.
+const RESTORE_REPOSITORY_KEY: &str =
+    "POST /api/v1/backup-repositories/{repository_id}/repository-key";
 /// The audit operation of `restoreBackup`.
 const RESTORE_BACKUP: &str = "POST /api/v1/backups/{backup_id}/restore";
 
@@ -357,6 +362,49 @@ pub struct UpdateBackupRepositoryRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = BackupSchedule, required = false)]
     pub control_plane_schedule: Option<BackupSchedule>,
+}
+
+/// The recovery key that restores the repository key on this primary
+/// (`openapi.yaml` `RestoreBackupRepositoryKeyRequest`). It is never
+/// serialized, and its `Debug` prints no key.
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    title = "RestoreBackupRepositoryKeyRequest",
+    description = "The recovery key that restores the repository key on this primary."
+)]
+pub struct RestoreBackupRepositoryKeyRequest {
+    /// The repository's current recovery key (`backup-format.md` section 3).
+    /// Write-only: never stored, returned or recorded.
+    #[schema(
+        value_type = String,
+        write_only,
+        pattern = "^qrk1(-[0-9A-HJKMNP-TV-Z]{4}){13}$"
+    )]
+    pub recovery_key: RecoveryKeyText,
+}
+
+/// The text of a recovery key as a request carries it: wiped from memory on
+/// drop, and printed by `Debug` as `RecoveryKeyText([redacted])`.
+pub struct RecoveryKeyText(zeroize::Zeroizing<String>);
+
+impl RecoveryKeyText {
+    /// The text, for the one place that parses it.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RecoveryKeyText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|text| Self(zeroize::Zeroizing::new(text)))
+    }
+}
+
+impl std::fmt::Debug for RecoveryKeyText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecoveryKeyText([redacted])")
+    }
 }
 
 /// `limit` and `cursor` (`openapi.yaml` `Limit` and `Cursor`).
@@ -1383,6 +1431,88 @@ pub async fn rotate_backup_recovery_key(
     }
 }
 
+/// Restores the repository key on a primary that does not hold it, as after
+/// a promotion, from the owner's recovery key (`backup-format.md` section 4,
+/// ADR 0322). The key is written on this primary only and never enters the
+/// change log. Human-only and owner-only.
+///
+/// The recovery key is held in zeroizing memory for the call only. The audit
+/// record's `params` are `{"recovery_key": "[redacted]"}` whatever the call
+/// sent (`audit-log-format.md` section 3), and no error, log line or response
+/// carries the recovery key or the repository key.
+///
+/// # Errors
+///
+/// `forbidden` for an agent (`reason: human_only`) or without
+/// `backup:manage`, `not_found` for an unknown repository, `conflict` when
+/// this primary already holds the key, `validation_failed` for a malformed
+/// recovery key, a fingerprint that differs from `recovery_key_fingerprint`,
+/// a bucket that cannot be read or no config object that opens with the key,
+/// or a database error.
+#[utoipa::path(
+    post,
+    path = "/api/v1/backup-repositories/{repository_id}/repository-key",
+    tag = "backups",
+    operation_id = "restoreBackupRepositoryKey",
+    extensions(("x-quoro-scope" = json!("backup:manage"))),
+    params(
+        ("repository_id" = String, Path, description = "Backup repository id (`brp_...`).",
+            pattern = "^brp_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    request_body(content = RestoreBackupRepositoryKeyRequest, content_type = "application/json",
+        description = "The recovery key."),
+    responses(
+        (status = 200, description = "The repository, with `repository_key_present` true.",
+            body = BackupRepository,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::Forbidden),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
+        (status = 422, response = crate::openapi::ValidationFailed),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+pub async fn restore_backup_repository_key(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    identity: crate::auth::Identity,
+    headers: HeaderMap,
+    Path(repository_id): Path<String>,
+    ApiJson(body): ApiJson<RestoreBackupRepositoryKeyRequest>,
+) -> Result<Json<BackupRepository>, ApiError> {
+    let ctx = CallCtx::new(identity, request_id.0, RESTORE_REPOSITORY_KEY, &headers);
+    // Never built from the body, so the key is in no `Value` at all.
+    let params = json!({ "recovery_key": "[redacted]" });
+    let target = crate::backups::repo::repository_target(&repository_id);
+    ctx.authorize_human(&state, Scope::BackupManage, Some(&target), None, &params)
+        .await?;
+    let result = match crate::backups::repo::parse_recovery_key(body.recovery_key.expose()) {
+        Ok(recovery) => {
+            crate::backups::repo::restore_key(&state, &ctx, &repository_id, &recovery, &params)
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    drop(body);
+    match result {
+        Ok(repository) => Ok(Json(repository_to_api(&repository))),
+        Err(error) => {
+            ctx.audit_error(
+                &state,
+                Some(Scope::BackupManage),
+                Some(&target),
+                None,
+                &params,
+                &error,
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
 /// Restores a succeeded, unpruned volume backup into a new volume on
 /// `node_id` and moves the app there (`openapi.yaml` `restoreBackup`). A human
 /// with `backup:restore` calls it directly; an agent reaches it through an
@@ -1560,6 +1690,10 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/backup-repositories/{repository_id}/recovery-key",
             post(rotate_backup_recovery_key),
         )
+        .route(
+            "/api/v1/backup-repositories/{repository_id}/repository-key",
+            post(restore_backup_repository_key),
+        )
 }
 
 /// OpenAPI paths and schemas of the backup operations.
@@ -1575,6 +1709,7 @@ pub fn routes() -> Router<AppState> {
         get_backup_repository,
         update_backup_repository,
         rotate_backup_recovery_key,
+        restore_backup_repository_key,
         restore_backup,
     ),
     components(
@@ -1586,6 +1721,7 @@ pub fn routes() -> Router<AppState> {
             BackupRepositoryWithRecoveryKey,
             CreateBackupRepositoryRequest,
             UpdateBackupRepositoryRequest,
+            RestoreBackupRepositoryKeyRequest,
             crate::backups::restore::RestoreBackupRequest,
         ),
         responses(
