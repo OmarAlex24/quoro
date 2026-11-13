@@ -474,3 +474,165 @@ async fn dispatch_control_plane(
     });
     Ok(Vec::new())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backups::{Backups, KEY_ABSENT};
+    use crate::crypto::DataKey;
+    use crate::deploy;
+    use std::sync::Arc;
+
+    const NODE: &str = "nod_00000000000000000000000001";
+
+    /// A node, an owner and a repository whose `repo_key_enc` is empty, as a
+    /// promoted primary rebuilds it from the change log (ADR 0322), on a
+    /// provider whose secret `key` opens. Returns the repository's id.
+    async fn insert_keyless_repository(store: &Store, key: &DataKey) -> String {
+        let now = crate::store::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, \
+             behind_nat, labels, capacity, allocated, kvm, engine_version, agent_version, \
+             desired_rev, applied_rev, log_seq, last_seen_at, created_at, subnet) \
+             VALUES (?, 'node-a', '[\"node\"]', NULL, 'pending', '', NULL, 1, '{}', '{}', '{}', \
+             '{}', NULL, NULL, 0, 0, 0, NULL, ?, '10.42.1.0/24')",
+        )
+        .bind(NODE)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, name, role, password_hash, disabled, created_at) \
+             VALUES ('usr_backups', 'backups@example.com', 'backups', 'owner', 'x', 0, ?)",
+        )
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let provider_id = "prv_backups";
+        sqlx::query(
+            "INSERT INTO providers (id, kind, name, config_json, secret_enc, created_by, \
+             created_at, rotated_at) \
+             VALUES (?, 'object_store', 'bucket', ?, ?, 'usr_backups', ?, NULL)",
+        )
+        .bind(provider_id)
+        .bind(
+            r#"{"endpoint":"https://s3.example.com","bucket":"quoro","access_key_id":"AKIDEXAMPLE"}"#,
+        )
+        .bind(key.encrypt(
+            crate::backups::PROVIDER_SECRET_CONTEXT,
+            provider_id,
+            b"provider-secret",
+        ))
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let repository_id = deploy::new_id_with_prefix("brp");
+        sqlx::query(
+            "INSERT INTO backup_repositories (id, name, provider_id, prefix, repo_key_enc, \
+             recovery_key_fingerprint, created_by, created_at) \
+             VALUES (?, 'main', ?, 'quoro-backups', X'', '0123456789abcdef', 'usr_backups', ?)",
+        )
+        .bind(&repository_id)
+        .bind(provider_id)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        repository_id
+    }
+
+    /// A volume backup on [`NODE`] in `status`, `queued` or `running`, of a
+    /// volume of its own. Returns its id.
+    async fn insert_active_backup(store: &Store, repository_id: &str, status: &str) -> String {
+        let backup_id = deploy::new_id_with_prefix("bkp");
+        sqlx::query(
+            "INSERT INTO backups (id, repository_id, source_kind, app_id, volume_id, node_id, \
+             status, \"trigger\", fencing_token, created_by_type, created_by_id, created_at) \
+             VALUES (?, ?, 'volume', ?, ?, ?, ?, 'api', 1, 'system', 'backups', ?)",
+        )
+        .bind(&backup_id)
+        .bind(repository_id)
+        .bind(deploy::new_id_with_prefix("app"))
+        .bind(deploy::new_id_with_prefix("vol"))
+        .bind(NODE)
+        .bind(status)
+        .bind(crate::store::now_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        backup_id
+    }
+
+    /// The backup's status and error.
+    async fn status_of(store: &Store, backup_id: &str) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, error FROM backups WHERE id = ?")
+            .bind(backup_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+    }
+
+    /// `node-agent-protocol.md` sections 6.7 and 7.3, step 4: a volume backup
+    /// still `running` when a primary starts without the repository key is
+    /// `failed` with `repository key absent` by the time `AppState` is open.
+    /// A sweep is held across the start, so every tick of the dispatch loop
+    /// returns before its passes (`backup-format.md` section 9) and only the
+    /// start's pass (`fail_without_key`) can fail the row.
+    #[tokio::test]
+    async fn the_start_fails_an_inherited_backup_before_any_tick() {
+        // The tunnel manager builds a reqwest client on the no-provider
+        // rustls feature.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let data_dir = std::env::temp_dir().join(format!(
+            "quoro-dispatch-{}",
+            &crate::store::random_secret()[..16]
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
+        let key = Arc::new(DataKey::ephemeral());
+        let repository_id = insert_keyless_repository(&store, &key).await;
+        let inherited = insert_active_backup(&store, &repository_id, "running").await;
+
+        let backups = Backups::s3();
+        let _sweep = backups.begin_sweep();
+        let state = AppState::open_with_upgrade(
+            store,
+            crate::ServerConfig {
+                data_dir: data_dir.clone(),
+                secure_cookies: false,
+                public_url: None,
+                tls_fingerprint: String::new(),
+                tls: crate::custody::test_tls(),
+                node_network: crate::NodeNetwork {
+                    subnet: "10.42.1.0/24".to_string(),
+                    gateway: "10.42.1.1".to_string(),
+                },
+                heartbeat_interval_ms: 200,
+                session_timeout_ms: 800,
+            },
+            Arc::new(crate::ReferenceAsDigest),
+            key,
+            backups.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            status_of(&state.store, &inherited).await,
+            ("failed".to_string(), Some(KEY_ABSENT.to_string()))
+        );
+
+        // The sweep does hold the ticks: a row left without the key after
+        // the start stays active through one.
+        let later = insert_active_backup(&state.store, &repository_id, "queued").await;
+        let tick = run(&state, time::OffsetDateTime::now_utc()).await.unwrap();
+        assert_eq!(tick, Tick::default());
+        assert_eq!(
+            status_of(&state.store, &later).await,
+            ("queued".to_string(), None)
+        );
+    }
+}
