@@ -7864,15 +7864,18 @@ paths:
 
         From M5b, when the app's lease row names a node that holds no lease
         for the app, as after the primary dropped a held grant of it
-        (`app.left_stopped`), the call grants that node the lease again with
-        a new token, and is not refused as already running
+        (`app.left_stopped`), the call grants that node the lease with a
+        new token, and is not refused as already running
         (node-agent-protocol.md section 8.4, "A holder that holds no
         lease"). It moves nothing: the lease stays with the node the row
         names. The call stays open while the lease's gate has not passed, at
         most `duration_ms + 2M`, as `failoverApp` does after a revoke, and
         answers `202` once the row's write commits. A grant that must wait
         for replication and majority support follows, and
-        `App.lease.grant_pending` shows the wait.
+        `App.lease.grant_pending` shows the wait. When the primary cannot
+        tell that the node holds no lease, because the node is not
+        connected, or a condition of that section does not hold, the call
+        answers as before M5b.
       x-quoro-scope: app:start
       parameters:
         - $ref: '#/components/parameters/AppId'
@@ -8094,12 +8097,13 @@ paths:
         `fence_failed`; `no_support`. The call answers `202` with the app
         when the switchover started. It ends with `app.switched_over`, the old
         node becoming the warm copy with no quarantine, or, when a step before
-        the revoke failed, with `app.switchover_failed`: the app resumed on
-        its node and nothing moved. When a step after the revoke fails, it
-        ends with `app.switchover_failed` at `step` `move`, which opens an
-        incident: the app stays stopped, its lease stays revoked, and
-        `failoverApp` to the same warm node completes the move
-        (node-agent-protocol.md section 6.13). The grant to the warm node
+        the revoke failed, with `app.switchover_failed`: the primary sent
+        the source `switchover_thaw` and nothing moved. When a step after the
+        revoke fails, it ends with `app.switchover_failed` at `step` `move`,
+        which opens an incident: the lease stays revoked, the app stays
+        stopped on its node or, when the node did not confirm the stop, may
+        still be paused there, and `failoverApp` to the same warm node
+        completes the move (node-agent-protocol.md section 6.13). The grant to the warm node
         waits for replication and majority support as a failover's grant does
         (`failoverApp`, ADR 0292): `App.lease.grant_pending` shows the wait,
         and `app.switched_over` then carries `grant_pending`. Destructive and off by default for agents,

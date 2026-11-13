@@ -243,7 +243,7 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 | `app.vulnerable` | The image an app runs has a new finding in the KEV catalog or with a CVSS score of 9.0 or more (ADR 0150); it opens an incident of its own, resolved when no such finding is open | critical CVE |
 | `app.failed_over` | The lease of a `warm` app moved to its warm node, which starts the app from its last complete copy (ADR 0175). It opens no incident | |
 | `app.switched_over` | A planned switchover of a `warm` app completed with no data lost; the former node is now its warm copy (ADR 0177). It opens no incident | |
-| `app.switchover_failed` | A planned switchover stopped before the lease moved. Before the revoke (`step` `freeze` or `revoke`) the app resumed on its node, nothing moved, and it opens no incident. After the revoke (`step` `move`) the app stays stopped with its lease revoked until `failoverApp` completes the move, and it opens an incident | |
+| `app.switchover_failed` | A planned switchover stopped before the lease moved. Before the revoke (`step` `freeze` or `revoke`) the primary sent the source `switchover_thaw`, nothing moved, and it opens no incident. After the revoke (`step` `move`) the lease stays revoked and the app is not moved until `failoverApp` completes the move, and it opens an incident | |
 | `app.left_stopped` | The app's HA policy left `warm` while a grant of its lease with a new token waited; the primary dropped that grant, so the node it named may hold no lease, and the app then stays stopped until an operator starts it (`startApp`). It opens no incident | |
 | `deployment.started` | A deployment began | |
 | `deployment.succeeded` | A deployment's instances are healthy | |
