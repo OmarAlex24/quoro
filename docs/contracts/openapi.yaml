@@ -7861,6 +7861,18 @@ paths:
         Starts the instances of a stopped app. A `conflict` is returned when the app
         is already running. `Quoro-Justification` is required when the caller is an
         agent (D-0031).
+
+        From M5b, when the app's lease row names a node that holds no lease
+        for the app, as after the primary dropped a held grant of it
+        (`app.left_stopped`), the call grants that node the lease again with
+        a new token, and is not refused as already running
+        (node-agent-protocol.md section 8.4, "A holder that holds no
+        lease"). It moves nothing: the lease stays with the node the row
+        names. The call stays open while the lease's gate has not passed, at
+        most `duration_ms + 2M`, as `failoverApp` does after a revoke, and
+        answers `202` once the row's write commits. A grant that must wait
+        for replication and majority support follows, and
+        `App.lease.grant_pending` shows the wait.
       x-quoro-scope: app:start
       parameters:
         - $ref: '#/components/parameters/AppId'

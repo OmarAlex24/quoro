@@ -602,7 +602,7 @@
 
     "data_app_left_stopped": {
       "type": "object",
-      "description": "The app's HA policy left `warm` while the primary held a grant of its lease with a new token that it had not sent, such as a failover's grant to the warm node. The primary dropped that grant, so the node it named holds no lease for the app, and the app stays stopped until an operator starts it (node-agent-protocol.md section 8.4, \"Ending the renewals\"). Emitted by the control plane as it drops the grant, right after the change of the policy commits; the actor is the caller of updateApp. A primary that restarted after that change committed holds no such grant and emits none. Opens no incident. Payload fields are additive within schema_version 1.",
+      "description": "The app's HA policy left `warm` while the primary held a grant of its lease with a new token that it had not sent, such as a failover's grant to the warm node. The primary dropped that grant, so the node it named may hold no lease for the app; when it holds none, the app stays stopped until an operator starts it, and `startApp` then grants that node the lease again (node-agent-protocol.md section 8.4, \"Ending the renewals\" and \"A holder that holds no lease\"). Emitted by the control plane as it drops the grant, right after the change of the policy commits; the actor is the caller of updateApp. A primary that restarted after that change committed holds no such grant and emits none. Opens no incident. Payload fields are additive within schema_version 1.",
       "required": ["app_id", "node_id", "fencing_token", "reason"],
       "properties": {
         "app_id": { "$ref": "#/$defs/AppId" },
