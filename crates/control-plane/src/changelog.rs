@@ -10,7 +10,7 @@
 //! 0302): [`append`] refuses it.
 
 use crate::jcs;
-use crate::store::{GENESIS_HASH, now_rfc3339, sha256_hex};
+use crate::store::{GENESIS_HASH, MAX_TERM, TermError, now_rfc3339, read_term, sha256_hex};
 use quoro_proto::wire::{self, ControlMessage};
 use serde_json::{Value, json};
 use sqlx::SqliteConnection;
@@ -18,10 +18,6 @@ use sqlx::SqliteConnection;
 /// The highest `seq` the change log carries, 2^53 - 1
 /// (`node-agent-protocol.md` section 7.1).
 pub(crate) const MAX_SEQ: u64 = (1 << 53) - 1;
-
-/// The term ceiling, 2^53 - 1: no machine sends, stores or adopts a higher
-/// term (`node-agent-protocol.md` section 8.8).
-pub(crate) const MAX_TERM: i64 = (1 << 53) - 1;
 
 /// Kind of identity behind a change (`change_log.actor_type`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,9 +100,9 @@ pub enum AppendError {
     FrameTooLarge {
         bytes: usize,
     },
-    /// `meta.term` holds no term an entry can carry: not an integer from 1
-    /// to [`MAX_TERM`] (`node-agent-protocol.md` section 8.8). It holds the
-    /// stored text.
+    /// `meta.term` holds no term an entry can carry: not a plain decimal
+    /// integer from 1 to 2^53 - 1 (`node-agent-protocol.md` section 8.8). It
+    /// holds the stored text.
     BadTerm(String),
 }
 
@@ -217,7 +213,11 @@ pub(crate) async fn prepare(
         Some((seq, hash)) => (seq + 1, hash),
         None => (1, GENESIS_HASH.to_string()),
     };
-    let term = current_term(conn).await?;
+    let term = match read_term(&mut *conn).await {
+        Ok(term) => term,
+        Err(TermError::Database(error)) => return Err(error.into()),
+        Err(TermError::Bad(value)) => return Err(AppendError::BadTerm(value)),
+    };
     let mut entry = StoredEntry {
         seq,
         term,
@@ -233,27 +233,6 @@ pub(crate) async fn prepare(
     };
     entry.hash = entry.receivable_hash()?;
     Ok(entry)
-}
-
-/// The primary's current term, `meta.term`, through `conn`: the term the
-/// entry [`prepare`] builds carries. A missing `meta.term` reads as 1, the
-/// term before the first promotion (`db-schema.sql`, `meta`).
-///
-/// # Errors
-///
-/// A database error, or [`AppendError::BadTerm`] for a stored value that is
-/// not an integer from 1 to [`MAX_TERM`].
-async fn current_term(conn: &mut SqliteConnection) -> Result<i64, AppendError> {
-    let stored: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'term'")
-        .fetch_optional(&mut *conn)
-        .await?;
-    let Some(value) = stored else {
-        return Ok(1);
-    };
-    match value.parse::<i64>() {
-        Ok(term) if (1..=MAX_TERM).contains(&term) => Ok(term),
-        _ => Err(AppendError::BadTerm(value)),
-    }
 }
 
 /// Writes an entry [`prepare`] built and returns its `seq`. Nothing may be
@@ -1121,7 +1100,16 @@ mod tests {
             .await
             .unwrap();
         let before = log_state(&mut w.tx).await;
-        for value in ["0", "-1", "seven", "", "1.5", "9007199254740992"] {
+        for value in [
+            "0",
+            "-1",
+            "+5",
+            "007",
+            "seven",
+            "",
+            "1.5",
+            "9007199254740992",
+        ] {
             set_term(&mut w.tx, value).await;
             let refused = append(&mut w.tx, &actor, "vm", "vm_1", Op::Update, json!({})).await;
             assert!(

@@ -7,7 +7,7 @@ use crate::api::nodes::NodeRole;
 use crate::capacity::{self, Loaded};
 use crate::error::ApiError;
 use crate::request::{CallCtx, Resource};
-use crate::store::{GENESIS_HASH, now_rfc3339};
+use crate::store::{GENESIS_HASH, now_rfc3339, read_term};
 use quoro_types::{Prefix, Scope, is_id};
 use serde_json::json;
 
@@ -73,6 +73,13 @@ pub async fn get_cluster(state: &AppState, ctx: &CallCtx) -> Result<Cluster, Api
                 .fetch_optional(state.store.pool())
                 .await?;
         let (log_seq, log_head_hash) = head.unwrap_or_else(|| (0, GENESIS_HASH.to_string()));
+        // The term `meta` stores, read as every other reader of the term
+        // reads it. A stored value that holds no term is an internal error,
+        // so the answer never carries a term above the ceiling
+        // (`node-agent-protocol.md` section 8.8).
+        let term = read_term(state.store.pool())
+            .await
+            .map_err(|error| ApiError::internal(&error))?;
         Ok(Cluster {
             id: state.cluster_id.clone(),
             name,
@@ -80,9 +87,7 @@ pub async fn get_cluster(state: &AppState, ctx: &CallCtx) -> Result<Cluster, Api
             primary_node_id,
             log_seq,
             log_head_hash,
-            // No promotion exists before the M5b promotion work; the only
-            // term so far is 1.
-            term: 1,
+            term,
             votes: votes(state).await?,
             // The current signing key (section 5.21). No rotation runs
             // before signing-key rotation ships (#76), so its field stays
