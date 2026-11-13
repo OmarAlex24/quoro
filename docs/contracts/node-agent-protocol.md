@@ -1918,7 +1918,7 @@ Before it changes anything, the command refuses when:
 - this host already has a control-plane database or a control-plane unit. A demoted primary's data must be moved aside first (section 7.4);
 - the agent's followed log is empty or quarantined;
 - the agent's followed log is below the agent's mark, or the agent is refollowing (section 7.1, ADR 0261). `--accept-loss` lifts these two refusals (below);
-- a `restore-pending` marker exists on this host (`backup-format.md` section 8.2, ADR 0285). The operator finishes the restore, or deletes the marker after checking that no `quoro restore` runs on the host;
+- a `restore-pending` marker exists on this host (`backup-format.md` section 8.2, ADR 0285). The operator finishes the restore, or, when no restored database is installed, deletes the marker after checking that no `quoro restore` runs on the host; after the stop at the token cap, the operator follows that stop's recovery instead (`backup-format.md` section 8.2);
 - the newest `welcome.schema_version` the agent stored is above the newest schema version this binary knows;
 - it cannot open a seal of every key in use: the current signing key and, during a rotation, the next one (section 7.5), every data-encryption key id, and the TLS key.
 
