@@ -1095,8 +1095,10 @@ async fn declare_lost_tx(
 ///    `revoked_at`, with the node still named as the last holder, one
 ///    change-log entry per lease ([`crate::leases::bump_tokens`], ADR 0202);
 /// 2. sets `nodes.lost_at`, after those revokes, so `revoked_at <= lost_at`
-///    holds for each of them ([`crate::leases::is_released`]); the node
-///    stays enrolled and a voter;
+///    holds for each row this write revokes ([`crate::leases::is_released`]);
+///    a kept earlier `revoked_at` is earlier only on the clock that wrote it,
+///    as an old primary's on `--ack-fence`. The node stays enrolled and a
+///    voter;
 /// 3. writes the node's change-log entry, whose `seq` it returns.
 ///
 /// A node already declared lost changes nothing and gives `None` (ADR 0202:
@@ -1163,8 +1165,9 @@ pub(crate) async fn declare_lost_write(
     .fetch_all(&mut *conn)
     .await?;
     crate::leases::bump_tokens(conn, &named, node_id, actor).await?;
-    // Taken after the revokes, so `revoked_at <= lost_at` holds for each of
-    // them ([`crate::leases::is_released`]).
+    // Taken after the revokes, so `revoked_at <= lost_at` holds for each row
+    // this write revokes ([`crate::leases::is_released`]); an earlier
+    // `revoked_at` it keeps is earlier only on the clock that wrote it.
     sqlx::query("UPDATE nodes SET lost_at = ? WHERE id = ?")
         .bind(now_rfc3339())
         .bind(node_id)

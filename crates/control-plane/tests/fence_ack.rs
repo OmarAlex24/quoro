@@ -2289,3 +2289,29 @@ async fn declaring_a_node_lost_leaves_a_row_revoked_at_the_cap_as_it_is() {
     );
     assert_eq!(entries[1].3["lost_at"], json!(declared));
 }
+
+/// Just below the cap, a revoked row is raised as any other: 2^53 − 2 goes
+/// to 2^53 − 1, its earlier revoke kept, and the declaration succeeds; only
+/// a row already revoked at the cap is left as it is.
+#[tokio::test]
+async fn declaring_a_node_lost_raises_a_row_revoked_one_below_the_cap() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, socket, _app_id, _vm_id, lease_id) = node_with_lease(&server, &owner).await;
+    let node_id = node.node_id.clone();
+    drop(socket);
+    wait_disconnected(&server, &node_id).await;
+    wait_row_disconnected(&server, &owner, &node_id).await;
+    second_lease(&server, &node_id, MAX_TOKEN - 1).await;
+    revoke_row(&server, SECOND_LEASE, EARLIER_REVOKE).await;
+
+    let res = declare_lost(&owner, &server, &node_id).await;
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    assert_eq!(
+        lease_row(&server, SECOND_LEASE).await,
+        (MAX_TOKEN, Some(EARLIER_REVOKE.to_string()), node_id.clone()),
+        "raised to the cap, its earlier revoke kept"
+    );
+    let (token, revoked_at, _) = lease_row(&server, &lease_id).await;
+    assert_eq!((token, revoked_at.is_some()), (2, true));
+}

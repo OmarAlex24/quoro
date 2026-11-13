@@ -580,12 +580,14 @@ mod tests {
         }
     }
 
-    /// Section 7.3 and section 8.6 (ADR 0325): only the leases the
-    /// declaration would raise are checked: unrevoked rows that name the old
-    /// primary's node. A row at the cap that another node holds, one the
-    /// node holds already revoked at the cap (as `removeNode` leaves it),
-    /// and the node's rows below the cap refuse nothing. Rows above the cap
-    /// are named too, each with its token, in id order.
+    /// Section 7.3 and section 8.6 (ADR 0325): only a lease the declaration
+    /// would raise past the cap is named: an unrevoked row of the old
+    /// primary's node at or above the cap. A revoked row below the cap is
+    /// raised to at most the cap, and one revoked at the cap is left as it
+    /// is (as `removeNode` leaves it), so neither refuses; nor does a row at
+    /// the cap that another node holds, or the node's unrevoked rows below
+    /// the cap. Rows above the cap are named too, each with its token, in id
+    /// order.
     #[test]
     fn the_cap_check_names_exactly_the_held_leases_at_the_cap() {
         let not_revoked = || Cell::Value(Value::Null);
