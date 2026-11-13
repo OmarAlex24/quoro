@@ -64,16 +64,23 @@
 //! - it turns `removed`, with its node entry, the whole row, as `removeNode`
 //!   writes a removal (section 10), so the voter set and the required set of
 //!   section 8.4 read it removed from that `seq` on. The same row write
-//!   clears its `cp_status`, so no removed machine keeps the primary status
-//!   and the next local enrollment on the new host takes it. With
-//!   `primary-node`, the write reads which node held the status before the
-//!   removals, and the move that follows names it as `from_node_id` in
+//!   clears its `cp_status`, so no removed machine keeps the primary status.
+//!   With `primary-node`, the write reads which node held the status before
+//!   the removals, and the move that follows names it as `from_node_id` in
 //!   `cluster.primary_moved`. The move writes no second entry for the old
 //!   primary, whose removal entry already reads no `cp_status`;
 //! - its custody seals are deleted (section 7.2,
 //!   [`crate::custody::delete_seals`]) and the records of the quarantined
 //!   copies it keeps are dropped ([`crate::quarantines::drop_node_copies`]),
 //!   as a removal does (section 10).
+//!
+//! With no `primary-node`, the write then clears `cp_status` on every machine
+//! that still holds it, whatever its roles, each row with its node entry
+//! ([`clear_cp_status`]), so no machine holds the primary status and the next
+//! local enrollment of the new host's agent takes it, and adopts no old row.
+//! A machine the write removed reads no `cp_status` in its removal entry
+//! already and is not written again. With `primary-node`, nothing more
+//! follows: the move gives the status to the new host's node.
 //!
 //! Then the write records `cluster.restored` (`audit-log-format.md` section
 //! 3.9), before the move's `cluster.primary_moved`, so it is the first record
@@ -552,9 +559,10 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
 /// The `--accept-loss` part of the first write ([module docs](self)), in the
 /// first write's transaction `conn`, after the mark: removes every machine
 /// with the `node` role that the database holds, not `removed`, other than
-/// `host_node`, the node `primary-node` names; then records
-/// `cluster.restored` with the operator's `statement`. Returns the removed
-/// ids, by id.
+/// `host_node`, the node `primary-node` names; with no `host_node`, clears
+/// `cp_status` on every machine that still holds it ([`clear_cp_status`]);
+/// then records `cluster.restored` with the operator's `statement`. Returns
+/// the removed ids, by id.
 ///
 /// `cluster.restored`'s `params.term` is the term the database holds when
 /// the write runs (`meta.term`), and its `change_seq` is the removal entry of
@@ -623,6 +631,14 @@ async fn remove_the_lost(
                 )
             })?;
     }
+    // Without `primary-node` nothing moves the primary status to the new
+    // host's node, so no machine keeps it, whatever its roles: the next local
+    // enrollment of the new host's agent takes it, and adopts no old row. A
+    // machine removed above reads no `cp_status` already, in its removal
+    // entry, and is not written again.
+    if host_node.is_none() {
+        clear_cp_status(conn, actor).await?;
+    }
 
     let change_seq = match last_removal {
         Some(seq) => Some(seq),
@@ -662,6 +678,40 @@ async fn remove_the_lost(
         .await
         .map_err(|error| format!("cannot record {RESTORED_OPERATION}: {error}"))?;
     Ok(lost)
+}
+
+/// Clears `cp_status` on every machine that still holds it, whatever its
+/// roles, each row with its whole-row node entry, as a move of the primary
+/// status clears it ([`primary_status::move_in`]). Run on the first write's
+/// transaction `conn` after `--accept-loss`'s removals when no `primary-node`
+/// asks for a move.
+///
+/// # Errors
+///
+/// A one-line reason for a database error, after which the caller drops the
+/// transaction, so nothing is written.
+async fn clear_cp_status(conn: &mut SqliteConnection, actor: &Actor) -> Result<(), String> {
+    let holders: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM nodes WHERE cp_status IS NOT NULL ORDER BY id")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|error| format!("cannot read the nodes that hold a cp_status: {error}"))?;
+    for node_id in &holders {
+        sqlx::query("UPDATE nodes SET cp_status = NULL WHERE id = ?")
+            .bind(node_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| format!("cannot clear the cp_status of node {node_id}: {error}"))?;
+        let payload = crate::driver::node_payload(conn, node_id)
+            .await
+            .map_err(|error| api_reason(&format!("cannot read node {node_id}"), error))?;
+        changelog::append(conn, actor, "node", node_id, Op::Update, payload)
+            .await
+            .map_err(|error| {
+                format!("cannot log the cleared cp_status of node {node_id}: {error}")
+            })?;
+    }
+    Ok(())
 }
 
 /// The machines the `--accept-loss` part of the first write removes, read

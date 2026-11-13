@@ -860,8 +860,8 @@ async fn no_identity_file_writes_no_marker() {
 }
 
 /// Without `primary-node`, the printed line says what becomes of the primary
-/// status: it stays where the backup had it, unless `--accept-loss`'s first
-/// write removes the machine that holds it.
+/// status: it stays where the backup had it, unless with `--accept-loss`,
+/// whose first write takes it from every machine.
 #[tokio::test]
 async fn without_a_marker_the_line_says_where_the_primary_status_goes() {
     let fixture = Fixture::new().await;
@@ -896,7 +896,7 @@ async fn without_a_marker_the_line_says_where_the_primary_status_goes() {
     );
     assert!(
         line.ends_with(
-            "; a machine the primary's first write removes loses the primary status, \
+            "; every machine loses the primary status in the primary's first write, \
              and the next local enrollment of this host's node agent takes it"
         ),
         "{line}"

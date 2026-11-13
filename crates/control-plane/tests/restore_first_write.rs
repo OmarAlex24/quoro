@@ -1631,7 +1631,19 @@ async fn an_accept_loss_first_write_without_primary_node_leaves_no_primary_statu
 
     // The next start, then the new host's agent enrolls with the local token.
     store.pool().close().await;
-    let server = start_in(dir.clone()).await;
+    let (server, node_id) = enroll_new_host_locally(dir.clone()).await;
+    assert!(!removed.contains(&node_id), "{node_id}");
+    let store = &server.state.store;
+    assert_eq!(cp_status(store, &node_id).await.as_deref(), Some("primary"));
+    assert_eq!(status(store, &old).await, "removed");
+    assert_eq!(cp_status(store, &old).await, None);
+}
+
+/// The next start on `dir`, then the new host's agent enrolling with the
+/// local token (ADR 0110). Returns the started server and the enrolled
+/// node's id.
+async fn enroll_new_host_locally(dir: TestDir) -> (Server, String) {
+    let server = start_in(dir).await;
     common::settle_voters(&server).await;
     quoro_control_plane::api::enroll::ensure_local_join(
         &server.data_dir,
@@ -1659,10 +1671,105 @@ async fn an_accept_loss_first_write_without_primary_node_leaves_no_primary_statu
     let code = res.status();
     let body: Value = res.json().await.unwrap();
     assert_eq!(code, 201, "{body}");
-    let node_id = body["node_id"].as_str().unwrap();
-    assert!(!removed.iter().any(|id| id == node_id), "{node_id}");
+    let node_id = body["node_id"].as_str().unwrap().to_string();
+    (server, node_id)
+}
+
+/// Without `primary-node`, the `--accept-loss` first write also clears
+/// `cp_status` on a machine it does not remove: here the old primary is
+/// edge-only, so the write removes the two machines with the `node` role and
+/// then clears the old primary's `cp_status`, in its row and in one node
+/// entry of its own that keeps its status, before `cluster.restored`. No
+/// node holds the status after the write, nothing is moved, and the new
+/// host's agent, enrolling with the local token, gets a new node with
+/// `cp_status = 'primary'` instead of adopting the old primary's row.
+#[tokio::test]
+async fn an_accept_loss_first_write_without_primary_node_clears_an_edge_only_primary() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    sqlx::query("UPDATE nodes SET roles = '[\"edge\"]' WHERE id = ?")
+        .bind(&old)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        log_head_of(&store).await,
+        head,
+        "the row is written directly"
+    );
+    assert_eq!(cp_status(&store, &old).await.as_deref(), Some("primary"));
+    let status_before = status(&store, &old).await;
+    write_marker(&dir, &forced(&head));
+
+    let mut removed = vec![NEW_NODE.to_string(), HOLDER.to_string()];
+    removed.sort();
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: removed.clone(),
+            moved: false
+        }
+    );
+    assert_eq!(status(&store, &old).await, status_before, "not removed");
+    assert_eq!(cp_status(&store, &old).await, None);
+    for id in &removed {
+        assert_eq!(status(&store, id).await, "removed", "{id}");
+        assert_eq!(cp_status(&store, id).await, None, "{id}");
+    }
+    let holders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE cp_status IS NOT NULL")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(holders, 0, "no node holds the primary status");
+    assert!(moved_audit_ids(&store).await.is_empty());
+
+    // One node entry for the old primary: the whole row, with no `cp_status`,
+    // by the `cluster` actor, before the `audit` entry of `cluster.restored`.
+    let entries = entries_after(&store, head.seq).await;
+    let old_entries: Vec<_> = entries
+        .iter()
+        .filter(|(_, kind, entity, _, _, _)| kind == "node" && *entity == old)
+        .collect();
+    assert_eq!(old_entries.len(), 1, "{entries:?}");
+    let (cleared_seq, _, _, actor_type, actor_id, payload) = old_entries[0];
+    assert_eq!(
+        (actor_type.as_str(), actor_id.as_str()),
+        ("system", "cluster")
+    );
+    assert_eq!(payload["id"], old.as_str());
+    assert_eq!(payload["status"], status_before.as_str());
+    assert_eq!(payload["roles"], json!(["edge"]));
+    assert!(payload["cp_status"].is_null(), "{payload}");
+    let records = records_after(&store, 0).await;
+    let restored = records
+        .iter()
+        .find(|record| record.operation == restore_pending::RESTORED_OPERATION)
+        .expect("cluster.restored");
+    assert_eq!(restored.params["removed_node_ids"], json!(removed));
+    let restored_seq: i64 = sqlx::query_scalar("SELECT seq FROM audit_log WHERE operation = ?")
+        .bind(restore_pending::RESTORED_OPERATION)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let restored_entry = entries
+        .iter()
+        .find(|(_, kind, entity, _, _, _)| kind == "audit" && *entity == restored_seq.to_string())
+        .expect("the audit entry of cluster.restored");
+    assert!(*cleared_seq < restored_entry.0, "{entries:?}");
+
+    // The next start, then the new host's agent enrolls with the local token.
+    store.pool().close().await;
+    let (server, node_id) = enroll_new_host_locally(dir.clone()).await;
+    assert_ne!(node_id, old, "the old primary's row is not adopted");
+    assert!(!removed.contains(&node_id), "{node_id}");
     let store = &server.state.store;
-    assert_eq!(cp_status(store, node_id).await.as_deref(), Some("primary"));
-    assert_eq!(status(store, &old).await, "removed");
+    assert_eq!(cp_status(store, &node_id).await.as_deref(), Some("primary"));
     assert_eq!(cp_status(store, &old).await, None);
+    let holders: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM nodes WHERE cp_status IS NOT NULL ORDER BY id")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(holders, vec![node_id]);
 }

@@ -204,8 +204,8 @@ pub enum PrimaryPick {
     /// The node in this host's node agent identity file.
     IdentityFile(String),
     /// No `primary-node` file. Without `--accept-loss` the primary status
-    /// stays where the backup had it; with it, a machine the primary's first
-    /// write removes loses the status, and the next local enrollment of this
+    /// stays where the backup had it; with it, every machine loses the status
+    /// in the primary's first write, and the next local enrollment of this
     /// host's node agent takes it. The text says why no file was written.
     Unchanged(String),
 }
@@ -329,10 +329,10 @@ pub async fn run(args: &[String], node_data_dir: &Path) -> Result<(), Error> {
 /// status then.
 #[must_use]
 pub fn primary_line(report: &Report) -> String {
-    let (takes, removes, loses) = if report.installed {
-        ("takes", "removes", "loses")
+    let (takes, loses) = if report.installed {
+        ("takes", "loses")
     } else {
-        ("would take", "would remove", "would lose")
+        ("would take", "would lose")
     };
     match &report.primary {
         PrimaryPick::NodeIdFlag(node_id) => format!(
@@ -342,7 +342,7 @@ pub fn primary_line(report: &Report) -> String {
             "node {node_id} (this host's node agent) {takes} the primary status at the primary's next start"
         ),
         PrimaryPick::Unchanged(reason) if report.accept_loss => format!(
-            "no {MARKER_FILE} file: {reason}; a machine the primary's first write {removes} {loses} the primary status, and the next local enrollment of this host's node agent {takes} it"
+            "no {MARKER_FILE} file: {reason}; every machine {loses} the primary status in the primary's first write, and the next local enrollment of this host's node agent {takes} it"
         ),
         PrimaryPick::Unchanged(reason) => format!(
             "no {MARKER_FILE} file: {reason}; the primary status stays where the backup had it"
