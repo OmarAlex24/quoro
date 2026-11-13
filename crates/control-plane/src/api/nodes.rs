@@ -28,6 +28,7 @@ const SET_TUNNEL_OPERATION: &str = "PUT /api/v1/nodes/{node_id}/tunnel";
 const DELETE_TUNNEL_OPERATION: &str = "DELETE /api/v1/nodes/{node_id}/tunnel";
 const FENCE_ACK_OPERATION: &str = "POST /api/v1/nodes/{node_id}/fence-ack";
 const DECLARE_LOST_OPERATION: &str = "POST /api/v1/nodes/{node_id}/declare-lost";
+const REMOVE_OPERATION: &str = "DELETE /api/v1/nodes/{node_id}";
 
 /// A machine running the Quoro binary (D-0012).
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -1100,6 +1101,81 @@ async fn declare_lost_tx(
     Ok(node)
 }
 
+/// Removes a node from the cluster (`node-agent-protocol.md` section 10):
+/// a connected node's leases are revoked over its session and every answer
+/// awaited, a disconnected node's tokens are raised as when declaring it
+/// lost; the node turns `removed`, its quarantine records and custody seals
+/// go in the same transaction, and its session ends with `node_removed`
+/// ([`crate::removal`]).
+#[utoipa::path(
+    delete,
+    path = "/api/v1/nodes/{node_id}",
+    tag = "nodes",
+    operation_id = "removeNode",
+    extensions(("x-quoro-scope" = json!("node:remove"))),
+    params(
+        ("node_id" = String, Path, description = "Node id (`nod_...`).", pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$"),
+        ("Quoro-Justification" = Option<String>, Header,
+            description = "The agent's stated reason for the call. Required when the caller is an agent; it is recorded in the audit log (D-0031). Human callers may omit it.",
+            nullable = false, min_length = 1, max_length = 2000),
+        ("Quoro-Incident" = Option<String>, Header,
+            description = "The incident (`inc_...`) the call belongs to, when an agent acts on an incident (D-0032).",
+            nullable = false, pattern = "^inc_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    responses(
+        (status = 202, description = "Removal accepted; the node status becomes `removed`.", body = Node,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::Forbidden),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+///
+/// # Errors
+///
+/// In this order: `forbidden` for an agent (`human_only`) or without
+/// `node:remove`; `not_found` for an unknown node; `conflict` for a node
+/// already removed, for the node that holds the primary status, while the
+/// node hosts a running instance, and while the voter-set gate refuses a
+/// voter change (section 8.10); then `conflict` when a connected node's
+/// fence is not confirmed, or when the node took a lease or connected while
+/// it was being removed. Or a database error.
+pub async fn remove_node(
+    State(state): State<AppState>,
+    identity: Identity,
+    headers: HeaderMap,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Path(node_id): Path<String>,
+) -> Result<(StatusCode, Json<Node>), ApiError> {
+    // The path's id, as the other deletes record theirs.
+    let params = json!({ "node_id": &node_id });
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.clone(),
+    };
+    let ctx = CallCtx::new(identity, request_id, REMOVE_OPERATION, &headers);
+    ctx.authorize_human(&state, Scope::NodeRemove, Some(&target), None, &params)
+        .await?;
+    match crate::removal::run(&state, &ctx, &node_id, &params).await {
+        Ok(node) => Ok((StatusCode::ACCEPTED, Json(node))),
+        Err(error) => {
+            ctx.audit_error(
+                &state,
+                Some(Scope::NodeRemove),
+                Some(&target),
+                None,
+                &params,
+                &error,
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
 /// Validates the provider, writes the row, its change-log entry and the audit
 /// record in one transaction.
 async fn set_tunnel_tx(
@@ -1707,6 +1783,23 @@ async fn roles_tx(
     let node = node_in(&mut w.tx, &state.hub, node_id).await?;
     w.commit().await?;
     Ok((node, true))
+}
+
+/// The node `node_id` as `getNode` returns it, `custody` included, read on
+/// `conn`.
+pub(crate) async fn node_view(
+    conn: &mut SqliteConnection,
+    state: &AppState,
+    node_id: &str,
+) -> Result<Node, ApiError> {
+    let mut node = node_in(conn, &state.hub, node_id).await?;
+    attach_custody(
+        &mut *conn,
+        &state.keyring(),
+        std::slice::from_mut(&mut node),
+    )
+    .await?;
+    Ok(node)
 }
 
 /// The node `node_id` as the API returns it, read on `conn`.

@@ -34,6 +34,77 @@ pub const VOTERS_CHANGING: &str = "the previous voter-set change has not reached
 pub const VOTERS_DISAGREE: &str =
     "the voter rows and the change log disagree on the voters; the change waits until they agree";
 
+/// What removing one machine does to the voter set (`node-agent-protocol.md`
+/// sections 8.10 and 10), as one read of the rows and the log gives it
+/// ([`voter_removal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VoterRemoval {
+    /// The machine is a voter neither in the rows nor in the log: the set
+    /// does not change.
+    NotVoter,
+    /// The rows and the log agree, and the machine is a voter in both: its
+    /// removal entry moves the voter-set version to its own `seq`.
+    Changes,
+    /// The rows and the log disagree on this machine alone (ADR 0321 item
+    /// 4): its removal entry ends the disagreement, the one voter change
+    /// that passes it. `in_log` says whether the log counts the machine as a
+    /// voter, so whether the entry moves the version.
+    Repairs { in_log: bool },
+    /// The rows and the log disagree on another machine, and this one is a
+    /// voter in one of them: the removal waits like every other voter change.
+    Blocked,
+}
+
+/// Classifies the removal of `node_id` against `set`, read on the removal's
+/// own write transaction.
+pub(crate) fn voter_removal(set: &crate::voters::SetOnWrite, node_id: &str) -> VoterRemoval {
+    let in_rows = set.contains_row_voter(node_id);
+    let Some(differs) = &set.disagreement else {
+        return if in_rows {
+            VoterRemoval::Changes
+        } else {
+            VoterRemoval::NotVoter
+        };
+    };
+    let only_rows = differs.only_in_rows.iter().any(|id| id == node_id);
+    let only_log = differs.only_in_log.iter().any(|id| id == node_id);
+    let alone = differs
+        .only_in_rows
+        .iter()
+        .chain(&differs.only_in_log)
+        .all(|id| id == node_id);
+    if (only_rows || only_log) && alone {
+        VoterRemoval::Repairs { in_log: only_log }
+    } else if in_rows || only_log {
+        VoterRemoval::Blocked
+    } else {
+        VoterRemoval::NotVoter
+    }
+}
+
+/// Rule 2 of section 8.10 for a removal classified `removal` against `set`:
+/// whether more than half of the current voters has acknowledged the current
+/// version. The current voters are those the change log gives at that
+/// version ([`crate::voters::SetOnWrite::log_voters`]), not the rows': in a
+/// repair where only the log names the machine, the machine counts in the
+/// denominator although it never acknowledges, and where only the rows name
+/// it, it does not count at all. When the two agree they are the same
+/// machines. A machine that is no voter changes nothing and passes; a
+/// blocked removal never does.
+pub(crate) fn removal_allowed(
+    set: &crate::voters::SetOnWrite,
+    removal: VoterRemoval,
+    acked: impl Fn(&str) -> Option<u64>,
+) -> bool {
+    match removal {
+        VoterRemoval::NotVoter => true,
+        VoterRemoval::Blocked => false,
+        VoterRemoval::Changes | VoterRemoval::Repairs { .. } => {
+            crate::voters::majority_holds(set.version, &set.log_voters(), acked)
+        }
+    }
+}
+
 impl NodeHub {
     /// Records that `node_id` acknowledged, with `command_result` `ok`, a
     /// `desired_state` carrying voter-set version `version`. The version
@@ -44,9 +115,9 @@ impl NodeHub {
         *held = (*held).max(version);
     }
 
-    /// Rule 2 of section 8.10, for every change of the voter set: the
-    /// enrollment of a voter, `updateNodeRoles` adding or removing a vote,
-    /// and (once it exists) the removal of a voter. It reads the version and
+    /// Rule 2 of section 8.10, for the enrollment of a voter and
+    /// `updateNodeRoles` adding or removing a vote; the removal of a voter
+    /// passes the same rule through [`NodeHub::voter_removal_gate`]. It reads the version and
     /// the voters on `conn`, which must be the change's own write
     /// transaction, so the acknowledgements are counted against the version
     /// that transaction sees and two changes never pass on the same
@@ -132,6 +203,115 @@ impl NodeHub {
             .landed(conn, seq)
             .await
             .map_err(|e| ApiError::internal(&e))
+    }
+
+    /// The voter set as the removal's own write transaction `conn` sees it
+    /// ([`crate::voters::VoterLog::read_on`]), for
+    /// [`voter_removal`] and [`NodeHub::voter_removal_gate`].
+    ///
+    /// # Errors
+    ///
+    /// `internal` when the set cannot be read.
+    pub(crate) async fn voter_set_on_write(
+        &self,
+        conn: &mut SqliteConnection,
+    ) -> Result<crate::voters::SetOnWrite, ApiError> {
+        self.0
+            .voters
+            .read_on(conn)
+            .await
+            .map_err(|e| ApiError::internal(&e))
+    }
+
+    /// Section 8.10 for `removeNode` (section 10), over `set` as the
+    /// removal's own write transaction read it
+    /// ([`NodeHub::voter_set_on_write`]), as [`NodeHub::voter_change_gate`]
+    /// does for the other voter changes:
+    ///
+    /// - a machine that is no voter changes nothing and passes;
+    /// - while the rows and the log disagree on another machine, the removal
+    ///   of a voter is refused with `conflict`;
+    /// - while they disagree on this machine alone, its removal is the one
+    ///   change the gate lets through, because its removal entry ends the
+    ///   disagreement (ADR 0321 item 4). It still needs rule 2's majority:
+    ///   there is no other bypass;
+    /// - rule 2 counts a majority of the current voters, those the change
+    ///   log gives at the current version ([`removal_allowed`]).
+    ///
+    /// Removal is never refused for leaving fewer than three voters, and has
+    /// no `force` (section 10). Returns what the removal does, never
+    /// [`VoterRemoval::Blocked`].
+    ///
+    /// # Errors
+    ///
+    /// `conflict` as above.
+    pub(crate) fn voter_removal_gate(
+        &self,
+        set: &crate::voters::SetOnWrite,
+        node_id: &str,
+    ) -> Result<VoterRemoval, ApiError> {
+        let removal = voter_removal(set, node_id);
+        if removal == VoterRemoval::Blocked {
+            if let Some(differs) = &set.disagreement {
+                tracing::warn!(
+                    version = set.version,
+                    only_in_rows = ?differs.only_in_rows,
+                    only_in_log = ?differs.only_in_log,
+                    node_id,
+                    "the removal of a voter waits: the voters in the nodes rows and those the change log replays differ on another machine"
+                );
+            }
+            return Err(ApiError::conflict(VOTERS_DISAGREE));
+        }
+        let acks = self.0.votes_acks.lock().expect("votes acks lock");
+        if removal_allowed(set, removal, |id| acks.get(id).copied()) {
+            Ok(removal)
+        } else {
+            Err(ApiError::conflict(VOTERS_CHANGING))
+        }
+    }
+
+    /// The check after the removal's write, on the same transaction `conn`,
+    /// once its removal entry is `seq` ([`NodeHub::voter_removal_gate`]):
+    /// a voter's removal moved the voter-set version to `seq`
+    /// ([`NodeHub::voter_change_landed`]); a repair ended the disagreement,
+    /// and moved the version too when the log counted the machine. As for
+    /// the other voter changes, a miss is a bug in the write, `internal`,
+    /// and the caller's transaction rolls back unwritten.
+    ///
+    /// # Errors
+    ///
+    /// `internal` as above, or when the set cannot be read.
+    pub(crate) async fn voter_removal_landed(
+        &self,
+        conn: &mut SqliteConnection,
+        removal: VoterRemoval,
+        seq: i64,
+    ) -> Result<(), ApiError> {
+        match removal {
+            VoterRemoval::NotVoter | VoterRemoval::Blocked => Ok(()),
+            VoterRemoval::Changes => self.voter_change_landed(conn, seq).await,
+            VoterRemoval::Repairs { in_log } => {
+                let set = self
+                    .0
+                    .voters
+                    .read_on(conn)
+                    .await
+                    .map_err(|e| ApiError::internal(&e))?;
+                if set.disagreement.is_some() {
+                    return Err(ApiError::internal(&format!(
+                        "the removal entry at change-log seq {seq} did not end the disagreement on the voters"
+                    )));
+                }
+                if in_log && u64::try_from(seq).ok() != Some(set.version) {
+                    return Err(ApiError::internal(&format!(
+                        "the removal entry at change-log seq {seq} left the voter-set version at {}",
+                        set.version
+                    )));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Test seam: records that every current voter acknowledged the current
@@ -312,5 +492,115 @@ impl Session {
             "a node answered stale_term: a higher term exists; this primary grants and renews no expiring lease and demotes itself"
         );
         drop(self.hub.stale_term(node_term));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VoterRemoval, removal_allowed, voter_removal};
+    use crate::voters::{Disagreement, SetOnWrite, Voter};
+
+    fn set(rows: &[&str], only_in_rows: &[&str], only_in_log: &[&str]) -> SetOnWrite {
+        let ids = |ids: &[&str]| ids.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
+        SetOnWrite {
+            version: 7,
+            voters: rows
+                .iter()
+                .map(|id| Voter {
+                    node_id: (*id).to_string(),
+                    roles: vec!["node".to_string()],
+                    mesh_address: None,
+                })
+                .collect(),
+            disagreement: (!only_in_rows.is_empty() || !only_in_log.is_empty()).then(|| {
+                Disagreement {
+                    only_in_rows: ids(only_in_rows),
+                    only_in_log: ids(only_in_log),
+                }
+            }),
+        }
+    }
+
+    /// Sections 8.10 and 10, ADR 0321 item 4: what the removal of one
+    /// machine does to the voter set, for each way the rows and the log can
+    /// stand.
+    #[test]
+    fn a_removal_changes_repairs_or_waits_for_the_voter_set() {
+        // They agree: a voter's removal changes the set, a non-voter's not.
+        let agree = set(&["nod_a", "nod_b"], &[], &[]);
+        assert_eq!(voter_removal(&agree, "nod_a"), VoterRemoval::Changes);
+        assert_eq!(voter_removal(&agree, "nod_e"), VoterRemoval::NotVoter);
+
+        // They disagree on X alone: removing X repairs it, from either side.
+        let in_log = set(&["nod_a", "nod_b"], &[], &["nod_x"]);
+        assert_eq!(
+            voter_removal(&in_log, "nod_x"),
+            VoterRemoval::Repairs { in_log: true }
+        );
+        let in_rows = set(&["nod_a", "nod_b", "nod_x"], &["nod_x"], &[]);
+        assert_eq!(
+            voter_removal(&in_rows, "nod_x"),
+            VoterRemoval::Repairs { in_log: false }
+        );
+        // Any other voter's removal waits; a non-voter's passes.
+        assert_eq!(voter_removal(&in_log, "nod_a"), VoterRemoval::Blocked);
+        assert_eq!(voter_removal(&in_rows, "nod_b"), VoterRemoval::Blocked);
+        assert_eq!(voter_removal(&in_log, "nod_e"), VoterRemoval::NotVoter);
+
+        // They disagree on X and Y: removing X does not end it.
+        let two = set(&["nod_a", "nod_y"], &["nod_y"], &["nod_x"]);
+        assert_eq!(voter_removal(&two, "nod_x"), VoterRemoval::Blocked);
+        assert_eq!(voter_removal(&two, "nod_y"), VoterRemoval::Blocked);
+        assert_eq!(voter_removal(&two, "nod_e"), VoterRemoval::NotVoter);
+    }
+
+    /// Whether rule 2 lets `node_id`'s removal through with `acked` holding
+    /// the set's version and every other machine holding none.
+    fn passes(set: &SetOnWrite, node_id: &str, acked: &[&str]) -> bool {
+        removal_allowed(set, voter_removal(set, node_id), |id| {
+            acked.contains(&id).then_some(set.version)
+        })
+    }
+
+    /// Section 8.10 rule 2 for a removal: the majority is counted over the
+    /// voters the change log gives at the current version, not the rows'.
+    #[test]
+    fn a_removal_counts_the_majority_over_the_logs_voters() {
+        // They agree, an even set: two of four is not a majority.
+        let agree = set(&["nod_a", "nod_b", "nod_c", "nod_d"], &[], &[]);
+        assert!(!passes(&agree, "nod_d", &["nod_a", "nod_b"]));
+        assert!(passes(&agree, "nod_d", &["nod_a", "nod_b", "nod_c"]));
+
+        // Only the log has X: the current set is {A, B, C, X}, four voters,
+        // and X never acknowledges. Two of the rows' three would be a
+        // majority of the rows, not of the set: three are needed.
+        let in_log = set(&["nod_a", "nod_b", "nod_c"], &[], &["nod_x"]);
+        assert_eq!(
+            voter_removal(&in_log, "nod_x"),
+            VoterRemoval::Repairs { in_log: true }
+        );
+        assert!(!passes(&in_log, "nod_x", &["nod_a", "nod_b"]));
+        assert!(passes(&in_log, "nod_x", &["nod_a", "nod_b", "nod_c"]));
+
+        // Only the rows have X: the current set is {A, B}, and X's own
+        // acknowledgement does not count. A and X are two of the rows'
+        // three, but only one of the set's two.
+        let in_rows = set(&["nod_a", "nod_b", "nod_x"], &["nod_x"], &[]);
+        assert_eq!(
+            voter_removal(&in_rows, "nod_x"),
+            VoterRemoval::Repairs { in_log: false }
+        );
+        assert!(!passes(&in_rows, "nod_x", &["nod_a", "nod_x"]));
+        assert!(passes(&in_rows, "nod_x", &["nod_a", "nod_b"]));
+        // Rows {A, B, C, X}, log {A, B, C}: two of the log's three pass,
+        // though they are only half of the rows.
+        let in_rows_even = set(&["nod_a", "nod_b", "nod_c", "nod_x"], &["nod_x"], &[]);
+        assert!(passes(&in_rows_even, "nod_x", &["nod_a", "nod_b"]));
+        assert!(!passes(&in_rows_even, "nod_x", &["nod_a", "nod_x"]));
+
+        // A non-voter changes nothing; a blocked removal never passes.
+        assert!(passes(&agree, "nod_e", &[]));
+        let two = set(&["nod_a", "nod_y"], &["nod_y"], &["nod_x"]);
+        assert!(!passes(&two, "nod_x", &["nod_a", "nod_y", "nod_x"]));
     }
 }

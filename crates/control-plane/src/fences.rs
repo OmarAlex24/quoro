@@ -12,7 +12,9 @@
 //! node answers `ok`.
 //!
 //! Both columns are replicated state: every write goes through the change log
-//! in the caller's transaction.
+//! in the caller's transaction. [`write_failure_row`] is the one exception:
+//! it writes the row only, and its caller must append the node's whole-row
+//! entry in the same transaction before it commits.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, PoisonError};
@@ -213,6 +215,29 @@ pub(crate) async fn record_failure(
     failed: &Failed<'_>,
     actor: &Actor,
 ) -> Result<bool, ApiError> {
+    if !write_failure_row(conn, node_id, failed).await? {
+        return Ok(false);
+    }
+    let payload = driver::node_payload(conn, node_id).await?;
+    changelog::append(conn, actor, "node", node_id, Op::Update, payload).await?;
+    Ok(true)
+}
+
+/// [`record_failure`]'s write of the node's row, without its change-log
+/// entry. For `removeNode` only, which writes the node's whole-row removal
+/// entry later in the same transaction: that one entry then carries the
+/// failure and the removal together (`crate::removal`). Any other caller
+/// must also append the node's whole-row entry before it commits, or the
+/// change log misses the write (ADR 0297). Returns whether the row changed.
+///
+/// # Errors
+///
+/// A database error, or a stored value that does not parse.
+pub(crate) async fn write_failure_row(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    failed: &Failed<'_>,
+) -> Result<bool, ApiError> {
     if failed.lease_ids.is_empty() {
         return Ok(false);
     }
@@ -252,8 +277,6 @@ pub(crate) async fn record_failure(
         .bind(node_id)
         .execute(&mut *conn)
         .await?;
-    let payload = driver::node_payload(conn, node_id).await?;
-    changelog::append(conn, actor, "node", node_id, Op::Update, payload).await?;
     Ok(true)
 }
 
@@ -291,6 +314,31 @@ pub(crate) async fn listed_leases(
         }
     }
     Ok(listed)
+}
+
+/// The nodes whose `fence_failure` lists `lease_id`, sorted.
+///
+/// # Errors
+///
+/// A database error, or a stored value that does not parse.
+pub(crate) async fn nodes_listing(
+    conn: &mut SqliteConnection,
+    lease_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, fence_failure FROM nodes WHERE fence_failure IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut listing = Vec::new();
+    for (node_id, text) in rows {
+        if parse::<FenceFailure>(Some(text))?
+            .is_some_and(|failure| failure.lease_ids.iter().any(|id| id == lease_id))
+        {
+            listing.push(node_id);
+        }
+    }
+    Ok(listing)
 }
 
 /// Each `(node, lease)` whose failed fence the node reported in a
@@ -332,6 +380,23 @@ impl UnrecordedFailures {
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .any(|(failed_on, _)| failed_on == node_id)
+    }
+
+    /// Every lease `node_id` reported a failed fence of that is not
+    /// recorded, sorted: what `removeNode` writes into the node's
+    /// `fence_failure` before the node is removed, so the failures outlive a
+    /// restart of the primary (`crate::removal`).
+    pub(crate) fn leases_of_node(&self, node_id: &str) -> Vec<String> {
+        let mut leases: Vec<String> = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(failed_on, _)| failed_on == node_id)
+            .map(|(_, failed)| failed.clone())
+            .collect();
+        leases.sort_unstable();
+        leases
     }
 
     /// Every lease some node reported a failed fence of that is not

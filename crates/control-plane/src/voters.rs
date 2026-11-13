@@ -167,6 +167,34 @@ pub struct SetOnWrite {
     pub disagreement: Option<Disagreement>,
 }
 
+impl SetOnWrite {
+    /// Whether the `nodes` rows make `node_id` a voter.
+    #[must_use]
+    pub fn contains_row_voter(&self, node_id: &str) -> bool {
+        self.voters.iter().any(|voter| voter.node_id == node_id)
+    }
+
+    /// The voters the change log gives at [`SetOnWrite::version`]: the
+    /// rows' voters without those only the rows name, and with those only
+    /// the log names. They are the current voters of rule 2 of section 8.10
+    /// whatever the rows say, because the version is the log's. Sorted.
+    #[must_use]
+    pub fn log_voters(&self) -> Vec<&str> {
+        let mut ids: BTreeSet<&str> = self
+            .voters
+            .iter()
+            .map(|voter| voter.node_id.as_str())
+            .collect();
+        if let Some(differs) = &self.disagreement {
+            for id in &differs.only_in_rows {
+                ids.remove(id.as_str());
+            }
+            ids.extend(differs.only_in_log.iter().map(String::as_str));
+        }
+        ids.into_iter().collect()
+    }
+}
+
 /// What the replay knows of one node.
 #[derive(Clone, Debug, Default)]
 struct NodeFacts {
@@ -363,12 +391,20 @@ fn votes_open(rows: &[(String, String, Option<String>, Option<i64>)]) -> Result<
 /// set may always change: the first voter needs nobody's acknowledgement.
 #[must_use]
 pub fn change_allowed(version: u64, voters: &[Voter], acked: impl Fn(&str) -> Option<u64>) -> bool {
+    let ids: Vec<&str> = voters.iter().map(|voter| voter.node_id.as_str()).collect();
+    majority_holds(version, &ids, acked)
+}
+
+/// [`change_allowed`] over the voters' ids: whether more than half of
+/// `voters` has acknowledged exactly `version`. An empty set always may.
+#[must_use]
+pub fn majority_holds(version: u64, voters: &[&str], acked: impl Fn(&str) -> Option<u64>) -> bool {
     if voters.is_empty() {
         return true;
     }
     let holding = voters
         .iter()
-        .filter(|voter| acked(&voter.node_id) == Some(version))
+        .filter(|id| acked(id) == Some(version))
         .count();
     holding * 2 > voters.len()
 }

@@ -109,6 +109,7 @@ pub struct RateLimited(Problem);
         crate::api::cluster::get_cluster_capacity,
         crate::api::nodes::list_nodes,
         crate::api::nodes::get_node,
+        crate::api::nodes::remove_node,
         crate::api::nodes::set_node_tunnel,
         crate::api::nodes::delete_node_tunnel,
         crate::api::nodes::ack_node_fence,

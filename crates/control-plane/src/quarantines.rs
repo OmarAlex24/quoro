@@ -233,7 +233,6 @@ impl ListedCopies {
 
     /// Forgets the copies `node_id` listed, for good: the node was removed,
     /// so a report of it still being applied lists nothing.
-    #[cfg_attr(not(test), expect(dead_code, reason = "removeNode (#740) calls it"))]
     pub(crate) fn forget(&self, node_id: &str) {
         let mut listed = self.0.lock().expect("listed copies lock");
         listed.by_node.remove(node_id);
@@ -764,7 +763,6 @@ async fn drop_deleted(
 ///
 /// A database or change-log error; the caller's transaction then rolls back
 /// with nothing dropped.
-#[cfg_attr(not(test), expect(dead_code, reason = "removeNode (#740) calls it"))]
 pub(crate) async fn drop_node_copies(
     conn: &mut SqliteConnection,
     actor: &Actor,
@@ -801,7 +799,6 @@ pub(crate) async fn drop_node_copies(
 /// ([`ListedCopies`]), so a removed node's unhashed copies no longer refuse
 /// `deleteVolume` and `deleteApp`. `removeNode` calls it once the transaction
 /// that ran [`drop_node_copies`] has committed.
-#[expect(dead_code, reason = "removeNode (#740) calls it")]
 pub(crate) fn forget_listed(hub: &NodeHub, node_id: &str) {
     hub.listed_copies().forget(node_id);
 }

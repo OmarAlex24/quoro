@@ -49,6 +49,9 @@ pub mod primary_status;
 /// Quarantined copies of a volume: recording, refusals and deletion (ADR
 /// 0176).
 pub(crate) mod quarantines;
+/// Removing a node from the cluster (`removeNode`, section 10 of the node
+/// agent protocol).
+pub(crate) mod removal;
 pub mod request;
 pub(crate) mod scheduler;
 pub mod service;
