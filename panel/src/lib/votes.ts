@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { QueryClient } from '@tanstack/react-query';
 import { isApiProblem } from '../api/fetcher';
+import { getGetClusterQueryKey } from '../api/generated/cluster/cluster';
 import type { ClusterVotes, Node } from '../api/generated/model';
+import { getListNodesQueryKey } from '../api/generated/nodes/nodes';
 import { shortId } from './agency-format';
 import type { LampTone } from './lamp';
 import { problemView, type ProblemView } from './problem';
@@ -74,6 +77,14 @@ export const voterSeats = (votes: ClusterVotes, nodes: readonly Node[]): VoterSe
     words: voter.connected ? 'Connected' : 'Disconnected',
   }));
 
+/**
+ * Whether HA is short of a vote, so the view offers a witness. A join token
+ * lives only as long as that offer: false with no votes yet, false once
+ * `count` reaches `required`.
+ */
+export const shortOfVotes = (votes: ClusterVotes | undefined): boolean =>
+  votes !== undefined && missingVoteWords(votes.count, votes.required) !== null;
+
 /** What the HA view says about `Cluster.votes`. */
 export const haReadout = (votes: ClusterVotes, nodes: readonly Node[]): HaReadout => {
   const { count, required } = votes;
@@ -131,6 +142,58 @@ export const witnessCandidates = (nodes: readonly Node[], votes: ClusterVotes): 
       !node.roles.some((role) => role === 'node' || role === 'witness'),
   );
 };
+
+/**
+ * What to know before giving the witness role to a candidate that is not
+ * connected, or null for a connected one. The server takes the role either
+ * way; the machine acts on it from its next desired state, so it votes only
+ * once its node agent connects.
+ */
+export const candidateNote = (node: Pick<Node, 'status'>): string | null =>
+  node.status === 'connected'
+    ? null
+    : 'Not connected. It gets the role now and can vote once its node agent connects.';
+
+/**
+ * What the HA view draws for `getCluster`:
+ * - `votes`: the last votes the server sent. `stale` says why the newest
+ *   refetch failed, beside them, or is null; one failed refetch does not
+ *   hide votes that are likely still true.
+ * - `failed`: the call failed and no votes ever arrived.
+ * - `loading`: the first answer is on its way.
+ * - `hidden`: nothing to show, as while the query is disabled.
+ */
+export type HaVotesState =
+  | { kind: 'votes'; votes: ClusterVotes; stale: ProblemView | null }
+  | { kind: 'failed'; problem: ProblemView }
+  | { kind: 'loading' }
+  | { kind: 'hidden' };
+
+export const haVotesState = ({
+  votes,
+  error,
+  loading,
+}: {
+  votes: ClusterVotes | undefined;
+  error: unknown;
+  loading: boolean;
+}): HaVotesState => {
+  const problem = error === null || error === undefined ? null : problemView(error, 'see the voters');
+  if (votes) return { kind: 'votes', votes, stale: problem };
+  if (problem) return { kind: 'failed', problem };
+  return loading ? { kind: 'loading' } : { kind: 'hidden' };
+};
+
+/**
+ * After a roles call, answered or refused: read the cluster's votes and the
+ * node list again, since both carry a machine's roles. Every page of the
+ * node list goes, whatever its parameters; nothing else does.
+ */
+export const refreshVoters = (queryClient: Pick<QueryClient, 'invalidateQueries'>): Promise<unknown> =>
+  Promise.all([
+    queryClient.invalidateQueries({ queryKey: getGetClusterQueryKey() }),
+    queryClient.invalidateQueries({ queryKey: getListNodesQueryKey() }),
+  ]);
 
 /**
  * The join command for a new witness. A join token carries no role

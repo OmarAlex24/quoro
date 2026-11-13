@@ -81,6 +81,48 @@ describe('HaVotesView with two voters', () => {
     expect(html).not.toContain('Create a join token');
   });
 
+  it('says to start the node agent after the join command, and only once a token exists', () => {
+    const token: NodeJoinTokenCreated = {
+      id: 'njt_01JCA0A1B2C3D4E5F6G7H8J9KM',
+      token: 'njt_secret',
+      expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+      join_command: 'quoro join https://10.0.0.3:8443 --token njt_secret --fingerprint 4f1c',
+    };
+    const text = (html: string) => html.replace(/<[^>]*>/g, '');
+    const html = render(votes, nodes, { joinToken: token });
+    expect(text(html)).toMatch(
+      /--role witness.*Then start the node agent on that machine with quoro node, and keep it running\. Until it connects, the witness cannot vote\./s,
+    );
+    expect(html).toContain('<code class="type-code">quoro node</code>');
+    expect(render(votes, nodes)).not.toContain('quoro node');
+  });
+
+  it('notes that a candidate which is not connected votes only once its agent connects', () => {
+    const away = node('lab-edge', ['edge'], { status: 'disconnected' });
+    const html = render(votes, [lab3, lab4, away]);
+    const note = 'Not connected. It gets the role now and can vote once its node agent connects.';
+    expect(html).toContain(`<p id="ha-cand-note-${away.id}" class="ha-cand-note">${note}</p>`);
+    // The button stays enabled, as the server takes the role, and points at the note.
+    expect(html).toMatch(new RegExp(`<button[^>]*aria-describedby="ha-cand-note-${away.id}"[^>]*>Add the witness role`));
+    expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*aria-describedby/);
+  });
+
+  it('adds no note to a connected candidate', () => {
+    const html = render(votes, nodes);
+    expect(html).not.toContain('ha-cand-note');
+    expect(html).not.toContain('aria-describedby');
+  });
+
+  it('keeps the votes when a refetch failed, with a quiet line beside them', () => {
+    const html = render(votes, nodes, { stale: problemView(new TypeError('Failed to fetch'), 'see the voters') });
+    expect(html).toContain('HA needs a third vote');
+    expect(html).toContain('Add the witness role');
+    expect(html).toMatch(
+      /<p class="ha-stale" role="status">.*These votes may be out of date\. Could not reach the server\. Check the connection and try again\./,
+    );
+    expect(html).not.toContain('role="alert"');
+  });
+
   it('shows the server words of a 409 and says to wait and try again', () => {
     const detail =
       'the previous voter-set change has not reached a majority of voters yet; try again once they have acknowledged it';
@@ -137,6 +179,15 @@ describe('HaVotesView with three voters', () => {
     votes.voters[1] = { ...votes.voters[1]!, connected: false };
     const html = render(votes, nodes);
     expect(html).toContain('<b>lab-4</b><span>node, edge</span><span class="text-fault">Disconnected</span>');
+  });
+
+  it('keeps the quiet line when a refetch failed, with the line beside it', () => {
+    const html = render(votesOf([lab3, lab4, witness], true), nodes, {
+      stale: problemView(new TypeError('Failed to fetch'), 'see the voters'),
+    });
+    expect(html).toContain('HA is ready.');
+    expect(html).toContain('These votes may be out of date.');
+    expect(render(votesOf([lab3, lab4, witness], true), nodes)).not.toContain('ha-stale');
   });
 
   it('waits for a majority before ha_ready, still without an offer', () => {

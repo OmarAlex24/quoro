@@ -1,9 +1,17 @@
+import { QueryClient } from '@tanstack/react-query';
 import { describe, expect, it } from 'vitest';
 import { ApiProblem } from '../api/fetcher';
+import { getGetClusterQueryKey } from '../api/generated/cluster/cluster';
 import type { ClusterVoter, ClusterVotes, Node } from '../api/generated/model';
+import { getListNodesQueryKey } from '../api/generated/nodes/nodes';
+import { getListVmsQueryKey } from '../api/generated/vms/vms';
 import {
+  candidateNote,
   haReadout,
+  haVotesState,
   missingVoteWords,
+  refreshVoters,
+  shortOfVotes,
   tallyWords,
   witnessCandidates,
   witnessJoinCommand,
@@ -163,5 +171,103 @@ describe('witnessProblem', () => {
     const offline = witnessProblem(new TypeError('Failed to fetch'));
     expect(offline.view.message).toBe('Could not reach the server. Check the connection and try again.');
     expect(offline.hint).toBeNull();
+  });
+});
+
+describe('shortOfVotes', () => {
+  // The HA view keeps a join token only while this holds (`HaVotes`).
+  it('holds while HA lacks a vote, so a join token stays', () => {
+    expect(shortOfVotes(votes([voter(lab3), voter(lab4)]))).toBe(true);
+    expect(shortOfVotes(votes([voter(lab3)]))).toBe(true);
+    expect(shortOfVotes(votes([]))).toBe(true);
+  });
+
+  it('ends once the count reaches required, before ha_ready, so the token goes', () => {
+    expect(shortOfVotes(votes([voter(lab3), voter(lab4), voter(edge)], false))).toBe(false);
+    expect(shortOfVotes(votes([voter(lab3), voter(lab4), voter(edge)], true))).toBe(false);
+    expect(shortOfVotes(votes([voter(lab3), voter(lab4), voter(edge)], true, 2))).toBe(false);
+  });
+
+  it('counts a disconnected voter, as the server does', () => {
+    expect(shortOfVotes(votes([voter(lab3), voter(lab4), voter(edge, false)]))).toBe(false);
+  });
+
+  it('does not hold with no votes yet', () => {
+    expect(shortOfVotes(undefined)).toBe(false);
+  });
+
+  it('agrees with the readout', () => {
+    for (const list of [[], [voter(lab3)], [voter(lab3), voter(lab4)], [voter(lab3), voter(lab4), voter(edge)]]) {
+      const current = votes(list);
+      expect(shortOfVotes(current)).toBe(haReadout(current, []).state === 'short');
+    }
+  });
+});
+
+describe('haVotesState', () => {
+  const current = votes([voter(lab3), voter(lab4)]);
+  const offline = new TypeError('Failed to fetch');
+
+  it('shows the votes when they arrived', () => {
+    expect(haVotesState({ votes: current, error: null, loading: false })).toEqual({
+      kind: 'votes',
+      votes: current,
+      stale: null,
+    });
+  });
+
+  it('keeps the last votes when a refetch fails, and says why beside them', () => {
+    const state = haVotesState({ votes: current, error: offline, loading: false });
+    expect(state.kind).toBe('votes');
+    if (state.kind !== 'votes') return;
+    expect(state.votes).toBe(current);
+    expect(state.stale?.message).toBe('Could not reach the server. Check the connection and try again.');
+  });
+
+  it('says why when the call fails before any votes arrived', () => {
+    const forbidden = new ApiProblem({ status: 403, code: 'forbidden', reason: 'scope_missing' });
+    expect(haVotesState({ votes: undefined, error: forbidden, loading: false })).toEqual({
+      kind: 'failed',
+      problem: { message: "Your role can't see the voters (scope_missing)", code: 'forbidden', reason: 'scope_missing' },
+    });
+  });
+
+  it('is loading until the first answer, and hidden while the query is off', () => {
+    expect(haVotesState({ votes: undefined, error: null, loading: true })).toEqual({ kind: 'loading' });
+    expect(haVotesState({ votes: undefined, error: undefined, loading: false })).toEqual({ kind: 'hidden' });
+  });
+});
+
+describe('candidateNote', () => {
+  it('says nothing about a connected machine', () => {
+    expect(candidateNote(edge)).toBeNull();
+  });
+
+  it('says what adding the role does to a machine that is not connected', () => {
+    const note = 'Not connected. It gets the role now and can vote once its node agent connects.';
+    expect(candidateNote(node('lab-edge', ['edge'], { status: 'disconnected' }))).toBe(note);
+    expect(candidateNote(node('lab-edge', ['edge'], { status: 'pending' }))).toBe(note);
+    expect(candidateNote(node('lab-edge', ['edge'], { status: 'fenced' }))).toBe(note);
+  });
+});
+
+describe('refreshVoters', () => {
+  const invalidated = (client: QueryClient, key: readonly unknown[]): boolean | undefined =>
+    client.getQueryState(key)?.isInvalidated;
+
+  it('reads the votes and every page of the node list again, and leaves other lists alone', async () => {
+    const client = new QueryClient();
+    const nodesPage = getListNodesQueryKey({ limit: 500 });
+    client.setQueryData(getGetClusterQueryKey(), { votes: votes([voter(lab3)]) });
+    client.setQueryData(getListNodesQueryKey(), { items: [lab3] });
+    client.setQueryData(nodesPage, { items: [lab3] });
+    client.setQueryData(getListVmsQueryKey(), { items: [] });
+
+    await refreshVoters(client);
+
+    expect(invalidated(client, getGetClusterQueryKey())).toBe(true);
+    expect(invalidated(client, getListNodesQueryKey())).toBe(true);
+    expect(invalidated(client, nodesPage)).toBe(true);
+    expect(invalidated(client, getListVmsQueryKey())).toBe(false);
   });
 });

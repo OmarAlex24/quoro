@@ -2,9 +2,10 @@
 import { useMutation } from '@tanstack/react-query';
 import { Plus } from 'lucide-react';
 import { useState, type ReactElement } from 'react';
-import { createNodeJoinToken } from '../api/generated/nodes/nodes';
+import type { NodeJoinTokenCreated } from '../api/generated/model';
 import { expiryWords } from '../lib/agency-format';
 import { canEnrollNodes } from '../lib/capabilities';
+import { createJoinToken } from '../lib/join-token';
 import { problemView } from '../lib/problem';
 import { useSession } from '../session';
 import { SecretOnce } from './secret-once';
@@ -17,15 +18,16 @@ const INVITE = 'Create a join token and run the installer on the new machine.';
 /**
  * Adding a node: a join token (`createNodeJoinToken`) and the one-line
  * command that enrolls the new machine, shown once in `SecretOnce`, as the HA
- * view's witness offer shows it. The secret lives in the mutation's result
- * only; closing the dialog drops it. Only an owner or an operator can create
- * a token; for anyone else the invitation is not shown. `trigger` is the
- * control that opens it; focus goes back to it when the dialog closes.
+ * view's witness offer shows it, with how the installer takes it. The secret
+ * lives in the mutation's result only; closing the dialog drops it. Only an
+ * owner or an operator can create a token; for anyone else the invitation is
+ * not shown. `trigger` is the control that opens it; focus goes back to it
+ * when the dialog closes.
  */
 export function AddNodeDialog({ trigger }: { trigger: ReactElement }) {
   const [open, setOpen] = useState(false);
   const joinToken = useMutation({
-    mutationFn: () => createNodeJoinToken({}, { headers: { 'Idempotency-Key': crypto.randomUUID() } }),
+    mutationFn: () => createJoinToken(),
   });
   const close = (next: boolean) => {
     if (!next) joinToken.reset();
@@ -39,17 +41,7 @@ export function AddNodeDialog({ trigger }: { trigger: ReactElement }) {
       <DialogContent title="Add a node" description={INVITE}>
         <div className="grid gap-3">
           {joinToken.data ? (
-            <>
-              <SecretOnce
-                label="Run this on the new machine"
-                secret={joinToken.data.join_command}
-                copyLabel="Copy command"
-                note={`The token is shown only this once and expires ${expiryWords(joinToken.data.expires_at)}.`}
-              />
-              <Button className="justify-self-end" onClick={() => close(false)}>
-                Done
-              </Button>
-            </>
+            <JoinCommand token={joinToken.data} onDone={() => close(false)} />
           ) : (
             <>
               <p className="text-[13px] leading-snug text-ink-2">
@@ -70,6 +62,34 @@ export function AddNodeDialog({ trigger }: { trigger: ReactElement }) {
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/**
+ * The token, once: the join command the server built, and how to use it. The
+ * command only enrolls; the installer runs it with `QUORO_ROLE=node` and then
+ * starts the node agent, so the words point there instead of to the command
+ * alone.
+ */
+export function JoinCommand({ token, onDone }: { token: NodeJoinTokenCreated; onDone: () => void }) {
+  return (
+    <>
+      <SecretOnce
+        label="Join command for the new machine"
+        secret={token.join_command}
+        copyLabel="Copy command"
+        note={`The token is shown only this once and expires ${expiryWords(token.expires_at)}.`}
+      />
+      <p className="next-step">
+        Run the installer on the new machine with <code className="type-code">QUORO_ROLE=node</code>, and this
+        command’s URL, token and fingerprint in <code className="type-code">QUORO_JOIN_URL</code>,{' '}
+        <code className="type-code">QUORO_JOIN_TOKEN</code> and <code className="type-code">QUORO_JOIN_FINGERPRINT</code>.
+        It runs the command for you and starts the node agent, <code className="type-code">quoro-node.service</code>.
+      </p>
+      <Button className="justify-self-end" onClick={onDone}>
+        Done
+      </Button>
+    </>
   );
 }
 
