@@ -7979,7 +7979,13 @@ paths:
           refused for that wait nor held open by it: it answers once the
           change that moves the lease commits, and the grant follows
           (ADR 0292). `App.lease.grant_pending` and
-          `App.lease.grant_waiting_on` show the wait.
+          `App.lease.grant_waiting_on` show the wait. The change itself
+          waits for the lease's gate: when the holder is declared lost and
+          the row reads `local` while the primary keeps a gate for the
+          lease in memory, as after the write that ends an `expiring`
+          lease's renewals, the call stays open until that gate passes
+          (section 8.3), as it does after a connected source's revoke
+          (below).
 
         When the source is connected, the primary first revokes its lease
         over the session; that loses the writes made since the last shipped
