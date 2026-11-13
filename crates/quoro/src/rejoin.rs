@@ -42,6 +42,7 @@
 //! fakes; the unit directory, systemd's unit directories, the journal
 //! socket, `/proc` and the clock are fields of [`Options`].
 
+use crate::host::{DATABASE, NODE_UNIT, Out, UNIT, systemctl, systemctl_check};
 use sqlx::Connection as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
 use std::fs;
@@ -53,14 +54,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// The control-plane unit.
-const UNIT: &str = "quoro.service";
 /// The control-plane unit's drop-in directory.
 const DROP_IN: &str = "quoro.service.d";
 /// The directory inside the copy that holds the unit file and its drop-ins.
 const SYSTEMD_DIR: &str = "systemd";
-/// The control-plane database inside the data directory.
-const DATABASE: &str = "quoro.db";
 /// The node agent's store inside the node data directory.
 const AGENT_STORE: &str = "node.db";
 /// Written first in the copy, before anything else changes.
@@ -74,8 +71,6 @@ const TERM_CEILING: u64 = (1 << 53) - 1;
 /// The states of `systemctl is-active` in which the unit counts as stopped.
 /// Any other state, one a later systemd adds included, refuses the moves.
 const STOPPED_STATES: [&str; 2] = ["inactive", "failed"];
-/// The node agent's unit.
-const NODE_UNIT: &str = "quoro-node.service";
 /// The directories systemd loads system units from, highest priority first
 /// (`systemd.unit(5)`, "Unit File Load Path"), and `/lib/systemd/system` of a
 /// system whose `/usr` is not merged.
@@ -192,24 +187,11 @@ pub struct RealSystemd;
 
 impl RealSystemd {
     fn run(args: &[&str]) -> Result<std::process::Output, String> {
-        std::process::Command::new("systemctl")
-            .args(args)
-            .output()
-            .map_err(|e| format!("cannot run systemctl {}: {e}", args.join(" ")))
+        systemctl(args)
     }
 
     fn check(args: &[&str]) -> Result<(), String> {
-        let output = Self::run(args)?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "systemctl {}: {}: {}",
-                args.join(" "),
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
-        }
+        systemctl_check(args)
     }
 }
 
@@ -462,41 +444,6 @@ pub enum Outcome {
     AlreadyRejoined(PathBuf),
     /// The host is a node again; everything is in this copy.
     Rejoined(PathBuf),
-}
-
-/// The lines the command prints on stdout, kept for the tests.
-pub struct Out {
-    /// Every line, in order.
-    pub lines: Vec<String>,
-    echo: bool,
-}
-
-impl Out {
-    /// Prints each line as it comes.
-    #[must_use]
-    pub fn printing() -> Self {
-        Self {
-            lines: Vec::new(),
-            echo: true,
-        }
-    }
-
-    /// Keeps the lines without printing them.
-    #[cfg(test)]
-    fn quiet() -> Self {
-        Self {
-            lines: Vec::new(),
-            echo: false,
-        }
-    }
-
-    fn say(&mut self, line: impl Into<String>) {
-        let line = line.into();
-        if self.echo {
-            println!("{line}");
-        }
-        self.lines.push(line);
-    }
 }
 
 /// `quoro node rejoin [--config PATH] [--force --statement "<why>"]`.

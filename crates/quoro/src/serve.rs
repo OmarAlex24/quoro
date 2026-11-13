@@ -383,8 +383,9 @@ impl DigestResolver for RegistryResolver {
 }
 
 /// The address the local node agent dials: the bound address, with an
-/// unspecified host (`0.0.0.0`, `::`) replaced by loopback.
-fn loopback(address: SocketAddr) -> SocketAddr {
+/// unspecified host (`0.0.0.0`, `::`) replaced by loopback. A promoted
+/// primary's agent dials the same address (`promote::prepare`).
+pub(crate) fn loopback(address: SocketAddr) -> SocketAddr {
     let ip = match address.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),

@@ -14,11 +14,16 @@ mod advertise;
 mod audit_cli;
 mod config;
 mod control;
+mod host;
 mod mcp_stdio;
 mod node;
 mod null_engine;
 mod panel;
 mod privilege;
+// The command `quoro cluster promote` (#19) calls these layers; until it lands
+// nothing outside their tests does.
+#[allow(dead_code, reason = "quoro cluster promote (#19) does not call it yet")]
+mod promote;
 mod rejoin;
 mod restore;
 mod serve;
