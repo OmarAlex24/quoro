@@ -18,18 +18,20 @@ use quoro_control_plane::auth::{Credential, Identity, Principal, UserIdentity};
 use quoro_control_plane::backups::{Bucket, BucketFactory, BucketStore, RepositoryTarget};
 use quoro_control_plane::changelog::{self, Actor, Op};
 use quoro_control_plane::deploy;
-use quoro_control_plane::rebuild::database::{self, Built, FollowedEntry};
+use quoro_control_plane::rebuild::database::{self, Built};
 use quoro_control_plane::request::CallCtx;
 use quoro_control_plane::store::{Store, random_secret};
+use quoro_control_plane::vulns::osv::{Affected, Event, Range, Record, Severity};
+use quoro_control_plane::vulns::subjects;
 use quoro_proto::custody::{self, CustodyKey};
 use quoro_proto::wire::{
-    self, Capacity as WireCapacity, Health, Heartbeat, Kvm as WireKvm, NodeMessage, ObservedStatus,
-    StatusReport, VmStatus, VolumeState as WireVolumeState, VolumeStatus,
+    self, Capacity as WireCapacity, EventBody, Health, Heartbeat, Kvm as WireKvm, NodeMessage,
+    ObservedStatus, QuarantineStatus, StatusReport, VmStatus, VolumeState as WireVolumeState,
+    VolumeStatus,
 };
 use quoro_providers::object_store::{MemoryStore, ObjectInfo, ObjectStore, ObjectStoreError};
 use quoro_types::{Prefix, Role, new_id};
 use serde_json::{Map, Value, json};
-use sqlx::Row as _;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -317,7 +319,11 @@ async fn open(server: &Server, node: &Enrolled, key: &CustodyKey) -> Socket {
     socket
 }
 
-fn status_report(applied_rev: u64, volumes: Vec<VolumeStatus>) -> NodeMessage {
+fn status_report(
+    applied_rev: u64,
+    volumes: Vec<VolumeStatus>,
+    quarantines: Vec<QuarantineStatus>,
+) -> NodeMessage {
     NodeMessage::StatusReport(StatusReport {
         applied_rev,
         vms: Vec::new(),
@@ -335,8 +341,50 @@ fn status_report(applied_rev: u64, volumes: Vec<VolumeStatus>) -> NodeMessage {
         volumes,
         images: Vec::new(),
         warm: Vec::new(),
-        quarantines: Vec::new(),
+        quarantines,
     })
+}
+
+/// The volume `volume_id` as its node reports it once it is ready.
+fn ready(volume_id: &str) -> VolumeStatus {
+    VolumeStatus {
+        volume_id: volume_id.to_string(),
+        state: WireVolumeState::Ready,
+        allocated_bytes: Some(4096),
+        error: None,
+    }
+}
+
+/// A Linux kernel record that affects the node's kernel, 6.9.0.
+fn kernel_record() -> Record {
+    Record {
+        id: "CVE-2026-98431".to_owned(),
+        modified: "2026-01-01T00:00:00Z".to_owned(),
+        summary: Some("CVE-2026-98431 summary".to_owned()),
+        severity: vec![Severity {
+            kind: "CVSS_V3".to_owned(),
+            score: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_owned(),
+        }],
+        affected: vec![Affected {
+            ecosystem: "Linux".to_owned(),
+            package: "Kernel".to_owned(),
+            ranges: vec![Range {
+                kind: "ECOSYSTEM".to_owned(),
+                events: vec![
+                    Event {
+                        introduced: Some("6.9.0".to_owned()),
+                        ..Default::default()
+                    },
+                    Event {
+                        fixed: Some("6.9.10".to_owned()),
+                        ..Default::default()
+                    },
+                ],
+            }],
+            versions: Vec::new(),
+        }],
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,32 +473,6 @@ fn owner_ctx(owner_id: &str) -> CallCtx {
 // Reading a database
 // ---------------------------------------------------------------------------
 
-/// The change log of `store`, as a node follows and stores it.
-async fn followed(store: &Store) -> Vec<FollowedEntry> {
-    let rows = sqlx::query(
-        "SELECT seq, term, time, actor_type, actor_id, entity_type, entity_id, op, payload, \
-         prev_hash, hash FROM change_log ORDER BY seq",
-    )
-    .fetch_all(store.pool())
-    .await
-    .unwrap();
-    rows.iter()
-        .map(|row| FollowedEntry {
-            seq: row.get::<i64, _>(0).unsigned_abs(),
-            term: row.get::<i64, _>(1).unsigned_abs(),
-            time: row.get(2),
-            actor_type: row.get(3),
-            actor_id: row.get(4),
-            entity_type: row.get(5),
-            entity_id: row.get(6),
-            op: row.get(7),
-            payload: row.get(8),
-            prev_hash: row.get(9),
-            hash: row.get(10),
-        })
-        .collect()
-}
-
 /// The row `filter` selects in `table`, as a payload carrying every column
 /// under its name: a JSON object or array in a TEXT column parsed, an
 /// integer as an integer, NULL as null. What a writer that logs the whole
@@ -529,14 +551,18 @@ async fn snapshot(server: &Server, dir: &Path) -> Store {
 
 /// Section 7.3 step 4 (ADR 0228, ADR 0297, ADR 0317, ADR 0322): a primary
 /// runs apps, deployments, a volume and its lease, environment variables,
-/// tokens, agents with keys and a grant, providers, the backup repository
-/// and a backup, the off-site audit export, a node with its custody seals
-/// and its tunnel, a webhook, a user deleted with its tokens, and an app
-/// deleted by an older writer that relied on the schema's cascade and then
-/// created again under the same id. The database built from its change log
-/// holds every replicated table row for row as the primary does, the change
-/// log entry for entry; `repo_key_enc` is an empty BLOB, the LOCAL tables
-/// are empty, and `meta` holds the four keys section 7.3 names.
+/// tokens, agents with keys and grants, a decided approval and the grant it
+/// issued, providers, the backup repository and a backup, the off-site audit
+/// export, a node with its custody seals and its tunnel, a domain, a
+/// webhook, an incident and the event that triggered it, a finding of the
+/// node's host kernel, a quarantined copy of a volume, a Git app's queued
+/// build, a user deleted with its tokens, and an app deleted by an older
+/// writer that relied on the schema's cascade and then created again under
+/// the same id, so that no replicated table is empty. The database built
+/// from its change log holds every replicated table row for row as the
+/// primary does, a JSON text column as the same JSON value, the change log
+/// entry for entry; `repo_key_enc` is an empty BLOB, the LOCAL tables are
+/// empty, and `meta` holds the four keys section 7.3 names.
 #[tokio::test]
 async fn the_built_database_holds_every_replicated_row_of_the_primary() {
     let mock = start_mock().await;
@@ -625,17 +651,10 @@ async fn the_built_database_holds_every_replicated_row_of_the_primary() {
     .await;
     let volume_id = volume["id"].as_str().unwrap().to_string();
     let snapshot_frame = recv_type(&mut socket, "desired_state").await;
+    let rev = snapshot_frame["body"]["rev"].as_u64().unwrap_or(1);
     send(
         &mut socket,
-        status_report(
-            snapshot_frame["body"]["rev"].as_u64().unwrap_or(1),
-            vec![VolumeStatus {
-                volume_id: volume_id.clone(),
-                state: WireVolumeState::Ready,
-                allocated_bytes: Some(4096),
-                error: None,
-            }],
-        ),
+        status_report(rev, vec![ready(&volume_id)], Vec::new()),
     )
     .await;
     wait_for(
@@ -730,6 +749,16 @@ async fn the_built_database_holds_every_replicated_row_of_the_primary() {
     )
     .await;
 
+    // A domain of the app, served through the tunnel.
+    post(
+        &owner,
+        &server,
+        &format!("/api/v1/apps/{app_id}/domains"),
+        json!({"hostname": "web.example.com", "tls_mode": "tunnel", "provider_id": tunnel_provider["id"]}),
+        201,
+    )
+    .await;
+
     // Tokens, and a user deleted with theirs, a revoked one included.
     post(
         &owner,
@@ -813,6 +842,14 @@ async fn the_built_database_holds_every_replicated_row_of_the_primary() {
         201,
     )
     .await;
+    post(
+        &owner,
+        &server,
+        "/api/v1/grants",
+        json!({"agent_id": agent_id, "scopes": ["app:read", "approval:create"], "selector": {"projects": ["demo"]}, "ttl_s": 3600, "reason": "tests"}),
+        201,
+    )
+    .await;
     let res = reqwest::Client::new()
         .post(server.url("/api/v1/auth/agent-token"))
         .header(
@@ -824,6 +861,37 @@ async fn the_built_database_holds_every_replicated_row_of_the_primary() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200, "mint: {}", res.text().await.unwrap());
+    let minted: Value = res.json().await.unwrap();
+    let agent_token = minted["access_token"].as_str().unwrap().to_string();
+
+    // A decided approval and the one-use grant it issued, which point at
+    // each other.
+    let res = reqwest::Client::new()
+        .post(server.url("/api/v1/approvals"))
+        .header("Authorization", format!("Bearer {agent_token}"))
+        .json(&json!({
+            "scope": "app:delete",
+            "target": {"type": "app", "id": app_id},
+            "operation": "DELETE /api/v1/apps/{app_id}",
+            "params": {"app_id": app_id},
+            "justification": "the build test needs a decided approval",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "approval: {}", res.text().await.unwrap());
+    let approval: Value = res.json().await.unwrap();
+    let approved = post_empty(
+        &owner,
+        &server,
+        &format!(
+            "/api/v1/approvals/{}/approve",
+            approval["id"].as_str().unwrap()
+        ),
+        200,
+    )
+    .await;
+    assert!(approved["grant_id"].is_string(), "{approved}");
     post(
         &owner,
         &server,
@@ -842,6 +910,111 @@ async fn the_built_database_holds_every_replicated_row_of_the_primary() {
         201,
     )
     .await;
+
+    // The node reports the app down, which opens an incident that names the
+    // event as its trigger.
+    let down_id = new_id(Prefix::Event);
+    send(
+        &mut socket,
+        NodeMessage::Event(EventBody {
+            schema_version: 1,
+            id: down_id.clone(),
+            kind: "app.down".to_string(),
+            time: "2026-11-13T10:15:32Z".to_string(),
+            source: json!({"kind": "node", "node_id": node.node_id}),
+            subject: json!({"type": "app", "id": app_id}),
+            project_id: Some(project_id.clone()),
+            incident_id: None,
+            request_id: None,
+            actor: Some(json!({"type": "node", "id": node.node_id})),
+            data: json!({
+                "app_id": app_id,
+                "node_id": node.node_id,
+                "check": "health_check",
+                "failures": 3,
+                "last_error": "connect: connection refused",
+            }),
+        }),
+    )
+    .await;
+    wait_for(
+        &server,
+        &format!("SELECT 1 FROM incidents WHERE trigger_event_id = '{down_id}'"),
+        "the incident the app.down opens",
+    )
+    .await;
+
+    // A finding of the node's host kernel, written by the reconcile of the
+    // host kernels against the cached Linux data.
+    server
+        .state
+        .vulns
+        .cache()
+        .replace_bucket("Linux", vec![kernel_record()])
+        .await
+        .unwrap();
+    let kernels = subjects::node_kernels(&server.state).await.unwrap();
+    subjects::reconcile_host_kernels(&server.state, &kernels)
+        .await
+        .unwrap();
+    wait_for(
+        &server,
+        &format!(
+            "SELECT 1 FROM vulnerability_findings WHERE node_id = '{}'",
+            node.node_id
+        ),
+        "the host kernel's finding",
+    )
+    .await;
+
+    // A quarantined copy of the volume, reported with its hash, which the
+    // primary records.
+    let quarantine_id = "qrn_01JC9Z6Q5W8N3K4T7R2M000001";
+    send(
+        &mut socket,
+        status_report(
+            rev,
+            vec![ready(&volume_id)],
+            vec![QuarantineStatus {
+                quarantine_id: quarantine_id.to_string(),
+                volume_id: volume_id.clone(),
+                app_id: app_id.clone(),
+                created_at: "2026-11-09T10:00:00Z".to_string(),
+                size_bytes: 1 << 20,
+                sha256: Some("a".repeat(64)),
+            }],
+        ),
+    )
+    .await;
+    wait_for(
+        &server,
+        &format!("SELECT 1 FROM volume_quarantines WHERE id = '{quarantine_id}'"),
+        "the quarantined copy being recorded",
+    )
+    .await;
+
+    // A Git app with a build queued on the node.
+    let site = post(
+        &owner,
+        &server,
+        "/api/v1/apps",
+        json!({
+            "project_id": project_id, "name": "site", "port": 8080,
+            "source": {"kind": "git", "repo_url": "https://github.com/example/blog.git", "ref": "main"},
+        }),
+        201,
+    )
+    .await;
+    let res = owner
+        .post(server.url(&format!(
+            "/api/v1/apps/{}/builds",
+            site["id"].as_str().unwrap()
+        )))
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "build: {}", res.text().await.unwrap());
 
     // An app deleted the way an older writer did it: only the app's own
     // delete is logged, and the schema's cascade removes its variable with
@@ -903,7 +1076,7 @@ async fn the_built_database_holds_every_replicated_row_of_the_primary() {
         Dir(std::env::temp_dir().join(format!("quoro-test-build-{}", &random_secret()[..12])));
     std::fs::create_dir_all(&dir.0).unwrap();
     let primary = snapshot(&server, &dir.0).await;
-    let entries = followed(&primary).await;
+    let entries = replay::followed(&primary).await;
     let term: String =
         sqlx::query_scalar("SELECT IFNULL((SELECT value FROM meta WHERE key = 'term'), '1')")
             .fetch_one(primary.pool())
@@ -943,35 +1116,20 @@ async fn the_built_database_holds_every_replicated_row_of_the_primary() {
         );
         assert_eq!(*rows, u64::try_from(original.len()).unwrap(), "{table}");
     }
-    for table in [
-        "users",
-        "api_tokens",
-        "agents",
-        "agent_keys",
-        "grants",
-        "projects",
-        "apps",
-        "app_env",
-        "deployments",
-        "vms",
-        "volumes",
-        "leases",
-        "backups",
-        "backup_repositories",
-        "providers",
-        "audit_exports",
-        "audit_log",
-        "events",
-        "nodes",
-        "node_credentials",
-        "node_join_tokens",
-        "node_key_custody",
-        "node_tunnels",
-        "signing_keys",
-        "webhooks",
-    ] {
-        assert!(built.rows[table] > 0, "the scenario leaves {table} empty");
-    }
+    // No replicated table is empty on either side.
+    let empty: Vec<&str> = built
+        .rows
+        .iter()
+        .filter(|(_, rows)| **rows == 0)
+        .map(|(table, _)| *table)
+        .collect();
+    assert!(empty.is_empty(), "the scenario leaves {empty:?} empty");
+    assert_eq!(
+        built.rows.values().filter(|rows| **rows > 0).count(),
+        31,
+        "{:?}",
+        built.rows
+    );
     assert_eq!(
         built.rows["api_tokens"], 1,
         "the operator's tokens left with them"

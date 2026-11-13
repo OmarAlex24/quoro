@@ -121,93 +121,31 @@ pub async fn rebuild(server: &Server, entity_types: &[&str]) -> Store {
     store
 }
 
-/// One change-log entry as [`fold`] reads it.
-pub struct Entry {
-    pub seq: i64,
-    pub entity_type: String,
-    pub entity_id: String,
-    pub op: String,
-    pub payload: Value,
-}
-
-/// A final row of [`fold`]: `(entity_type, entity_id, row)`.
-pub type FoldedRow = (String, String, serde_json::Map<String, Value>);
-
-/// One entity's row as the fold has it so far.
-struct Folded {
-    first_seq: i64,
-    /// Whether the entity received a `create` at all.
-    ever_created: bool,
-    /// Whether the current row starts with a `create`: false until the
-    /// first `create` and again after each `delete`, so updates that follow
-    /// a delete make a row of updates only.
-    created: bool,
-    row: Option<serde_json::Map<String, Value>>,
-}
-
-/// Folds `entries`, in `seq` order, per entity as the promotion's fold does
-/// (section 7.3 step 4, ADR 0317): a `create` replaces the entity's row, an
-/// `update` merges over it, or over an empty row when it has none, and a
-/// `delete` removes it. Returns the final rows, ordered by the `seq` of each
-/// entity's first entry; a deleted entity has none. [`rebuild`] does not use
-/// it: it folds with the promotion's own `rebuild::fold`.
-///
-/// # Errors
-///
-/// A message naming the entity and the `seq` of its first entry when the
-/// entity never received a `create`, or when its final row is made only of
-/// updates, which updates that follow its last `delete` make: the fold
-/// never inserts a row made only of updates. Also on an unknown op.
-pub fn fold(entries: impl IntoIterator<Item = Entry>) -> Result<Vec<FoldedRow>, String> {
-    let mut folded: std::collections::BTreeMap<(String, String), Folded> =
-        std::collections::BTreeMap::new();
-    for entry in entries {
-        let fields = entry.payload.as_object().cloned().unwrap_or_default();
-        let entity = folded
-            .entry((entry.entity_type, entry.entity_id))
-            .or_insert_with(|| Folded {
-                first_seq: entry.seq,
-                ever_created: false,
-                created: false,
-                row: None,
-            });
-        match entry.op.as_str() {
-            "create" => {
-                entity.ever_created = true;
-                entity.created = true;
-                entity.row = Some(fields);
-            }
-            "update" => entity
-                .row
-                .get_or_insert_with(Default::default)
-                .extend(fields),
-            "delete" => {
-                entity.created = false;
-                entity.row = None;
-            }
-            other => return Err(format!("seq {}: unknown op {other}", entry.seq)),
-        }
-    }
-    let mut folded: Vec<_> = folded.into_iter().collect();
-    folded.sort_by_key(|(_, entity)| entity.first_seq);
-    let mut rows = Vec::new();
-    for ((entity_type, entity_id), entity) in folded {
-        let at = format!(
-            "{entity_type} {entity_id}, first entry seq {}",
-            entity.first_seq
-        );
-        if !entity.ever_created {
-            return Err(format!("{at}: never received a create"));
-        }
-        let Some(row) = entity.row else { continue };
-        if !entity.created {
-            return Err(format!(
-                "{at}: its row after its last delete is made only of updates"
-            ));
-        }
-        rows.push((entity_type, entity_id, row));
-    }
-    Ok(rows)
+/// The change log of `store` in `seq` order, as a node follows and stores
+/// it: what `rebuild::database::build` takes.
+pub async fn followed(store: &Store) -> Vec<database::FollowedEntry> {
+    let rows = sqlx::query(
+        "SELECT seq, term, time, actor_type, actor_id, entity_type, entity_id, op, payload, \
+         prev_hash, hash FROM change_log ORDER BY seq",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    rows.iter()
+        .map(|row| database::FollowedEntry {
+            seq: row.get::<i64, _>(0).unsigned_abs(),
+            term: row.get::<i64, _>(1).unsigned_abs(),
+            time: row.get(2),
+            actor_type: row.get(3),
+            actor_id: row.get(4),
+            entity_type: row.get(5),
+            entity_id: row.get(6),
+            op: row.get(7),
+            payload: row.get(8),
+            prev_hash: row.get(9),
+            hash: row.get(10),
+        })
+        .collect()
 }
 
 /// `columns` of every row of `table`, ordered by its key. A JSON object or
