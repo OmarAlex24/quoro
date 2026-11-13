@@ -1,13 +1,11 @@
 //! The host preparation of `quoro cluster promote` on a host laid out in a
-//! temporary directory, with a fake systemd, account database, owner change
-//! and clock, so nothing needs root.
+//! temporary directory, with a fake systemd, account database, owner change,
+//! listener and clock, so nothing needs root.
 
 use super::*;
 use quoro_node_agent::identity::{self, Identity};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
-use std::net::TcpListener;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The uid and gid the fake `useradd` gives `quoro-api`.
@@ -16,6 +14,50 @@ const SYSTEM_GID: u32 = 996;
 
 /// What `install_primary_config` writes above `local = false`.
 const ADDED: &str = "# The node agent runs as quoro-node.service (ADR 0089).\nlocal = false\n";
+
+/// A node host's `quoro.toml` as `install_node_config` writes it: no
+/// `listen` and no `data_dir`, so the defaults apply.
+const NODE_CONFIG: &str = "\
+# Quoro configuration (ADR 0089 privilege split).
+# This host is a node: it runs microVMs for its primary and runs no
+# control plane. Edit this file and restart with:
+#   systemctl restart quoro-node
+
+# Engine: \"cloud-hypervisor\" runs one microVM per app; \"fake\" runs nothing
+# and exists for development only. An edge starts no VM, so the agent
+# ignores this line and runs without an engine.
+engine = \"cloud-hypervisor\"
+
+# Engine settings. The values below are the defaults, and the block is
+# commented out; uncomment a line only to change it. Guest DNS defaults
+# to this host's non-loopback resolvers; set dns to override them.
+# [cloud_hypervisor]
+# artifacts_dir = \"/usr/local/lib/quoro\"
+# init_binary = \"/usr/local/lib/quoro/quoro-init\"
+# state_dir = \"/var/lib/quoro-node/engine\"
+# bridge = \"quoro0\"
+# subnet = \"10.42.0.0/24\"
+# dns = [\"192.0.2.53\"]
+
+[node]
+# The identity, local store and engine state of the agent on this host.
+# data_dir = \"/var/lib/quoro-node\"
+";
+
+/// The address the agent dials with the default `listen`, `0.0.0.0:8443`.
+const LOOPBACK: &str = "127.0.0.1:8443";
+
+/// What the promotion wrote in the data directory before this step, as
+/// root: the database with its WAL and shared-memory files, and the keys.
+const WRITTEN: [&str; 7] = [
+    "quoro.db",
+    "quoro.db-wal",
+    "quoro.db-shm",
+    "keys/signing.key",
+    "keys/data.key",
+    "tls/cert.pem",
+    "tls/key.pem",
+];
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
@@ -26,7 +68,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "quoro-promote-{}-{}",
+            "quoro-test-promote-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -51,67 +93,39 @@ fn mode_of(path: &Path) -> u32 {
     fs::symlink_metadata(path).unwrap().mode() & 0o7777
 }
 
-/// A node host's `quoro.toml` as `install_node_config` writes it, with the
-/// test's listener and data directory.
-fn node_config(listen: SocketAddr, data_dir: &Path) -> String {
-    format!(
-        "# Quoro configuration (ADR 0089 privilege split).\n\
-         # This host is a node: it runs microVMs for its primary and runs no\n\
-         # control plane. Edit this file and restart with:\n\
-         #   systemctl restart quoro-node\n\
-         \n\
-         listen = \"{listen}\"\n\
-         data_dir = \"{}\"\n\
-         \n\
-         engine = \"cloud-hypervisor\"\n\
-         \n\
-         [node]\n\
-         # The identity, local store and engine state of the agent on this host.\n\
-         # data_dir = \"/var/lib/quoro-node\"\n",
-        data_dir.display()
-    )
-}
-
-/// A node host: `etc/quoro/quoro.toml` (`0640`), `var/lib` without the
-/// control plane's directory, `units/` for `/etc/systemd/system`, and
-/// `shells/` with an executable `nologin` and `false`.
+/// A node host that the promotion brought to step 6, under a temporary
+/// root: `etc/quoro/quoro.toml` as the installer wrote it (`0640`),
+/// `etc/systemd/system` without the control plane's unit, `var/lib/quoro`
+/// with what the promotion wrote ([`WRITTEN`], `0600`) and the M1 engine
+/// state `engine/state`, and `shells/` with an executable `nologin` and
+/// `false`.
 struct Host {
     scratch: Scratch,
-    listen: SocketAddr,
-    _listener: Option<TcpListener>,
 }
 
 impl Host {
-    /// A host whose control plane's address accepts connections.
     fn new() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let listen = listener.local_addr().unwrap();
-        Self::with(listen, Some(listener))
-    }
-
-    /// A host whose control plane's address accepts nothing: port 1 is not
-    /// an ephemeral port, so no connection to it can connect to itself.
-    fn without_listener() -> Self {
-        Self::with("127.0.0.1:1".parse().unwrap(), None)
-    }
-
-    fn with(listen: SocketAddr, listener: Option<TcpListener>) -> Self {
-        let scratch = Scratch::new();
-        for dir in ["etc/quoro", "var/lib", "units", "shells"] {
-            fs::create_dir_all(scratch.0.join(dir)).unwrap();
-        }
-        write_mode(&scratch.0.join("shells/nologin"), b"", 0o755);
-        write_mode(&scratch.0.join("shells/false"), b"", 0o755);
         let host = Self {
-            scratch,
-            listen,
-            _listener: listener,
+            scratch: Scratch::new(),
         };
-        write_mode(
-            &host.config(),
-            node_config(listen, &host.data_dir()).as_bytes(),
-            0o640,
-        );
+        for dir in [
+            "etc/quoro",
+            "etc/systemd/system",
+            "var/lib/quoro/keys",
+            "var/lib/quoro/tls",
+            "var/lib/quoro/engine",
+            "shells",
+        ] {
+            fs::create_dir_all(host.root().join(dir)).unwrap();
+        }
+        fs::set_permissions(host.data_dir(), fs::Permissions::from_mode(0o755)).unwrap();
+        for name in WRITTEN {
+            write_mode(&host.data_dir().join(name), name.as_bytes(), 0o600);
+        }
+        write_mode(&host.data_dir().join("engine/state"), b"m1", 0o600);
+        write_mode(&host.root().join("shells/nologin"), b"", 0o755);
+        write_mode(&host.root().join("shells/false"), b"", 0o755);
+        write_mode(&host.config(), NODE_CONFIG.as_bytes(), 0o640);
         host
     }
 
@@ -132,13 +146,13 @@ impl Host {
     }
 
     fn unit(&self) -> PathBuf {
-        self.root().join("units/quoro.service")
+        self.root().join("etc/systemd/system/quoro.service")
     }
 
     fn options(&self) -> Options {
         Options {
-            config: self.config(),
-            unit_dir: self.root().join("units"),
+            config: PathBuf::from(CONFIG_PATH),
+            root: self.root().to_path_buf(),
             shells: vec![
                 self.root().join("shells/missing"),
                 self.root().join("shells/nologin"),
@@ -147,23 +161,24 @@ impl Host {
         }
     }
 
-    /// The names under `etc/quoro`, `var/lib` and `units`, with each file's
-    /// bytes, so a test can tell that nothing changed.
+    /// Every name under `etc` and `var`, with each file's bytes and each
+    /// link's target, so a test can tell that nothing changed.
     fn snapshot(&self) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         let mut entries = Vec::new();
-        for dir in ["etc/quoro", "var/lib", "units"] {
-            let mut stack = vec![self.root().join(dir)];
-            while let Some(path) = stack.pop() {
-                let metadata = fs::symlink_metadata(&path).unwrap();
-                if metadata.is_dir() {
-                    for entry in fs::read_dir(&path).unwrap() {
-                        stack.push(entry.unwrap().path());
-                    }
-                    entries.push((path, None));
-                } else {
-                    let bytes = fs::read(&path).unwrap();
-                    entries.push((path, Some(bytes)));
+        let mut stack = vec![self.root().join("etc"), self.root().join("var")];
+        while let Some(path) = stack.pop() {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_symlink() {
+                let target = fs::read_link(&path).unwrap();
+                entries.push((path, Some(target.as_os_str().as_bytes().to_vec())));
+            } else if metadata.is_dir() {
+                for entry in fs::read_dir(&path).unwrap() {
+                    stack.push(entry.unwrap().path());
                 }
+                entries.push((path, None));
+            } else {
+                let bytes = fs::read(&path).unwrap();
+                entries.push((path, Some(bytes)));
             }
         }
         entries.sort();
@@ -176,12 +191,23 @@ impl Host {
 #[derive(Default)]
 struct FakeSystemd {
     log: RefCell<Vec<String>>,
-    /// The answers of `is-active quoro.service`, in order. Once they are
-    /// used up, the unit reads active, or inactive with `stays_down`.
+    /// What `is-active quoro.service` answers until this fake started it.
+    active_before: Cell<bool>,
+    /// Whether `start` or `restart` of `quoro.service` ran.
+    started: Cell<bool>,
+    /// The answers of `is-active quoro.service` once it started, in order.
+    /// Once they are used up, the unit reads active, or inactive with
+    /// `stays_down`.
     answers: RefCell<VecDeque<bool>>,
     stays_down: Cell<bool>,
     /// What `is-active quoro-node.service` answers.
     node_active: Cell<bool>,
+    /// The data directory a start of `quoro.service` writes in, as `quoro
+    /// serve` does: the database when it is missing, and its WAL and
+    /// shared-memory files.
+    serves: RefCell<Option<PathBuf>>,
+    /// A file `daemon-reload` removes, as if it went away after the checks.
+    lost_on_reload: RefCell<Option<PathBuf>>,
 }
 
 impl FakeSystemd {
@@ -204,10 +230,29 @@ impl FakeSystemd {
             .filter(|logged| logged.as_str() == entry)
             .count()
     }
+
+    fn bring_up(&self, call: &str, unit: &str) -> Result<(), String> {
+        if unit == UNIT {
+            self.started.set(true);
+            if let Some(dir) = self.serves.borrow().as_deref() {
+                let database = dir.join(DATABASE);
+                if !database.exists() {
+                    write_mode(&database, b"SQLite format 3\0", 0o600);
+                }
+                for side in ["quoro.db-wal", "quoro.db-shm"] {
+                    write_mode(&dir.join(side), b"served", 0o600);
+                }
+            }
+        }
+        self.record(format!("{call} {unit}"))
+    }
 }
 
 impl Systemd for FakeSystemd {
     fn daemon_reload(&self) -> Result<(), String> {
+        if let Some(path) = self.lost_on_reload.borrow().as_deref() {
+            fs::remove_file(path).unwrap();
+        }
         self.record("daemon-reload".to_string())
     }
 
@@ -216,7 +261,11 @@ impl Systemd for FakeSystemd {
     }
 
     fn start(&self, unit: &str) -> Result<(), String> {
-        self.record(format!("start {unit}"))
+        self.bring_up("start", unit)
+    }
+
+    fn restart(&self, unit: &str) -> Result<(), String> {
+        self.bring_up("restart", unit)
     }
 
     fn stop(&self, unit: &str) -> Result<(), String> {
@@ -225,12 +274,14 @@ impl Systemd for FakeSystemd {
 
     fn is_active(&self, unit: &str) -> bool {
         self.log.borrow_mut().push(format!("is-active {unit}"));
-        if unit == UNIT {
-            let next = self.answers.borrow_mut().pop_front();
-            next.unwrap_or(!self.stays_down.get())
-        } else {
-            self.node_active.get()
+        if unit != UNIT {
+            return self.node_active.get();
         }
+        if !self.started.get() {
+            return self.active_before.get();
+        }
+        let next = self.answers.borrow_mut().pop_front();
+        next.unwrap_or(!self.stays_down.get())
     }
 }
 
@@ -307,6 +358,18 @@ impl FakeFs {
             owners.insert(to.to_path_buf(), owner);
         }
     }
+
+    /// The paths given an owner, in order.
+    fn chowned(&self) -> Vec<PathBuf> {
+        self.events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Chown { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 impl HostFs for FakeFs {
@@ -324,6 +387,15 @@ impl HostFs for FakeFs {
             .borrow_mut()
             .insert(path.to_path_buf(), (uid, gid));
         Ok(())
+    }
+
+    fn chown_opened(&self, fd: BorrowedFd<'_>, path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+        // The descriptor is the entry at `path`, opened without following
+        // a link.
+        let opened = rustix::fs::fstat(fd)?;
+        let named = fs::symlink_metadata(path)?;
+        assert_eq!((opened.st_dev, opened.st_ino), (named.dev(), named.ino()));
+        self.chown(path, uid, gid)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -350,6 +422,26 @@ impl HostFs for FakeFs {
     }
 }
 
+/// A listener that accepts, or refuses with `refuses`, and records every
+/// address tried.
+#[derive(Default)]
+struct FakeProbe {
+    refuses: Cell<bool>,
+    tried: RefCell<Vec<SocketAddr>>,
+}
+
+impl Probe for FakeProbe {
+    fn connect(&self, address: SocketAddr, timeout: Duration) -> Result<(), String> {
+        assert_eq!(timeout, POLL);
+        self.tried.borrow_mut().push(address);
+        if self.refuses.get() {
+            Err("Connection refused (os error 111)".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// A clock that only adds up the waits.
 #[derive(Default)]
 struct FakeClock {
@@ -367,22 +459,36 @@ struct Fakes {
     systemd: FakeSystemd,
     accounts: FakeAccounts,
     fs: FakeFs,
+    probe: FakeProbe,
     clock: FakeClock,
 }
 
 impl Fakes {
+    /// Fakes whose `quoro.service` writes in `host`'s data directory when
+    /// it starts.
+    fn serving(host: &Host) -> Self {
+        let fakes = Self::default();
+        *fakes.systemd.serves.borrow_mut() = Some(host.data_dir());
+        fakes
+    }
+
     fn seams(&self) -> Seams<'_> {
         Seams {
             systemd: &self.systemd,
             accounts: &self.accounts,
             fs: &self.fs,
+            probe: &self.probe,
             clock: &self.clock,
         }
     }
 
     fn prepare(&self, host: &Host) -> (Result<Prepared, String>, Vec<String>) {
+        self.prepare_with(&host.options())
+    }
+
+    fn prepare_with(&self, options: &Options) -> (Result<Prepared, String>, Vec<String>) {
         let mut out = Out::quiet();
-        let result = prepare_host(&host.options(), &self.seams(), &mut out);
+        let result = prepare_host(options, &self.seams(), &mut out);
         (result, out.lines)
     }
 
@@ -394,13 +500,26 @@ impl Fakes {
             self.fs.events.borrow().is_empty(),
             "no owner change or rename"
         );
+        assert!(self.probe.tried.borrow().is_empty(), "no connection");
     }
+}
+
+/// Asserts that `host` refuses with an error that holds `says` and ends by
+/// saying that nothing was changed, and that nothing changed.
+fn assert_refused(host: &Host, says: &str) {
+    let fakes = Fakes::serving(host);
+    let before = host.snapshot();
+    let error = fakes.prepare(host).0.unwrap_err();
+    assert!(error.contains(says), "{error}");
+    assert!(error.ends_with("nothing was changed"), "{error}");
+    assert_eq!(host.snapshot(), before);
+    fakes.assert_untouched();
 }
 
 #[test]
 fn a_node_host_is_prepared_as_the_installer_prepares_a_primary() {
     let host = Host::new();
-    let fakes = Fakes::default();
+    let fakes = Fakes::serving(&host);
     let original = fs::read_to_string(host.config()).unwrap();
     let metadata = fs::metadata(host.config()).unwrap();
 
@@ -413,10 +532,13 @@ fn a_node_host_is_prepared_as_the_installer_prepares_a_primary() {
             uid: SYSTEM_UID,
             gid: SYSTEM_GID,
             data_dir: host.data_dir(),
+            handed: WRITTEN.len() + 2,
             local: LocalEdit::Added,
             pre_promote: PrePromote::Written,
-            listen: host.listen,
-            url: format!("https://{}", host.listen),
+            unit_changed: true,
+            brought: Brought::Restarted,
+            listen: crate::config::DEFAULT_LISTEN.parse().unwrap(),
+            url: format!("https://{LOOPBACK}"),
         }
     );
 
@@ -431,13 +553,12 @@ fn a_node_host_is_prepared_as_the_installer_prepares_a_primary() {
         )]
     );
 
-    // Step 2: the data directory, empty, and /etc/quoro.
+    // Step 2: the data directory, quoro-api:quoro-api 0700, and /etc/quoro.
     assert_eq!(mode_of(&host.data_dir()), 0o700);
     assert_eq!(
         fakes.fs.owner(&host.data_dir()),
         Some((SYSTEM_UID, SYSTEM_GID))
     );
-    assert_eq!(fs::read_dir(host.data_dir()).unwrap().count(), 0);
     let etc = host.root().join("etc/quoro");
     assert_eq!(mode_of(&etc), 0o755);
     assert_eq!(fakes.fs.owner(&etc), Some((0, 0)));
@@ -463,28 +584,31 @@ fn a_node_host_is_prepared_as_the_installer_prepares_a_primary() {
     assert_eq!(mode_of(&host.config()), 0o640);
     assert_eq!(fakes.fs.owner(&host.config()), Some((0, SYSTEM_GID)));
 
-    // Step 4: the packaged unit, root:root 0644, reloaded, enabled, started
-    // and waited for.
+    // Step 4: the packaged unit, root:root 0644, reloaded, enabled,
+    // restarted because it is new, and waited for on the default listener.
     assert_eq!(fs::read_to_string(host.unit()).unwrap(), UNIT_FILE);
     assert_eq!(mode_of(&host.unit()), 0o644);
     assert_eq!(fakes.fs.owner(&host.unit()), Some((0, 0)));
     assert_eq!(
         fakes.systemd.sequence(),
         [
+            "is-active quoro.service",
             "daemon-reload",
             "enable quoro.service",
-            "start quoro.service",
+            "restart quoro.service",
             "is-active quoro.service",
         ]
     );
-    assert_eq!(fakes.systemd.count("is-active quoro.service"), 5);
+    assert_eq!(fakes.systemd.count("is-active quoro.service"), 1 + 5);
+    let loopback: SocketAddr = LOOPBACK.parse().unwrap();
+    assert_eq!(*fakes.probe.tried.borrow(), [loopback]);
     assert_eq!(
         lines.last().map(String::as_str),
-        Some(format!("the control plane accepts connections on {}", host.listen).as_str())
+        Some(format!("the control plane accepts connections on {LOOPBACK}").as_str())
     );
 
     // No partial file is left.
-    for dir in [etc, host.root().join("units")] {
+    for dir in [etc, host.root().join("etc/systemd/system")] {
         for entry in fs::read_dir(dir).unwrap() {
             let name = entry.unwrap().file_name();
             assert!(
@@ -495,10 +619,53 @@ fn a_node_host_is_prepared_as_the_installer_prepares_a_primary() {
     }
 }
 
+/// Section 7.3: the promotion wrote the database and the keys as root. The
+/// hand-over gives every one of them, and every directory, to quoro-api,
+/// each directory after its contents and the data directory last, and
+/// leaves `engine/` root's, as `install_primary_data_dir` does.
+#[test]
+fn the_data_directory_is_handed_to_quoro_api_but_engine() {
+    let host = Host::new();
+    let fakes = Fakes::serving(&host);
+    let prepared = fakes.prepare(&host).0.unwrap();
+
+    let data = host.data_dir();
+    let chowned = fakes.fs.chowned();
+    let mut handed: Vec<PathBuf> = WRITTEN.iter().map(|name| data.join(name)).collect();
+    handed.extend([data.join("keys"), data.join("tls"), data.clone()]);
+    for path in &handed {
+        assert_eq!(
+            fakes.fs.owner(path),
+            Some((SYSTEM_UID, SYSTEM_GID)),
+            "{path:?}"
+        );
+        assert_eq!(
+            chowned.iter().filter(|chowned| *chowned == path).count(),
+            1,
+            "{path:?} is handed over once"
+        );
+    }
+    assert_eq!(prepared.handed, handed.len() - 1);
+    assert_eq!(fakes.fs.owner(&data.join("engine")), None);
+    assert_eq!(fakes.fs.owner(&data.join("engine/state")), None);
+    // The modes are kept.
+    assert_eq!(mode_of(&data.join("keys/data.key")), 0o600);
+
+    let at = |path: PathBuf| chowned.iter().position(|chowned| *chowned == path).unwrap();
+    assert!(at(data.join("keys/signing.key")) < at(data.join("keys")));
+    assert!(at(data.join("tls/key.pem")) < at(data.join("tls")));
+    let last_inside = handed[..handed.len() - 1]
+        .iter()
+        .map(|path| at(path.clone()))
+        .max()
+        .unwrap();
+    assert!(last_inside < at(data.clone()), "the directory comes last");
+}
+
 #[test]
 fn each_file_is_written_whole_then_given_its_mode_and_owner_then_put_in_place() {
     let host = Host::new();
-    let fakes = Fakes::default();
+    let fakes = Fakes::serving(&host);
     fakes.prepare(&host).0.unwrap();
 
     let events = fakes.fs.events.borrow().clone();
@@ -545,10 +712,123 @@ fn each_file_is_written_whole_then_given_its_mode_and_owner_then_put_in_place() 
     )));
 }
 
+/// Section 7.3 writes the database and the keys before the start. A data
+/// directory without one of them refuses before any change, so the control
+/// plane never starts empty or with keys of its own.
+#[test]
+fn a_data_directory_without_the_database_or_a_key_refuses_and_starts_nothing() {
+    for name in PRIMARY_FILES {
+        let host = Host::new();
+        fs::remove_file(host.data_dir().join(name)).unwrap();
+        assert_refused(&host, &format!("does not hold {name} as a regular file"));
+    }
+
+    let host = Host::new();
+    fs::remove_dir_all(host.data_dir()).unwrap();
+    assert_refused(&host, "does not exist");
+}
+
+/// The files are checked again right before the start: one that went away
+/// after the changes began stops the run with the unit not started.
+#[test]
+fn a_file_lost_before_the_start_leaves_the_unit_not_started() {
+    let host = Host::new();
+    let fakes = Fakes::serving(&host);
+    *fakes.systemd.lost_on_reload.borrow_mut() = Some(host.data_dir().join("keys/data.key"));
+
+    let error = fakes.prepare(&host).0.unwrap_err();
+    assert!(error.contains("does not hold keys/data.key"), "{error}");
+    assert!(error.ends_with("quoro.service was not started"), "{error}");
+    assert_eq!(fakes.systemd.count("start quoro.service"), 0);
+    assert_eq!(fakes.systemd.count("restart quoro.service"), 0);
+    assert!(!host.data_dir().join("keys/data.key").exists());
+}
+
+/// A symbolic link where this step reads or hands something over refuses
+/// before any change: at `quoro.toml`, at `/etc/quoro`, at `/var/lib/quoro`
+/// and inside it.
+#[test]
+fn a_symbolic_link_refuses_before_any_change() {
+    let host = Host::new();
+    let real = host.root().join("elsewhere.toml");
+    fs::rename(host.config(), &real).unwrap();
+    std::os::unix::fs::symlink(&real, host.config()).unwrap();
+    assert_refused(&host, "quoro.toml is not a regular file");
+
+    let host = Host::new();
+    let etc = host.root().join("etc/quoro");
+    fs::rename(&etc, host.root().join("etc/quoro-real")).unwrap();
+    std::os::unix::fs::symlink("quoro-real", &etc).unwrap();
+    assert_refused(&host, "the configuration directory");
+    assert_refused(&host, "is a symbolic link");
+
+    let host = Host::new();
+    let data = host.data_dir();
+    fs::rename(&data, host.root().join("var/lib/quoro-real")).unwrap();
+    std::os::unix::fs::symlink("quoro-real", &data).unwrap();
+    assert_refused(&host, "the data directory");
+    assert_refused(&host, "is a symbolic link");
+
+    // A link inside the data directory, to a directory or to a file.
+    for target in ["/etc", "/etc/passwd"] {
+        let host = Host::new();
+        std::os::unix::fs::symlink(target, host.data_dir().join("tls/extra")).unwrap();
+        assert_refused(&host, "tls/extra is a symbolic link");
+    }
+
+    // A key reached through a link is not in the data directory.
+    let host = Host::new();
+    let keys = host.data_dir().join("keys");
+    fs::rename(&keys, host.root().join("keys-real")).unwrap();
+    std::os::unix::fs::symlink(host.root().join("keys-real"), &keys).unwrap();
+    assert_refused(&host, "does not hold keys/signing.key, keys/data.key");
+}
+
+/// A file with another hard link may have a name outside the data
+/// directory, which the hand-over would give to quoro-api too.
+#[test]
+fn a_file_with_another_hard_link_refuses_before_any_change() {
+    let host = Host::new();
+    let outside = host.root().join("outside");
+    write_mode(&outside, b"root's", 0o600);
+    fs::hard_link(&outside, host.data_dir().join("linked")).unwrap();
+    assert_refused(&host, "linked has 2 hard links");
+}
+
+/// The unit runs `quoro serve` with `QUORO_CONFIG=/etc/quoro/quoro.toml`
+/// and may write only `/var/lib/quoro`.
+#[test]
+fn another_configuration_or_data_directory_refuses_before_any_change() {
+    let host = Host::new();
+    let fakes = Fakes::serving(&host);
+    let before = host.snapshot();
+    let mut options = host.options();
+    options.config = PathBuf::from("/etc/quoro/other.toml");
+    let error = fakes.prepare_with(&options).0.unwrap_err();
+    assert!(
+        error.contains("QUORO_CONFIG=/etc/quoro/quoro.toml"),
+        "{error}"
+    );
+    assert!(error.ends_with("nothing was changed"), "{error}");
+    assert_eq!(host.snapshot(), before);
+    fakes.assert_untouched();
+
+    let host = Host::new();
+    let text = NODE_CONFIG.replacen("engine = ", "data_dir = \"/srv/quoro\"\nengine = ", 1);
+    write_mode(&host.config(), text.as_bytes(), 0o640);
+    assert_refused(&host, "may write only /var/lib/quoro");
+
+    // Naming the default is the same as leaving it out.
+    let host = Host::new();
+    let text = NODE_CONFIG.replacen("engine = ", "data_dir = \"/var/lib/quoro\"\nengine = ", 1);
+    write_mode(&host.config(), text.as_bytes(), 0o640);
+    Fakes::serving(&host).prepare(&host).0.unwrap();
+}
+
 #[test]
 fn a_quoro_api_with_a_login_uid_refuses_and_changes_nothing() {
     let host = Host::new();
-    let fakes = Fakes::default();
+    let fakes = Fakes::serving(&host);
     fakes.accounts.user.set(Some(1000));
     fakes.accounts.group.set(Some(1000));
     let before = host.snapshot();
@@ -565,9 +845,26 @@ fn a_quoro_api_with_a_login_uid_refuses_and_changes_nothing() {
 }
 
 #[test]
+fn a_quoro_api_without_its_group_refuses_and_changes_nothing() {
+    let host = Host::new();
+    let fakes = Fakes::serving(&host);
+    fakes.accounts.user.set(Some(999));
+    let before = host.snapshot();
+
+    let error = fakes.prepare(&host).0.unwrap_err();
+    assert!(
+        error.contains("exists without a group quoro-api"),
+        "{error}"
+    );
+    assert!(error.ends_with("nothing was changed"), "{error}");
+    assert_eq!(host.snapshot(), before);
+    fakes.assert_untouched();
+}
+
+#[test]
 fn an_existing_system_quoro_api_is_kept() {
     let host = Host::new();
-    let fakes = Fakes::default();
+    let fakes = Fakes::serving(&host);
     fakes.accounts.user.set(Some(999));
     fakes.accounts.group.set(Some(990));
 
@@ -578,31 +875,50 @@ fn an_existing_system_quoro_api_is_kept() {
     assert!(fakes.accounts.created.borrow().is_empty());
     assert!(lines.contains(&"user quoro-api exists (uid 999); left as is".to_string()));
     assert_eq!(fakes.fs.owner(&host.data_dir()), Some((999, 990)));
+    assert_eq!(
+        fakes.fs.owner(&host.data_dir().join("quoro.db")),
+        Some((999, 990))
+    );
     assert_eq!(fakes.fs.owner(&host.config()), Some((0, 990)));
 }
 
+/// `getent` as the host answers it: the id in the third field, `None` for
+/// exit status 2 (no such entry), and an error for any other status.
 #[test]
-fn a_data_directory_that_holds_a_database_refuses_and_changes_nothing() {
-    let host = Host::new();
-    fs::create_dir(host.data_dir()).unwrap();
-    fs::write(host.data_dir().join("quoro.db"), b"SQLite format 3\0").unwrap();
-    let fakes = Fakes::default();
-    let before = host.snapshot();
-
-    let error = fakes.prepare(&host).0.unwrap_err();
-    assert!(
-        error.contains("already holds a control-plane database"),
-        "{error}"
+fn getent_s_answer_is_read_as_the_installer_reads_it() {
+    let passwd = "quoro-api:x:997:996::/var/lib/quoro:/usr/sbin/nologin\n";
+    assert_eq!(
+        read_getent("passwd", "quoro-api", Some(0), passwd, ""),
+        Ok(Some(997))
     );
-    assert!(error.ends_with("Nothing was changed"), "{error}");
-    assert_eq!(host.snapshot(), before);
-    fakes.assert_untouched();
+    let group = "quoro-api:x:996:\n";
+    assert_eq!(
+        read_getent("group", "quoro-api", Some(0), group, ""),
+        Ok(Some(996))
+    );
+    assert_eq!(
+        read_getent("passwd", "quoro-api", Some(2), "", ""),
+        Ok(None)
+    );
+    let error = read_getent("passwd", "quoro-api", Some(1), "", "bad option").unwrap_err();
+    assert!(error.contains("exit status 1: bad option"), "{error}");
+    let error = read_getent("passwd", "quoro-api", None, "", "").unwrap_err();
+    assert!(error.contains("killed by a signal"), "{error}");
+    let error = read_getent("passwd", "quoro-api", Some(0), "quoro-api:x\n", "").unwrap_err();
+    assert!(error.contains("printed no id"), "{error}");
+
+    // The host's own getent: root is uid and gid 0, and a name no host has
+    // is no entry.
+    assert_eq!(RealAccounts.uid("root"), Ok(Some(0)));
+    assert_eq!(RealAccounts.gid("root"), Ok(Some(0)));
+    assert_eq!(RealAccounts.uid("quoro-no-such-user-x9"), Ok(None));
+    assert_eq!(RealAccounts.gid("quoro-no-such-group-x9"), Ok(None));
 }
 
 #[test]
 fn a_rerun_finds_every_step_done_and_keeps_it() {
     let host = Host::new();
-    let fakes = Fakes::default();
+    let fakes = Fakes::serving(&host);
     let original = fs::read(host.config()).unwrap();
     fakes.prepare(&host).0.unwrap();
     let after_first = host.snapshot();
@@ -612,6 +928,9 @@ fn a_rerun_finds_every_step_done_and_keeps_it() {
     assert!(!prepared.user_created);
     assert_eq!(prepared.local, LocalEdit::AlreadySet);
     assert_eq!(prepared.pre_promote, PrePromote::Kept);
+    assert!(!prepared.unit_changed);
+    // The unit is active, so it is restarted.
+    assert_eq!(prepared.brought, Brought::Restarted);
     assert_eq!(host.snapshot(), after_first, "no file changed");
     assert_eq!(fs::read(host.copy()).unwrap(), original);
     assert_eq!(fakes.accounts.created.borrow().len(), 1);
@@ -629,15 +948,59 @@ fn a_rerun_finds_every_step_done_and_keeps_it() {
         fakes.fs.owner(&host.data_dir()),
         Some((SYSTEM_UID, SYSTEM_GID))
     );
-    // Both runs reload, enable and start; starting a running unit does
-    // nothing.
-    assert_eq!(fakes.systemd.count("start quoro.service"), 2);
+    assert_eq!(fakes.systemd.count("restart quoro.service"), 2);
+}
+
+/// A run whose unit did not stay active can be run again: the database the
+/// start opened refuses nothing, the files it wrote are handed over too,
+/// and an inactive unit whose file did not change is started.
+#[test]
+fn a_rerun_after_the_unit_did_not_stay_active_finishes() {
+    let host = Host::new();
+    fs::remove_file(host.data_dir().join("quoro.db-wal")).unwrap();
+    fs::remove_file(host.data_dir().join("quoro.db-shm")).unwrap();
+    let fakes = Fakes::serving(&host);
+    fakes.systemd.stays_down.set(true);
+    let error = fakes.prepare(&host).0.unwrap_err();
+    assert!(error.contains("did not stay active"), "{error}");
+    let wal = host.data_dir().join("quoro.db-wal");
+    assert!(wal.exists(), "the start wrote it");
+
+    fakes.systemd.stays_down.set(false);
+    fakes.systemd.answers.borrow_mut().push_back(false);
+    fakes.fs.events.borrow_mut().clear();
+    let prepared = fakes.prepare(&host).0.unwrap();
+    assert_eq!(prepared.brought, Brought::Started);
+    assert!(!prepared.unit_changed);
+    assert_eq!(fakes.systemd.count("start quoro.service"), 1);
+    assert_eq!(fakes.fs.owner(&wal), Some((SYSTEM_UID, SYSTEM_GID)));
+    assert!(
+        fakes.fs.chowned().contains(&wal),
+        "handed over by the rerun"
+    );
+}
+
+/// A run whose listener never answered can be run again: the active unit
+/// is restarted and the rerun finishes.
+#[test]
+fn a_rerun_after_the_listener_did_not_answer_finishes() {
+    let host = Host::new();
+    let fakes = Fakes::serving(&host);
+    fakes.probe.refuses.set(true);
+    let error = fakes.prepare(&host).0.unwrap_err();
+    assert!(error.contains("nothing accepted a connection"), "{error}");
+
+    fakes.probe.refuses.set(false);
+    let prepared = fakes.prepare(&host).0.unwrap();
+    assert_eq!(prepared.brought, Brought::Restarted);
+    assert_eq!(fakes.systemd.count("restart quoro.service"), 2);
+    assert_eq!(fakes.systemd.count("start quoro.service"), 0);
 }
 
 #[test]
 fn a_run_stopped_between_the_copy_and_the_edit_is_finished_by_the_next() {
     let host = Host::new();
-    let fakes = Fakes::default();
+    let fakes = Fakes::serving(&host);
     let original = fs::read(host.config()).unwrap();
     *fakes.fs.stop_at.borrow_mut() = Some(host.config());
 
@@ -670,7 +1033,7 @@ fn a_run_stopped_between_the_copy_and_the_edit_is_finished_by_the_next() {
 fn an_existing_pre_promote_copy_is_never_overwritten() {
     let host = Host::new();
     write_mode(&host.copy(), b"# from an earlier promotion\n", 0o600);
-    let fakes = Fakes::default();
+    let fakes = Fakes::serving(&host);
 
     let (result, lines) = fakes.prepare(&host);
     assert_eq!(result.unwrap().pre_promote, PrePromote::Kept);
@@ -688,10 +1051,29 @@ fn an_existing_pre_promote_copy_is_never_overwritten() {
     );
 }
 
+/// A run stopped after the copy was linked and before its partial name was
+/// removed leaves that name; the next run keeps the copy and removes it.
+#[test]
+fn a_stray_partial_name_of_a_kept_copy_is_removed() {
+    let host = Host::new();
+    let original = fs::read(host.config()).unwrap();
+    write_mode(&host.copy(), &original, 0o640);
+    let stray = host
+        .root()
+        .join("etc/quoro/.quoro.toml.pre-promote.promote-partial");
+    fs::hard_link(host.copy(), &stray).unwrap();
+    let fakes = Fakes::serving(&host);
+
+    let prepared = fakes.prepare(&host).0.unwrap();
+    assert_eq!(prepared.pre_promote, PrePromote::Kept);
+    assert!(!stray.exists(), "the stray name is removed");
+    assert_eq!(fs::read(host.copy()).unwrap(), original);
+}
+
 #[test]
 fn the_unit_must_read_active_five_polls_in_a_row() {
     let host = Host::new();
-    let fakes = Fakes::default();
+    let fakes = Fakes::serving(&host);
     fakes
         .systemd
         .answers
@@ -699,14 +1081,14 @@ fn the_unit_must_read_active_five_polls_in_a_row() {
         .extend([true, true, true, true, false]);
 
     fakes.prepare(&host).0.unwrap();
-    assert_eq!(fakes.systemd.count("is-active quoro.service"), 10);
+    assert_eq!(fakes.systemd.count("is-active quoro.service"), 1 + 10);
     assert_eq!(fakes.clock.slept.get(), Duration::from_secs(9));
 }
 
 #[test]
 fn a_unit_that_does_not_stay_active_fails_after_twenty_polls() {
     let host = Host::new();
-    let fakes = Fakes::default();
+    let fakes = Fakes::serving(&host);
     fakes.systemd.stays_down.set(true);
 
     let error = fakes.prepare(&host).0.unwrap_err();
@@ -718,20 +1100,23 @@ fn a_unit_that_does_not_stay_active_fails_after_twenty_polls() {
         error.contains("journalctl -u quoro.service -n 50 --no-pager"),
         "{error}"
     );
-    assert_eq!(fakes.systemd.count("is-active quoro.service"), 20);
+    assert_eq!(fakes.systemd.count("is-active quoro.service"), 1 + 20);
     assert_eq!(fakes.clock.slept.get(), Duration::from_secs(20));
+    assert!(fakes.probe.tried.borrow().is_empty());
 }
 
 #[test]
 fn a_listener_that_never_answers_fails_within_the_bound() {
-    let host = Host::without_listener();
-    let fakes = Fakes::default();
+    let host = Host::new();
+    let fakes = Fakes::serving(&host);
+    fakes.probe.refuses.set(true);
 
     let error = fakes.prepare(&host).0.unwrap_err();
     assert!(
-        error.contains("nothing accepted a connection on 127.0.0.1:1"),
+        error.contains("nothing accepted a connection on 127.0.0.1:8443 (Connection refused"),
         "{error}"
     );
+    assert_eq!(fakes.probe.tried.borrow().len(), 30);
     // Four waits while the unit reads active five times, then 29 between
     // the 30 tries.
     assert_eq!(fakes.clock.slept.get(), Duration::from_secs(4 + 29));
@@ -742,6 +1127,9 @@ fn the_embedded_unit_is_the_packaged_one() {
     let packaged =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/systemd/quoro.service");
     assert_eq!(UNIT_FILE, fs::read_to_string(packaged).unwrap());
+    // The two places this step requires are the unit's.
+    assert!(UNIT_FILE.contains(&format!("QUORO_CONFIG={CONFIG_PATH}\n")));
+    assert!(UNIT_FILE.contains(&format!("ReadWritePaths={DATA_DIR}\n")));
 }
 
 #[test]
@@ -841,20 +1229,12 @@ fn a_node_table_written_another_way_is_refused() {
 #[test]
 fn a_node_table_written_another_way_refuses_before_any_change() {
     let host = Host::new();
-    let text = format!(
-        "listen = \"{}\"\ndata_dir = \"{}\"\nnode = {{ local = true }}\n",
-        host.listen,
-        host.data_dir().display()
+    write_mode(
+        &host.config(),
+        b"engine = \"cloud-hypervisor\"\nnode = { local = true }\n",
+        0o640,
     );
-    write_mode(&host.config(), text.as_bytes(), 0o640);
-    let fakes = Fakes::default();
-    let before = host.snapshot();
-
-    let error = fakes.prepare(&host).0.unwrap_err();
-    assert!(error.contains("by hand"), "{error}");
-    assert!(error.ends_with("nothing was changed"), "{error}");
-    assert_eq!(host.snapshot(), before);
-    fakes.assert_untouched();
+    assert_refused(&host, "by hand");
 }
 
 /// An enrolled agent's `identity.json` in `dir`; returns its pin.
@@ -911,26 +1291,35 @@ impl Agent for FakeAgent<'_> {
 
 const LOCAL_URL: &str = "https://127.0.0.1:8443";
 
+/// An agent of `systemd`'s log, enrolled with `primary_url` in `scratch`.
+fn agent<'a>(scratch: &Scratch, systemd: &'a FakeSystemd, refuse: bool) -> FakeAgent<'a> {
+    FakeAgent {
+        data_dir: scratch.0.clone(),
+        refuse,
+        log: &systemd.log,
+    }
+}
+
 #[tokio::test]
 async fn the_agent_is_pointed_at_the_local_control_plane_and_keeps_its_pin() {
     let scratch = Scratch::new();
     let fingerprint = enrolled(&scratch.0, "https://old.example.com:8443");
     let systemd = FakeSystemd::default();
     systemd.node_active.set(true);
-    let agent = FakeAgent {
-        data_dir: scratch.0.clone(),
-        refuse: false,
-        log: &systemd.log,
-    };
 
-    let pointed = point_agent(LOCAL_URL, &agent, &systemd, &mut Out::quiet())
-        .await
-        .unwrap();
+    let pointed = point_agent(
+        LOCAL_URL,
+        &agent(&scratch, &systemd, false),
+        &systemd,
+        &mut Out::quiet(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         pointed,
         Pointed::Changed {
             previous: "https://old.example.com:8443".to_string(),
-            restarted: true,
+            was_running: true,
         }
     );
     // The pin first, then the stop, the write and the start, as
@@ -954,24 +1343,62 @@ async fn the_agent_is_pointed_at_the_local_control_plane_and_keeps_its_pin() {
 }
 
 #[tokio::test]
-async fn an_agent_that_already_dials_it_is_left_alone() {
+async fn a_running_agent_that_already_dials_it_is_left_alone() {
     let scratch = Scratch::new();
     enrolled(&scratch.0, LOCAL_URL);
     let path = scratch.0.join(identity::IDENTITY_FILE);
     let before = fs::read(&path).unwrap();
     let systemd = FakeSystemd::default();
     systemd.node_active.set(true);
-    let agent = FakeAgent {
-        data_dir: scratch.0.clone(),
-        refuse: false,
-        log: &systemd.log,
-    };
+    let mut out = Out::quiet();
 
-    let pointed = point_agent(LOCAL_URL, &agent, &systemd, &mut Out::quiet())
-        .await
-        .unwrap();
-    assert_eq!(pointed, Pointed::Already);
-    assert_eq!(systemd.sequence(), [format!("verify {LOCAL_URL}")]);
+    let pointed = point_agent(
+        LOCAL_URL,
+        &agent(&scratch, &systemd, false),
+        &systemd,
+        &mut out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(pointed, Pointed::Already { started: false });
+    assert_eq!(
+        systemd.sequence(),
+        [
+            format!("verify {LOCAL_URL}"),
+            "is-active quoro-node.service".to_string(),
+        ]
+    );
+    assert_eq!(fs::read(path).unwrap(), before);
+    assert_eq!(out.lines.last().unwrap(), "quoro-node.service is active");
+}
+
+/// A rerun after a start of the agent that failed finds the address set:
+/// it starts the agent, so the run never ends with the agent stopped.
+#[tokio::test]
+async fn a_stopped_agent_that_already_dials_it_is_started() {
+    let scratch = Scratch::new();
+    enrolled(&scratch.0, LOCAL_URL);
+    let path = scratch.0.join(identity::IDENTITY_FILE);
+    let before = fs::read(&path).unwrap();
+    let systemd = FakeSystemd::default();
+
+    let pointed = point_agent(
+        LOCAL_URL,
+        &agent(&scratch, &systemd, false),
+        &systemd,
+        &mut Out::quiet(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pointed, Pointed::Already { started: true });
+    assert_eq!(
+        systemd.sequence(),
+        [
+            format!("verify {LOCAL_URL}"),
+            "is-active quoro-node.service".to_string(),
+            "start quoro-node.service".to_string(),
+        ]
+    );
     assert_eq!(fs::read(path).unwrap(), before);
 }
 
@@ -983,15 +1410,15 @@ async fn a_refused_pin_changes_nothing() {
     let before = fs::read(&path).unwrap();
     let systemd = FakeSystemd::default();
     systemd.node_active.set(true);
-    let agent = FakeAgent {
-        data_dir: scratch.0.clone(),
-        refuse: true,
-        log: &systemd.log,
-    };
 
-    let error = point_agent(LOCAL_URL, &agent, &systemd, &mut Out::quiet())
-        .await
-        .unwrap_err();
+    let error = point_agent(
+        LOCAL_URL,
+        &agent(&scratch, &systemd, true),
+        &systemd,
+        &mut Out::quiet(),
+    )
+    .await
+    .unwrap_err();
     assert!(
         error.contains("not the pinned primary certificate"),
         "{error}"
@@ -1001,25 +1428,25 @@ async fn a_refused_pin_changes_nothing() {
 }
 
 #[tokio::test]
-async fn an_agent_that_is_not_running_is_pointed_and_left_stopped() {
+async fn an_agent_that_is_not_running_is_pointed_and_started() {
     let scratch = Scratch::new();
     enrolled(&scratch.0, "https://old.example.com:8443");
     let systemd = FakeSystemd::default();
-    let agent = FakeAgent {
-        data_dir: scratch.0.clone(),
-        refuse: false,
-        log: &systemd.log,
-    };
     let mut out = Out::quiet();
 
-    let pointed = point_agent(LOCAL_URL, &agent, &systemd, &mut out)
-        .await
-        .unwrap();
+    let pointed = point_agent(
+        LOCAL_URL,
+        &agent(&scratch, &systemd, false),
+        &systemd,
+        &mut out,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         pointed,
         Pointed::Changed {
             previous: "https://old.example.com:8443".to_string(),
-            restarted: false,
+            was_running: false,
         }
     );
     assert_eq!(
@@ -1028,14 +1455,12 @@ async fn an_agent_that_is_not_running_is_pointed_and_left_stopped() {
             format!("verify {LOCAL_URL}"),
             "is-active quoro-node.service".to_string(),
             "write identity".to_string(),
+            "start quoro-node.service".to_string(),
         ]
     );
-    assert!(
-        out.lines
-            .iter()
-            .any(|line| line.contains("was not running")),
-        "{:?}",
-        out.lines
+    assert_eq!(
+        out.lines.last().unwrap(),
+        "quoro-node.service was not active; started it"
     );
     assert_eq!(
         identity::load_identity(&scratch.0).unwrap().primary_url,
