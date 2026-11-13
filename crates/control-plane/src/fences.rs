@@ -46,7 +46,8 @@ pub(crate) struct FenceAckPending {
     /// The acknowledged token of each lease in `lease_ids`: for a lease the
     /// node still holds, its `fencing_token` after the acknowledgement's
     /// increment; for one another node holds, that lease's token plus one
-    /// (ADR 0247); for one with no row, [`UNKNOWN_LEASE_TOKEN`]. An
+    /// (ADR 0247), at most [`UNKNOWN_LEASE_TOKEN`] (2^53 − 1, the cap of
+    /// section 8.6; #947); for one with no row, [`UNKNOWN_LEASE_TOKEN`]. An
     /// acknowledgement a primary before ADR 0245 recorded has none.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fencing_tokens: BTreeMap<String, u64>,

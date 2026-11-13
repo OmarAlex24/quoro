@@ -2050,13 +2050,28 @@ async fn declaring_lost_a_node_whose_lease_is_at_the_cap_writes_nothing() {
     assert!(lost_at(&server, &node_id).await.is_some());
 }
 
-/// Section 8.5 step 3 and section 8.6, "The cap": an acknowledgement that
-/// lists a lease another node holds at 2^53 − 1 answers `200` and stores
+/// Section 8.5 step 3 and section 8.6, "The cap" (#947): an acknowledgement
+/// that lists a lease another node holds at 2^53 − 1 answers `200` and stores
 /// that token for it, as for a lease with no row, not one above it, which
-/// the change log refuses (ADR 0247). The lease is left as it is; the node's
-/// change-log entry and its `fence_ack` carry the capped token.
+/// the change log refuses. The lease is left as it is; the node's change-log
+/// entry and its `fence_ack` carry the capped token.
 #[tokio::test]
 async fn an_ack_of_a_lease_another_node_holds_at_the_cap_stores_the_cap() {
+    acks_a_lease_another_node_holds_at(MAX_TOKEN).await;
+}
+
+/// One below the cap, the token plus one is the cap itself (ADR 0247), so
+/// the same acknowledgement stores 2^53 − 1 too: the cap applies only past
+/// it, not one step early.
+#[tokio::test]
+async fn an_ack_of_a_lease_another_node_holds_one_below_the_cap_stores_the_cap() {
+    acks_a_lease_another_node_holds_at(MAX_TOKEN - 1).await;
+}
+
+/// The node's failed fence lists its lease; the lease then moves to another
+/// node at `row_token`; the acknowledgement stores 2^53 − 1 for it, and the
+/// node's change-log entry and `fence_ack` carry that token.
+async fn acks_a_lease_another_node_holds_at(row_token: i64) {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (node, mut socket, app_id, vm_id, lease_id) = node_with_lease(&server, &owner).await;
@@ -2076,11 +2091,11 @@ async fn an_ack_of_a_lease_another_node_holds_at_the_cap_stores_the_cap() {
         |node| !node["fence_failure"].is_null(),
     )
     .await;
-    // The lease moved on to another node meanwhile, which holds it at the
-    // cap.
+    // The lease moved on to another node meanwhile, which holds it at
+    // `row_token`.
     sqlx::query("UPDATE leases SET holder_node_id = ?, fencing_token = ? WHERE id = ?")
         .bind(&other.node_id)
-        .bind(MAX_TOKEN)
+        .bind(row_token)
         .bind(&lease_id)
         .execute(server.state.store.pool())
         .await
@@ -2097,7 +2112,7 @@ async fn an_ack_of_a_lease_another_node_holds_at_the_cap_stores_the_cap() {
     assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
     assert_eq!(
         lease_row(&server, &lease_id).await,
-        (MAX_TOKEN, None, other.node_id.clone()),
+        (row_token, None, other.node_id.clone()),
         "a lease another node holds is left as it is"
     );
     let tokens = json!({ lease_id.as_str(): MAX_TOKEN });
