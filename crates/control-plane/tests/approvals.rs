@@ -479,7 +479,10 @@ async fn approving_without_a_body_records_params_as_an_empty_object() {
     // The owner's approval with no body records `{}` (audit-log-format.md
     // section 2), not `null`.
     let res = decide(&owner, &server, &approval_id, true, None).await;
-    assert_eq!(res.status(), 200, "approve: {}", res.text().await.unwrap());
+    assert_eq!(res.status(), 200);
+    let approved: Value = res.json().await.unwrap();
+    assert_eq!(approved["status"], "approved", "{approved}");
+    assert!(approved["grant_id"].is_string(), "{approved}");
     assert_eq!(
         decision_params(&server, APPROVE, "ok").await,
         (json!({}), "object".to_string())
@@ -551,6 +554,16 @@ async fn denying_without_a_body_records_params_as_an_empty_object() {
         .unwrap();
     assert_eq!(status, "pending");
     assert_eq!(decisions_without_object_params(&server).await, 0);
+    let (records,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM audit_log WHERE target_id = ? AND operation IN (?, ?)",
+    )
+    .bind(&pending_id)
+    .bind(APPROVE)
+    .bind(DENY)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(records, 0, "a refused body writes no decision record");
 }
 
 #[tokio::test]

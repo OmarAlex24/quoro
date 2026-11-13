@@ -701,7 +701,8 @@ pub async fn decide(
     // `params` is always a JSON object (audit-log-format.md section 2): a
     // decision sent with no body has no parameters and records `{}`, never
     // `null`. A body is a `DecisionRequest`, which serializes to an object;
-    // a body that does not parse as one is refused before it reaches here.
+    // a body that does not parse as one is refused before it reaches here,
+    // and one sent without a JSON `Content-Type` is read as no body.
     let params = match &body {
         Some(body) => serde_json::to_value(body)
             .map_err(|e| ApiError::internal(&format!("decision params: {e}")))?,
