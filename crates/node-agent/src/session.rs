@@ -3485,10 +3485,11 @@ fn advertised_timeout(failed_attempts: u32) -> Duration {
 }
 
 /// Dials `primary_url`, the address that last worked, with the full
-/// [`tls::CONNECT_TIMEOUT`]. While it refuses the TCP connection, the dial is
-/// repeated every [`REFUSED_RETRY_STEP`] for [`REFUSED_RETRY_WINDOW`]: a
-/// restarting primary refuses for a fraction of a second, and walking its
-/// other addresses meanwhile only delays the reconnect (issue #359).
+/// [`tls::CONNECT_TIMEOUT`] for each dial, upgrade included ([`dial_one`]).
+/// While it refuses the TCP connection, the dial is repeated every
+/// [`REFUSED_RETRY_STEP`] for [`REFUSED_RETRY_WINDOW`]: a restarting primary
+/// refuses for a fraction of a second, and walking its other addresses
+/// meanwhile only delays the reconnect (issue #359).
 async fn dial_known(
     base_url: &str,
     credential: &str,
@@ -3515,8 +3516,11 @@ fn is_refused(error: &AgentError) -> bool {
     )
 }
 
-/// Opens one pinned TLS connection to `base_url` within `timeout` and upgrades
-/// it to the node protocol (section 3.1).
+/// Opens one pinned TLS connection to `base_url` and upgrades it to the node
+/// protocol (section 3.1). One deadline, `timeout` from the start of the
+/// dial, bounds the TCP connection, the TLS handshake and the WebSocket
+/// upgrade together (ADR 0235), so an address that completes TLS and never
+/// answers the upgrade is a failed dial too.
 async fn dial_one(
     base_url: &str,
     credential: &str,
@@ -3524,6 +3528,7 @@ async fn dial_one(
     timeout: Duration,
 ) -> Result<WebSocketStream<TlsStream<tokio::net::TcpStream>>, AgentError> {
     let url = session_url(base_url)?;
+    let deadline = Instant::now() + timeout;
     let stream = tls::connect_with_timeout(&url, fingerprint, timeout).await?;
 
     let mut request = url
@@ -3538,21 +3543,31 @@ async fn dial_one(
     let config = WebSocketConfig::default()
         .max_message_size(Some(wire::MAX_MESSAGE_BYTES))
         .max_frame_size(Some(wire::MAX_MESSAGE_BYTES));
-    match client_async_with_config(request, stream, Some(config)).await {
-        Ok((ws, _response)) => Ok(ws),
-        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+    // The upgrade gets what is left of the deadline after TCP and TLS.
+    let upgraded = tokio::time::timeout_at(
+        deadline,
+        client_async_with_config(request, stream, Some(config)),
+    )
+    .await;
+    match upgraded {
+        Ok(Ok((ws, _response))) => Ok(ws),
+        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response)))
             if matches!(response.status().as_u16(), 401 | 403) =>
         {
             Err(AgentError::Fatal(FatalReason::Unauthenticated))
         }
-        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
             Err(AgentError::Protocol(format!(
                 "the primary answered the upgrade with HTTP {}",
                 response.status()
             )))
         }
-        Err(e) => Err(AgentError::Protocol(format!(
+        Ok(Err(e)) => Err(AgentError::Protocol(format!(
             "the WebSocket upgrade failed: {e}"
+        ))),
+        Err(_) => Err(AgentError::Protocol(format!(
+            "the primary at {url} did not answer the WebSocket upgrade within the {}s connect timeout",
+            timeout.as_secs_f64()
         ))),
     }
 }

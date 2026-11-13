@@ -4287,6 +4287,122 @@ async fn a_freeze_ends_a_dial_attempt_under_way() {
     listener.abort();
 }
 
+/// Section 4.4 and ADR 0235: one deadline, the dial's connect timeout,
+/// bounds TCP, TLS and the WebSocket upgrade. `primary_url` refuses the
+/// connection, so after about 2 s the attempt reaches the advertised
+/// addresses, with the 2 s timeout of the first attempt. The first completes
+/// TLS, reads the upgrade request and never answers it. The dial gives up on
+/// it within that timeout, closes the connection and dials the next stored
+/// address, which gets the `hello`.
+#[tokio::test]
+async fn an_upgrade_that_is_never_answered_ends_within_the_connect_timeout() {
+    use tokio::io::AsyncReadExt as _;
+
+    let dir = TempDir::new();
+    let (cert, key) = self_signed();
+    let pin = tls::cert_fingerprint(cert.as_ref());
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+    let (events, mut seen) = mpsc::unbounded_channel::<(&'static str, Instant)>();
+
+    // A port nothing listens on: bound once, then released.
+    let refused = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("https://127.0.0.1:{}", probe.local_addr().unwrap().port())
+    };
+
+    let stalled = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let stalled_url = format!("https://127.0.0.1:{}", stalled.local_addr().unwrap().port());
+    let stalled_task = {
+        let acceptor = acceptor.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = stalled.accept().await {
+                let acceptor = acceptor.clone();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    // Reads the upgrade request, answers nothing, and reports
+                    // when the agent closes the connection.
+                    let mut request: Vec<u8> = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    while let Ok(read) = stream.read(&mut buf).await
+                        && read > 0
+                    {
+                        let complete = request.windows(4).any(|end| end == b"\r\n\r\n");
+                        request.extend_from_slice(&buf[..read]);
+                        if !complete && request.windows(4).any(|end| end == b"\r\n\r\n") {
+                            let _ = events.send(("upgrade", Instant::now()));
+                        }
+                    }
+                    let _ = events.send(("closed", Instant::now()));
+                });
+            }
+        })
+    };
+
+    let reachable = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let reachable_url = format!(
+        "https://127.0.0.1:{}",
+        reachable.local_addr().unwrap().port()
+    );
+    let reachable_task = tokio::spawn(async move {
+        while let Ok((tcp, _)) = reachable.accept().await {
+            let acceptor = acceptor.clone();
+            let events = events.clone();
+            tokio::spawn(async move {
+                if let Ok(stream) = acceptor.accept(tcp).await
+                    && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+                {
+                    while let Some(Ok(message)) = ws.next().await {
+                        if let Message::Text(text) = message
+                            && serde_json::from_str::<Value>(text.as_str())
+                                .is_ok_and(|frame| frame["type"] == "hello")
+                        {
+                            let _ = events.send(("hello", Instant::now()));
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let (_store, stop, running) =
+        dialing_agent(&dir, &refused, &pin, &[stalled_url, reachable_url]).await;
+
+    let limit = Duration::from_secs(20);
+    let deadline = Instant::now() + limit;
+    let (mut upgrade, mut closed, mut hello) = (None, None, None);
+    while closed.is_none() || hello.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let (event, at) = tokio::time::timeout(left, seen.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the unanswered upgrade did not end, or the next address got no hello, within {limit:?}")
+            })
+            .expect("the servers run");
+        match event {
+            "upgrade" => upgrade = upgrade.or(Some(at)),
+            "closed" => closed = closed.or(Some(at)),
+            _ => hello = hello.or(Some(at)),
+        }
+    }
+    let upgrade =
+        upgrade.expect("the first advertised address completed TLS and got the upgrade request");
+    let waited = hello.unwrap().duration_since(upgrade);
+    assert!(
+        waited < Duration::from_secs(4),
+        "the next address got hello {waited:?} after the unanswered upgrade; the connect timeout is 2 s"
+    );
+    assert!(!running.is_finished(), "an unanswered upgrade is not fatal");
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    stalled_task.abort();
+    reachable_task.abort();
+}
+
 /// Section 7.3 "The freeze" (ADR 0261): a `log_diverged` handled after a
 /// freeze committed changes nothing. The freeze is set over another
 /// connection between `hello` and `welcome`, and the error follows
