@@ -2046,6 +2046,72 @@ async fn a_backup_in_progress_fails_at_start_without_the_repository_key() {
     assert_eq!(status, "queued");
 }
 
+/// The per-tick fallback (`node-agent-protocol.md` section 7.3, step 4): a
+/// volume backup still active on a running primary that no longer holds the
+/// repository key fails at the next tick with `repository key absent`. That
+/// pass runs before the timeout pass, so a tick 25 hours after the backup was
+/// created records this reason and not `timeout`.
+#[tokio::test]
+async fn a_tick_fails_an_active_backup_without_the_repository_key_before_its_timeout() {
+    let setup = setup().await;
+    let pool = setup.server.state.store.pool();
+    let res = setup
+        .owner
+        .post(
+            setup
+                .server
+                .url(&format!("/api/v1/apps/{}/backups", setup.app_id)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "create: {}", res.text().await.unwrap());
+    let backup_id = res.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let created_at: String = sqlx::query_scalar("SELECT created_at FROM backups WHERE id = ?")
+        .bind(&backup_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let created_at =
+        time::OffsetDateTime::parse(&created_at, &time::format_description::well_known::Rfc3339)
+            .unwrap();
+    drop_repository_key(&setup.server, &setup.repo_id).await;
+
+    let tick = quoro_control_plane::backups::dispatch::run(
+        &setup.server.state,
+        created_at + time::Duration::hours(25),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            tick,
+            quoro_control_plane::backups::dispatch::Tick {
+                key_absent: 1,
+                timed_out: 0,
+                ..
+            }
+        ),
+        "{tick:?}"
+    );
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error FROM backups WHERE id = ?")
+            .bind(&backup_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        row,
+        (
+            "failed".to_string(),
+            Some("repository key absent".to_string())
+        )
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Restoring the repository key (ADR 0322)
 // ---------------------------------------------------------------------------
