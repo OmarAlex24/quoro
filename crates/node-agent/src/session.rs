@@ -1736,10 +1736,13 @@ impl Session {
     /// first, and a snapshot whose term cannot be kept is not stored.
     ///
     /// A term above 2^53 - 1 is answered `bad_message` and changes nothing
-    /// (section 8.8 "The term ceiling"). That check comes before the
-    /// signature's: such a body has no RFC 8785 form, so no signature over it
-    /// can verify, and checking the signature first would answer
-    /// `bad_signature` instead.
+    /// (section 8.8 "The term ceiling"). That check reads the raw body and
+    /// comes before the signature's. An integer term above the ceiling has
+    /// no RFC 8785 form, so no signature over it verifies, and checking the
+    /// signature first would answer `bad_signature`. A float term below
+    /// 1e21, such as `1e20`, has one, so a body signed with it verifies: this
+    /// check refuses it for its term, as the typed body, which takes no float
+    /// term, would after it.
     async fn on_desired_state<S>(
         &mut self,
         raw: &RawFrame,
@@ -1749,7 +1752,7 @@ impl Session {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        if vote::above_ceiling(body) {
+        if wire::term_above_ceiling(body) {
             warn!(
                 max_term = wire::MAX_TERM,
                 "a desired_state's term is above the term ceiling; it changes nothing"
@@ -3421,9 +3424,10 @@ fn stale_term(kind: &str, highest: u64) -> NodeMessage {
     })
 }
 
-/// The `bad_message` a machine answers a `welcome`, `desired_state` or
-/// `support_request` whose term is above 2^53 - 1 with: non-fatal, without a
-/// term (sections 5.18 and 8.8 "The term ceiling").
+/// The `bad_message` a machine answers a `welcome` or `desired_state` whose
+/// term is above 2^53 - 1 with: non-fatal, without a term (sections 5.18 and
+/// 8.8 "The term ceiling"). A voter's answer to such a `support_request` is
+/// [`vote::decide_support`]'s.
 fn above_ceiling(kind: &str) -> NodeMessage {
     NodeMessage::Error(ProtocolError {
         code: ErrorCode::BadMessage,
@@ -3442,7 +3446,7 @@ fn above_ceiling(kind: &str) -> NodeMessage {
 fn welcome_above_ceiling(text: &str) -> Option<String> {
     RawFrame::parse(text)
         .ok()
-        .filter(|raw| raw.kind == "welcome" && vote::above_ceiling(&raw.body))
+        .filter(|raw| raw.kind == "welcome" && wire::term_above_ceiling(&raw.body))
         .map(|raw| raw.id)
 }
 

@@ -31,8 +31,8 @@ use quoro_proto::custody::CustodyKey;
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
     Command, ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck,
-    LogEntries, MAX_TERM, QuarantineStatus, Spec, SpecEdge, SpecNetwork, SpecVoter, SpecVotes,
-    SpecWitness, SupportRequest, Welcome,
+    LogEntries, MAX_TERM, QuarantineStatus, RawFrame, Spec, SpecEdge, SpecNetwork, SpecVoter,
+    SpecVotes, SpecWitness, SupportRequest, Welcome,
 };
 use quoro_proto::{
     ErrorCode, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ProtocolError, ResourceType,
@@ -2993,14 +2993,21 @@ async fn a_support_request_with_a_lower_term_ends_the_session() {
 }
 
 /// Asserts that `frame` is the non-fatal `bad_message` answering `re`,
-/// without a term: the answer to a term above the ceiling (section 8.8 "The
-/// term ceiling").
+/// without a term, that the ceiling check sent: the answer to a term above
+/// the ceiling (section 8.8 "The term ceiling"), not a `bad_message` for
+/// another fault of the frame.
 fn assert_above_ceiling(frame: &Value, re: &str) {
     assert_eq!(frame["type"], "error", "{frame}");
     assert_eq!(frame["re"], re, "{frame}");
     assert_eq!(frame["body"]["code"], "bad_message", "{frame}");
     assert_eq!(frame["body"]["fatal"], false, "{frame}");
     assert!(frame["body"].get("term").is_none(), "{frame}");
+    assert!(
+        frame["body"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("term ceiling")),
+        "{frame}"
+    );
 }
 
 /// A `welcome` answering `re` whose `term` is the JSON number `term`, with a
@@ -3057,11 +3064,15 @@ async fn a_welcome_above_the_term_ceiling_adopts_nothing_and_the_node_redials() 
 }
 
 /// Sections 5.11 and 8.8 "The term ceiling": a `desired_state` whose term is
-/// above 2^53 - 1 is answered `bad_message`, not `bad_signature`, and changes
-/// nothing: no term raised, no snapshot stored. No signature can cover such
-/// a body, which has no RFC 8785 form; here it was signed at the ceiling and
-/// its term raised after. The session goes on, and a snapshot at the ceiling
-/// is stored.
+/// above 2^53 - 1 is answered `bad_message` for its term, whatever its
+/// signature, and changes nothing: no term raised, no snapshot stored. An
+/// integer term above the ceiling has no RFC 8785 form, so no signature can
+/// cover it: those bodies are signed at the ceiling and their term raised
+/// after, and would draw `bad_signature` if the signature were checked
+/// first. A float term below 1e21 has one: `msg_float_signed` is signed with
+/// its term `1e20` and verifies as the node reads it, so only the ceiling
+/// check refuses it for its term. The session goes on, and a snapshot at the
+/// ceiling is stored.
 #[tokio::test]
 async fn a_desired_state_above_the_term_ceiling_is_bad_message_and_changes_nothing() {
     let dir = TempDir::new();
@@ -3072,23 +3083,32 @@ async fn a_desired_state_above_the_term_ceiling_is_bad_message_and_changes_nothi
         _observed,
     } = term_node(&dir, None).await;
     let (mut ws, serving) = welcomed(session, 2).await;
-    for (id, term) in [
-        ("msg_above", json!(MAX_TERM + 1)),
-        ("msg_max", json!(u64::MAX)),
-        ("msg_float", json!(1e20)),
+    for (id, term, signed_with_it) in [
+        ("msg_above", json!(MAX_TERM + 1), false),
+        ("msg_max", json!(u64::MAX), false),
+        ("msg_float", json!(1e20), false),
+        ("msg_float_signed", json!(1e20), true),
     ] {
         let mut state = snapshot(4, Vec::new()).state;
         state.term = MAX_TERM;
         let mut body = state.to_unsigned_value();
-        sign::sign_body(&key, &mut body).unwrap();
-        body["term"] = term;
-        send(
-            &mut ws,
-            ControlMessage::DesiredState(body)
-                .to_frame(id, None)
-                .to_text(),
-        )
-        .await;
+        if signed_with_it {
+            body["term"] = term;
+            sign::sign_body(&key, &mut body).unwrap();
+        } else {
+            sign::sign_body(&key, &mut body).unwrap();
+            body["term"] = term;
+        }
+        let text = ControlMessage::DesiredState(body)
+            .to_frame(id, None)
+            .to_text();
+        let read = RawFrame::parse(&text).unwrap();
+        assert_eq!(
+            sign::verify_body(&key.verifying_key(), &read.body).is_ok(),
+            signed_with_it,
+            "{id}"
+        );
+        send(&mut ws, text).await;
         assert_above_ceiling(&reply_to(&mut ws, id).await, id);
         assert_eq!(store.highest_term().await.unwrap(), Some(2), "{id}");
         assert_eq!(store.latest_desired().await.unwrap(), None, "{id}");
@@ -3107,28 +3127,39 @@ async fn a_desired_state_above_the_term_ceiling_is_bad_message_and_changes_nothi
 }
 
 /// Sections 5.27 and 8.8 "The term ceiling": a `support_request` whose term
-/// is above 2^53 - 1 is answered `bad_message`, non-fatal and without a
-/// term, on a voter and on a machine that is not one, as the term check
-/// runs on every machine. Nothing changes: no term raised, no promise
-/// stored, and the session goes on.
+/// is above 2^53 - 1 changes nothing: no term raised, no promise stored, and
+/// the session goes on. A voter answers it `bad_message`, non-fatal and
+/// without a term; a machine that is not a voter ignores it, as it ignores
+/// every `support_request`.
 #[tokio::test]
-async fn a_support_request_above_the_term_ceiling_is_bad_message_and_changes_nothing() {
-    for current in [Some(voter_snapshot(1, 3120)), None] {
-        let voter = current.is_some();
+async fn a_support_request_above_the_term_ceiling_is_bad_message_on_a_voter_and_ignored_otherwise()
+{
+    for current in [voter_snapshot(1, 3120), snapshot(1, Vec::new())] {
+        let voter = current.state.spec.votes.is_some();
         let dir = TempDir::new();
         let TermNode {
             session,
             store,
             _observed,
             ..
-        } = term_node(&dir, current).await;
+        } = term_node(&dir, Some(current)).await;
         let (mut ws, serving) = welcomed(session, 2).await;
         send(
             &mut ws,
             support_frame(MAX_TERM + 1, "nod_primary", 15_000, 15_000, "msg_above"),
         )
         .await;
-        assert_above_ceiling(&reply_to(&mut ws, "msg_above").await, "msg_above");
+        let frames = frames_before_pong(&mut ws, "msg_ping").await;
+        let answers: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| frame["re"] == "msg_above")
+            .collect();
+        if voter {
+            assert_eq!(answers.len(), 1, "{frames:?}");
+            assert_above_ceiling(answers[0], "msg_above");
+        } else {
+            assert!(answers.is_empty(), "no answer, no error: {frames:?}");
+        }
         assert_eq!(
             store.highest_term().await.unwrap(),
             Some(2),

@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use quoro_proto::wire::{
     BackupState, BuildPhase, BuildState, FailedStep, MAX_TERM, SnapshotMethod, VolumeState,
+    term_above_ceiling,
 };
 use quoro_proto::{FenceReason, LeaseId, LeaseMode, ResourceType};
 use serde_json::Value;
@@ -1167,7 +1168,7 @@ impl NodeStore {
     /// and for a body whose `term` is above [`MAX_TERM`], which is never
     /// stored (section 8.8 "The term ceiling").
     pub async fn store_desired(&self, rev: u64, body: &Value) -> Result<(), AgentError> {
-        if crate::vote::above_ceiling(body) {
+        if term_above_ceiling(body) {
             return Err(above_ceiling("desired_state's", body.get("term")));
         }
         let text = serde_json::to_string(body)

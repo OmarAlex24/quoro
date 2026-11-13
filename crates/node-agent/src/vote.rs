@@ -6,9 +6,11 @@
 //! store ([`check_term`]): a higher term in a `welcome`, a `desired_state` or
 //! a `support_request` is stored before anything acts on it, and a lower one
 //! is answered `stale_term`. A term above the ceiling, [`MAX_TERM`], is never
-//! stored or adopted (section 8.8 "The term ceiling"): the session answers
-//! such a frame `bad_message` before any of this runs ([`above_ceiling`]),
-//! and the store refuses to write one.
+//! stored or adopted (section 8.8 "The term ceiling"): the session answers a
+//! `welcome` or `desired_state` with such a term `bad_message` before any of
+//! this runs ([`quoro_proto::wire::term_above_ceiling`]), [`decide_support`]
+//! refuses such a `support_request` on a voter and ignores it on a machine
+//! that is not one, and the store refuses to write one.
 //!
 //! A voter is a machine whose newest desired state carries `spec.votes`
 //! (section 6.12). It answers each `support_request` ([`answer_support`]) with
@@ -36,7 +38,6 @@ use quoro_proto::wire::{
     VoteOutcome, VoteRefusal, VoteRequest,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tracing::warn;
 
 use crate::AgentError;
@@ -201,25 +202,13 @@ pub enum TermCheck {
     },
 }
 
-/// Whether the `term` member of the JSON object `body` is a number above
-/// [`MAX_TERM`] (section 8.8 "The term ceiling"). It reads the raw JSON, so a
-/// term too large for a `u64`, which serde reads as a float, counts as well.
-/// Every integer up to 2^53 is exact as an `f64`, so the comparison is exact.
-#[must_use]
-pub fn above_ceiling(body: &Value) -> bool {
-    body.get("term")
-        .and_then(Value::as_f64)
-        .is_some_and(|term| term > MAX_TERM as f64)
-}
-
 /// Compares `term` with the highest term seen and stores it when it is higher
 /// (section 8.8 "Terms"). A machine with no stored term has seen none; terms
 /// start at 1. A vote counts among the terms seen (section 8.8), so the term
 /// of a stored vote counts even if the stored term was not raised with it.
 ///
 /// A term above [`MAX_TERM`] is never stored (section 8.8 "The term
-/// ceiling"): the session answers its frame `bad_message` before it calls
-/// this, and the store refuses it here as well.
+/// ceiling"): no caller passes one, and the store refuses it here as well.
 ///
 /// # Errors
 ///
@@ -334,9 +323,10 @@ pub struct VoteWrite {
 ///
 /// The order:
 ///
-/// 0. A `term` above [`MAX_TERM`] is `bad_message`, without a term, on every
-///    machine, and nothing is written (sections 5.27 and 8.8 "The term
-///    ceiling"): the ceiling applies to every machine as step 1 does.
+/// 0. A `term` above [`MAX_TERM`] writes nothing (section 8.8 "The term
+///    ceiling"). A voter answers it `bad_message`, without a term; a machine
+///    that is not a voter ignores it, as it ignores every `support_request`
+///    (section 5.27).
 /// 1. The term, on every machine. Section 8.8 "Terms" has every machine,
 ///    voter or not, refuse a lower term in a `support_request` and keep a
 ///    higher one, so the term check runs before the voter check; a
@@ -369,6 +359,9 @@ pub fn decide_support(
     received: &Received,
 ) -> (SupportAnswer, VoteWrite) {
     if request.term > MAX_TERM {
+        if voters_version.is_none() {
+            return (SupportAnswer::Ignore, VoteWrite::default());
+        }
         let answer = SupportAnswer::Refuse {
             message: format!(
                 "the support_request's term {} is above the term ceiling {MAX_TERM}",
@@ -805,12 +798,11 @@ mod tests {
     };
 
     use quoro_proto::wire::MAX_TERM;
-    use serde_json::json;
 
     use super::{
         Received, StoredSupport, StoredVote, SupportAnswer, TermCheck, VoteDecision, VoteState,
-        VoteWrite, above_ceiling, answer_support, answer_vote, check_term, decide_support,
-        decide_vote, horizon_span, may_ask, mesh_ip, not_allowed, rebase_at_start, support_after,
+        VoteWrite, answer_support, answer_vote, check_term, decide_support, decide_vote,
+        horizon_span, may_ask, mesh_ip, not_allowed, rebase_at_start, support_after,
     };
     use crate::lease::{HostClock, ManualHostClock};
     use crate::store::{NodeStore, VOTE};
@@ -1027,36 +1019,13 @@ mod tests {
         assert_eq!(store.highest_term().await.unwrap(), Some(MAX_TERM));
     }
 
-    /// [`above_ceiling`] reads the raw `term`: a number above 2^53 - 1,
-    /// whether serde holds it as a `u64` or, past `u64::MAX`, as a float.
-    #[test]
-    fn above_ceiling_reads_the_raw_term() {
-        for body in [
-            json!({"term": MAX_TERM + 1}),
-            json!({"term": u64::MAX}),
-            serde_json::from_str("{\"term\": 18446744073709551616}").unwrap(),
-            json!({"term": 1e300}),
-        ] {
-            assert!(above_ceiling(&body), "{body}");
-        }
-        for body in [
-            json!({"term": MAX_TERM}),
-            json!({"term": 1}),
-            json!({"term": -1}),
-            json!({"term": "9007199254740992"}),
-            json!({}),
-            json!(null),
-        ] {
-            assert!(!above_ceiling(&body), "{body}");
-        }
-    }
-
     /// Sections 5.27 and 8.8 "The term ceiling": a `support_request` whose
-    /// term is above 2^53 - 1 is `bad_message` without a term, on a voter and
-    /// on a machine that is not one, and writes nothing: no term, no support.
-    /// A request at the ceiling is granted as usual.
+    /// term is above 2^53 - 1 writes nothing, no term and no support. A voter
+    /// answers it `bad_message` without a term; a machine that is not a voter
+    /// ignores it, as it ignores every `support_request`. A request at the
+    /// ceiling is granted as usual.
     #[tokio::test]
-    async fn a_support_request_above_the_ceiling_is_refused_and_writes_nothing() {
+    async fn a_support_request_above_the_ceiling_is_refused_by_a_voter_and_writes_nothing() {
         let state = VoteState {
             highest_term: Some(2),
             vote: None,
@@ -1072,30 +1041,47 @@ mod tests {
                     PRIMARY,
                     &received,
                 );
-                assert!(
-                    matches!(answer, SupportAnswer::Refuse { term: None, .. }),
-                    "{voters_version:?} {term}: {answer:?}"
-                );
+                if voters_version.is_some() {
+                    assert!(
+                        matches!(answer, SupportAnswer::Refuse { term: None, .. }),
+                        "{term}: {answer:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(answer, SupportAnswer::Ignore),
+                        "{term}: {answer:?}"
+                    );
+                }
                 assert_eq!(write, VoteWrite::default(), "{voters_version:?} {term}");
             }
         }
 
         let (_dir, store) = open().await;
         store.raise_term(2).await.unwrap();
-        let answer = answer_support(
-            &store,
-            Some(3120),
-            PRIMARY,
-            &request(MAX_TERM + 1, 15_000, 15_000),
-            &received,
-        )
-        .await;
-        assert!(
-            matches!(answer, SupportAnswer::Refuse { term: None, .. }),
-            "{answer:?}"
-        );
-        assert_eq!(store.highest_term().await.unwrap(), Some(2));
-        assert_eq!(store.support().await.unwrap(), None);
+        for voters_version in [Some(3120), None] {
+            let answer = answer_support(
+                &store,
+                voters_version,
+                PRIMARY,
+                &request(MAX_TERM + 1, 15_000, 15_000),
+                &received,
+            )
+            .await;
+            if voters_version.is_some() {
+                assert!(
+                    matches!(answer, SupportAnswer::Refuse { term: None, .. }),
+                    "{answer:?}"
+                );
+            } else {
+                assert!(matches!(answer, SupportAnswer::Ignore), "{answer:?}");
+            }
+            assert_eq!(
+                store.highest_term().await.unwrap(),
+                Some(2),
+                "{voters_version:?}"
+            );
+            assert_eq!(store.support().await.unwrap(), None, "{voters_version:?}");
+        }
 
         granted(&store, &request(MAX_TERM, 15_000, 15_000), &received).await;
         assert_eq!(store.highest_term().await.unwrap(), Some(MAX_TERM));

@@ -3602,6 +3602,27 @@ impl Session {
             ));
             return false;
         }
+        // Section 8.8, "The term ceiling": an `error` whose `term` is above
+        // 2^53 - 1 is malformed. The primary does not demote itself on it and
+        // records nothing from it, not even the answer to the request it
+        // names: it logs it and drops it, answers nothing, and the session
+        // goes on. The check reads the raw body before it is decoded, so a
+        // term that a `u64` cannot hold (an integer above `u64::MAX`, or a
+        // float of any size) is logged and dropped too, not answered as an
+        // undecodable frame. No `error` that decodes below carries such a
+        // term.
+        if raw.kind == "error" && wire::term_above_ceiling(&raw.body) {
+            tracing::error!(
+                node_id = %self.node_id,
+                code = %raw.body["code"],
+                message = %raw.body["message"],
+                node_term = %raw.body["term"],
+                max_term = wire::MAX_TERM,
+                re = ?raw.re,
+                "a node's error carries a term above the term ceiling: it is malformed, and this primary neither demotes itself on it nor records anything from it"
+            );
+            return false;
+        }
         let message = match NodeMessage::from_raw(&raw) {
             Ok(message) => message,
             Err(error) => return decode_failure(&error, outbox),
@@ -3770,21 +3791,10 @@ impl Session {
                     message = %error.message,
                     "node reported an error"
                 );
-                // Section 8.8, "The term ceiling": an `error` whose `term` is
-                // above 2^53 - 1 is malformed. The primary does not demote
-                // itself on it and records nothing from it, not even the
-                // answer to the request it names: it is logged and dropped.
-                if let Some(term) = error.term.filter(|term| *term > wire::MAX_TERM) {
-                    tracing::error!(
-                        node_id = %self.node_id,
-                        code = ?error.code,
-                        node_term = term,
-                        max_term = wire::MAX_TERM,
-                        re = ?raw.re,
-                        "a node's error carries a term above the term ceiling: it is malformed, and this primary neither demotes itself on it nor records anything from it"
-                    );
-                    return false;
-                }
+                // An `error` whose `term` is above the term ceiling was
+                // logged and dropped before it was decoded (section 8.8), so
+                // `error.term` is at most 2^53 - 1 here.
+                //
                 // Section 8.8, "Terms": a `stale_term`, whatever it answers,
                 // means a higher term exists. The primary demotes itself and
                 // ends this session like every other one (section 7.4).
