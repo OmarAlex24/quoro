@@ -1,8 +1,8 @@
 //! What the host commands that move a control plane on or off a host share:
 //! `quoro node rejoin` (`node-agent-protocol.md` section 7.4) and the host
 //! preparation of `quoro cluster promote` (section 7.3, step 6). The names of
-//! the two units and of the control-plane database, the lines a command
-//! prints, and the host's `systemctl`.
+//! the two units, of the control-plane database and of the agent's store, the
+//! lines a command prints, and the host's `systemctl`.
 
 use std::process::Output;
 
@@ -12,6 +12,8 @@ pub const UNIT: &str = "quoro.service";
 pub const NODE_UNIT: &str = "quoro-node.service";
 /// The control-plane database inside the data directory.
 pub const DATABASE: &str = "quoro.db";
+/// The node agent's store inside the node data directory.
+pub const AGENT_STORE: &str = "node.db";
 
 /// Runs `systemctl <args>` and returns what it printed and its status.
 ///

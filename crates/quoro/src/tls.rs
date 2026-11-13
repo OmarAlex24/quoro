@@ -216,7 +216,7 @@ fn decode_pem(bytes: &[u8], label: &str) -> io::Result<Vec<u8>> {
 }
 
 /// Standard-alphabet base64, ignoring whitespace and stopping at padding.
-fn base64_decode(input: &str) -> io::Result<Vec<u8>> {
+pub(crate) fn base64_decode(input: &str) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let mut acc = 0u32;
     let mut bits = 0u8;

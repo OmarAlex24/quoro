@@ -7,8 +7,8 @@
 //! so the `match` below is less code than a parser. Every other command line
 //! goes to the client CLI (`quoro_cli`), which talks to a primary's API; the
 //! hand-offs are the unknown-command arm, `mcp` other than `mcp stdio`, `audit`
-//! other than `verify`, `cluster` other than `cluster maintenance`, and
-//! `--help`.
+//! other than `verify`, `cluster` other than `cluster maintenance` and
+//! `cluster promote`, and `--help`.
 
 mod advertise;
 mod audit_cli;
@@ -20,9 +20,6 @@ mod node;
 mod null_engine;
 mod panel;
 mod privilege;
-// The command `quoro cluster promote` (#19) calls these layers; until it lands
-// nothing outside their tests does.
-#[allow(dead_code, reason = "quoro cluster promote (#19) does not call it yet")]
 mod promote;
 mod rejoin;
 mod restore;
@@ -66,6 +63,14 @@ commands:
                                         leases with SECONDS (15 to 600,
                                         default 180) so warm apps survive it;
                                         --end goes back to the default
+  cluster promote [--dry-run] [--ack-fence] [--accept-loss]
+                  [--statement TEXT]
+  cluster promote --abort               as root on a machine with the node
+                                        role, when the primary is gone: run
+                                        the refusals and show the log
+                                        position (the later steps are not
+                                        built yet); --abort ends a freeze a
+                                        stopped promotion left
   mcp stdio --context NAME [--url URL] [--fingerprint FINGERPRINT]
             [--key-file PATH] [--justification TEXT]
   mcp stdio --url URL --fingerprint FINGERPRINT --key-file PATH
@@ -142,10 +147,14 @@ async fn main() -> ExitCode {
         "join" => join_command(rest).await,
         "node" => node_command(rest).await,
         // `cluster maintenance` reaches the primary on this host over its
-        // control socket (section 8.11); every other `cluster` command is
-        // the client's.
+        // control socket (section 8.11), and `cluster promote` runs on the
+        // machine to promote (section 7.3); every other `cluster` command
+        // is the client's.
         "cluster" if rest.first().is_some_and(|word| word == "maintenance") => {
             control::maintenance_command(&rest[1..]).await
+        }
+        "cluster" if rest.first().is_some_and(|word| word == "promote") => {
+            promote::command(&rest[1..]).await
         }
         "audit" => audit_cli::run(rest).await,
         "vuln" => vuln_cli::run(rest).await,

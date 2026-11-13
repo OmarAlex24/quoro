@@ -174,6 +174,29 @@ pub fn load_or_create_custody_key(data_dir: &Path) -> Result<CustodyKey, AgentEr
     }
 }
 
+/// Loads the custody key from [`CUSTODY_KEY_FILE`] and never creates one.
+/// `quoro cluster promote` opens its seals with the key the agent made
+/// (section 7.3): a machine without the file holds no seal it could open, and
+/// a key made then would be one the primary never bound (ADR 0231).
+///
+/// # Errors
+///
+/// [`AgentError::Identity`] when the file is missing, cannot be read or is
+/// not 32 bytes. Nothing is written in any case.
+pub fn load_custody_key(data_dir: &Path) -> Result<CustodyKey, AgentError> {
+    let path = data_dir.join(CUSTODY_KEY_FILE);
+    match fs::read(&path) {
+        Ok(bytes) => parse_custody_key(&path, bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(AgentError::Identity(format!(
+                "{} is missing; this machine has no custody key",
+                path.display()
+            )))
+        }
+        Err(error) => Err(unreadable_custody_key(&path, &error)),
+    }
+}
+
 /// Generates a custody key and writes it to [`CUSTODY_KEY_FILE`] only if no
 /// file is there ([`write_private_new`]). When one is, it was created after
 /// [`load_or_create_custody_key`] found none: it is read once and used, and
@@ -615,6 +638,36 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "custody.key is root-only");
         }
         assert_eq!(names(), [CUSTODY_KEY_FILE]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Section 7.3: the load-only path reads the key the agent made and
+    /// never creates one. A missing file is an error that leaves the
+    /// directory as it was; a malformed one is refused with the file named.
+    #[test]
+    fn loading_the_custody_key_never_creates_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "quoro-identity-unit-{}",
+            util::hex(&util::random_bytes::<8>())
+        ));
+        ensure_data_dir(&dir).unwrap();
+        let path = dir.join(CUSTODY_KEY_FILE);
+
+        let error = load_custody_key(&dir).unwrap_err().to_string();
+        assert!(error.contains(CUSTODY_KEY_FILE), "{error}");
+        assert!(!path.exists(), "no custody key is created");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+        let made = load_or_create_custody_key(&dir).unwrap();
+        assert_eq!(
+            load_custody_key(&dir).unwrap().public_key(),
+            made.public_key()
+        );
+
+        fs::write(&path, [7u8; 31]).unwrap();
+        let error = load_custody_key(&dir).unwrap_err().to_string();
+        assert!(error.contains(CUSTODY_KEY_FILE), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), [7u8; 31]);
         let _ = fs::remove_dir_all(&dir);
     }
 
