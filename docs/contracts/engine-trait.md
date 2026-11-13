@@ -716,12 +716,22 @@ pub trait Engine: Send + Sync {
     ) -> impl Future<Output = Result<(), EngineError>> + Send {
         async { Err(EngineError::Unsupported("warm volumes are not implemented by this engine".into())) }
     }
-    /// Freezes a running VM's vCPUs. Added in M5b; section 3.22.
-    fn pause(&self, _id: &VmId) -> impl Future<Output = Result<(), EngineError>> + Send {
+    /// Freezes a running VM's vCPUs, waiting at most `within`. Added in
+    /// M5b; section 3.22.
+    fn pause(
+        &self,
+        _id: &VmId,
+        _within: Duration,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send {
         async { Err(EngineError::Unsupported("pausing a VM is not implemented by this engine".into())) }
     }
-    /// Added in M5b; section 3.22.
-    fn resume(&self, _id: &VmId) -> impl Future<Output = Result<(), EngineError>> + Send {
+    /// Lets a paused VM run again, waiting at most `within`. Added in M5b;
+    /// section 3.22.
+    fn resume(
+        &self,
+        _id: &VmId,
+        _within: Duration,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send {
         async { Err(EngineError::Unsupported("pausing a VM is not implemented by this engine".into())) }
     }
     /// Asks the guest of the running VM that attaches the volume to flush the
@@ -978,6 +988,10 @@ What a warm source and a warm target need from the engine (ADR 0172 to ADR 0177,
 - **`commit_staged_volume`** syncs the staging file, renames it over the volume file in one step on the same filesystem, syncs the directory and returns the volume's `VolumeInfo`. A volume that has no file yet (the first copy on a target) gets it. A VM that exists and attaches the volume is `Conflict`: the target's standby VM is not created until it is the source (`node-agent-protocol.md` section 5.11). After a crash the volume file is either the old copy or the new one, never a mix.
 - **`discard_staged_volume`** removes the staging file; a missing one is `Ok`. Staging files left by a crash are removed by the node agent at start, so a copy that did not complete leaves nothing.
 - **`pause`** freezes a running VM's vCPUs; its memory, devices and volumes stay as they are, and the guest sees no event. **`resume`** lets it run again. They are what a planned switchover freezes the app's writes with (ADR 0177, `node-agent-protocol.md` section 5.17). Pausing a paused VM and resuming a running one are `Ok`. A VM that is not running or paused is `Conflict`; an unknown one is `NotFound`. A paused VM keeps `VmState::Running` in `inspect` and `list`: the node agent records the freeze itself, so it knows after a restart which VM it paused. `stop` and `delete` work on a paused VM, and no stop ever resumes a VM `pause` froze (section 3.8, ADR 0270). A graceful stop resumes a VM that a `PauseCopy` snapshot paused before it presses the power button, also during a fence's graceful phase (`node-agent-protocol.md` section 8.5 step 1), and the snapshot then drops its copy; a forced stop, a fence's forced phase included, never resumes a VM (ADR 0279).
+  - **Bounds.** Both take a bound `within`, as `start` does (section 3.7, ADR 0242) and `stop` does with `force_within` (section 3.8, ADR 0243). When `within` passes before the VMM has confirmed the pause or the resume, the engine gives up with `Timeout` and releases the VM's operation lock (section 4), so a `stop` never waits longer than `within` for it.
+  - After a `Timeout` the VM may be paused or running, and since a paused VM reads `Running` in `inspect`, the node agent cannot tell which. It keeps the freeze recorded and treats the VM as possibly running; the fence at the lease's `valid_until` still stops it (`node-agent-protocol.md` section 8.5).
+  - The node agent passes the start bound, 3 s, to a resume under an `expiring` lease, so the start margin that `node-agent-protocol.md` section 5.17 asks of that resume covers it, as the same margin covers a start (section 6.4 there). It passes a bound of its choosing to the freeze's `pause` and to every other resume. A `Timeout` of the freeze's `pause` is a failed step of `switchover_freeze` (section 5.17 there).
+- **Snapshot files.** Every call that takes a `VolumeSnapshot`, `volume_changed_ranges` (`newer` or `base`), `stage_volume` from a snapshot and `delete_volume_snapshot` (section 3.16), answers `Conflict` for a snapshot whose `location` is not a file named `<volume id>.….snapshot` directly in the engine's current volume directory, so no call reads, clones or deletes a file elsewhere. A file it opens that is not a regular file, such as a directory or a symlink, is `Conflict`, and a missing one is `NotFound`. The node agent's hand-over relies on these answers when it takes a file of that directory as evidence that the directory is the real one (`node-agent-protocol.md` section 9).
 - **`flush_volume`** (ADR 0282) asks the guest to flush the volume's filesystem, as a snapshot does first (section 3.16), and returns the outcome after at most `within`.
   - The VM keeps running during the flush, which takes no VM operation lock (section 4). `within` bounds the whole flush, from the `/vm.info` check through the connect to the answer.
   - The outcomes are those of section 3.16, with `TimedOut` after `within`.
@@ -991,7 +1005,7 @@ What a warm source and a warm target need from the engine (ADR 0172 to ADR 0177,
 - Operations on one `VmId` are serialized by the caller. The node agent holds one lock per VM, so it never issues `start` and `delete` for the same id concurrently. The engine does not promise ordering for concurrent calls on one id and may return `Conflict`.
 - The engine must be safe to call concurrently for **different** VMs, on many VMs at once. This is what lets one node run several apps and replace them independently.
 - `capabilities`, `probe_host`, `ensure_network`, `prepare_image`, `remove_image`, `image_inventory`, `uninventoried_images`, `inventory_cached_image` and `list` are safe concurrently with any VM operation. So are `volume_changed_ranges` on snapshots and the staging calls, which the node agent serializes per volume; `pause` and `resume` are VM operations, serialized per `VmId` like `start` and `stop`. `flush_volume`, and the flush that begins a snapshot (section 3.16), take no VM operation lock and are safe concurrently with any VM operation, so a forced stop never waits for a flush (ADR 0282). `prepare_image`, `prepare_layout`, `inventory_cached_image` and `remove_image` are serialized per digest (section 3.21). `ensure_network` and `prepare_image` are internally serialized by the implementation where the underlying operation is not reentrant.
-- `start` and `stop` enforce their bounds themselves, so a caller never has to drop the future to bound them. Dropping the future of a `start` or a `stop` does not abandon a forced stop the engine has begun: the engine carries it to the kill and the reap in a task of its own. A `stop` called while such a stop of the same VM still runs joins it, within its own bound (ADR 0243).
+- `start`, `stop`, `pause` and `resume` enforce their bounds themselves, so a caller never has to drop the future to bound them. A `pause` or a `resume` that returned `Timeout` has released the VM's operation lock (section 3.22). Dropping the future of a `start` or a `stop` does not abandon a forced stop the engine has begun: the engine carries it to the kill and the reap in a task of its own. A `stop` called while such a stop of the same VM still runs joins it, within its own bound (ADR 0243).
 - No call blocks the runtime for longer than an I/O wait: image preparation and boot are awaited, never run on the reactor thread.
 
 ## 5. Cloud Hypervisor implementation
