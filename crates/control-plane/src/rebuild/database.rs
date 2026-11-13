@@ -68,8 +68,8 @@
 //! - JSON `null` is SQL `NULL`, except in a `NOT NULL` column that holds JSON
 //!   text (its table checks it with `json_valid`), which the primary can only
 //!   have written as the text `null`: an approval decided with no body
-//!   keeps `params` `null` in its audit record. A nullable JSON text column
-//!   keeps `NULL`, as each of its writers stores an absent value.
+//!   before #970 kept `params` `null` in its audit record. A nullable JSON
+//!   text column keeps `NULL`, as each of its writers stores an absent value.
 //!
 //! A value that does not fit its column stops the build with an error that
 //! names the entity, the `seq` of the entry that wrote the value and the
