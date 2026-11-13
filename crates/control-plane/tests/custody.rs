@@ -9,7 +9,7 @@ mod common;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use common::replay;
-use common::{Server, restart_with_resolver, start_patient_in};
+use common::{Server, TestDir, restart_with_resolver, start_patient_in};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::ReferenceAsDigest;
 use quoro_control_plane::changelog::{self, Actor, Op};
@@ -38,11 +38,7 @@ const OTHER_NODE: &str = "nod_01JC9Y2M4Q7V8B1N6T3R5K9XZP";
 
 /// A primary whose keys are all files in its data directory.
 async fn start() -> Server {
-    let dir = std::env::temp_dir().join(format!(
-        "quoro-custody-{}",
-        &quoro_control_plane::store::random_secret()[..16]
-    ));
-    start_patient_in(dir).await
+    start_patient_in(TestDir::new("quoro-custody")).await
 }
 
 fn new_key() -> CustodyKey {
@@ -1214,7 +1210,7 @@ impl OldCredential {
 /// [`old_primary`]'s data directory, its credentials, and the `seq` of the
 /// newest change-log entry it wrote: the start's entries come after it.
 struct OldPrimary {
-    dir: std::path::PathBuf,
+    dir: TestDir,
     credentials: Vec<OldCredential>,
     head_seq: i64,
 }
@@ -1303,11 +1299,7 @@ async fn log_old_credential(store: &Store, node_id: &str, op: Op) {
 /// 0012, issue #751), two written since, and no `signing_keys` row: one
 /// credential of each [`Written`] case.
 async fn old_primary() -> OldPrimary {
-    let dir = std::env::temp_dir().join(format!(
-        "quoro-custody-{}",
-        &quoro_control_plane::store::random_secret()[..16]
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("quoro-custody");
     let store = Store::open(&dir.join("quoro.db")).await.unwrap();
     let first = "2026-10-01T10:00:00.000Z";
     let second = "2026-10-02T10:00:00.000Z";

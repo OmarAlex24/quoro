@@ -27,10 +27,65 @@ pub const TLS_FINGERPRINT: &str = concat!(
     "0000000000000000000000000000000000000000000000000000000000000000"
 );
 
+/// A data directory under the system temp directory, removed with everything
+/// in it when the last clone drops, including when the test panics.
+///
+/// Every [`Server`] holds a clone of its directory, and so does a server
+/// restarted on it, so the directory outlives a server that is dropped and
+/// reopened. A test that stops every server and opens the directory again
+/// keeps its own clone from [`TestDir::new`] until it ends.
+#[derive(Clone)]
+pub struct TestDir(Arc<DirGuard>);
+
+struct DirGuard(PathBuf);
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        // A file written into the directory while it is being removed fails
+        // the removal; the next try removes that file too.
+        for _ in 0..3 {
+            match std::fs::remove_dir_all(&self.0) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => continue,
+                _ => return,
+            }
+        }
+    }
+}
+
+impl TestDir {
+    /// Creates `<temp dir>/<prefix>-<random>`.
+    pub fn new(prefix: &str) -> TestDir {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", &random_secret()[..16]));
+        std::fs::create_dir_all(&path).unwrap();
+        TestDir(Arc::new(DirGuard(path)))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0.0
+    }
+}
+
+impl std::ops::Deref for TestDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.path()
+    }
+}
+
+impl AsRef<Path> for TestDir {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
 pub struct Server {
     pub base: String,
     pub data_dir: PathBuf,
     pub state: AppState,
+    /// Removes `data_dir` once this server, every server restarted on it and
+    /// the test's own [`TestDir`] are dropped.
+    dir: TestDir,
 }
 
 impl Server {
@@ -146,7 +201,8 @@ pub async fn start() -> Server {
 /// The restart tests stop one process and start another on the same directory.
 /// The data-encryption key must outlive the process, as `keys/data.key` does in
 /// production: a fresh key would leave stored webhook secrets undecryptable.
-pub async fn start_in(data_dir: PathBuf) -> Server {
+/// Such a test keeps a clone of `data_dir` while no server is running.
+pub async fn start_in(data_dir: TestDir) -> Server {
     let data_key = Arc::new(DataKey::load_or_create(&data_dir).unwrap());
     start_at(data_dir, 200, 800, None, data_key, false).await
 }
@@ -154,7 +210,7 @@ pub async fn start_in(data_dir: PathBuf) -> Server {
 /// [`start_in`] with the patient node sessions of
 /// [`start_with_patient_node_session`]: every key the primary holds is a file
 /// in `data_dir`, as in production, so a test can read the key files.
-pub async fn start_patient_in(data_dir: PathBuf) -> Server {
+pub async fn start_patient_in(data_dir: TestDir) -> Server {
     let data_key = Arc::new(DataKey::load_or_create(&data_dir).unwrap());
     start_at(data_dir, 200, 30_000, None, data_key, false).await
 }
@@ -195,9 +251,8 @@ async fn start_inner(
     cloudflare: Option<(String, String)>,
     peer_addresses: bool,
 ) -> Server {
-    let data_dir = std::env::temp_dir().join(format!("quoro-test-{}", &random_secret()[..16]));
     start_at(
-        data_dir,
+        TestDir::new("quoro-test"),
         heartbeat_interval_ms,
         session_timeout_ms,
         cloudflare,
@@ -208,7 +263,7 @@ async fn start_inner(
 }
 
 async fn start_at(
-    data_dir: PathBuf,
+    dir: TestDir,
     heartbeat_interval_ms: u64,
     session_timeout_ms: u64,
     cloudflare: Option<(String, String)>,
@@ -218,6 +273,7 @@ async fn start_at(
     // reqwest may carry the binary's no-provider rustls feature in a workspace
     // build; an earlier test having installed it already is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let data_dir = dir.to_path_buf();
     std::fs::create_dir_all(&data_dir).unwrap();
     let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
     let mut state = AppState::open(
@@ -258,6 +314,7 @@ async fn start_at(
         base,
         data_dir,
         state,
+        dir,
     }
 }
 
@@ -283,6 +340,7 @@ pub async fn restart_with_resolver(server: &Server, resolver: Arc<dyn DigestReso
         base,
         data_dir: server.data_dir.clone(),
         state,
+        dir: server.dir.clone(),
     }
 }
 
@@ -311,6 +369,7 @@ pub async fn restart_reloading_tls(server: &Server) -> Server {
         base,
         data_dir: server.data_dir.clone(),
         state,
+        dir: server.dir.clone(),
     }
 }
 

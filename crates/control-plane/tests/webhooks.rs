@@ -8,15 +8,15 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::any;
-use common::{Server, problem, start, start_in};
+use common::{Server, TestDir, problem, start, start_in};
 use hmac::{Hmac, Mac};
 use quoro_control_plane::changelog::Actor;
 use quoro_control_plane::events::{self, NewEvent, Source, StoredEvent};
-use quoro_control_plane::store::{Store, now_rfc3339, random_secret, rfc3339_in};
+use quoro_control_plane::store::{Store, now_rfc3339, rfc3339_in};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use sqlx::Row;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -223,11 +223,9 @@ async fn emit_app_event(server: &Server, app_id: &str, kind: &'static str) -> St
 }
 
 /// A fresh data directory that survives one control-plane process, for the
-/// restart tests.
-fn temp_data_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("quoro-test-{}", &random_secret()[..16]));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// restart tests; removed when the test ends.
+fn temp_data_dir() -> TestDir {
+    TestDir::new("quoro-test")
 }
 
 /// Commits an event straight into the database of a stopped control plane.
