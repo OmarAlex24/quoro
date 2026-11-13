@@ -12,7 +12,9 @@
 //! node answers `ok`.
 //!
 //! Both columns are replicated state: every write goes through the change log
-//! in the caller's transaction.
+//! in the caller's transaction. [`write_failure_row`] is the one exception:
+//! it writes the row only, and its caller must append the node's whole-row
+//! entry in the same transaction before it commits.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, PoisonError};
@@ -213,7 +215,7 @@ pub(crate) async fn record_failure(
     failed: &Failed<'_>,
     actor: &Actor,
 ) -> Result<bool, ApiError> {
-    if !write_failure(conn, node_id, failed).await? {
+    if !write_failure_row(conn, node_id, failed).await? {
         return Ok(false);
     }
     let payload = driver::node_payload(conn, node_id).await?;
@@ -224,13 +226,14 @@ pub(crate) async fn record_failure(
 /// [`record_failure`]'s write of the node's row, without its change-log
 /// entry. For `removeNode` only, which writes the node's whole-row removal
 /// entry later in the same transaction: that one entry then carries the
-/// failure and the removal together (`crate::removal`). Returns whether the
-/// row changed.
+/// failure and the removal together (`crate::removal`). Any other caller
+/// must also append the node's whole-row entry before it commits, or the
+/// change log misses the write (ADR 0297). Returns whether the row changed.
 ///
 /// # Errors
 ///
 /// A database error, or a stored value that does not parse.
-pub(crate) async fn write_failure(
+pub(crate) async fn write_failure_row(
     conn: &mut SqliteConnection,
     node_id: &str,
     failed: &Failed<'_>,

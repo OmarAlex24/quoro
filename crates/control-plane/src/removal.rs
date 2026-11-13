@@ -383,14 +383,18 @@ async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result
             )));
         }
         // Not in `fence_failure` yet, so `ackNodeFence` would find nothing
-        // to acknowledge. A retry sends the revoke again: the node's next
-        // `fence_failed` answer records the failure, and a removal of the
-        // node once it is not connected writes it ([`record_unrecorded`]).
+        // to acknowledge. The check runs before the node answers a revoke
+        // this attempt sent again, so a retry while the node is connected is
+        // refused here too; the node's answer to that revoke records the
+        // failure, and a later attempt finds it. A removal that goes on
+        // writes every unrecorded failure in its own transaction
+        // ([`record_unrecorded`]).
         if unrecorded {
             return Err(ApiError::conflict(format!(
                 "the node could not confirm that the VMs of {lease_id} stopped (fence_failed), \
                  and the primary has not recorded that failure yet, so there is no failed fence \
-                 to acknowledge; retry the removal"
+                 to acknowledge; a retry sends the lease_revoke again, and the node's answer to it \
+                 records the failure for the attempt after that"
             )));
         }
         // Section 8.5: a lease another node's failed fence lists is granted
@@ -434,7 +438,7 @@ async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result
 /// removal: nothing is removed. Returns the leases written, which the caller
 /// notes recorded once the transaction committed.
 ///
-/// Only the row is written here ([`crate::fences::write_failure`]); the
+/// Only the row is written here ([`crate::fences::write_failure_row`]); the
 /// removal entry, the whole row, carries the failure into the change log.
 /// One entry for both means that no prefix of the log, which a promoted
 /// follower may hold, has the node removed without its failure. It also
@@ -468,7 +472,7 @@ async fn record_unrecorded(
             app_ids.push(lease.resource_id);
         }
     }
-    crate::fences::write_failure(
+    crate::fences::write_failure_row(
         conn,
         node_id,
         &crate::fences::Failed {
