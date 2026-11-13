@@ -203,8 +203,10 @@ pub enum PrimaryPick {
     NodeIdFlag(String),
     /// The node in this host's node agent identity file.
     IdentityFile(String),
-    /// No `primary-node` file: the primary status stays where the backup had
-    /// it. The text says why.
+    /// No `primary-node` file. Without `--accept-loss` the primary status
+    /// stays where the backup had it; with it, a machine the primary's first
+    /// write removes loses the status, and the next local enrollment of this
+    /// host's node agent takes it. The text says why no file was written.
     Unchanged(String),
 }
 
@@ -295,22 +297,7 @@ pub async fn run(args: &[String], node_data_dir: &Path) -> Result<(), Error> {
     if report.skipped_seals > 0 {
         println!("skipped {} invalid seals", report.skipped_seals);
     }
-    let takes = if report.installed {
-        "takes"
-    } else {
-        "would take"
-    };
-    match &report.primary {
-        PrimaryPick::NodeIdFlag(node_id) => println!(
-            "node {node_id} (--node-id) {takes} the primary status at the primary's next start"
-        ),
-        PrimaryPick::IdentityFile(node_id) => println!(
-            "node {node_id} (this host's node agent) {takes} the primary status at the primary's next start"
-        ),
-        PrimaryPick::Unchanged(reason) => println!(
-            "no {MARKER_FILE} file: {reason}; the primary status stays where the backup had it"
-        ),
-    }
+    println!("{}", primary_line(&report));
     if report.accept_loss {
         let removes = if report.installed {
             "removes"
@@ -335,6 +322,32 @@ pub async fn run(args: &[String], node_data_dir: &Path) -> Result<(), Error> {
         "the restored database is as old as the backup; audit verification against the off-site copy will report tail_truncated"
     );
     Ok(())
+}
+
+/// The line `quoro restore` prints about the primary status: the node that
+/// takes it, or why no `primary-node` file was written and what becomes of the
+/// status then.
+#[must_use]
+pub fn primary_line(report: &Report) -> String {
+    let (takes, removes, loses) = if report.installed {
+        ("takes", "removes", "loses")
+    } else {
+        ("would take", "would remove", "would lose")
+    };
+    match &report.primary {
+        PrimaryPick::NodeIdFlag(node_id) => format!(
+            "node {node_id} (--node-id) {takes} the primary status at the primary's next start"
+        ),
+        PrimaryPick::IdentityFile(node_id) => format!(
+            "node {node_id} (this host's node agent) {takes} the primary status at the primary's next start"
+        ),
+        PrimaryPick::Unchanged(reason) if report.accept_loss => format!(
+            "no {MARKER_FILE} file: {reason}; a machine the primary's first write {removes} {loses} the primary status, and the next local enrollment of this host's node agent {takes} it"
+        ),
+        PrimaryPick::Unchanged(reason) => format!(
+            "no {MARKER_FILE} file: {reason}; the primary status stays where the backup had it"
+        ),
+    }
 }
 
 /// The restore of section 8.2 over any object store.

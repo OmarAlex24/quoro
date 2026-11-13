@@ -859,6 +859,51 @@ async fn no_identity_file_writes_no_marker() {
     assert!(reason.contains("no node agent identity file"), "{reason}");
 }
 
+/// Without `primary-node`, the printed line says what becomes of the primary
+/// status: it stays where the backup had it, unless `--accept-loss`'s first
+/// write removes the machine that holds it.
+#[tokio::test]
+async fn without_a_marker_the_line_says_where_the_primary_status_goes() {
+    let fixture = Fixture::new().await;
+    fixture
+        .add_backup("bkp_01JC9Z1A2B3C4D5E6F7G8H9J0K", &fixture.database, NEW)
+        .await;
+    let dir = fixture.data_dir("line-plain");
+    let report = restore::execute(&fixture.store, &fixture.options(&dir, None))
+        .await
+        .unwrap();
+    assert!(!report.accept_loss);
+    let line = restore::primary_line(&report);
+    assert!(
+        line.starts_with("no primary-node file: no --node-id and no node agent identity file"),
+        "{line}"
+    );
+    assert!(
+        line.ends_with("; the primary status stays where the backup had it"),
+        "{line}"
+    );
+
+    let fixture = node_fixture().await;
+    let dir = fixture.data_dir("line-forced");
+    let report = restore::execute(&fixture.store, &fixture.forced_options(&dir))
+        .await
+        .unwrap();
+    assert!(report.accept_loss);
+    let line = restore::primary_line(&report);
+    assert!(
+        line.starts_with("no primary-node file: no --node-id and no node agent identity file"),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(
+            "; a machine the primary's first write removes loses the primary status, \
+             and the next local enrollment of this host's node agent takes it"
+        ),
+        "{line}"
+    );
+    assert!(!line.contains("stays where the backup had it"), "{line}");
+}
+
 #[tokio::test]
 async fn a_node_id_the_database_does_not_hold_or_holds_removed_is_refused() {
     let fixture = node_fixture().await;
