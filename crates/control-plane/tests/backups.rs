@@ -1910,7 +1910,7 @@ async fn a_backup_in_progress_fails_at_start_without_the_repository_key() {
         // A later report of the backup changes nothing, even a `succeeded`
         // one with a real manifest. The volume report sent after it is
         // applied only once the backup report was.
-        let manifest = write_manifest(&setup, &backup_id, &vec![9u8; 64 * 1024]).await;
+        let manifest = write_manifest(&setup, &backup_id, &vec![8 + round as u8; 64 * 1024]).await;
         send(
             &mut setup.socket,
             status_report(
