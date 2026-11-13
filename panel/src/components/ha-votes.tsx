@@ -6,7 +6,7 @@ import { useGetCluster } from '../api/generated/cluster/cluster';
 import type { Node, NodeJoinTokenCreated } from '../api/generated/model';
 import { expiryWords } from '../lib/agency-format';
 import { canChangeVoters } from '../lib/capabilities';
-import { joinTokenMutation } from '../lib/join-token';
+import { joinTokenMutation, releasePage } from '../lib/join-token';
 import { problemView, type ProblemView } from '../lib/problem';
 import { cn } from '../lib/utils';
 import {
@@ -138,7 +138,7 @@ export function HaVotesView(props: HaVotesViewProps) {
             {readout.headline}
           </h2>
           <p className="ha-line">{readout.line}</p>
-          {stale ? <StaleNote problem={stale} /> : null}
+          <StaleNote problem={stale} />
         </div>
         <span className="ha-tally">{readout.tally}</span>
       </div>
@@ -230,8 +230,14 @@ function WitnessOffer({
       <div className="ha-way">
         <h3 className="ha-way-t">Enroll a new machine as the witness</h3>
         <p className="ha-way-p">
-          A small machine is enough. It needs the <code className="type-code">quoro</code> binary at the cluster’s
-          version{version ? `, ${version}` : ''}. The join token is for one machine and lasts an hour.
+          A small machine is enough, with iproute2 and nftables installed. From the archive of{' '}
+          <a href={releasePage(version)} target="_blank" rel="noreferrer" className="set-inline-link">
+            {version ? `release ${version}` : 'the release'}
+          </a>
+          {version ? ', the cluster’s version,' : ' at the cluster’s version,'} put{' '}
+          <code className="type-code">quoro</code> in <code className="type-code">/usr/local/bin</code> and{' '}
+          <code className="type-code">quoro-node.service</code> in{' '}
+          <code className="type-code">/etc/systemd/system</code>. The join token is for one machine and lasts an hour.
         </p>
         {joinToken ? (
           <div className="grid gap-2">
@@ -242,8 +248,9 @@ function WitnessOffer({
               note={`The token is shown only this once and expires ${expiryWords(joinToken.expires_at)}.`}
             />
             <p className="next-step">
-              Then start the node agent there with <code className="type-code">quoro node</code>, as root too, and
-              keep it running, for example as a systemd service. Until it connects, the witness cannot vote.
+              Then start its node agent, as root too:{' '}
+              <code className="type-code">systemctl enable --now quoro-node</code>. Until the agent connects, the
+              witness cannot vote.
             </p>
             <Button size="sm" className="justify-self-start" onClick={onDropToken}>
               Done
@@ -315,12 +322,20 @@ function Candidate({
   );
 }
 
-/** The newest refetch failed: the last votes stay, with this beside them. */
-function StaleNote({ problem }: { problem: ProblemView }) {
+/**
+ * The newest refetch failed: the last votes stay, with this beside them. The
+ * status element stays mounted, empty and out of sight while the votes are
+ * current, so a screen reader announces the note when it fills.
+ */
+function StaleNote({ problem }: { problem: ProblemView | null }) {
   return (
-    <p className="ha-stale" role="status">
-      <LampDot ring="fault" core="fault" size={9} />
-      <span>These votes may be out of date. {problem.message}</span>
+    <p className={cn('ha-stale', !problem && 'sr-only')} role="status">
+      {problem ? (
+        <>
+          <LampDot ring="fault" core="fault" size={9} />
+          <span>These votes may be out of date. {problem.message}</span>
+        </>
+      ) : null}
     </p>
   );
 }
@@ -357,16 +372,16 @@ function HaSettled({ readout, stale }: { readout: HaReadout; stale: ProblemView 
       {away.length > 0 ? (
         <p className="next-step">
           Make sure the node agent, <code className="type-code">quoro node</code>, is running on{' '}
-          {away.map((name, index) => (
+          {away.map((voter, index) => (
             <Fragment key={index}>
               {index === 0 ? null : index === away.length - 1 ? ' and ' : ', '}
-              <b>{name}</b>
+              {voter.named ? <b>{voter.words}</b> : voter.words}
             </Fragment>
           ))}
           .
         </p>
       ) : null}
-      {stale ? <StaleNote problem={stale} /> : null}
+      <StaleNote problem={stale} />
     </section>
   );
 }

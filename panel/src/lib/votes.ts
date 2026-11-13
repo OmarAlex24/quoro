@@ -24,7 +24,14 @@ export type HaState = 'short' | 'waiting' | 'ready';
 /** One voter as the view shows it: its name, its roles and its session. */
 export interface VoterSeat {
   nodeId: string;
+  /** Its name in the node list, or its short id while the list has none. */
   name: string;
+  /**
+   * Whether the node list names it. A machine that has just joined is in the
+   * votes (read every 5 s) a few seconds before it is in the node list (every
+   * 10 s).
+   */
+  named: boolean;
   roles: string[];
   connected: boolean;
   tone: LampTone;
@@ -68,14 +75,18 @@ export const tallyWords = (count: number, required: number): string =>
 
 /** Each voter with its name from the nodes list, or its short id while the list has none. */
 export const voterSeats = (votes: ClusterVotes, nodes: readonly Node[]): VoterSeat[] =>
-  votes.voters.map((voter) => ({
-    nodeId: voter.node_id,
-    name: nodes.find((node) => node.id === voter.node_id)?.name ?? shortId(voter.node_id),
-    roles: [...voter.roles],
-    connected: voter.connected,
-    tone: voter.connected ? 'run' : 'fault',
-    words: voter.connected ? 'Connected' : 'Disconnected',
-  }));
+  votes.voters.map((voter) => {
+    const node = nodes.find((candidate) => candidate.id === voter.node_id);
+    return {
+      nodeId: voter.node_id,
+      name: node?.name ?? shortId(voter.node_id),
+      named: node !== undefined,
+      roles: [...voter.roles],
+      connected: voter.connected,
+      tone: voter.connected ? 'run' : 'fault',
+      words: voter.connected ? 'Connected' : 'Disconnected',
+    };
+  });
 
 /**
  * Whether HA is short of a vote, so the view offers a witness. A join token
@@ -163,13 +174,30 @@ export const witnessCandidates = (nodes: readonly Node[], votes: ClusterVotes): 
 export const candidateNote = (node: Pick<Node, 'status'>): string | null =>
   node.status === 'connected' ? null : 'It gets the role now and can vote once its node agent connects.';
 
+/** One machine, or the machines not named yet, in the line about disconnected voters. */
+export interface AwayVoter {
+  /** A machine's name, or "the new machine". */
+  words: string;
+  /** Whether `words` is a machine's name, which the line sets in bold. */
+  named: boolean;
+}
+
 /**
- * The voters that are not connected, by name, for the line that says what to
- * do about them. The server counts a voter connected or not, so HA can reach
- * its count, and even be ready, while one of them still waits for its agent.
+ * The voters that are not connected, for the line that says what to do about
+ * them. The server counts a voter connected or not, so HA can reach its
+ * count, and even be ready, while one of them still waits for its agent.
+ *
+ * Each named voter by its name, in order. A voter the node list does not name
+ * yet is a machine that has just joined: the line calls it "the new machine"
+ * (two or more: "the new machines", once, at the end), never by a cut-off id.
  */
-export const disconnectedVoters = (seats: readonly VoterSeat[]): string[] =>
-  seats.filter((seat) => !seat.connected).map((seat) => seat.name);
+export const disconnectedVoters = (seats: readonly VoterSeat[]): AwayVoter[] => {
+  const away = seats.filter((seat) => !seat.connected);
+  const named: AwayVoter[] = away.filter((seat) => seat.named).map((seat) => ({ words: seat.name, named: true }));
+  const unnamed = away.length - named.length;
+  if (unnamed === 0) return named;
+  return [...named, { words: unnamed === 1 ? 'the new machine' : 'the new machines', named: false }];
+};
 
 /**
  * What the HA view draws for `getCluster`:

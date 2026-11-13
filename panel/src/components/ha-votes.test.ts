@@ -93,14 +93,25 @@ describe('HaVotesView with two voters', () => {
     expect(html).not.toContain('Create a join token');
   });
 
-  it('says the new machine needs the quoro binary at the cluster\'s version, before any token', () => {
-    expect(text(render(votes, nodes, { version: '0.1.0' }))).toContain(
-      'A small machine is enough. It needs the quoro binary at the cluster’s version, 0.1.0. The join token is for one machine and lasts an hour.',
+  it('says what a fresh machine needs before the join: its packages, and the binary and unit of the cluster\'s release', () => {
+    const html = render(votes, nodes, { version: '0.1.0' });
+    expect(text(html)).toContain(
+      'A small machine is enough, with iproute2 and nftables installed. From the archive of release 0.1.0, the cluster’s version, put quoro in /usr/local/bin and quoro-node.service in /etc/systemd/system. The join token is for one machine and lasts an hour.',
     );
-    expect(text(render(votes, nodes))).toContain('It needs the quoro binary at the cluster’s version. The join token');
+    expect(html).toContain(
+      '<a href="https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0" target="_blank" rel="noreferrer" class="set-inline-link">release 0.1.0</a>',
+    );
   });
 
-  it('says to run the join as root, then to start the node agent as root and keep it running', () => {
+  it('points to the list of releases while the cluster\'s version is unknown', () => {
+    const html = render(votes, nodes);
+    expect(text(html)).toContain(
+      'From the archive of the release at the cluster’s version, put quoro in /usr/local/bin and quoro-node.service in /etc/systemd/system.',
+    );
+    expect(html).toContain('<a href="https://github.com/OmarAlex24/quoro/releases" target="_blank"');
+  });
+
+  it('says to run the join as root, then to start the node agent with its unit, as root too', () => {
     const token: NodeJoinTokenCreated = {
       id: 'njt_01JCA0A1B2C3D4E5F6G7H8J9KM',
       token: 'njt_secret',
@@ -109,12 +120,12 @@ describe('HaVotesView with two voters', () => {
     };
     const html = render(votes, nodes, { joinToken: token });
     expect(text(html)).toMatch(
-      /Run this as root on the new machine.*--role witness.*Then start the node agent there with quoro node, as root too, and keep it running, for example as a systemd service\. Until it connects, the witness cannot vote\./s,
+      /Run this as root on the new machine.*--role witness.*Then start its node agent, as root too: systemctl enable --now quoro-node\. Until the agent connects, the witness cannot vote\./s,
     );
-    expect(html).toContain('<code class="type-code">quoro node</code>');
+    expect(html).toContain('<code class="type-code">systemctl enable --now quoro-node</code>');
     // No installer: it has no witness role.
     expect(html).not.toContain('QUORO_ROLE');
-    expect(render(votes, nodes)).not.toContain('quoro node');
+    expect(render(votes, nodes)).not.toContain('systemctl');
   });
 
   it('notes beside the button that a candidate which is not connected votes only once its agent connects', () => {
@@ -162,6 +173,11 @@ describe('HaVotesView with two voters', () => {
       /<p class="ha-stale" role="status">.*These votes may be out of date\. Could not reach the server\. Check the connection and try again\./,
     );
     expect(html).not.toContain('role="alert"');
+  });
+
+  // A status element inserted with its text is not always announced: it is there, empty, before.
+  it('keeps the status element mounted, empty and out of sight, while the votes are current', () => {
+    expect(render(votes, nodes)).toContain('<p class="ha-stale sr-only" role="status"></p>');
   });
 
   it('shows the server words of a 409 and says to wait and try again', () => {
@@ -233,6 +249,18 @@ describe('HaVotesView with three voters', () => {
     expect(html).toContain('<b>lab-edge</b>.</p>');
   });
 
+  // The votes are read every 5 s and the node list every 10 s, so a machine that has just joined has no name yet.
+  it('calls a voter that is not in the node list yet the new machine, not by a cut-off id', () => {
+    const joined = node('lab-witness', ['witness'], { id: 'nod_01JCZZZZZZZZZZZZZZZZZZZZZW' });
+    const votes = votesOf([lab3, lab4, joined], true);
+    votes.voters[2] = { ...votes.voters[2]!, connected: false };
+    const html = render(votes, [lab3, lab4]);
+    expect(html).toContain('is running on the new machine.</p>');
+    expect(html.match(/nod_01JCZZ…/g)).toHaveLength(1);
+    // Once the list names it, the line does too.
+    expect(text(render(votes, [lab3, lab4, joined]))).toContain('is running on lab-witness.');
+  });
+
   it('names every disconnected voter in one line', () => {
     const votes = votesOf([lab3, lab4, witness], false);
     votes.voters[1] = { ...votes.voters[1]!, connected: false };
@@ -252,7 +280,11 @@ describe('HaVotesView with three voters', () => {
     });
     expect(html).toContain('HA is ready.');
     expect(html).toContain('These votes may be out of date.');
-    expect(render(votesOf([lab3, lab4, witness], true), nodes)).not.toContain('ha-stale');
+    expect(html).toContain('ha-quiet-rows');
+    const current = render(votesOf([lab3, lab4, witness], true), nodes);
+    expect(current).toContain('<p class="ha-stale sr-only" role="status"></p>');
+    expect(current).not.toContain('out of date');
+    expect(current).not.toContain('ha-quiet-rows');
   });
 
   it('waits for a majority before ha_ready, still without an offer', () => {
@@ -322,8 +354,25 @@ describe('the HaVotes container', () => {
     const html = renderContainer(signedIn(new QueryClient()));
     expect(html).not.toContain('ha-skel');
     expect(html).toContain('HA needs a third vote');
-    expect(text(html)).toContain('It needs the quoro binary at the cluster’s version, 0.1.0.');
+    expect(text(html)).toContain('From the archive of release 0.1.0, the cluster’s version, put quoro in');
+    expect(html).toContain('href="https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0"');
     expect(html).toContain('Add the witness role');
+    // The votes are current: the status element is there, empty.
+    expect(html).toContain('<p class="ha-stale sr-only" role="status"></p>');
+  });
+
+  it('keeps the cached votes when the newest read of the cluster failed, and says they may be out of date', () => {
+    const client = signedIn(new QueryClient());
+    const query = client.getQueryCache().find({ queryKey: getGetClusterQueryKey() });
+    if (!query) throw new Error('no cluster query in the cache');
+    query.setState({ status: 'error', fetchStatus: 'idle', error: new TypeError('Failed to fetch') });
+
+    const html = renderContainer(client);
+    expect(html).toContain('HA needs a third vote');
+    expect(html).toMatch(
+      /<p class="ha-stale" role="status">.*These votes may be out of date\. Could not reach the server\./,
+    );
+    expect(html).not.toContain('role="alert"');
   });
 
   /** The container's two mutations, in the order it calls `useMutation`. */
@@ -347,6 +396,9 @@ describe('the HaVotes container', () => {
     expect(keys).toHaveLength(2);
     for (const key of keys) expect(key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(keys[0]).not.toBe(keys[1]);
+    // An empty body, so the server's one-hour expiry applies.
+    const bodies = requests.filter((request) => request.path === '/api/v1/nodes/join-tokens').map((r) => r.body);
+    expect(await Promise.all(bodies)).toEqual(['{}', '{}']);
   });
 
   const invalidated = (client: QueryClient) =>

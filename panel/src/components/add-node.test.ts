@@ -2,7 +2,8 @@ import { MutationObserver, QueryClient, QueryClientProvider } from '@tanstack/re
 import { createElement, type ReactElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import type { NodeJoinTokenCreated } from '../api/generated/model';
+import { getGetClusterQueryKey } from '../api/generated/cluster/cluster';
+import type { Cluster, NodeJoinTokenCreated } from '../api/generated/model';
 import { RecordingClient, serveMockApi } from '../mocks/node-server';
 import { AddNodeDialog, JoinCommand } from './add-node';
 import { Button } from './ui/button';
@@ -28,6 +29,15 @@ const TOKEN: NodeJoinTokenCreated = {
   join_command: 'quoro join https://10.0.0.3:8443 --token njt_secret --fingerprint 4f1c',
 };
 
+/** The token's plate as the open dialog shows it, with the cluster's version in the cache, or none yet. */
+const renderJoin = (version?: string): string => {
+  const client = new QueryClient();
+  if (version) client.setQueryData(getGetClusterQueryKey(), { version } as Cluster);
+  return renderToStaticMarkup(
+    createElement(QueryClientProvider, { client }, createElement(JoinCommand, { token: TOKEN, onDone: () => undefined })),
+  );
+};
+
 const INSTALL =
   'curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/install.sh | sudo QUORO_ROLE=node';
 
@@ -51,16 +61,13 @@ describe('AddNodeDialog', () => {
   });
 
   it('gives the installer command to run as root, at the cluster\'s version, with the agent it starts', () => {
-    const html = renderToStaticMarkup(
-      createElement(JoinCommand, { token: TOKEN, version: '0.1.0', onDone: () => undefined }),
-    );
+    const html = renderJoin('0.1.0');
     const shown = text(html);
-    expect(shown).toContain('Join command for the new machine');
-    // The join command is the server's, unchanged.
-    expect(shown).toContain('quoro join https://10.0.0.3:8443 --token njt_secret --fingerprint 4f1c');
-    expect(shown).toContain(
-      'On the new machine, run the installer as root, with the URL, token and fingerprint from this command:',
+    // The join command is the server's, unchanged, and labelled for what it is for here: its values.
+    expect(shown).toMatch(
+      /^Join command: its URL, token and fingerprint go in the installer commandCopy command.*quoro join https:\/\/10\.0\.0\.3:8443 --token njt_secret --fingerprint 4f1cThe token is shown/,
     );
+    expect(shown).toContain('On the new machine, run the installer as root:Copy installer commandCopiedcurl -fsSL');
     expect(shown).toContain(
       `${INSTALL} QUORO_VERSION=0.1.0 QUORO_JOIN_URL=<url> QUORO_JOIN_TOKEN=<token> QUORO_JOIN_FINGERPRINT=<fingerprint> sh`,
     );
@@ -72,9 +79,7 @@ describe('AddNodeDialog', () => {
   });
 
   it('keeps the token out of the installer command, which is not secret', () => {
-    const html = renderToStaticMarkup(
-      createElement(JoinCommand, { token: TOKEN, version: '0.1.0', onDone: () => undefined }),
-    );
+    const html = renderJoin('0.1.0');
     // In the join command's well only, never in the installer's.
     expect(text(html).match(/njt_secret/g)).toHaveLength(1);
     const wells = html.match(/<code[^>]*>[\s\S]*?<\/code>/g) ?? [];
@@ -84,7 +89,7 @@ describe('AddNodeDialog', () => {
   });
 
   it('asks for the cluster\'s version while it is unknown', () => {
-    const shown = text(renderToStaticMarkup(createElement(JoinCommand, { token: TOKEN, onDone: () => undefined })));
+    const shown = text(renderJoin());
     expect(shown).toContain(`${INSTALL} QUORO_VERSION=<version> QUORO_JOIN_URL=<url>`);
     expect(shown).toContain(
       'Set QUORO_VERSION to the cluster’s version. Without it, the installer installs the latest release.',
@@ -106,5 +111,8 @@ describe('AddNodeDialog', () => {
     expect(keys).toHaveLength(2);
     for (const key of keys) expect(key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(keys[0]).not.toBe(keys[1]);
+    // An empty body, so the server's one-hour expiry applies.
+    const bodies = requests.filter((request) => request.path === '/api/v1/nodes/join-tokens').map((r) => r.body);
+    expect(await Promise.all(bodies)).toEqual(['{}', '{}']);
   });
 });

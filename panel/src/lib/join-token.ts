@@ -30,6 +30,18 @@ export const joinTokenMutation = (): UseMutationOptions<NodeJoinTokenCreated, Er
 /** Where the installer lives, as installer/README.md names it. */
 export const INSTALLER_URL = 'https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/install.sh';
 
+/** Where the releases are published (.github/workflows/release.yml), one tag `v<version>` each. */
+export const RELEASES_URL = 'https://github.com/OmarAlex24/quoro/releases';
+
+/**
+ * The release page of the cluster's version, whose archive holds the `quoro`
+ * binary and `quoro-node.service` (the installer checks for both), or the
+ * list of releases while the version is unknown. A witness takes them from
+ * there: the installer has no witness role.
+ */
+export const releasePage = (version: string | undefined): string =>
+  version ? `${RELEASES_URL}/tag/v${encodeURIComponent(version)}` : RELEASES_URL;
+
 /**
  * The installer's command for a new node (installer/README.md), as one line.
  * The URL, token and fingerprint stay placeholders: the panel shows the token

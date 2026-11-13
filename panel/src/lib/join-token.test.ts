@@ -2,7 +2,13 @@ import { MutationObserver, QueryClient } from '@tanstack/react-query';
 import { describe, expect, it } from 'vitest';
 import type { NodeJoinTokenCreated, NodeJoinTokenRequest } from '../api/generated/model';
 import { serveMockApi } from '../mocks/node-server';
-import { createJoinToken, joinTokenMutation, nodeInstallerCommand, type JoinTokenCreator } from './join-token';
+import {
+  createJoinToken,
+  joinTokenMutation,
+  nodeInstallerCommand,
+  releasePage,
+  type JoinTokenCreator,
+} from './join-token';
 
 const { requests } = serveMockApi();
 
@@ -70,5 +76,16 @@ describe('nodeInstallerCommand', () => {
   it('leaves the version a placeholder while it is unknown', () => {
     expect(nodeInstallerCommand(undefined)).toContain(' QUORO_VERSION=<version> ');
     expect(nodeInstallerCommand('')).toContain(' QUORO_VERSION=<version> ');
+  });
+});
+
+describe('releasePage', () => {
+  it('is the release of the cluster\'s version, by its tag', () => {
+    expect(releasePage('0.1.0')).toBe('https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0');
+  });
+
+  it('is the list of releases while the version is unknown', () => {
+    expect(releasePage(undefined)).toBe('https://github.com/OmarAlex24/quoro/releases');
+    expect(releasePage('')).toBe('https://github.com/OmarAlex24/quoro/releases');
   });
 });

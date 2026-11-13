@@ -280,11 +280,33 @@ describe('candidateNote', () => {
 describe('disconnectedVoters', () => {
   it('names the voters that are not connected, in their order', () => {
     const current = votes([voter(lab3), voter(lab4, false), voter(edge, false)]);
-    expect(disconnectedVoters(haReadout(current, [lab3, lab4, edge]).seats)).toEqual(['lab-4', 'lab-edge']);
+    expect(disconnectedVoters(haReadout(current, [lab3, lab4, edge]).seats)).toEqual([
+      { words: 'lab-4', named: true },
+      { words: 'lab-edge', named: true },
+    ]);
   });
 
   it('is empty when every voter is connected', () => {
     expect(disconnectedVoters(haReadout(votes([voter(lab3), voter(lab4)]), [lab3, lab4]).seats)).toEqual([]);
+  });
+
+  // The votes are read every 5 s, the node list every 10 s: a machine that has just joined votes before it has a name.
+  it('calls a voter the node list does not name yet the new machine, not by its id', () => {
+    const joined = node('lab-witness', ['witness'], { id: 'nod_01JCZZZZZZZZZZZZZZZZZZZZZW' });
+    const current = votes([voter(lab3), voter(lab4), voter(joined, false)]);
+    const seats = haReadout(current, [lab3, lab4]).seats;
+    expect(seats[2]).toMatchObject({ name: 'nod_01JCZZ…', named: false });
+    expect(disconnectedVoters(seats)).toEqual([{ words: 'the new machine', named: false }]);
+  });
+
+  it('names the known ones first, then the new machines once', () => {
+    const first = node('one', ['witness'], { id: 'nod_01JCZZZZZZZZZZZZZZZZZZZZZ1' });
+    const second = node('two', ['witness'], { id: 'nod_01JCZZZZZZZZZZZZZZZZZZZZZ2' });
+    const current = votes([voter(first, false), voter(lab3), voter(lab4, false), voter(second, false)]);
+    expect(disconnectedVoters(haReadout(current, [lab3, lab4]).seats)).toEqual([
+      { words: 'lab-4', named: true },
+      { words: 'the new machines', named: false },
+    ]);
   });
 });
 
