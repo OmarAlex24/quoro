@@ -367,7 +367,11 @@ pub struct UpdateBackupRepositoryRequest {
 /// The recovery key that restores the repository key on this primary
 /// (`openapi.yaml` `RestoreBackupRepositoryKeyRequest`). It is never
 /// serialized, and its `Debug` prints no key.
-#[derive(Debug, Deserialize, ToSchema)]
+///
+/// It is read only from a JSON object, as the schema's `type: object` says:
+/// a derived `Deserialize` would also read an array such as `["qrk1-..."]`.
+/// Fields other than `recovery_key` are ignored.
+#[derive(Debug, ToSchema)]
 #[schema(
     title = "RestoreBackupRepositoryKeyRequest",
     description = "The recovery key that restores the repository key on this primary."
@@ -405,6 +409,94 @@ impl std::fmt::Debug for RecoveryKeyText {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RecoveryKeyText([redacted])")
     }
+}
+
+impl<'de> Deserialize<'de> for RestoreBackupRepositoryKeyRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(RestoreKeyRequestVisitor)
+    }
+}
+
+/// Reads a [`RestoreBackupRepositoryKeyRequest`] from a map, and from
+/// nothing else.
+struct RestoreKeyRequestVisitor;
+
+impl<'de> serde::de::Visitor<'de> for RestoreKeyRequestVisitor {
+    type Value = RestoreBackupRepositoryKeyRequest;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON object with a recovery_key string")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut recovery_key: Option<RecoveryKeyText> = None;
+        while let Some(field) = map.next_key::<RestoreKeyRequestField>()? {
+            match field {
+                RestoreKeyRequestField::RecoveryKey => {
+                    if recovery_key.is_some() {
+                        return Err(serde::de::Error::duplicate_field("recovery_key"));
+                    }
+                    recovery_key = Some(map.next_value()?);
+                }
+                RestoreKeyRequestField::Other => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        recovery_key
+            .map(|recovery_key| RestoreBackupRepositoryKeyRequest { recovery_key })
+            .ok_or_else(|| serde::de::Error::missing_field("recovery_key"))
+    }
+}
+
+/// A field name of a [`RestoreBackupRepositoryKeyRequest`] body. The name is
+/// compared and not kept.
+enum RestoreKeyRequestField {
+    RecoveryKey,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for RestoreKeyRequestField {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Name;
+        impl serde::de::Visitor<'_> for Name {
+            type Value = RestoreKeyRequestField;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a field name")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                Ok(if name == "recovery_key" {
+                    RestoreKeyRequestField::RecoveryKey
+                } else {
+                    RestoreKeyRequestField::Other
+                })
+            }
+        }
+        deserializer.deserialize_identifier(Name)
+    }
+}
+
+/// The detail of every refused `restoreBackupRepositoryKey` body. A
+/// rejection's own text can quote the body, and a body that is only a JSON
+/// string is the recovery key itself, so none of it is answered.
+const RESTORE_KEY_BODY_REFUSED: &str =
+    "the body must be a JSON object with a recovery_key string, sent as application/json";
+
+/// [`ApiJson`]'s refusal of a `restoreBackupRepositoryKey` body, with its
+/// status and code kept and its detail replaced by a fixed text that holds
+/// nothing of the body.
+fn restore_key_body_refused(rejection: ApiError) -> ApiError {
+    let detail = if rejection.code == crate::error::Code::PayloadTooLarge {
+        format!(
+            "the request body is larger than {} bytes (256 KiB)",
+            crate::request::MAX_BODY_BYTES
+        )
+    } else {
+        RESTORE_KEY_BODY_REFUSED.to_string()
+    };
+    ApiError::new(rejection.code, detail)
 }
 
 /// `limit` and `cursor` (`openapi.yaml` `Limit` and `Cursor`).
@@ -1439,16 +1531,19 @@ pub async fn rotate_backup_recovery_key(
 /// The recovery key is held in zeroizing memory for the call only. The audit
 /// record's `params` are `{"recovery_key": "[redacted]"}` whatever the call
 /// sent (`audit-log-format.md` section 3), and no error, log line or response
-/// carries the recovery key or the repository key.
+/// carries the recovery key or the repository key. A body that is not a JSON
+/// object with a `recovery_key` string is answered with a fixed detail
+/// ([`restore_key_body_refused`]).
 ///
 /// # Errors
 ///
-/// `forbidden` for an agent (`reason: human_only`) or without
-/// `backup:manage`, `not_found` for an unknown repository, `conflict` when
-/// this primary already holds the key, `validation_failed` for a malformed
-/// recovery key, a fingerprint that differs from `recovery_key_fingerprint`,
-/// a bucket that cannot be read or no config object that opens with the key,
-/// or a database error.
+/// `validation_failed` (or `payload_too_large`) for a body that cannot be
+/// read as the request, `forbidden` for an agent (`reason: human_only`) or
+/// without `backup:manage`, `not_found` for an unknown repository,
+/// `conflict` when this primary already holds the key, `validation_failed`
+/// for a malformed recovery key, a fingerprint that differs from
+/// `recovery_key_fingerprint`, a bucket that cannot be read or no config
+/// object that opens with the key, or a database error.
 #[utoipa::path(
     post,
     path = "/api/v1/backup-repositories/{repository_id}/repository-key",
@@ -1480,8 +1575,12 @@ pub async fn restore_backup_repository_key(
     identity: crate::auth::Identity,
     headers: HeaderMap,
     Path(repository_id): Path<String>,
-    ApiJson(body): ApiJson<RestoreBackupRepositoryKeyRequest>,
+    body: Result<ApiJson<RestoreBackupRepositoryKeyRequest>, ApiError>,
 ) -> Result<Json<BackupRepository>, ApiError> {
+    // A body that cannot be read as the request is answered before the call
+    // is authorized, as `ApiJson` answers it on every operation, but never
+    // with the rejection's own text.
+    let ApiJson(body) = body.map_err(restore_key_body_refused)?;
     let ctx = CallCtx::new(identity, request_id.0, RESTORE_REPOSITORY_KEY, &headers);
     // Never built from the body, so the key is in no `Value` at all.
     let params = json!({ "recovery_key": "[redacted]" });
