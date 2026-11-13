@@ -737,13 +737,27 @@ mod tests {
 
     const D: u64 = DEFAULT_DURATION_MS;
 
-    /// Support for the first question only, none after it.
-    #[derive(Debug, Default)]
-    struct SupportOnce(AtomicBool);
+    /// Support for the first question asked from the task that built it,
+    /// none after it and none for any other task: the hub's own held-grant
+    /// task, which may attempt alongside the test's, never takes it.
+    #[derive(Debug)]
+    struct SupportOnce {
+        asker: Option<tokio::task::Id>,
+        given: AtomicBool,
+    }
+
+    impl SupportOnce {
+        fn here() -> Self {
+            Self {
+                asker: tokio::task::try_id(),
+                given: AtomicBool::new(false),
+            }
+        }
+    }
 
     impl VoterSupport for SupportOnce {
         fn supports(&self, _duration_ms: u64) -> bool {
-            !self.0.swap(true, Ordering::SeqCst)
+            tokio::task::try_id() == self.asker && !self.given.swap(true, Ordering::SeqCst)
         }
     }
 
@@ -988,8 +1002,13 @@ mod tests {
 
         // Support lost between the attempt's first read and its send under
         // the writer gate: the send asks again, and nothing goes.
-        hub.set_voter_support(Arc::new(SupportOnce::default()));
+        let once = Arc::new(SupportOnce::here());
+        hub.set_voter_support(once.clone());
         hub.attempt_held().await;
+        assert!(
+            once.given.load(Ordering::SeqCst),
+            "the attempt's first read had support"
+        );
         assert!(
             conversions(&queued(&mut on)).is_empty(),
             "support lost before the send"
