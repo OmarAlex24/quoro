@@ -689,7 +689,7 @@ A `lease_revoke` whose fence failed:
 | `server_time` | string | yes | Primary's wall-clock time |
 | `heartbeat_interval_ms` | integer | yes | 5 000 in v1 |
 | `session_timeout_ms` | integer | yes | 15 000 in v1 |
-| `primary_node_id` | string (`nod_`) | yes | The node holding the primary status |
+| `primary_node_id` | string (`nod_`) | yes | The node holding the primary status; while no machine holds it, the connecting machine's own id (`backup-format.md` section 8.2) |
 | `primary_urls` | array of string | no | Other base URLs where the primary's listener can be reached, best first, and from M5b the URLs of the machines that could be promoted; at most 16 (ADR 0139, ADR 0235, section 7.3) |
 | `schema_version` | integer | no | From M5b: the schema version of the primary's database (`db-schema.sql` `meta`). The node keeps the newest it saw; `quoro cluster promote` refuses to rebuild a database from a log newer than its binary (section 7.3, ADR 0229) |
 

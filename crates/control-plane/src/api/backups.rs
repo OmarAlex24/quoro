@@ -176,9 +176,11 @@ pub struct Backup {
     /// The backed-up volume; null for `control_plane`.
     #[schema(pattern = "^vol_[0-9A-HJKMNP-TV-Z]{26}$")]
     pub volume_id: Option<String>,
-    /// The node that took it, the volume's node or the primary.
+    /// The node that took it, the volume's node or the primary's; null for a
+    /// control-plane backup taken while no machine holds the primary status
+    /// (`backup-format.md` section 8.2).
     #[schema(required = false, pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
-    pub node_id: String,
+    pub node_id: Option<String>,
     /// Backup status.
     #[schema(inline)]
     pub status: BackupStatus,
@@ -601,7 +603,7 @@ impl BackupRecord {
             source_kind: self.source_kind,
             app_id: self.app_id.clone(),
             volume_id: self.volume_id.clone(),
-            node_id: self.node_id.clone(),
+            node_id: Some(self.node_id.clone()),
             status: self.status,
             trigger: self.trigger,
             snapshot_method: self.snapshot_method,
@@ -748,7 +750,7 @@ fn backup_resource<'a>(backup: &'a Backup, project_id: Option<&'a str>) -> Resou
         id: &backup.id,
         app_id: backup.app_id.as_deref(),
         project_id,
-        node_id: Some(&backup.node_id),
+        node_id: backup.node_id.as_deref(),
     }
 }
 
@@ -1118,7 +1120,9 @@ pub async fn create_backup(
                     serde_json::to_value(&backup).unwrap_or(Value::Null),
                 );
             }
-            state.hub.node_changed(&backup.node_id);
+            if let Some(node_id) = &backup.node_id {
+                state.hub.node_changed(node_id);
+            }
             Ok((StatusCode::ACCEPTED, Json(backup)).into_response())
         }
         Err(error) => {

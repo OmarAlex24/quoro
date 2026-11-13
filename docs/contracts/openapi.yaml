@@ -769,9 +769,12 @@ components:
           type: string
           description: Version of the running binary.
         primary_node_id:
-          type: string
+          type: [string, 'null']
           pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
-          description: Node that currently holds the primary status.
+          description: |
+            Node that currently holds the primary status, or null while no
+            machine holds it, as after an `--accept-loss` restore until the
+            new host's agent enrolls (backup-format.md section 8.2).
         log_seq:
           type: integer
           minimum: 0
@@ -3626,9 +3629,12 @@ components:
           pattern: '^vol_[0-9A-HJKMNP-TV-Z]{26}$'
           description: The backed-up volume; null for `control_plane`.
         node_id:
-          type: string
+          type: [string, 'null']
           pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
-          description: The node that took it, the volume's node or the primary.
+          description: |
+            The node that took it, the volume's node or the primary's; null
+            for a control-plane backup taken while no machine holds the
+            primary status (backup-format.md section 8.2).
         status:
           type: string
           description: |
