@@ -7,14 +7,17 @@
 mod common;
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use common::replay;
 use common::{Server, restart_with_resolver, start_patient_in};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::ReferenceAsDigest;
+use quoro_control_plane::changelog::{self, Actor, Op};
+use quoro_control_plane::store::Store;
 use quoro_proto::custody::{self, CustodyKey, KeyKind, SealContext};
 use quoro_proto::wire::{self, Capacity as WireCapacity, Kvm as WireKvm, LogAck, NodeMessage};
 use quoro_proto::{jcs, sign};
+use quoro_types::{Prefix, new_id};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -1172,4 +1175,260 @@ async fn node_entries_rebuild_every_column_of_the_row() {
     let mut expected = names.clone();
     expected.sort_unstable();
     assert_eq!(logged, expected);
+}
+
+/// One machine of [`old_primary`]: its id and the credential secret it
+/// holds, whose SHA-256 is its `credential_hash`.
+struct OldCredential {
+    node_id: String,
+    secret: String,
+}
+
+/// Inserts an edge machine's row the way an enrollment writes it, with no
+/// change-log entry.
+async fn insert_old_node(store: &Store, node_id: &str, name: &str) {
+    sqlx::query(
+        "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, behind_nat, \
+         labels, capacity, allocated, kvm, engine_version, agent_version, desired_rev, applied_rev, \
+         log_seq, last_seen_at, created_at) \
+         VALUES (?, ?, '[\"edge\"]', NULL, 'disconnected', '', NULL, 1, '{}', '{}', '{}', '{}', \
+         NULL, NULL, 0, 0, 0, NULL, '2026-10-01T10:00:00.000Z')",
+    )
+    .bind(node_id)
+    .bind(name)
+    .execute(store.pool())
+    .await
+    .unwrap();
+}
+
+/// A primary's data directory whose database holds node credentials
+/// written before every insert and update of a row was logged (migration
+/// 0012, issue #751), and no `signing_keys` row:
+///
+/// - one credential with no change-log entry at all;
+/// - one inserted with no entry and replaced later by a re-enrollment, which
+///   logged the whole row as an `update`: an update with no create;
+/// - one revoked, with no entry, so `revoked_at` is not NULL.
+async fn old_primary() -> (std::path::PathBuf, Vec<OldCredential>) {
+    let dir = std::env::temp_dir().join(format!(
+        "quoro-custody-{}",
+        &quoro_control_plane::store::random_secret()[..16]
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("quoro.db")).await.unwrap();
+    let mut credentials = Vec::new();
+    for (name, revoked_at, updated) in [
+        ("edge-unlogged", None, false),
+        ("edge-updated", None, true),
+        ("edge-revoked", Some("2026-10-03T10:00:00.000Z"), false),
+    ] {
+        let node_id = new_id(Prefix::Node);
+        insert_old_node(&store, &node_id, name).await;
+        let mut secret = quoro_control_plane::store::random_secret();
+        sqlx::query(
+            "INSERT INTO node_credentials (node_id, credential_hash, created_at, revoked_at) \
+             VALUES (?, ?, '2026-10-01T10:00:00.000Z', ?)",
+        )
+        .bind(&node_id)
+        .bind(sha256_hex(secret.as_bytes()))
+        .bind(revoked_at)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        if updated {
+            secret = quoro_control_plane::store::random_secret();
+            let created_at = "2026-10-02T10:00:00.000Z";
+            let mut w = store.begin_write().await.unwrap();
+            sqlx::query(
+                "UPDATE node_credentials SET credential_hash = ?, created_at = ?, revoked_at = NULL \
+                 WHERE node_id = ?",
+            )
+            .bind(sha256_hex(secret.as_bytes()))
+            .bind(created_at)
+            .bind(&node_id)
+            .execute(&mut *w.tx)
+            .await
+            .unwrap();
+            changelog::append(
+                &mut w.tx,
+                &Actor::system("test"),
+                "node_credential",
+                &node_id,
+                Op::Update,
+                json!({
+                    "node_id": node_id,
+                    "credential_hash": sha256_hex(secret.as_bytes()),
+                    "created_at": created_at,
+                    "revoked_at": null,
+                }),
+            )
+            .await
+            .unwrap();
+            w.commit().await.unwrap();
+        }
+        credentials.push(OldCredential { node_id, secret });
+    }
+    store.pool().close().await;
+    (dir, credentials)
+}
+
+/// The `node_credential` and `signing_key` change-log entries, oldest first:
+/// `(seq, entity_type, entity_id, op, payload)`.
+async fn backfill_entries(server: &Server) -> Vec<(i64, String, String, String, Value)> {
+    let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
+        "SELECT seq, entity_type, entity_id, op, payload FROM change_log \
+         WHERE entity_type IN ('node_credential', 'signing_key') ORDER BY seq",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(seq, entity_type, entity_id, op, payload)| {
+            (
+                seq,
+                entity_type,
+                entity_id,
+                op,
+                serde_json::from_str(&payload).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Migration 0012 and section 7.3 step 4 (issue #751): a primary whose node
+/// credentials were written before every insert and update was logged, and
+/// that holds no `signing_keys` row, writes at its start the entries a
+/// promotion rebuilds both tables from. Folded as a promotion folds them,
+/// the log gives back every column of every row.
+#[tokio::test]
+async fn a_start_logs_what_a_promotion_rebuilds_credentials_and_the_signing_key_from() {
+    let (dir, credentials) = old_primary().await;
+    let server = start_patient_in(dir).await;
+
+    let rebuilt = replay::rebuild_folded(&server, &["node_credential", "signing_key"]).await;
+    for (table, count) in [("node_credentials", credentials.len()), ("signing_keys", 1)] {
+        let columns = replay::column_names(&server.state.store, table).await;
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        replay::assert_rebuilt(&server, &rebuilt, table, &columns, count).await;
+    }
+
+    // The row is the key this primary signs with, named as section 7.2
+    // names it.
+    let (key_id, public_key, state): (String, String, String) =
+        sqlx::query_as("SELECT key_id, public_key, state FROM signing_keys")
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, "current");
+    assert_eq!(public_key, server.state.keys.public_key_base64());
+    assert_eq!(key_id, sha256_hex(&STANDARD.decode(&public_key).unwrap()));
+    assert_eq!(key_id, server.state.keys.key_id());
+}
+
+/// A second start writes no `node_credential` or `signing_key` entry and no
+/// second `signing_keys` row: the step writes only what the log lacks.
+#[tokio::test]
+async fn a_second_start_logs_no_credential_or_signing_key_again() {
+    let (dir, credentials) = old_primary().await;
+    let server = start_patient_in(dir).await;
+    let logged = backfill_entries(&server).await;
+    // The old update, one create per credential and the signing key's.
+    assert_eq!(logged.len(), 1 + credentials.len() + 1, "{logged:?}");
+
+    let restarted = restart_with_resolver(&server, Arc::new(ReferenceAsDigest)).await;
+    assert_eq!(backfill_entries(&restarted).await, logged);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM signing_keys")
+        .fetch_one(restarted.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+/// The forms a payload could carry `bytes` in: hex, upper-case hex,
+/// standard base64 and URL-safe base64 without padding.
+fn encodings(bytes: &[u8]) -> Vec<String> {
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    vec![
+        hex.to_uppercase(),
+        hex,
+        STANDARD.encode(bytes),
+        URL_SAFE_NO_PAD.encode(bytes),
+    ]
+}
+
+/// Sections 7.1 and 11, what followers and off-site copies read: no
+/// change-log entry holds the signing key's seed or its private half, in
+/// any common encoding, and the `signing_key` entry carries the public key
+/// of the key file. A `node_credential` entry carries the row's four
+/// columns, the credential only as its SHA-256.
+#[tokio::test]
+async fn the_start_up_entries_hold_no_private_key_and_only_credential_hashes() {
+    let (dir, credentials) = old_primary().await;
+    let server = start_patient_in(dir).await;
+    let seed: [u8; 32] = std::fs::read(server.data_dir.join("keys").join("signing.key"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let signing = sign::signing_key_from_seed(&seed);
+    let mut secrets = encodings(&seed);
+    secrets.extend(encodings(&signing.to_keypair_bytes()));
+
+    let payloads: Vec<(String, String)> =
+        sqlx::query_as("SELECT entity_type, payload FROM change_log ORDER BY seq")
+            .fetch_all(server.state.store.pool())
+            .await
+            .unwrap();
+    for (entity_type, payload) in &payloads {
+        for secret in &secrets {
+            assert!(
+                !payload.contains(secret.as_str()),
+                "a {entity_type} entry holds the signing key's private bytes"
+            );
+        }
+    }
+
+    let entries = backfill_entries(&server).await;
+    let keys_of = |payload: &Value| -> Vec<String> {
+        let mut keys: Vec<String> = payload.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let signing_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|(_, entity_type, ..)| entity_type == "signing_key")
+        .map(|(.., payload)| payload)
+        .collect();
+    assert_eq!(signing_entries.len(), 1);
+    let payload = signing_entries[0];
+    assert_eq!(
+        keys_of(payload),
+        ["created_at", "key_id", "public_key", "state"]
+    );
+    assert_eq!(
+        payload["public_key"],
+        sign::public_key_to_base64(&signing.verifying_key())
+    );
+
+    for credential in &credentials {
+        let created: Vec<&Value> = entries
+            .iter()
+            .filter(|(_, entity_type, entity_id, op, _)| {
+                entity_type == "node_credential"
+                    && *entity_id == credential.node_id
+                    && op == "create"
+            })
+            .map(|(.., payload)| payload)
+            .collect();
+        assert_eq!(created.len(), 1, "{}", credential.node_id);
+        let payload = created[0];
+        assert_eq!(
+            keys_of(payload),
+            ["created_at", "credential_hash", "node_id", "revoked_at"]
+        );
+        assert_eq!(
+            payload["credential_hash"],
+            sha256_hex(credential.secret.as_bytes())
+        );
+        assert!(!payload.to_string().contains(&credential.secret));
+    }
 }

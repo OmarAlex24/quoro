@@ -184,22 +184,7 @@ pub async fn rebuild(server: &Server, entity_types: &[&str]) -> Store {
         let fields = payload.as_object().cloned().unwrap_or_default();
         let at = format!("seq {seq} {op} {entity_type} {entity_id}");
         match op.as_str() {
-            "create" => {
-                let mut names = Vec::new();
-                let mut values = Vec::new();
-                for column in &columns {
-                    if let Some(value) = fields.get(&column.name) {
-                        names.push(format!("\"{}\"", column.name));
-                        values.push(bind_value(table, column, value));
-                    }
-                }
-                let sql = format!(
-                    "INSERT INTO \"{table}\" ({}) VALUES ({})",
-                    names.join(", "),
-                    vec!["?"; names.len()].join(", ")
-                );
-                assert_eq!(execute(&store, &sql, values).await, 1, "{at}");
-            }
+            "create" => insert_row(&store, table, &columns, &fields, &at).await,
             "update" => {
                 let (filter, key_values) = key_filter(&key, &entity_id);
                 let mut sets = Vec::new();
@@ -242,6 +227,111 @@ pub async fn rebuild(server: &Server, entity_types: &[&str]) -> Store {
         applied += 1;
     }
     assert!(applied > 0, "no entries of {entity_types:?} in the log");
+    store
+}
+
+/// Inserts one row of `table` holding only the fields `fields` carries.
+async fn insert_row(
+    store: &Store,
+    table: &str,
+    columns: &[Column],
+    fields: &serde_json::Map<String, Value>,
+    at: &str,
+) {
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    for column in columns {
+        if let Some(value) = fields.get(&column.name) {
+            names.push(format!("\"{}\"", column.name));
+            values.push(bind_value(table, column, value));
+        }
+    }
+    let sql = format!(
+        "INSERT INTO \"{table}\" ({}) VALUES ({})",
+        names.join(", "),
+        vec!["?"; names.len()].join(", ")
+    );
+    assert_eq!(execute(store, &sql, values).await, 1, "{at}");
+}
+
+/// One entity's row as the fold has it so far.
+struct Folded {
+    first_seq: i64,
+    created: bool,
+    row: Option<serde_json::Map<String, Value>>,
+}
+
+/// Rebuilds the tables of `entity_types` from `server`'s change log as the
+/// promotion's fold does (section 7.3 step 4, ADR 0317), into a new
+/// in-memory database of the same schema. Each entity's entries, in `seq`
+/// order, fold into one row: a `create` replaces it, an `update` merges over
+/// it, or over an empty row when it has none yet, and a `delete` removes it.
+/// The final rows are inserted once every entry is folded, each holding only
+/// what its payloads carried. An entity that never received a `create` fails
+/// the test, naming the entity and the `seq` of its first entry.
+///
+/// Unlike [`rebuild`], a log that holds an update before its create
+/// rebuilds here, as it does in a promotion.
+pub async fn rebuild_folded(server: &Server, entity_types: &[&str]) -> Store {
+    let store = Store::open_in_memory().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let entries =
+        sqlx::query("SELECT seq, entity_type, entity_id, op, payload FROM change_log ORDER BY seq")
+            .fetch_all(server.state.store.pool())
+            .await
+            .unwrap();
+    let mut folded: std::collections::BTreeMap<(String, String), Folded> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        let entity_type: String = entry.get(1);
+        if !entity_types.contains(&entity_type.as_str()) {
+            continue;
+        }
+        let seq: i64 = entry.get(0);
+        let entity_id: String = entry.get(2);
+        let op: String = entry.get(3);
+        let payload: Value = serde_json::from_str(&entry.get::<String, _>(4)).unwrap();
+        let fields = payload.as_object().cloned().unwrap_or_default();
+        let entity = folded
+            .entry((entity_type, entity_id))
+            .or_insert_with(|| Folded {
+                first_seq: seq,
+                created: false,
+                row: None,
+            });
+        match op.as_str() {
+            "create" => {
+                entity.created = true;
+                entity.row = Some(fields);
+            }
+            "update" => entity
+                .row
+                .get_or_insert_with(Default::default)
+                .extend(fields),
+            "delete" => entity.row = None,
+            other => panic!("seq {seq}: unknown op {other}"),
+        }
+    }
+    assert!(
+        !folded.is_empty(),
+        "no entries of {entity_types:?} in the log"
+    );
+    let mut folded: Vec<_> = folded.into_iter().collect();
+    folded.sort_by_key(|(_, entity)| entity.first_seq);
+    for ((entity_type, entity_id), entity) in folded {
+        let at = format!(
+            "{entity_type} {entity_id}, first entry seq {}",
+            entity.first_seq
+        );
+        assert!(entity.created, "{at}: never received a create");
+        let Some(row) = entity.row else { continue };
+        let table = table_of(&entity_type);
+        let columns = columns(&store, table).await;
+        insert_row(&store, table, &columns, &row, &at).await;
+    }
     store
 }
 
