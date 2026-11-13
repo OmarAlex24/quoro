@@ -219,6 +219,13 @@ impl Cache {
         ))
     }
 
+    /// Closes the pool and waits until its connections are closed, so a test
+    /// can remove the directory the file is in.
+    #[cfg(test)]
+    pub(crate) async fn close(&self) {
+        self.pool.close().await;
+    }
+
     /// Starts a write transaction: the gate first, then a connection.
     ///
     /// It starts with `BEGIN IMMEDIATE`, so it takes SQLite's write lock at
