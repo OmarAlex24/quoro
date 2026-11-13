@@ -792,18 +792,14 @@ pub(crate) async fn raise_duration(
 /// every grant's raise and record ([`raise_duration`]), so no longer grant
 /// is recorded between them.
 ///
+/// After a maintenance window, the hub lowers the durations its `W` raised
+/// this way (section 8.11, [`crate::session::NodeHub::lower_durations`]).
+///
 /// [`Authority::may_lower`]: crate::authority::Authority::may_lower
 ///
 /// # Errors
 ///
 /// A duration outside 3 000 to 600 000 ms, or a database error.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "lowered after a longer grant, which nothing sends yet"
-    )
-)]
 pub(crate) async fn lower_duration(
     w: &mut crate::store::WriteTx,
     authority: &crate::authority::Authority,

@@ -27,9 +27,14 @@ RestartPreventExitStatus=78
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes
-# The only writable path is the data directory.
+# The only writable paths are the data directory and /run/quoro, which holds
+# the local control socket of `quoro cluster maintenance` (node-agent protocol
+# section 8.11): systemd creates it for the service user, mode 0700, and
+# removes it when the service stops.
 ProtectSystem=strict
 ReadWritePaths=/var/lib/quoro
+RuntimeDirectory=quoro
+RuntimeDirectoryMode=0700
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

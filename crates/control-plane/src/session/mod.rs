@@ -20,6 +20,8 @@ mod follow;
 mod held;
 mod local_end;
 mod local_report;
+/// The maintenance window, `quoro cluster maintenance` (section 8.11).
+pub mod maintenance;
 pub(crate) mod mesh;
 pub mod serving;
 mod votes;
@@ -643,6 +645,9 @@ struct HubInner {
     /// The voters' support of this primary (section 8.8), which the
     /// authority answers from unless a test replaced it.
     support: Arc<crate::support::SupportTracker>,
+    /// The maintenance window, in memory only: a restart closes it (section
+    /// 8.11, [`maintenance`]).
+    maintenance: maintenance::Window,
     /// The newest voter-set version each machine acknowledged with
     /// `command_result` `ok` on a `desired_state` that carried it, for rule 2
     /// of section 8.10 ([`NodeHub::voter_change_gate`]). It outlives the
@@ -860,6 +865,7 @@ impl NodeHub {
             authority,
             voters,
             support,
+            maintenance: maintenance::Window::default(),
             votes_acks: Mutex::new(HashMap::new()),
             removed_nodes: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
@@ -3136,6 +3142,11 @@ async fn run_session(
     // `not_primary`, one that attached after the flag was set too.
     let mut demoted = hub.0.store.demoted_watch();
     let mut demoted_open = true;
+    // Section 8.11: a maintenance window that starts opening, fails or ends
+    // changes the `max_lease_ms` of the support requests; a voter gets one at
+    // once instead of at its next `S / 3`.
+    let mut support_lease = hub.0.maintenance.subscribe();
+    let mut support_lease_open = true;
     let mut session = Session::new(hub, node_id, generation);
     let mut superseded = false;
     let mut reason = "session_closed";
@@ -3305,6 +3316,15 @@ async fn run_session(
             // Every `S / 3` while the voter's session lives (section 5.27).
             () = support_due, if session.support_due.is_some() => {
                 session.send_support_request(&mut outbox).await;
+            }
+            // At once when a maintenance window changes `max_lease_ms`
+            // (section 8.11), on a session that already sends them.
+            changed_lease = support_lease.changed(), if support_lease_open => {
+                if changed_lease.is_err() {
+                    support_lease_open = false;
+                } else if session.support_due.is_some() {
+                    session.send_support_request(&mut outbox).await;
+                }
             }
             () = sleep => {
                 if session.connected {
@@ -4399,7 +4419,10 @@ impl Session {
     ///     8.4, "Settling a lease");
     ///   - an `expiring` row at the renewal's token is answered with a
     ///     `lease_grant` at that token, `mode` `expiring`, for `D`, with `re`
-    ///     set; a marked one while the policy is `warm` is settled too;
+    ///     set; a marked one while the policy is `warm` is settled too. While
+    ///     a maintenance window is open, an unmarked one of its leases that
+    ///     still stores at least `W` is answered for `W` instead (section
+    ///     8.11, [`maintenance`]);
     ///   - a conversion in flight over a marked row, or while the policy is
     ///     off `warm`, was ended by the policy change: the renewal is
     ///     answered as for an `expiring` lease, with no write, and the
@@ -4551,9 +4574,15 @@ impl Session {
         };
         // An ordinary answer, settling or not, carries `D` and raises the
         // stored duration to it; the others carry the stored duration when
-        // it is shorter and write nothing.
+        // it is shorter and write nothing. While a maintenance window is
+        // open, an ordinary answer to one of its leases carries `W`, which
+        // the row as read here already stores, so the raise writes nothing
+        // (section 8.11, ADR 0268).
         let (duration_ms, lease) = if let Plan::Ordinary { .. } = plan {
-            let duration_ms = DEFAULT_DURATION_MS;
+            let duration_ms = self
+                .hub
+                .window_answer_ms(&lease, &self.node_id)
+                .unwrap_or(DEFAULT_DURATION_MS);
             let stored = i64::try_from(duration_ms).unwrap_or(i64::MAX);
             if let Err(e) = leases::raise_duration(&mut w, lease_id, stored, &actor).await {
                 tracing::warn!(code = %e.code.as_str(), lease_id, "cannot raise a lease's duration");
@@ -4628,6 +4657,8 @@ impl Session {
             self.hub
                 .conversion_answered(&self.node_id, self.generation, lease_id, in_flight);
         }
+        self.hub
+            .window_answered(lease_id, &self.node_id, duration_ms, sent_wall);
         self.note_granted(lease_id, duration_ms);
         // The answer is `expiring` at the renewal's token, whatever the row
         // reads: a settle's row may still read `local`, or a lower token.
