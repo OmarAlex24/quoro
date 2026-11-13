@@ -27,17 +27,20 @@
 //!
 //! Before anything changes, the command also refuses (issue #881): a unit
 //! file or drop-in of the unit that systemd loads from outside the places it
-//! moves, or a configuration of the unit that names another data directory,
-//! since the unit would stay and could start a fresh, empty control plane;
-//! on a host with no control-plane unit, a database a process holds open;
-//! and a forced run with no database. A lock on the data directory's parent
-//! keeps two runs apart, no rename replaces an existing name, and the unit
-//! counts as stopped only when it reads `inactive` or `failed`.
+//! moves, another `quoro.service` in a systemd unit directory, an
+//! `ExecStart` whose configuration it cannot read back, or a configuration
+//! of the unit that names another data directory, since the unit would stay
+//! and could start a fresh, empty control plane; on a host with no
+//! control-plane unit, a database a process holds open; a forced run with no
+//! database; and a filesystem whose renames cannot refuse to replace a name.
+//! A lock on the data directory's parent keeps two runs apart, no rename
+//! replaces an existing name, and the unit counts as stopped only when it
+//! reads `inactive` or `failed`.
 //!
 //! The systemd calls go through [`Systemd`] and the file-system calls the
 //! tests replace through [`Fs`], so the tests drive every failure with
-//! fakes; the unit directory, the journal socket, `/proc` and the clock are
-//! fields of [`Options`].
+//! fakes; the unit directory, systemd's unit directories, the journal
+//! socket, `/proc` and the clock are fields of [`Options`].
 
 use sqlx::Connection as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
@@ -73,6 +76,24 @@ const TERM_CEILING: u64 = (1 << 53) - 1;
 const STOPPED_STATES: [&str; 2] = ["inactive", "failed"];
 /// The node agent's unit.
 const NODE_UNIT: &str = "quoro-node.service";
+/// The directories systemd loads system units from, highest priority first
+/// (`systemd.unit(5)`, "Unit File Load Path"), and `/lib/systemd/system` of a
+/// system whose `/usr` is not merged.
+const UNIT_SEARCH_PATHS: [&str; 13] = [
+    "/etc/systemd/system.control",
+    "/run/systemd/system.control",
+    "/run/systemd/transient",
+    "/run/systemd/generator.early",
+    "/etc/systemd/system",
+    "/etc/systemd/system.attached",
+    "/run/systemd/system",
+    "/run/systemd/system.attached",
+    "/run/systemd/generator",
+    "/usr/local/lib/systemd/system",
+    "/usr/lib/systemd/system",
+    "/lib/systemd/system",
+    "/run/systemd/generator.late",
+];
 
 /// The command line of `quoro node rejoin`, read by [`parse_args`].
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -257,12 +278,18 @@ impl Systemd for RealSystemd {
 
 /// The file-system calls a test replaces: the moves of the unit file and
 /// its drop-in directory, so a rename can cross devices or a removal fail,
-/// the device of a directory, and a point between two reads of a database.
+/// every other rename, so a filesystem can lack `RENAME_NOREPLACE`, the
+/// device of a directory, and a point between two reads of a database.
 #[derive(Clone, Copy)]
 pub struct Fs {
-    /// Renames a file, a symbolic link or a directory, never over an
+    /// The first try at moving the unit file and its drop-in directory:
+    /// renames a file, a symbolic link or a directory, never over an
     /// existing name.
     pub rename: fn(&Path, &Path) -> io::Result<()>,
+    /// Every other rename, never over an existing name: the data
+    /// directory's, those inside the copy, and the probe that the copy's
+    /// filesystem supports them ([`probe_noreplace`]).
+    pub rename_noreplace: fn(&Path, &Path) -> io::Result<()>,
     /// Removes a file or a symbolic link, after its copy is in place.
     pub remove_file: fn(&Path) -> io::Result<()>,
     /// Removes a directory tree, after its copy is in place.
@@ -278,6 +305,7 @@ impl Fs {
     /// The real calls.
     pub const REAL: Self = Self {
         rename: rename_noreplace,
+        rename_noreplace,
         remove_file: real_remove_file,
         remove_tree: real_remove_tree,
         device: real_device,
@@ -329,6 +357,63 @@ fn lock(parent: &Path) -> Result<fs::File, String> {
     }
 }
 
+/// Refuses, before anything changes, a directory whose filesystem cannot
+/// rename without replacing (NFS, OpenZFS before 2.2, FUSE without
+/// `rename2`, all of which answer `EINVAL`): the data directory's rename
+/// would fail after the unit was stopped, and every rerun at the same rename.
+/// It creates a scratch file with a name no run used, renames it to a second
+/// such name and removes it.
+///
+/// Every no-replace rename lands in the copy, in `dir`: the data
+/// directory's, and the unit file's and its drop-ins'. A move from a unit
+/// directory on another mount fails with `EXDEV` before the filesystem reads
+/// the flag, and falls back to a copy renamed inside the copy, so the unit
+/// directory needs no probe of its own.
+fn probe_noreplace(fs_calls: &Fs, dir: &Path) -> Result<(), String> {
+    let name = format!(
+        ".quoro-rejoin-probe-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    );
+    let (scratch, renamed) = (dir.join(&name), dir.join(format!("{name}-renamed")));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&scratch)
+        .map_err(|e| {
+            format!(
+                "cannot create {} to test a rename: {e}; nothing was changed",
+                scratch.display()
+            )
+        })?;
+    let result = (fs_calls.rename_noreplace)(&scratch, &renamed);
+    let left = if result.is_ok() { &renamed } else { &scratch };
+    let removed = fs::remove_file(left)
+        .map_err(|e| format!("cannot remove the scratch file {}: {e}", left.display()));
+    match result {
+        Ok(()) => removed,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Err(format!(
+                "the filesystem of {} cannot rename without replacing an existing name (renameat2 with RENAME_NOREPLACE: {e}), and this command never replaces one. Put the data directory on a filesystem that supports it, such as ext4, XFS or btrfs, and run this again. {}Nothing was changed",
+                dir.display(),
+                removed.err().map(|e| format!("{e}. ")).unwrap_or_default()
+            ))
+        }
+        Err(e) => Err(format!(
+            "cannot rename {} to {} to test a rename: {e}. {}Nothing was changed",
+            scratch.display(),
+            renamed.display(),
+            removed.err().map(|e| format!("{e}. ")).unwrap_or_default()
+        )),
+    }
+}
+
 fn real_remove_file(path: &Path) -> io::Result<()> {
     fs::remove_file(path)
 }
@@ -355,6 +440,9 @@ pub struct Options {
     pub proc_dir: PathBuf,
     /// The configuration `quoro serve` reads without `--config`.
     pub default_config: PathBuf,
+    /// The directories systemd loads system units from, `unit_dir` among
+    /// them ([`UNIT_SEARCH_PATHS`]).
+    pub unit_search_paths: Vec<PathBuf>,
     /// The effective uid of this process, when it could be read.
     pub euid: Option<u32>,
     /// The clock.
@@ -440,6 +528,7 @@ pub async fn command(args: &[String]) -> ExitCode {
         mountinfo: PathBuf::from("/proc/self/mountinfo"),
         proc_dir: PathBuf::from("/proc"),
         default_config: PathBuf::from(crate::config::DEFAULT_PATH),
+        unit_search_paths: UNIT_SEARCH_PATHS.iter().map(PathBuf::from).collect(),
         euid,
         now: SystemTime::now,
         command_line: command_line(&request),
@@ -758,7 +847,9 @@ struct UnitReport {
     drop_ins: Vec<PathBuf>,
     /// `Environment`, as `NAME=value` words.
     environment: Vec<String>,
-    /// The `argv[]` of each `ExecStart`.
+    /// The `argv[]` of each `ExecStart`, split at spaces: systemd joins the
+    /// arguments with spaces and quotes none of them, so an argument that
+    /// holds a space reads as two words.
     exec_start: Vec<Vec<String>>,
 }
 
@@ -776,11 +867,18 @@ fn parse_show(text: &str) -> UnitReport {
             }
             "Environment" => report.environment = split_words(value),
             // `{ path=... ; argv[]=quoro serve ... ; ignore_errors=no ; ... }`,
-            // once for each command.
+            // once for each command. The arguments are joined with spaces,
+            // unquoted and unescaped, so they are split at spaces only.
             "ExecStart" => {
                 for command in value.split("argv[]=").skip(1) {
                     let end = command.find(" ;").unwrap_or(command.len());
-                    report.exec_start.push(split_words(&command[..end]));
+                    report.exec_start.push(
+                        command[..end]
+                            .split(' ')
+                            .filter(|word| !word.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                    );
                 }
             }
             _ => {}
@@ -789,9 +887,10 @@ fn parse_show(text: &str) -> UnitReport {
     report
 }
 
-/// The words of a value `systemctl show` prints: separated by spaces, with
-/// double or single quotes around a word that holds a space, and a
-/// backslash before a character that would otherwise end it.
+/// The words of a list `systemctl show` prints, as `DropInPaths` and
+/// `Environment`: separated by spaces, with double or single quotes around a
+/// word that holds a space, and a backslash before a character that would
+/// otherwise end it. `ExecStart` is not printed this way.
 fn split_words(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -839,6 +938,44 @@ fn is_one_of(path: &Path, places: &[&Path]) -> bool {
     })
 }
 
+/// The `--config` of one `ExecStart`, read with `quoro serve`'s own parser
+/// from the words after `serve`; `None` without one. It refuses, since the
+/// unit's configuration could then differ from the one this command reads:
+/// an `ExecStart` without `serve`; words after it that do not read as `quoro
+/// serve`'s flags, as when a `--config` path holds a space, which `systemctl
+/// show` prints unquoted; a relative `--config`, which `quoro serve` reads
+/// from the unit's working directory; and a `--config` that does not exist,
+/// which `quoro serve` would replace with its defaults.
+fn serve_config(argv: &[String]) -> Result<Option<PathBuf>, String> {
+    let command = argv.join(" ");
+    let Some(serve) = argv.iter().skip(1).position(|word| word == "serve") else {
+        return Err(format!(
+            "the ExecStart of {UNIT}, {command}, does not run quoro serve, so this command cannot tell which configuration it reads. Make it run quoro serve --config with the configuration's absolute path, run systemctl daemon-reload, and run this again; nothing was changed"
+        ));
+    };
+    let flags = crate::parse_serve_flags(&argv[serve + 2..]).map_err(|e| {
+        format!(
+            "the ExecStart of {UNIT}, {command}, does not read as quoro serve's flags ({e}). systemctl show prints its arguments joined with spaces and unquoted, so a --config path with a space cannot be read back. Give the unit a --config path without spaces, run systemctl daemon-reload, and run this again; nothing was changed"
+        )
+    })?;
+    let Some(path) = crate::flag(&flags, "config").map(PathBuf::from) else {
+        return Ok(None);
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "the --config of the ExecStart of {UNIT}, {}, is a relative path, which quoro serve reads from the unit's working directory and this command would read from this one. Give the unit the configuration's absolute path, run systemctl daemon-reload, and run this again; nothing was changed",
+            path.display()
+        ));
+    }
+    match fs::metadata(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(format!(
+            "the --config of the ExecStart of {UNIT}, {}, does not exist: quoro serve would run with its defaults, or this command misread the ExecStart. Point --config at the unit's configuration, run systemctl daemon-reload, and run this again; nothing was changed",
+            path.display()
+        )),
+        _ => Ok(Some(path)),
+    }
+}
+
 /// Refuses a control-plane unit this command would leave behind (issue
 /// #881): a unit file systemd loads from anywhere but `units`, the unit file
 /// in place and in the copy; a drop-in in a `quoro.service.d` other than
@@ -848,9 +985,9 @@ fn is_one_of(path: &Path, places: &[&Path]) -> bool {
 /// fresh, empty control plane. A drop-in for every service (`service.d`) is
 /// not the unit's own and stays.
 ///
-/// The unit's configuration is the `--config` of its `ExecStart`, or
-/// `default_config` without one, as `quoro serve` reads it, and the file its
-/// `QUORO_CONFIG` names.
+/// The unit's configuration is the `--config` of each `ExecStart`, or
+/// `default_config` without one, as `quoro serve` reads it ([`serve_config`]),
+/// and the file its `QUORO_CONFIG` names.
 fn check_unit(
     report: &UnitReport,
     data_dir: &Path,
@@ -881,17 +1018,16 @@ fn check_unit(
             ));
         }
     }
+    let without_config = "the configuration quoro serve reads without --config";
     let mut configs = Vec::new();
     for argv in &report.exec_start {
-        if let Some(pair) = argv.windows(2).rev().find(|pair| pair[0] == "--config") {
-            configs.push((PathBuf::from(&pair[1]), "the --config of its ExecStart"));
+        match serve_config(argv)? {
+            Some(path) => configs.push((path, "the --config of its ExecStart")),
+            None => configs.push((default_config.to_path_buf(), without_config)),
         }
     }
     if configs.is_empty() {
-        configs.push((
-            default_config.to_path_buf(),
-            "the configuration quoro serve reads without --config",
-        ));
+        configs.push((default_config.to_path_buf(), without_config));
     }
     if let Some(path) = report
         .environment
@@ -916,6 +1052,30 @@ fn check_unit(
                 path.display(),
                 named.display(),
                 data_dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a `quoro.service` in a systemd unit directory other than
+/// `unit_dir`, the one this command moves from (issue #881). `unit_dir`'s
+/// copy hides it now; once that copy moves and systemd reloads, systemd
+/// would load this one: the unit would stay, and a later start would create
+/// a fresh, empty control plane. A link counts as itself, so a unit file in
+/// `unit_dir` that links to such a file refuses too.
+fn check_other_units(search_paths: &[PathBuf], unit_dir: &Path) -> Result<(), String> {
+    let own = fs::canonicalize(unit_dir).ok();
+    for dir in search_paths {
+        if dir == unit_dir || (own.is_some() && fs::canonicalize(dir).ok() == own) {
+            continue;
+        }
+        let other = dir.join(UNIT);
+        if exists(&other) {
+            return Err(format!(
+                "{} is another {UNIT}: once this command moves {} aside and systemd reloads, systemd would load that one, and a later start would create a fresh, empty control plane. Remove it or move it out of systemd's unit directories, run systemctl daemon-reload, and run this again; nothing was changed",
+                other.display(),
+                unit_dir.join(UNIT).display()
             ));
         }
     }
@@ -1249,7 +1409,7 @@ fn move_entry(fs_calls: &Fs, source: &Path, target: &Path) -> Result<(), String>
                 )
             })?;
             sync_dir(target_parent)?;
-            rename_noreplace(&temporary, target).map_err(|e| {
+            (fs_calls.rename_noreplace)(&temporary, target).map_err(|e| {
                 if e.kind() == io::ErrorKind::AlreadyExists {
                     format!(
                         "{} appeared during the copy; nothing is overwritten",
@@ -1490,8 +1650,17 @@ pub async fn rejoin(
             Some(moved) if !data_in_place => moved,
             _ => data_dir,
         };
+        // A rerun without --force finishes a forced run, whose statement
+        // stands in the copy.
+        let forced = match &earlier_statement {
+            Some(path) => format!(
+                "this run finishes a forced run (its statement is in {}); a forced run",
+                path.display()
+            ),
+            None => "--force".to_string(),
+        };
         return Err(format!(
-            "--force moves a control plane aside only with its database, and {} holds no {DATABASE}; check data_dir in quoro.toml. Nothing was changed",
+            "{forced} moves a control plane aside only with its database, and {} holds no {DATABASE}; check data_dir in quoro.toml. Nothing was changed",
             looked_in.display()
         ));
     }
@@ -1628,6 +1797,11 @@ pub async fn rejoin(
             ));
         }
     }
+    check_other_units(&options.unit_search_paths, &options.unit_dir)?;
+    // Last, since it creates and removes a scratch file: a filesystem whose
+    // renames cannot refuse to replace a name would stop the run half-way,
+    // and every rerun at the same rename.
+    probe_noreplace(&options.fs, parent)?;
 
     // Step 6: the statement in the journal, before anything changes.
     if let Some(statement) = record_statement {
@@ -1714,7 +1888,7 @@ pub async fn rejoin(
                 copy_tree(&unit_file, &temporary)
             };
             copied
-                .and_then(|()| rename_noreplace(&temporary, &unit_target))
+                .and_then(|()| (options.fs.rename_noreplace)(&temporary, &unit_target))
                 .map_err(|e| {
                     interrupted(&format!(
                         "cannot copy the link {} into {}: {e}",
@@ -1751,7 +1925,7 @@ pub async fn rejoin(
     // whether an earlier run made it, for `rejoin-done`.
     let mut moves = Vec::new();
     if data_in_place {
-        rename_noreplace(data_dir, &data_target).map_err(|e| {
+        (options.fs.rename_noreplace)(data_dir, &data_target).map_err(|e| {
             interrupted(&format!(
                 "cannot rename {} to {}: {e}",
                 data_dir.display(),

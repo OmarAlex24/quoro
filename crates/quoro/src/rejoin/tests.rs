@@ -102,6 +102,12 @@ impl Host {
         self.unit_dir().join(DROP_IN)
     }
 
+    /// A unit directory systemd reads after `unit_dir`, as
+    /// `/usr/lib/systemd/system`.
+    fn vendor_units(&self) -> PathBuf {
+        self.root.join("vendor-units")
+    }
+
     fn socket(&self) -> PathBuf {
         self.root.join("j.sock")
     }
@@ -115,6 +121,11 @@ impl Host {
             mountinfo: self.root.join("mountinfo"),
             proc_dir: self.root.join("proc"),
             default_config: self.config(),
+            unit_search_paths: vec![
+                self.root.join("run-units"),
+                self.unit_dir(),
+                self.vendor_units(),
+            ],
             euid: Some(0),
             now: fixed_now,
             command_line: "quoro node rejoin".to_string(),
@@ -281,8 +292,12 @@ struct FakeSystemd {
     /// Drop-ins `DropInPaths` lists after those in the host's drop-in
     /// directory.
     extra_drop_ins: Vec<PathBuf>,
-    /// The `--config` of `ExecStart`.
+    /// The `--config` of `ExecStart`, printed as systemd prints it: joined
+    /// with a space, unquoted.
     exec_config: Option<PathBuf>,
+    /// The whole `argv[]` of `ExecStart`, instead of `quoro serve` and
+    /// `exec_config`.
+    exec_argv: Option<String>,
     /// The `QUORO_CONFIG` of `Environment`.
     env_config: Option<PathBuf>,
     /// Whether `quoro-node.service` is enabled and active.
@@ -311,6 +326,7 @@ impl FakeSystemd {
             fragment: None,
             extra_drop_ins: Vec::new(),
             exec_config: None,
+            exec_argv: None,
             env_config: Some(host.config()),
             node_agent: true,
             calls: RefCell::new(Vec::new()),
@@ -406,9 +422,13 @@ impl Systemd for FakeSystemd {
             .iter()
             .map(|path| path.display().to_string())
             .collect();
-        let argv = match &self.exec_config {
-            Some(config) => format!("/usr/local/bin/quoro serve --config {}", config.display()),
-            None => "/usr/local/bin/quoro serve".to_string(),
+        // systemd joins the arguments with spaces and quotes none of them.
+        let argv = match (&self.exec_argv, &self.exec_config) {
+            (Some(argv), _) => argv.clone(),
+            (None, Some(config)) => {
+                format!("/usr/local/bin/quoro serve --config {}", config.display())
+            }
+            (None, None) => "/usr/local/bin/quoro serve".to_string(),
         };
         let environment = self
             .env_config
@@ -438,7 +458,26 @@ fn forced(statement: &str) -> Request {
     }
 }
 
+/// Held for reading by every span that holds a lock on a data directory's
+/// parent, and for writing around the one start of a child process. A child
+/// holds a copy of each of this process's descriptors until it runs its
+/// program, so a lock another test's run took would outlive that run and
+/// refuse the next one with "holds the lock".
+static FORK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 async fn run(
+    host: &Host,
+    request: &Request,
+    options: &Options,
+    systemd: &FakeSystemd,
+) -> (Result<Outcome, String>, Vec<String>) {
+    let _span = FORK.read().await;
+    run_in_span(host, request, options, systemd).await
+}
+
+/// [`run`] inside a span that already holds [`FORK`] for reading: a second
+/// read could wait forever behind a writer queued after the first.
+async fn run_in_span(
     host: &Host,
     request: &Request,
     options: &Options,
@@ -1706,8 +1745,11 @@ async fn an_agent_without_its_own_running_unit_is_warned_about_and_the_run_finis
 
 #[test]
 fn what_systemctl_show_prints_is_read() {
+    // systemd prints ExecStart's arguments joined with spaces, unquoted and
+    // unescaped (`argv[]=/sbin/agetty -o -- \u ...` on systemd 257), and
+    // DropInPaths and Environment quoted.
     let report = parse_show(
-        "ExecStart={ path=/usr/local/bin/quoro ; argv[]=/usr/local/bin/quoro serve --config \"/etc/quoro/a b.toml\" ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n\
+        "ExecStart={ path=/usr/local/bin/quoro ; argv[]=/usr/local/bin/quoro serve --config /etc/quoro/a b\\c.toml ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n\
          Environment=\"QUORO_CONFIG=/etc/quoro/a b.toml\" RUST_LOG=info\n\
          FragmentPath=/etc/systemd/system/quoro.service\n\
          DropInPaths=/etc/systemd/system/quoro.service.d/override.conf /run/systemd/system/service.d/zzz-lxc-service.conf\n",
@@ -1727,14 +1769,33 @@ fn what_systemctl_show_prints_is_read() {
         report.environment,
         ["QUORO_CONFIG=/etc/quoro/a b.toml", "RUST_LOG=info"]
     );
+    // The space splits the path, and the backslash stays.
     assert_eq!(
         report.exec_start,
         [vec![
             "/usr/local/bin/quoro",
             "serve",
             "--config",
-            "/etc/quoro/a b.toml"
+            "/etc/quoro/a",
+            "b\\c.toml"
         ]]
+    );
+    let words = |argv: &str| -> Vec<String> { argv.split(' ').map(str::to_string).collect() };
+    assert!(
+        serve_config(&report.exec_start[0])
+            .unwrap_err()
+            .contains("unexpected argument 'b\\c.toml'")
+    );
+    assert_eq!(serve_config(&words("/usr/local/bin/quoro serve")), Ok(None));
+    assert!(
+        serve_config(&words("/usr/local/bin/quoro serve --config quoro.toml"))
+            .unwrap_err()
+            .contains("relative path")
+    );
+    assert!(
+        serve_config(&words("/usr/local/bin/quoro version"))
+            .unwrap_err()
+            .contains("does not run quoro serve")
     );
     assert_eq!(
         parse_show("FragmentPath=\nDropInPaths=\nEnvironment=\nExecStart=\n"),
@@ -1812,6 +1873,175 @@ async fn a_unit_file_drop_in_or_configuration_left_behind_refuses() {
     assert!(result.is_ok(), "{result:?}");
 }
 
+/// Writes a configuration at `path` whose data directory is the host's.
+fn same_config(host: &Host, path: &Path) {
+    fs::copy(host.config(), path).unwrap();
+}
+
+/// #881 point 2: an `ExecStart` whose configuration cannot be read back from
+/// what `systemctl show` prints.
+#[tokio::test]
+async fn an_exec_start_this_command_cannot_read_back_refuses() {
+    for case in [
+        "space",
+        "backslash",
+        "relative",
+        "missing",
+        "no serve",
+        "unknown flag",
+    ] {
+        let host = demoted_host().await;
+        let mut systemd = FakeSystemd::new(&host);
+        let expected = match case {
+            // `--config "<root>/a b.toml"`, which names another data
+            // directory, while `<root>/a` names the host's: read as `<root>/a`,
+            // the check would pass.
+            "space" => {
+                same_config(&host, &host.root.join("a"));
+                fs::copy(other_config(&host), host.root.join("a b.toml")).unwrap();
+                systemd.exec_config = Some(host.root.join("a b.toml"));
+                "unexpected argument 'b.toml'".to_string()
+            }
+            // `<root>/a\b.toml` names another data directory, and `<root>/ab.toml`,
+            // the path without its backslash, the host's.
+            "backslash" => {
+                same_config(&host, &host.root.join("ab.toml"));
+                fs::copy(other_config(&host), host.root.join("a\\b.toml")).unwrap();
+                systemd.exec_config = Some(host.root.join("a\\b.toml"));
+                format!(
+                    "{} (the --config of its ExecStart of {UNIT}) names the data directory",
+                    host.root.join("a\\b.toml").display()
+                )
+            }
+            "relative" => {
+                systemd.exec_argv = Some("/usr/local/bin/quoro serve --config quoro.toml".into());
+                "is a relative path".to_string()
+            }
+            "missing" => {
+                systemd.exec_config = Some(host.root.join("missing.toml"));
+                format!(
+                    "{}, does not exist",
+                    host.root.join("missing.toml").display()
+                )
+            }
+            "no serve" => {
+                systemd.exec_argv = Some("/usr/local/bin/start-quoro".into());
+                "does not run quoro serve".to_string()
+            }
+            _ => {
+                systemd.exec_argv = Some("/usr/local/bin/quoro serve --verbose".into());
+                "unknown option '--verbose'".to_string()
+            }
+        };
+        let before = host.listing();
+        let (result, _) = run(&host, &plain(), &host.options(), &systemd).await;
+        let error = result.unwrap_err();
+        assert!(error.contains(&expected), "{case}: {error}");
+        assert!(error.contains("nothing was changed"), "{case}: {error}");
+        assert_eq!(host.listing(), before, "{case}");
+        assert!(systemd.calls().is_empty(), "{case}: nothing was stopped");
+    }
+
+    // A path with a backslash is read as it is: here it names the host's
+    // configuration, and the run goes on.
+    let host = demoted_host().await;
+    same_config(&host, &host.root.join("a\\b.toml"));
+    let systemd = FakeSystemd {
+        exec_config: Some(host.root.join("a\\b.toml")),
+        ..FakeSystemd::new(&host)
+    };
+    let (result, _) = run(&host, &plain(), &host.options(), &systemd).await;
+    assert!(result.is_ok(), "{result:?}");
+}
+
+/// #881 point 2: another `quoro.service` that systemd would load once the
+/// one in `unit_dir` moved.
+#[tokio::test]
+async fn another_copy_of_the_unit_in_a_unit_directory_refuses() {
+    for linked in [false, true] {
+        let host = demoted_host().await;
+        fs::create_dir(host.vendor_units()).unwrap();
+        let vendor = host.vendor_units().join(UNIT);
+        fs::write(&vendor, "[Service]\nExecStart=/usr/local/bin/quoro serve\n").unwrap();
+        if linked {
+            // The unit file in place is a link to it, which systemd follows.
+            fs::remove_file(host.unit_file()).unwrap();
+            symlink(&vendor, host.unit_file()).unwrap();
+        }
+        let before = host.listing();
+        let systemd = FakeSystemd::new(&host);
+        let (result, _) = run(&host, &plain(), &host.options(), &systemd).await;
+        let error = result.unwrap_err();
+        assert!(
+            error.contains(&format!("{} is another {UNIT}", vendor.display())),
+            "linked {linked}: {error}"
+        );
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert_eq!(host.listing(), before, "linked {linked}");
+        assert!(systemd.calls().is_empty(), "linked {linked}");
+        assert!(host.copies().is_empty(), "linked {linked}");
+    }
+
+    // A unit directory that is a link to unit_dir, as /lib to /usr/lib, holds
+    // the same file, and a drop-in directory elsewhere is not a unit file.
+    let host = demoted_host().await;
+    symlink(host.unit_dir(), host.root.join("units-link")).unwrap();
+    fs::create_dir_all(host.vendor_units().join(DROP_IN)).unwrap();
+    let options = Options {
+        unit_search_paths: vec![
+            host.unit_dir(),
+            host.root.join("units-link"),
+            host.vendor_units(),
+        ],
+        ..host.options()
+    };
+    let systemd = FakeSystemd::new(&host);
+    let (result, _) = run(&host, &plain(), &options, &systemd).await;
+    assert!(result.is_ok(), "{result:?}");
+}
+
+/// A rename that fails as on NFS, or OpenZFS before 2.2, given
+/// `RENAME_NOREPLACE`.
+fn no_noreplace(_: &Path, _: &Path) -> io::Result<()> {
+    Err(io::Error::from(rustix::io::Errno::INVAL))
+}
+
+/// A rename that fails as on a kernel without `renameat2`.
+fn no_renameat2(_: &Path, _: &Path) -> io::Result<()> {
+    Err(io::Error::from(rustix::io::Errno::NOSYS))
+}
+
+/// A filesystem without `RENAME_NOREPLACE` refuses before anything changes:
+/// otherwise the data directory's rename would fail after the stop, and
+/// every rerun at the same rename.
+#[tokio::test]
+async fn a_filesystem_without_noreplace_renames_refuses_before_anything_changes() {
+    for rename in [no_noreplace, no_renameat2] {
+        let host = demoted_host().await;
+        let before = host.listing();
+        let systemd = FakeSystemd::new(&host);
+        let options = Options {
+            fs: Fs {
+                rename,
+                rename_noreplace: rename,
+                ..Fs::REAL
+            },
+            ..host.options()
+        };
+        let (result, _) = run(&host, &plain(), &options, &systemd).await;
+        let error = result.unwrap_err();
+        assert!(error.contains("RENAME_NOREPLACE"), "{error}");
+        assert!(
+            error.contains(&format!("the filesystem of {}", host.parent().display())),
+            "{error}"
+        );
+        assert!(error.ends_with("Nothing was changed"), "{error}");
+        assert_eq!(host.listing(), before, "the scratch file is gone");
+        assert!(systemd.calls().is_empty(), "nothing was stopped");
+        assert!(host.copies().is_empty(), "no rejoin-started");
+    }
+}
+
 /// #881 point 3.
 #[tokio::test]
 async fn a_database_held_open_without_a_unit_refuses() {
@@ -1842,11 +2072,15 @@ async fn a_database_held_open_without_a_unit_refuses() {
     // descriptor's link.
     let held = host.root.join("held");
     fs::write(&held, b"x").unwrap();
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .stdin(fs::File::open(&held).unwrap())
-        .spawn()
-        .unwrap();
+    let mut child = {
+        // No other test holds a lock while the child copies the descriptors.
+        let _fork = FORK.write().await;
+        std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(fs::File::open(&held).unwrap())
+            .spawn()
+            .unwrap()
+    };
     let found = holders(Path::new("/proc"), std::slice::from_ref(&held));
     child.kill().unwrap();
     child.wait().unwrap();
@@ -1863,17 +2097,19 @@ async fn a_database_held_open_without_a_unit_refuses() {
 #[tokio::test]
 async fn a_second_run_is_refused_while_the_first_holds_the_lock() {
     let host = demoted_host().await;
+    let span = FORK.read().await;
     let first = fs::File::open(host.parent()).unwrap();
     rustix::fs::flock(&first, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
     let before = host.listing();
     let systemd = FakeSystemd::new(&host);
-    let (result, _) = run(&host, &plain(), &host.options(), &systemd).await;
+    let (result, _) = run_in_span(&host, &plain(), &host.options(), &systemd).await;
     let error = result.unwrap_err();
     assert!(error.contains("holds the lock"), "{error}");
     assert_eq!(host.listing(), before);
     assert!(systemd.calls().is_empty());
 
     drop(first);
+    drop(span);
     let (result, _) = run(&host, &plain(), &host.options(), &systemd).await;
     assert!(matches!(result, Ok(Outcome::Rejoined(_))), "{result:?}");
 }
@@ -1928,6 +2164,42 @@ async fn a_forced_run_without_a_database_refuses() {
         assert!(systemd.calls().is_empty());
         assert!(receive(&journal).is_none(), "no statement was recorded");
     }
+}
+
+/// #881 point 5, on a rerun without `--force` of a copy a forced run made:
+/// the refusal does not speak of a `--force` the operator did not give.
+#[tokio::test]
+async fn a_rerun_of_a_forced_copy_without_a_database_refuses_without_naming_force() {
+    let host = Host::new();
+    host.control_plane(&[("term", "4")]).await;
+    host.unit();
+    let journal = UnixDatagram::bind(host.socket()).unwrap();
+    let systemd = FakeSystemd {
+        fail_stop: true,
+        ..FakeSystemd::new(&host)
+    };
+    let (result, _) = run(&host, &forced("first"), &host.options(), &systemd).await;
+    assert!(result.is_err());
+    assert!(receive(&journal).is_some());
+    let copy = host.copies()[0].clone();
+    fs::remove_file(host.data_dir().join(DATABASE)).unwrap();
+
+    let before = host.listing();
+    let systemd = FakeSystemd::new(&host);
+    let (result, _) = run(&host, &plain(), &host.options(), &systemd).await;
+    let error = result.unwrap_err();
+    assert!(!error.contains("--force"), "{error}");
+    assert!(
+        error.starts_with(&format!(
+            "this run finishes a forced run (its statement is in {})",
+            copy.join(STATEMENT).display()
+        )),
+        "{error}"
+    );
+    assert!(error.contains(&format!("holds no {DATABASE}")), "{error}");
+    assert_eq!(host.listing(), before);
+    assert!(systemd.calls().is_empty());
+    assert!(receive(&journal).is_none());
 }
 
 /// The `moved:` lines of a copy's `rejoin-done`.
