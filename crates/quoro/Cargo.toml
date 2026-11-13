@@ -35,8 +35,10 @@ quoro-backup = { path = "../backup" }
 quoro-providers = { path = "../providers" }
 # Wire shapes (capacity, KVM) the node agent reports.
 quoro-proto = { path = "../proto" }
-# The control plane's local join file is JSON.
-serde_json = { version = "1", default-features = false, features = ["std"] }
+# The control plane's local join file is JSON. Floats parse exactly, so
+# `quoro audit verify --file` re-hashes an exported record from its text
+# (audit-log-format.md section 5, ADR 0315).
+serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip"] }
 quoro-types = { path = "../types" }
 # The async runtime: listener, signals, the driver channel and the driver loop.
 tokio = { version = "1", default-features = false, features = [

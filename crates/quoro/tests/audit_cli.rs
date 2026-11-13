@@ -104,7 +104,10 @@ async fn db_verify_accepts_a_copy_and_names_the_tampered_seq() {
 async fn verify_accepts_records_that_keep_a_digest() {
     // Section 4.1: parameters whose change-log entry a node could not
     // receive are kept as a digest. Such records verify offline like any
-    // other, from a database copy and from an exported segment.
+    // other, from a database copy and from an exported segment. Floats parse
+    // exactly (ADR 0315), so parameters with floats whose text an
+    // approximate parser reads back as other numbers are kept, and their
+    // record re-hashes from its stored and its exported text.
     let dir = std::env::temp_dir().join(format!("quoro-audit-digest-{}", random_secret()));
     std::fs::create_dir_all(&dir).unwrap();
     let database = dir.join("quoro.db");
@@ -115,7 +118,7 @@ async fn verify_accepts_records_that_keep_a_digest() {
         json!({ "slug": "web", "name": "Web" }),
         serde_json::from_str(r#"{"n": 1e16}"#).unwrap(),
         serde_json::from_str(r#"{"n": 18446744073709551615}"#).unwrap(),
-        serde_json::from_str(r#"{"x": 18983552425072.563}"#).unwrap(),
+        serde_json::from_str(r#"{"x": 1548.2162860866162, "y": 18983552425072.563}"#).unwrap(),
         json!({ "blob": "x".repeat(1_048_000) }),
     ] {
         let mut with_params = record();
@@ -128,7 +131,7 @@ async fn verify_accepts_records_that_keep_a_digest() {
             .fetch_one(store.pool())
             .await
             .unwrap();
-    assert_eq!(digests.0, 4);
+    assert_eq!(digests.0, 3);
     let rows = sqlx::query(&format!(
         "SELECT {} FROM audit_log ORDER BY seq",
         audit::COLUMNS

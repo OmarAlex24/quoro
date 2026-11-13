@@ -5182,6 +5182,83 @@ mod tests {
         assert!(store.log_entries().await.unwrap().is_empty());
     }
 
+    /// ADR 0315: the entry the primary's tests hash, holding two floats, is
+    /// verified from the frame the primary sends, stored, and after a restart
+    /// re-hashes from its stored text.
+    #[tokio::test]
+    async fn a_float_entry_from_the_primary_is_stored_and_re_hashes_from_its_text() {
+        use crate::follow::testing::{FLOAT_ENTRY, received, sha256};
+        let hash = sha256(FLOAT_ENTRY);
+        let entries =
+            crate::follow::verify_batch(0, ZERO_HASH, &received(FLOAT_ENTRY, &hash)).unwrap();
+        assert_eq!(
+            entries[0].payload,
+            r#"{"x":1548.2162860866163,"y":18983552425072.562}"#
+        );
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        store.store_log_batch(&entries, Some(1)).await.unwrap();
+        drop(store);
+
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        assert_eq!(store.log_position().await.unwrap(), (1, hash.clone()));
+        let mut value = store.log_entries().await.unwrap()[0].to_value().unwrap();
+        assert_eq!(value["hash"], json!(hash));
+        value.as_object_mut().unwrap().remove("hash");
+        assert_eq!(jcs::canonicalize(&value).unwrap(), FLOAT_ENTRY);
+    }
+
+    /// ADR 0315: an entry a development build since #723 hashed over a
+    /// float's best-effort read-back, which a node on that build verified and
+    /// stored. The node never re-hashes what it stored: after a restart its
+    /// `hello` and a promotion read the entry's `seq` and `hash`, the next
+    /// entries chain on that hash, and a quarantine moves it aside as stored.
+    #[tokio::test]
+    async fn a_stored_entry_that_no_longer_verifies_is_kept_and_followed_on_from() {
+        use crate::follow::testing::{STALE_HASHED, sha256};
+        let hash = sha256(STALE_HASHED);
+        let entry = LogEntry {
+            seq: 1,
+            term: 1,
+            time: "2026-11-10T10:15:31.000Z".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: "test".to_owned(),
+            entity_type: "vm".to_owned(),
+            entity_id: "vm_1".to_owned(),
+            op: "update".to_owned(),
+            payload: r#"{"x":1548.2162860866163}"#.to_owned(),
+            prev_hash: ZERO_HASH.to_owned(),
+            hash: hash.clone(),
+        };
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        store
+            .store_log_batch(std::slice::from_ref(&entry), Some(1))
+            .await
+            .unwrap();
+        drop(store);
+
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        assert_eq!(store.log_position().await.unwrap(), (1, hash.clone()));
+        let reads = crate::freeze::promotion_reads(&store).await.unwrap();
+        assert_eq!((reads.log_seq, reads.log_hash.as_str()), (1, hash.as_str()));
+        let next = verified(2, &hash, 2, "a");
+        store.store_log_batch(&next, Some(3)).await.unwrap();
+        assert_eq!(store.log_position().await.unwrap().0, 3);
+        assert_eq!(store.log_entries().await.unwrap()[0], entry);
+
+        let LogQuarantine::Moved(path) = store.quarantine_log("test").await.unwrap() else {
+            panic!("a copy was written");
+        };
+        let text = std::fs::read_to_string(&path).unwrap();
+        let first = text.lines().next().unwrap();
+        assert!(
+            first.contains(r#""payload":{"x":1548.2162860866163}"#),
+            "{first}"
+        );
+        assert!(first.contains(&format!(r#""hash":"{hash}""#)), "{first}");
+    }
+
     /// A quarantine file is never written over an existing one, even with the
     /// same time in its name.
     #[test]

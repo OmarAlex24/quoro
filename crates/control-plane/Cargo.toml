@@ -39,7 +39,9 @@ base64 = { version = "0.22", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt", "macros"] }
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "1", default-features = false, features = ["std"] }
+# Floats parse exactly: the audit and change-log hashes are re-hashed from the
+# stored text (ADR 0315), also when this crate is built alone.
+serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip"] }
 utoipa = { version = "5", default-features = false, features = ["macros"] }
 sha2 = { version = "0.10", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
