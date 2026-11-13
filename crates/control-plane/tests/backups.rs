@@ -2545,8 +2545,8 @@ async fn only_an_owner_restores_the_repository_key() {
     assert_no_key_anywhere(&server, &[&recovery], &repo_key, &texts).await;
 }
 
-/// After `rotateBackupRecoveryKey` wrote config-2, and with config-1 gone as
-/// section 4's rotation leaves the bucket, the new recovery key restores the
+/// After `rotateBackupRecoveryKey` wrote config-2, the test removes the older
+/// config to check the fingerprint refusal: the new recovery key restores the
 /// key and the old one is refused by its fingerprint. The restored key
 /// rotates again: config-3 opens to the same repository key.
 #[tokio::test]
