@@ -1787,16 +1787,18 @@ async fn a_failed_clear_of_lost_at_ends_the_session() {
 /// non-fatal `bad_message` that ends the session (section 4.2 rules 3 to 5).
 /// The node has a pending `fence_ack` for one lease, so the session start
 /// waits for the revokes before sending it, and holds a second lease that
-/// the declaration revoked. The `declared_lost` revoke of that second lease
-/// is answered with a `command_result`, then, on a second server, with an
-/// `error`; either answer is the last one `lost_at` waits for.
+/// the declaration revoked. The declaration raised the acknowledged lease
+/// too (ADR 0202), so it is revoked again and answered `ok` first. The
+/// `declared_lost` revoke of the second lease is answered with a
+/// `command_result`, then, on a second server, with an `error`; either
+/// answer is the last one `lost_at` waits for.
 #[tokio::test]
 async fn a_failed_clear_of_lost_at_sends_nothing_after_the_answer() {
     for refused in [false, true] {
         let case = if refused { "error" } else { "command_result" };
         let server = start_with_patient_node_session().await;
         let owner = server.owner().await;
-        let (node, _app_id, _lease_id) = acked_while_away(&server, &owner).await;
+        let (node, _app_id, lease_id) = acked_while_away(&server, &owner).await;
         let node_id = node.node_id.clone();
         sqlx::query(
             "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
@@ -1817,10 +1819,23 @@ async fn a_failed_clear_of_lost_at_sends_nothing_after_the_answer() {
         });
         let mut socket = connect(&server, &node.credential).await;
         send(&mut socket, hello(&node_id, Vec::new())).await;
-        let frames = recv_until(&mut socket, &["welcome", "lease_revoke"]).await;
-        let revoke = of_type(&frames, "lease_revoke")[0].clone();
-        assert_eq!(revoke["body"]["lease_id"], SECOND_LEASE, "{case}: {revoke}");
+        let mut frames = recv_until(&mut socket, &["welcome", "lease_revoke"]).await;
+        while of_type(&frames, "lease_revoke").len() < 2 {
+            frames.push(recv_frame(&mut socket).await);
+        }
+        let revoke_of = |id: &str| -> Value {
+            of_type(&frames, "lease_revoke")
+                .into_iter()
+                .find(|revoke| revoke["body"]["lease_id"] == id)
+                .unwrap_or_else(|| panic!("{case}: no revoke of {id}: {frames:?}"))
+                .clone()
+        };
+        let acked = revoke_of(&lease_id);
+        let revoke = revoke_of(SECOND_LEASE);
+        assert_eq!(acked["body"]["reason"], "declared_lost", "{case}: {acked}");
+        assert_eq!(acked["body"]["fencing_token"], 3, "{case}: {acked}");
         assert_eq!(revoke["body"]["reason"], "declared_lost", "{case}");
+        reply(&mut socket, ok_result(), acked["id"].as_str()).await;
         let answer = if refused {
             NodeMessage::Error(quoro_proto::ProtocolError {
                 code: ErrorCode::BadMessage,
@@ -2144,4 +2159,132 @@ async fn acks_a_lease_another_node_holds_at(row_token: i64) {
     )
     .await;
     wait_for_no_pending_ack(&server, &mut socket, &node_id).await;
+}
+
+/// Records `lease_id` revoked in the primary's view at `at`, as a revoke the
+/// node never answered leaves it.
+async fn revoke_row(server: &Server, lease_id: &str, at: &str) {
+    sqlx::query("UPDATE leases SET revoked_at = ? WHERE id = ?")
+        .bind(at)
+        .bind(lease_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+}
+
+/// A `revoked_at` older than any the tests write through the API.
+const EARLIER_REVOKE: &str = "2026-11-12T10:15:32Z";
+
+/// Waits until the node row reads `disconnected`: the session's end writes
+/// it with its change-log entry, so no entry of the session's end follows.
+async fn wait_row_disconnected(server: &Server, owner: &reqwest::Client, node_id: &str) {
+    wait_for_node(owner, server, None, node_id, "disconnected", |node| {
+        node["status"] == "disconnected"
+    })
+    .await;
+}
+
+/// Section 8.3 and ADR 0202: declaring a node lost raises every lease row
+/// that names it, a row revoked before the declaration included (a revoke
+/// the node never answered left it at the token the node may still run
+/// under). Both rows end at their token plus one and revoked, the earlier
+/// row keeping its `revoked_at`, `lost_at` is set after both, and each row
+/// gets one change-log entry before the node's.
+#[tokio::test]
+async fn declaring_a_node_lost_raises_a_row_revoked_before_the_declaration() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, socket, _app_id, _vm_id, lease_id) = node_with_lease(&server, &owner).await;
+    let node_id = node.node_id.clone();
+    drop(socket);
+    wait_disconnected(&server, &node_id).await;
+    wait_row_disconnected(&server, &owner, &node_id).await;
+    second_lease(&server, &node_id, 3).await;
+    revoke_row(&server, SECOND_LEASE, EARLIER_REVOKE).await;
+
+    let before = log_head(&server).await;
+    let res = declare_lost(&owner, &server, &node_id).await;
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let body: Value = res.json().await.unwrap();
+    let declared = body["lost_at"].as_str().expect("lost_at").to_string();
+    assert_eq!(
+        lost_at(&server, &node_id).await.as_deref(),
+        Some(declared.as_str())
+    );
+
+    let (token, revoked_at, holder) = lease_row(&server, &lease_id).await;
+    let revoked_at = revoked_at.expect("recorded revoked in the primary's view");
+    assert_eq!((token, holder.as_str()), (2, node_id.as_str()));
+    assert!(revoked_at <= declared, "{revoked_at} <= {declared}");
+    assert_eq!(
+        lease_row(&server, SECOND_LEASE).await,
+        (4, Some(EARLIER_REVOKE.to_string()), node_id.clone()),
+        "the row revoked before is raised and keeps its revoked_at"
+    );
+
+    let entries = entries_after(&server, before).await;
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    let mut leases: Vec<(&str, i64, Value)> = entries[..2]
+        .iter()
+        .map(|(_, kind, id, payload)| {
+            assert_eq!(kind, "lease", "{entries:?}");
+            (
+                id.as_str(),
+                payload["fencing_token"].as_i64().unwrap(),
+                payload["revoked_at"].clone(),
+            )
+        })
+        .collect();
+    leases.sort_by_key(|(id, _, _)| id.to_string());
+    let mut expected = vec![
+        (lease_id.as_str(), 2, json!(revoked_at)),
+        (SECOND_LEASE, 4, json!(EARLIER_REVOKE)),
+    ];
+    expected.sort_by_key(|(id, _, _)| id.to_string());
+    assert_eq!(leases, expected);
+    let (_, kind, id, payload) = &entries[2];
+    assert_eq!((kind.as_str(), id.as_str()), ("node", node_id.as_str()));
+    assert_eq!(payload["lost_at"], json!(declared), "{payload}");
+}
+
+/// Section 8.3 and section 8.6, "The cap": a row already revoked at
+/// 2^53 − 1 can never be granted again, so declaring its node lost leaves it
+/// as it is, with no change-log entry, instead of refusing with
+/// `token_exhausted`. The node's other row is raised and the declaration
+/// succeeds.
+#[tokio::test]
+async fn declaring_a_node_lost_leaves_a_row_revoked_at_the_cap_as_it_is() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, socket, _app_id, _vm_id, lease_id) = node_with_lease(&server, &owner).await;
+    let node_id = node.node_id.clone();
+    drop(socket);
+    wait_disconnected(&server, &node_id).await;
+    wait_row_disconnected(&server, &owner, &node_id).await;
+    second_lease(&server, &node_id, MAX_TOKEN).await;
+    revoke_row(&server, SECOND_LEASE, EARLIER_REVOKE).await;
+
+    let before = log_head(&server).await;
+    let res = declare_lost(&owner, &server, &node_id).await;
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let body: Value = res.json().await.unwrap();
+    let declared = body["lost_at"].as_str().expect("lost_at").to_string();
+    assert_eq!(
+        lease_row(&server, SECOND_LEASE).await,
+        (MAX_TOKEN, Some(EARLIER_REVOKE.to_string()), node_id.clone()),
+        "the row revoked at the cap is left as it is"
+    );
+    let (token, revoked_at, _) = lease_row(&server, &lease_id).await;
+    assert_eq!((token, revoked_at.is_some()), (2, true));
+
+    let entries = entries_after(&server, before).await;
+    let kinds: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|(_, kind, id, _)| (kind.as_str(), id.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [("lease", lease_id.as_str()), ("node", node_id.as_str())]
+    );
+    assert_eq!(entries[1].3["lost_at"], json!(declared));
 }

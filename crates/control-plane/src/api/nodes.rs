@@ -1008,9 +1008,11 @@ pub async fn declare_node_lost(
 
 /// Section 8.3, "Declaring a node lost", in one transaction:
 ///
-/// 1. increments the `fencing_token` of every lease the node holds, `local`
-///    and `expiring`, and records it revoked in the primary's view, with the
-///    node still named as the last holder ([`crate::leases::bump_tokens`]);
+/// 1. increments the `fencing_token` of every lease row that names the node
+///    as its holder, `local` and `expiring`, a revoked one included, and
+///    records it revoked in the primary's view, keeping an earlier
+///    `revoked_at`, with the node still named as the last holder
+///    ([`crate::leases::bump_tokens`], ADR 0202);
 /// 2. sets `nodes.lost_at`; the node stays enrolled and a voter;
 /// 3. writes the change-log entries and the audit record.
 ///
@@ -1087,10 +1089,11 @@ async fn declare_lost_tx(
 /// The write of declaring `node_id` lost (section 8.3, "Declaring a node
 /// lost"), in the caller's transaction, by `actor`:
 ///
-/// 1. increments the `fencing_token` of every lease the node holds, `local`
-///    and `expiring`, and records it revoked in the primary's view, with the
-///    node still named as the last holder, one change-log entry per lease
-///    ([`crate::leases::bump_tokens`]);
+/// 1. increments the `fencing_token` of every lease row that names the node
+///    as its holder, `local` and `expiring`, a revoked one included, and
+///    records it revoked in the primary's view, keeping an earlier
+///    `revoked_at`, with the node still named as the last holder, one
+///    change-log entry per lease ([`crate::leases::bump_tokens`], ADR 0202);
 /// 2. sets `nodes.lost_at`, after those revokes, so `revoked_at <= lost_at`
 ///    holds for each of them ([`crate::leases::is_released`]); the node
 ///    stays enrolled and a voter;
@@ -1101,21 +1104,25 @@ async fn declare_lost_tx(
 /// token cap refuses with `token_exhausted` before anything is written
 /// (section 8.6, ADR 0325), and the caller drops its transaction.
 ///
-/// Only rows that name the node and are not revoked yet change: a lease whose
-/// row names another node already carries a higher token than this node's,
-/// and a revoked row is not held, a row already revoked at the cap included.
-/// `fence_failure` is left as it is (ADR 0202), and no release is recorded
-/// ([`crate::leases::Releases`]): a lease moves on `lost_at` through
-/// [`crate::leases::is_released`], which keeps an `expiring` lease behind its
-/// gate, and only while the node has not reported since
-/// ([`crate::leases::declaration_releases`]).
+/// Only rows that name the node change: a lease whose row names another node
+/// already carries a higher token than this node's. A row revoked before the
+/// declaration is raised too: a revoke the node never answered (a restore's
+/// `moved` revoke whose session ended first, a removal whose fence did not
+/// complete) left it at the token the node may still run under. A row
+/// already revoked at the token cap is left as it is, as `removeNode` leaves
+/// it ([`crate::removal`]). `fence_failure` is left as it is (ADR 0202),
+/// and no release is recorded ([`crate::leases::Releases`]): a lease moves on
+/// `lost_at` through [`crate::leases::is_released`], which keeps an
+/// `expiring` lease behind its gate, and only while the node has not
+/// reported since ([`crate::leases::declaration_releases`]).
 ///
 /// It checks nothing else. `declareNodeLost` ([`declare_lost_tx`]) refuses
 /// an unknown, `removed` or connected node before it calls this. The
 /// promotion write of `quoro cluster promote --ack-fence` calls it directly
-/// for the old primary's node (section 7.3 step 5, [`crate::promotion`]):
-/// the contract gives that write no such refusal, and the new primary has no
-/// session with any node yet.
+/// for the old primary's node (section 7.3 step 5, [`crate::promotion`]),
+/// so `--ack-fence` raises the node's revoked rows too: the contract gives
+/// that write no such refusal, and the new primary has no session with any
+/// node yet.
 ///
 /// # Errors
 ///
@@ -1137,12 +1144,24 @@ pub(crate) async fn declare_lost_write(
     if lost_at.is_some() {
         return Ok(None);
     }
-    let held: Vec<String> = crate::leases::held_by_node(conn, node_id)
-        .await?
-        .into_iter()
-        .map(|lease| lease.id)
-        .collect();
-    crate::leases::bump_tokens(conn, &held, node_id, actor).await?;
+    // Every row that names the node, a revoked one included (ADR 0202);
+    // `bump_tokens` keeps an earlier `revoked_at`. A row already revoked at
+    // the cap ([`crate::leases::MAX_TOKEN`]) is left out: no grant ever
+    // issues a token past the cap, so the row is never granted again, and
+    // raising it would refuse every declaration of the node. An unrevoked
+    // row at the cap still refuses the declaration with `token_exhausted` in
+    // `bump_tokens` (ADR 0325).
+    let named: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM leases WHERE holder_node_id = ? \
+         AND (revoked_at IS NULL OR fencing_token < ?) ORDER BY id",
+    )
+    .bind(node_id)
+    .bind(crate::leases::MAX_TOKEN)
+    .fetch_all(&mut *conn)
+    .await?;
+    crate::leases::bump_tokens(conn, &named, node_id, actor).await?;
+    // Taken after the revokes, so `revoked_at <= lost_at` holds for each of
+    // them ([`crate::leases::is_released`]).
     sqlx::query("UPDATE nodes SET lost_at = ? WHERE id = ?")
         .bind(now_rfc3339())
         .bind(node_id)
