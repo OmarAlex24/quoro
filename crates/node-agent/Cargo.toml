@@ -77,8 +77,9 @@ tar = { version = "0.4", default-features = false }
 # `wg-quick` process (ADR 0063, section 6.9). The crates are MIT and only the
 # Linux build uses them.
 # `statvfs` for `status_report.disk_free_gb` without `unsafe`; already in the
-# lock file through the engine.
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "time"] }
+# lock file through the engine. `geteuid` for the vote client's root check
+# (section 8.9); the engine already enables `process`.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "time", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 genetlink = "0.3.1"

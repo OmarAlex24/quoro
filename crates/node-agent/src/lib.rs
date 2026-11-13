@@ -35,6 +35,7 @@ pub mod tls;
 pub mod transcript;
 mod util;
 pub mod vote;
+pub mod vote_client;
 pub mod vote_listener;
 pub mod warm;
 
