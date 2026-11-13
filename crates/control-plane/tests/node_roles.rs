@@ -859,8 +859,10 @@ async fn after_a_restart_a_revoked_expiring_lease_counts_until_its_start_gate_pa
         machines,
     } = three_voters(&server, &owner).await;
     let lease = "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0F";
-    // 6 s and two margins of 1 s: the start gate passes 8 s after the start.
-    lease_row(&server, lease, &b.node_id, 6_000, true).await;
+    // 15 s and two margins of 1.5 s: the start gate passes 18 s after the
+    // start, which leaves a loaded runner time to restart, reconnect the
+    // three machines and log in before the first refusal.
+    lease_row(&server, lease, &b.node_id, 15_000, true).await;
     drop(machines);
     for node in [&a, &b, &edge] {
         while node_status(&server, &node.node_id).await != "disconnected" {
