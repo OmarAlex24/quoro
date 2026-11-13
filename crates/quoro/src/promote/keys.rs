@@ -30,6 +30,10 @@
 //! is missing, does not open or opens to another key. Without the custody
 //! key, a key's seal is still checked for what needs no key: that it is in
 //! the log and is base64.
+//!
+//! [`open`] makes the same checks and returns what each seal holds, with
+//! the key id of the `current` row of `signing_keys`, for the key
+//! installation of step 6 (`install_keys`); [`check`] returns only the keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -42,6 +46,7 @@ use quoro_node_agent::identity::{self, Identity};
 use quoro_proto::custody::{self, CustodyKey, KeyKind, SealContext};
 use quoro_proto::sign;
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 use super::command::kind_name;
 
@@ -57,12 +62,17 @@ const SEAL_TABLE: &str = "node_key_custody";
 const SIGNING_TABLE: &str = "signing_keys";
 /// The prefix of a pinned fingerprint.
 const FINGERPRINT_PREFIX: &str = "sha256:";
+/// The `state` of the `signing_keys` row of the key in use outside a
+/// rotation (section 7.5).
+const CURRENT: &str = "current";
 
 /// What the followed log says about the keys.
 #[derive(Debug, Default)]
 struct Ledger {
     /// The key id of every `signing_keys` row.
     signing_keys: BTreeSet<String>,
+    /// The key id of the `current` row of `signing_keys`, if there is one.
+    current_signing: Option<String>,
     /// This machine's seals: `(key_kind, key_id)` to `sealed`, the base64
     /// text a change-log payload carries.
     seals: BTreeMap<(String, String), String>,
@@ -70,9 +80,30 @@ struct Ledger {
 
 /// The TLS seal's plaintext: `{"cert_pem": ..., "key_pem": ...}`.
 #[derive(serde::Deserialize)]
-struct TlsPair {
-    cert_pem: String,
-    key_pem: String,
+pub(crate) struct TlsPair {
+    /// The certificate chain, PEM.
+    pub(crate) cert_pem: String,
+    /// The private key, PEM.
+    pub(crate) key_pem: String,
+}
+
+/// A key in use, opened from this machine's seal of it ([`open`]).
+pub(crate) struct OpenedKey {
+    /// Its kind.
+    pub(crate) kind: KeyKind,
+    /// Its key id.
+    pub(crate) key_id: String,
+    /// What its seal holds (section 7.2), wiped when dropped.
+    pub(crate) plaintext: Zeroizing<Vec<u8>>,
+}
+
+/// The keys in use, opened ([`open`]).
+pub(crate) struct Opened {
+    /// Every key in use with what its seal holds, in [`check`]'s order.
+    pub(crate) keys: Vec<OpenedKey>,
+    /// The key id of the `current` row of `signing_keys` in the followed
+    /// log, when it holds one.
+    pub(crate) current_signing: Option<String>,
 }
 
 /// Checks that this machine can open a seal of every key in use, each to
@@ -94,6 +125,26 @@ pub(crate) async fn check(
     entries: &[LogEntry],
     node_data_dir: &Path,
 ) -> Result<Vec<(KeyKind, String)>, Vec<String>> {
+    open(identity, entries, node_data_dir).await.map(|opened| {
+        opened
+            .keys
+            .into_iter()
+            .map(|key| (key.kind, key.key_id))
+            .collect()
+    })
+}
+
+/// [`check`], returning what each seal holds and the key id of the
+/// `current` row of `signing_keys`.
+///
+/// # Errors
+///
+/// As [`check`].
+pub(crate) async fn open(
+    identity: &Identity,
+    entries: &[LogEntry],
+    node_data_dir: &Path,
+) -> Result<Opened, Vec<String>> {
     let ledger = read_ledger(&identity.node_id, entries)
         .await
         .map_err(|message| vec![message])?;
@@ -106,13 +157,24 @@ pub(crate) async fn check(
             None
         }
     };
-    for (kind, key_id) in &in_use {
-        if let Err(problem) = open_seal(identity, &ledger, custody_key.as_ref(), *kind, key_id) {
-            problems.push(format!("the {} {key_id}: {problem}", kind_name(*kind)));
+    let mut keys = Vec::with_capacity(in_use.len());
+    for (kind, key_id) in in_use {
+        match open_seal(identity, &ledger, custody_key.as_ref(), kind, &key_id) {
+            Ok(Some(plaintext)) => keys.push(OpenedKey {
+                kind,
+                key_id,
+                plaintext,
+            }),
+            // Without the custody key, which is its own problem.
+            Ok(None) => {}
+            Err(problem) => problems.push(format!("the {} {key_id}: {problem}", kind_name(kind))),
         }
     }
     if problems.is_empty() {
-        Ok(in_use)
+        Ok(Opened {
+            keys,
+            current_signing: ledger.current_signing,
+        })
     } else {
         Err(problems)
     }
@@ -166,9 +228,10 @@ fn in_use(
     keys
 }
 
-/// Opens this machine's seal of the `kind` key `key_id` and checks that it
-/// holds that key. Without `custody_key`, whose absence is its own problem,
-/// it checks only that the seal is in the log and is base64.
+/// Opens this machine's seal of the `kind` key `key_id`, checks that it
+/// holds that key and returns what it holds. Without `custody_key`, whose
+/// absence is its own problem, it checks only that the seal is in the log
+/// and is base64, and returns `None`.
 ///
 /// # Errors
 ///
@@ -180,7 +243,7 @@ fn open_seal(
     custody_key: Option<&CustodyKey>,
     kind: KeyKind,
     key_id: &str,
-) -> Result<(), String> {
+) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
     let Some(text) = ledger
         .seals
         .get(&(kind.as_str().to_string(), key_id.to_string()))
@@ -190,7 +253,7 @@ fn open_seal(
     let sealed = crate::tls::base64_decode(text)
         .map_err(|_| "its seal in the followed log is not base64".to_string())?;
     let Some(custody_key) = custody_key else {
-        return Ok(());
+        return Ok(None);
     };
     let context = SealContext {
         cluster_id: &identity.cluster_id,
@@ -200,7 +263,8 @@ fn open_seal(
     };
     let opened = custody::open(custody_key, &context, &sealed)
         .map_err(|e| format!("its seal does not open with this machine's custody key ({e})"))?;
-    holds(kind, key_id, &opened)
+    holds(kind, key_id, &opened)?;
+    Ok(Some(opened))
 }
 
 /// Whether `plaintext`, an opened seal, is the `kind` key `key_id`.
@@ -281,6 +345,9 @@ async fn read_ledger(node_id: &str, entries: &[LogEntry]) -> Result<Ledger, Stri
     if let Some(rows) = folded.tables.get(SIGNING_TABLE) {
         for (entity_id, row) in rows {
             let key_id = text(&row.cells, "key_id").unwrap_or(entity_id.as_str());
+            if text(&row.cells, "state") == Some(CURRENT) {
+                ledger.current_signing = Some(key_id.to_string());
+            }
             ledger.signing_keys.insert(key_id.to_string());
         }
     }
