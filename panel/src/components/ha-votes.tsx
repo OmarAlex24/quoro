@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ShieldAlert, ShieldCheck, ShieldEllipsis } from 'lucide-react';
-import { useEffect, useState } from 'react';
-import { getGetClusterQueryKey, useGetCluster } from '../api/generated/cluster/cluster';
+import { Fragment, useEffect, useState } from 'react';
+import { useGetCluster } from '../api/generated/cluster/cluster';
 import type { Node, NodeJoinTokenCreated } from '../api/generated/model';
-import { createNodeJoinToken, getListNodesQueryKey, updateNodeRoles } from '../api/generated/nodes/nodes';
 import { expiryWords } from '../lib/agency-format';
 import { canChangeVoters } from '../lib/capabilities';
+import { joinTokenMutation, releasePage } from '../lib/join-token';
 import { problemView, type ProblemView } from '../lib/problem';
 import { cn } from '../lib/utils';
 import {
+  addWitnessMutation,
+  candidateNote,
+  disconnectedVoters,
+  dropTokenUnlessShort,
   haReadout,
+  haVotesState,
   witnessCandidates,
   witnessJoinCommand,
   witnessProblem,
@@ -19,7 +24,9 @@ import {
   type WitnessProblem,
 } from '../lib/votes';
 import { useSession } from '../session';
+import { LampDot } from './lamp';
 import { SecretOnce } from './secret-once';
+import { SkelBar, Skeleton } from './skeleton';
 import { ToneLamp } from './tone-lamp';
 import { Button } from './ui/button';
 import { ProblemBanner } from './ui/problem-banner';
@@ -43,43 +50,32 @@ export function HaVotes({ nodes }: { nodes: readonly Node[] }) {
   });
   const [addingId, setAddingId] = useState<string | null>(null);
 
-  const addWitness = useMutation({
-    mutationFn: (node: Node) => updateNodeRoles(node.id, { add: ['witness'] }),
-    onMutate: (node) => setAddingId(node.id),
-    onSettled: () => {
-      setAddingId(null);
-      void queryClient.invalidateQueries({ queryKey: getGetClusterQueryKey() });
-      void queryClient.invalidateQueries({ queryKey: getListNodesQueryKey() });
-    },
-  });
+  const addWitness = useMutation(addWitnessMutation(queryClient, setAddingId));
   // The secret lives in this mutation's result only; `reset()` drops it.
-  const joinToken = useMutation({
-    mutationFn: () => createNodeJoinToken({}, { headers: { 'Idempotency-Key': crypto.randomUUID() } }),
-  });
+  const joinToken = useMutation(joinTokenMutation());
 
   const votes = cluster.data?.votes;
-  const short = votes !== undefined && haReadout(votes, nodes).state === 'short';
   const dropToken = joinToken.reset;
   // The secret goes with the offer: once HA has its votes, nothing shows it again.
-  useEffect(() => {
-    if (!short) dropToken();
-  }, [short, dropToken]);
+  useEffect(() => dropTokenUnlessShort(votes, dropToken), [votes, dropToken]);
 
-  if (cluster.error) {
-    return <ProblemBanner view={problemView(cluster.error, 'see the voters')} className="mb-4" />;
-  }
-  if (!votes) return null;
+  const state = haVotesState(cluster);
+  if (state.kind === 'loading') return <HaVotesSkeleton />;
+  if (state.kind === 'failed') return <ProblemBanner view={state.problem} className="mb-4" />;
+  if (state.kind === 'hidden') return null;
 
   return (
     <HaVotesView
-      readout={haReadout(votes, nodes)}
-      candidates={witnessCandidates(nodes, votes)}
+      readout={haReadout(state.votes, nodes)}
+      candidates={witnessCandidates(nodes, state.votes)}
+      version={cluster.data?.version}
       canChange={canChangeVoters(me)}
       addingId={addingId}
       busy={addWitness.isPending || joinToken.isPending}
       problem={addWitness.error ? witnessProblem(addWitness.error) : null}
       joinToken={joinToken.data ?? null}
       tokenProblem={joinToken.error ? problemView(joinToken.error, 'create join tokens') : null}
+      stale={state.stale}
       onAddWitness={(node) => {
         joinToken.reset();
         addWitness.mutate(node);
@@ -93,9 +89,24 @@ export function HaVotes({ nodes }: { nodes: readonly Node[] }) {
   );
 }
 
+/** The view while the first votes load: the one-line strip HA settles into, as dither. */
+function HaVotesSkeleton() {
+  return (
+    <div className="n1 ha-skel">
+      <span className="n1-gl" aria-hidden="true" />
+      <Skeleton label="Loading the voters" className="ha-skel-f">
+        <SkelBar width="min(320px, 70%)" />
+        <SkelBar width="min(200px, 45%)" height={10} />
+      </Skeleton>
+    </div>
+  );
+}
+
 export interface HaVotesViewProps {
   readout: HaReadout;
   candidates: readonly Node[];
+  /** The cluster's version, which a new witness's `quoro` binary should match. */
+  version?: string;
   canChange: boolean;
   /** The machine whose roles call is in flight. */
   addingId: string | null;
@@ -104,6 +115,8 @@ export interface HaVotesViewProps {
   problem: WitnessProblem | null;
   joinToken: NodeJoinTokenCreated | null;
   tokenProblem: ProblemView | null;
+  /** The newest refetch failed: the view shows the last votes and says so. */
+  stale?: ProblemView | null;
   onAddWitness: (node: Node) => void;
   onCreateToken: () => void;
   onDropToken: () => void;
@@ -111,8 +124,8 @@ export interface HaVotesViewProps {
 
 /** What the HA view draws, from props only. */
 export function HaVotesView(props: HaVotesViewProps) {
-  const { readout } = props;
-  if (readout.state !== 'short') return <HaSettled readout={readout} />;
+  const { readout, stale = null } = props;
+  if (readout.state !== 'short') return <HaSettled readout={readout} stale={stale} />;
 
   return (
     <section className="ha" aria-labelledby="ha-title">
@@ -125,6 +138,7 @@ export function HaVotesView(props: HaVotesViewProps) {
             {readout.headline}
           </h2>
           <p className="ha-line">{readout.line}</p>
+          <StaleNote problem={stale} />
         </div>
         <span className="ha-tally">{readout.tally}</span>
       </div>
@@ -161,6 +175,11 @@ function Seat({ seat }: { seat: VoterSeat }) {
         ))}
         <span className={cn('ha-seat-w', !seat.connected && 'text-fault')}>{seat.words}</span>
       </span>
+      {seat.connected ? null : (
+        <p className="next-step">
+          Make sure its node agent, <code className="type-code">quoro node</code>, is running on that machine.
+        </p>
+      )}
     </li>
   );
 }
@@ -168,6 +187,7 @@ function Seat({ seat }: { seat: VoterSeat }) {
 /** The two ways to a third vote: an enrolled machine gains the role, or a new one joins as a witness. */
 function WitnessOffer({
   candidates,
+  version,
   canChange,
   addingId,
   busy,
@@ -188,29 +208,14 @@ function WitnessOffer({
         ) : (
           <ul className="ha-cands" aria-label="Machines without a vote">
             {candidates.map((node) => (
-              <li key={node.id} className="ha-cand">
-                <ToneLamp
-                  tone={node.status === 'connected' ? 'run' : 'fault'}
-                  size={11}
-                  label={node.status === 'connected' ? 'Connected' : 'Not connected'}
-                />
-                <b>{node.name}</b>
-                {node.roles.map((role) => (
-                  <Tag key={role} tone="plain">
-                    {role}
-                  </Tag>
-                ))}
-                {canChange ? (
-                  <Button
-                    size="sm"
-                    className="ml-auto"
-                    disabled={busy}
-                    onClick={() => onAddWitness(node)}
-                  >
-                    {addingId === node.id ? 'Adding the witness role…' : 'Add the witness role'}
-                  </Button>
-                ) : null}
-              </li>
+              <Candidate
+                key={node.id}
+                node={node}
+                canChange={canChange}
+                adding={addingId === node.id}
+                busy={busy}
+                onAdd={() => onAddWitness(node)}
+              />
             ))}
           </ul>
         )}
@@ -224,15 +229,29 @@ function WitnessOffer({
 
       <div className="ha-way">
         <h3 className="ha-way-t">Enroll a new machine as the witness</h3>
-        <p className="ha-way-p">A small machine is enough. The join token is for one machine and lasts an hour.</p>
+        <p className="ha-way-p">
+          A small machine is enough, with iproute2 and nftables installed. From the archive of{' '}
+          <a href={releasePage(version)} target="_blank" rel="noreferrer" className="set-inline-link">
+            {version ? `release ${version}` : 'the release'}
+          </a>
+          {version ? ', the cluster’s version,' : ' at the cluster’s version,'} put{' '}
+          <code className="type-code">quoro</code> in <code className="type-code">/usr/local/bin</code> and{' '}
+          <code className="type-code">quoro-node.service</code> in{' '}
+          <code className="type-code">/etc/systemd/system</code>. The join token is for one machine and lasts an hour.
+        </p>
         {joinToken ? (
           <div className="grid gap-2">
             <SecretOnce
-              label="Run this on the new machine"
+              label="Run this as root on the new machine"
               secret={witnessJoinCommand(joinToken.join_command)}
               copyLabel="Copy command"
               note={`The token is shown only this once and expires ${expiryWords(joinToken.expires_at)}.`}
             />
+            <p className="next-step">
+              Then start its node agent, as root too:{' '}
+              <code className="type-code">systemctl enable --now quoro-node</code>. Until the agent connects, the
+              witness cannot vote.
+            </p>
             <Button size="sm" className="justify-self-start" onClick={onDropToken}>
               Done
             </Button>
@@ -253,12 +272,87 @@ function WitnessOffer({
   );
 }
 
-/** Enough voters: one quiet line, and the voters by name. */
-function HaSettled({ readout }: { readout: HaReadout }) {
+/**
+ * A machine that can gain the vote. One that is not connected can too (the
+ * server takes the role either way); beside the button, a note says that it
+ * votes only once its agent connects. Without the button there is no note.
+ */
+function Candidate({
+  node,
+  canChange,
+  adding,
+  busy,
+  onAdd,
+}: {
+  node: Node;
+  canChange: boolean;
+  adding: boolean;
+  busy: boolean;
+  onAdd: () => void;
+}) {
+  const connected = node.status === 'connected';
+  const note = canChange ? candidateNote(node) : null;
+  const noteId = `ha-cand-note-${node.id}`;
+  return (
+    <li className="ha-cand">
+      <ToneLamp tone={connected ? 'run' : 'fault'} size={11} label={connected ? 'Connected' : 'Not connected'} />
+      <b>{node.name}</b>
+      {node.roles.map((role) => (
+        <Tag key={role} tone="plain">
+          {role}
+        </Tag>
+      ))}
+      {canChange ? (
+        <Button
+          size="sm"
+          className="ml-auto"
+          disabled={busy}
+          aria-describedby={note ? noteId : undefined}
+          onClick={onAdd}
+        >
+          {adding ? 'Adding the witness role…' : 'Add the witness role'}
+        </Button>
+      ) : null}
+      {note ? (
+        <p id={noteId} className="ha-cand-note">
+          {note}
+        </p>
+      ) : null}
+    </li>
+  );
+}
+
+/**
+ * The newest refetch failed: the last votes stay, with this beside them. The
+ * status element stays mounted, empty and out of sight while the votes are
+ * current, so a screen reader announces the note when it fills.
+ */
+function StaleNote({ problem }: { problem: ProblemView | null }) {
+  return (
+    <p className={cn('ha-stale', !problem && 'sr-only')} role="status">
+      {problem ? (
+        <>
+          <LampDot ring="fault" core="fault" size={9} />
+          <span>These votes may be out of date. {problem.message}</span>
+        </>
+      ) : null}
+    </p>
+  );
+}
+
+/**
+ * Enough voters: one quiet line, and the voters by name. A voter that is not
+ * connected still counts, so under them a line says what it needs.
+ */
+function HaSettled({ readout, stale }: { readout: HaReadout; stale: ProblemView | null }) {
   const ready = readout.state === 'ready';
   const Icon = ready ? ShieldCheck : ShieldEllipsis;
+  const away = disconnectedVoters(readout.seats);
   return (
-    <section className={cn('n1 ha-quiet', !ready && 'n1-shift')} aria-labelledby="ha-title">
+    <section
+      className={cn('n1 ha-quiet', !ready && 'n1-shift', (stale || away.length > 0) && 'ha-quiet-rows')}
+      aria-labelledby="ha-title"
+    >
       <span className="n1-gl" aria-hidden="true">
         <Icon strokeWidth={1.7} />
       </span>
@@ -275,6 +369,19 @@ function HaSettled({ readout }: { readout: HaReadout }) {
           </li>
         ))}
       </ul>
+      {away.length > 0 ? (
+        <p className="next-step">
+          Make sure the node agent, <code className="type-code">quoro node</code>, is running on{' '}
+          {away.map((voter, index) => (
+            <Fragment key={index}>
+              {index === 0 ? null : index === away.length - 1 ? ' and ' : ', '}
+              {voter.named ? <b>{voter.words}</b> : voter.words}
+            </Fragment>
+          ))}
+          .
+        </p>
+      ) : null}
+      <StaleNote problem={stale} />
     </section>
   );
 }

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { QueryClient, UseMutationOptions } from '@tanstack/react-query';
 import { isApiProblem } from '../api/fetcher';
-import type { ClusterVotes, Node } from '../api/generated/model';
+import { getGetClusterQueryKey } from '../api/generated/cluster/cluster';
+import type { Cluster, ClusterVotes, Node } from '../api/generated/model';
+import { getListNodesQueryKey, updateNodeRoles } from '../api/generated/nodes/nodes';
 import { shortId } from './agency-format';
 import type { LampTone } from './lamp';
 import { problemView, type ProblemView } from './problem';
@@ -21,7 +24,14 @@ export type HaState = 'short' | 'waiting' | 'ready';
 /** One voter as the view shows it: its name, its roles and its session. */
 export interface VoterSeat {
   nodeId: string;
+  /** Its name in the node list, or its short id while the list has none. */
   name: string;
+  /**
+   * Whether the node list names it. A machine that has just joined is in the
+   * votes (read every 5 s) a few seconds before it is in the node list (every
+   * 10 s).
+   */
+  named: boolean;
   roles: string[];
   connected: boolean;
   tone: LampTone;
@@ -65,14 +75,36 @@ export const tallyWords = (count: number, required: number): string =>
 
 /** Each voter with its name from the nodes list, or its short id while the list has none. */
 export const voterSeats = (votes: ClusterVotes, nodes: readonly Node[]): VoterSeat[] =>
-  votes.voters.map((voter) => ({
-    nodeId: voter.node_id,
-    name: nodes.find((node) => node.id === voter.node_id)?.name ?? shortId(voter.node_id),
-    roles: [...voter.roles],
-    connected: voter.connected,
-    tone: voter.connected ? 'run' : 'fault',
-    words: voter.connected ? 'Connected' : 'Disconnected',
-  }));
+  votes.voters.map((voter) => {
+    const node = nodes.find((candidate) => candidate.id === voter.node_id);
+    return {
+      nodeId: voter.node_id,
+      name: node?.name ?? shortId(voter.node_id),
+      named: node !== undefined,
+      roles: [...voter.roles],
+      connected: voter.connected,
+      tone: voter.connected ? 'run' : 'fault',
+      words: voter.connected ? 'Connected' : 'Disconnected',
+    };
+  });
+
+/**
+ * Whether HA is short of a vote, so the view offers a witness. A join token
+ * lives only as long as that offer: false with no votes yet, false once
+ * `count` reaches `required`.
+ */
+export const shortOfVotes = (votes: ClusterVotes | undefined): boolean =>
+  votes !== undefined && missingVoteWords(votes.count, votes.required) !== null;
+
+/**
+ * The HA view calls this whenever the votes change: the join token goes with
+ * the offer, so once HA is no longer short of a vote `drop` (the token
+ * mutation's `reset`) runs and nothing shows that token again, even if HA
+ * falls short later.
+ */
+export const dropTokenUnlessShort = (votes: ClusterVotes | undefined, drop: () => void): void => {
+  if (!shortOfVotes(votes)) drop();
+};
 
 /** What the HA view says about `Cluster.votes`. */
 export const haReadout = (votes: ClusterVotes, nodes: readonly Node[]): HaReadout => {
@@ -131,6 +163,98 @@ export const witnessCandidates = (nodes: readonly Node[], votes: ClusterVotes): 
       !node.roles.some((role) => role === 'node' || role === 'witness'),
   );
 };
+
+/**
+ * What to know before giving the witness role to a candidate that is not
+ * connected, or null for a connected one. The server takes the role either
+ * way; the machine acts on it from its next desired state, so it votes only
+ * once its node agent connects. The view shows it beside the button only, and
+ * its lamp already says "Not connected".
+ */
+export const candidateNote = (node: Pick<Node, 'status'>): string | null =>
+  node.status === 'connected' ? null : 'It gets the role now and can vote once its node agent connects.';
+
+/** One machine, or the machines not named yet, in the line about disconnected voters. */
+export interface AwayVoter {
+  /** A machine's name, or "the new machine". */
+  words: string;
+  /** Whether `words` is a machine's name, which the line sets in bold. */
+  named: boolean;
+}
+
+/**
+ * The voters that are not connected, for the line that says what to do about
+ * them. The server counts a voter connected or not, so HA can reach its
+ * count, and even be ready, while one of them still waits for its agent.
+ *
+ * Each named voter by its name, in order. A voter the node list does not name
+ * yet is a machine that has just joined: the line calls it "the new machine"
+ * (two or more: "the new machines", once, at the end), never by a cut-off id.
+ */
+export const disconnectedVoters = (seats: readonly VoterSeat[]): AwayVoter[] => {
+  const away = seats.filter((seat) => !seat.connected);
+  const named: AwayVoter[] = away.filter((seat) => seat.named).map((seat) => ({ words: seat.name, named: true }));
+  const unnamed = away.length - named.length;
+  if (unnamed === 0) return named;
+  return [...named, { words: unnamed === 1 ? 'the new machine' : 'the new machines', named: false }];
+};
+
+/**
+ * What the HA view draws for `getCluster`:
+ * - `votes`: the last votes the server sent. `stale` says why the newest
+ *   refetch failed, beside them, or is null; one failed refetch does not
+ *   hide votes that are likely still true.
+ * - `failed`: the call failed and no votes ever arrived.
+ * - `loading`: the first answer is on its way.
+ * - `hidden`: nothing to show, as while the query is disabled.
+ */
+export type HaVotesState =
+  | { kind: 'votes'; votes: ClusterVotes; stale: ProblemView | null }
+  | { kind: 'failed'; problem: ProblemView }
+  | { kind: 'loading' }
+  | { kind: 'hidden' };
+
+/** From the `getCluster` query as `useGetCluster` returns it, passed whole. */
+export const haVotesState = (cluster: {
+  data?: Pick<Cluster, 'votes'>;
+  error: unknown;
+  isLoading: boolean;
+}): HaVotesState => {
+  const votes = cluster.data?.votes;
+  const { error } = cluster;
+  const problem = error === null || error === undefined ? null : problemView(error, 'see the voters');
+  if (votes) return { kind: 'votes', votes, stale: problem };
+  if (problem) return { kind: 'failed', problem };
+  return cluster.isLoading ? { kind: 'loading' } : { kind: 'hidden' };
+};
+
+/**
+ * After a roles call, answered or refused: read the cluster's votes and the
+ * node list again, since both carry a machine's roles. Every page of the
+ * node list goes, whatever its parameters; nothing else does.
+ */
+export const refreshVoters = (queryClient: Pick<QueryClient, 'invalidateQueries'>): Promise<unknown> =>
+  Promise.all([
+    queryClient.invalidateQueries({ queryKey: getGetClusterQueryKey() }),
+    queryClient.invalidateQueries({ queryKey: getListNodesQueryKey() }),
+  ]);
+
+/**
+ * The HA view's roles mutation, passed to `useMutation` as is: add `witness`
+ * to an enrolled machine. `adding` names the machine while the call is in
+ * flight, then null. Answered or refused, the voters are read again.
+ */
+export const addWitnessMutation = (
+  queryClient: Pick<QueryClient, 'invalidateQueries'>,
+  adding: (nodeId: string | null) => void,
+): UseMutationOptions<Node, Error, Node> => ({
+  mutationFn: (node) => updateNodeRoles(node.id, { add: ['witness'] }),
+  onMutate: (node) => adding(node.id),
+  onSettled: () => {
+    adding(null);
+    void refreshVoters(queryClient);
+  },
+});
 
 /**
  * The join command for a new witness. A join token carries no role

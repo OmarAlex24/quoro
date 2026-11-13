@@ -1,11 +1,20 @@
+import { MutationObserver, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it } from 'vitest';
-import { ApiProblem } from '../api/fetcher';
-import type { ClusterVotes, Node, NodeJoinTokenCreated } from '../api/generated/model';
+import { afterEach, describe, expect, it } from 'vitest';
+import { ApiProblem, isApiProblem } from '../api/fetcher';
+import { getGetMeQueryKey } from '../api/generated/auth/auth';
+import { getGetClusterQueryKey } from '../api/generated/cluster/cluster';
+import type { Cluster, ClusterVotes, MeResponse, Node, NodeJoinTokenCreated } from '../api/generated/model';
+import { getListNodesQueryKey } from '../api/generated/nodes/nodes';
+import { getListVmsQueryKey } from '../api/generated/vms/vms';
 import { problemView } from '../lib/problem';
 import { haReadout, witnessCandidates, witnessProblem } from '../lib/votes';
-import { HaVotesView, type HaVotesViewProps } from './ha-votes';
+import { db } from '../mocks/db';
+import { clusterVotes, failNextRolesCall } from '../mocks/handlers-nodes';
+import { RecordingClient, serveMockApi } from '../mocks/node-server';
+import { SessionProvider } from '../session';
+import { HaVotes, HaVotesView, type HaVotesViewProps } from './ha-votes';
 
 const node = (name: string, roles: Node['roles'], fields: Partial<Node> = {}): Node =>
   ({ id: `nod_${name}`, name, roles, status: 'connected', cp_status: null, ...fields }) as Node;
@@ -41,6 +50,9 @@ const render = (votes: ClusterVotes, nodes: Node[], overrides: Partial<HaVotesVi
   );
 
 const decode = (html: string): string => html.replace(/&#x27;/g, "'").replace(/&quot;/g, '"');
+
+/** What a reader sees: the markup without its tags. */
+const text = (html: string): string => decode(html.replace(/<[^>]*>/g, ''));
 
 describe('HaVotesView with two voters', () => {
   const votes = votesOf([lab3, lab4], false);
@@ -79,6 +91,93 @@ describe('HaVotesView with two voters', () => {
     );
     expect(html).toContain('Copy command');
     expect(html).not.toContain('Create a join token');
+  });
+
+  it('says what a fresh machine needs before the join: its packages, and the binary and unit of the cluster\'s release', () => {
+    const html = render(votes, nodes, { version: '0.1.0' });
+    expect(text(html)).toContain(
+      'A small machine is enough, with iproute2 and nftables installed. From the archive of release 0.1.0, the cluster’s version, put quoro in /usr/local/bin and quoro-node.service in /etc/systemd/system. The join token is for one machine and lasts an hour.',
+    );
+    expect(html).toContain(
+      '<a href="https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0" target="_blank" rel="noreferrer" class="set-inline-link">release 0.1.0</a>',
+    );
+  });
+
+  it('points to the list of releases while the cluster\'s version is unknown', () => {
+    const html = render(votes, nodes);
+    expect(text(html)).toContain(
+      'From the archive of the release at the cluster’s version, put quoro in /usr/local/bin and quoro-node.service in /etc/systemd/system.',
+    );
+    expect(html).toContain('<a href="https://github.com/OmarAlex24/quoro/releases" target="_blank"');
+  });
+
+  it('says to run the join as root, then to start the node agent with its unit, as root too', () => {
+    const token: NodeJoinTokenCreated = {
+      id: 'njt_01JCA0A1B2C3D4E5F6G7H8J9KM',
+      token: 'njt_secret',
+      expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+      join_command: 'quoro join https://10.0.0.3:8443 --token njt_secret --fingerprint 4f1c',
+    };
+    const html = render(votes, nodes, { joinToken: token });
+    expect(text(html)).toMatch(
+      /Run this as root on the new machine.*--role witness.*Then start its node agent, as root too: systemctl enable --now quoro-node\. Until the agent connects, the witness cannot vote\./s,
+    );
+    expect(html).toContain('<code class="type-code">systemctl enable --now quoro-node</code>');
+    // No installer: it has no witness role.
+    expect(html).not.toContain('QUORO_ROLE');
+    expect(render(votes, nodes)).not.toContain('systemctl');
+  });
+
+  it('notes beside the button that a candidate which is not connected votes only once its agent connects', () => {
+    const away = node('lab-edge', ['edge'], { status: 'disconnected' });
+    const html = render(votes, [lab3, lab4, away]);
+    const note = 'It gets the role now and can vote once its node agent connects.';
+    expect(html).toContain(`<p id="ha-cand-note-${away.id}" class="ha-cand-note">${note}</p>`);
+    // The lamp says "Not connected" once; the note does not repeat it.
+    expect(html.match(/Not connected/g)).toHaveLength(1);
+    // The button stays enabled, as the server takes the role, and points at the note.
+    expect(html).toMatch(new RegExp(`<button[^>]*aria-describedby="ha-cand-note-${away.id}"[^>]*>Add the witness role`));
+    expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*aria-describedby/);
+  });
+
+  it('shows no note to a session without the button', () => {
+    const away = node('lab-edge', ['edge'], { status: 'disconnected' });
+    const html = render(votes, [lab3, lab4, away], { canChange: false });
+    expect(html).not.toContain('ha-cand-note');
+    expect(html).not.toContain('It gets the role now');
+    expect(html).toContain('lab-edge');
+  });
+
+  it('says what a seat that is not connected needs', () => {
+    const current = votesOf([lab3, lab4], false);
+    current.voters[1] = { ...current.voters[1]!, connected: false };
+    const html = render(current, nodes);
+    expect(html.match(/class="next-step"/g)).toHaveLength(1);
+    expect(text(html)).toMatch(
+      /lab-4.*Disconnected.*Make sure its node agent, quoro node, is running on that machine\..*No voter/s,
+    );
+    expect(render(votes, nodes)).not.toContain('Make sure');
+  });
+
+  it('adds no note to a connected candidate', () => {
+    const html = render(votes, nodes);
+    expect(html).not.toContain('ha-cand-note');
+    expect(html).not.toContain('aria-describedby');
+  });
+
+  it('keeps the votes when a refetch failed, with a quiet line beside them', () => {
+    const html = render(votes, nodes, { stale: problemView(new TypeError('Failed to fetch'), 'see the voters') });
+    expect(html).toContain('HA needs a third vote');
+    expect(html).toContain('Add the witness role');
+    expect(html).toMatch(
+      /<p class="ha-stale" role="status">.*These votes may be out of date\. Could not reach the server\. Check the connection and try again\./,
+    );
+    expect(html).not.toContain('role="alert"');
+  });
+
+  // A status element inserted with its text is not always announced: it is there, empty, before.
+  it('keeps the status element mounted, empty and out of sight, while the votes are current', () => {
+    expect(render(votes, nodes)).toContain('<p class="ha-stale sr-only" role="status"></p>');
   });
 
   it('shows the server words of a 409 and says to wait and try again', () => {
@@ -139,10 +238,195 @@ describe('HaVotesView with three voters', () => {
     expect(html).toContain('<b>lab-4</b><span>node, edge</span><span class="text-fault">Disconnected</span>');
   });
 
+  it('says what a disconnected voter needs, even while HA is ready', () => {
+    // The server counts the voter connected or not: HA has its count, and the readout stays the server's.
+    const votes = votesOf([lab3, lab4, witness], true);
+    votes.voters[2] = { ...votes.voters[2]!, connected: false };
+    const html = render(votes, nodes);
+    expect(html).toContain('HA is ready.');
+    expect(html).toContain('ha-quiet-rows');
+    expect(text(html)).toContain('Make sure the node agent, quoro node, is running on lab-edge.');
+    expect(html).toContain('<b>lab-edge</b>.</p>');
+  });
+
+  // The votes are read every 5 s and the node list every 10 s, so a machine that has just joined has no name yet.
+  it('calls a voter that is not in the node list yet the new machine, not by a cut-off id', () => {
+    const joined = node('lab-witness', ['witness'], { id: 'nod_01JCZZZZZZZZZZZZZZZZZZZZZW' });
+    const votes = votesOf([lab3, lab4, joined], true);
+    votes.voters[2] = { ...votes.voters[2]!, connected: false };
+    const html = render(votes, [lab3, lab4]);
+    expect(html).toContain('is running on the new machine.</p>');
+    expect(html.match(/nod_01JCZZ…/g)).toHaveLength(1);
+    // Once the list names it, the line does too.
+    expect(text(render(votes, [lab3, lab4, joined]))).toContain('is running on lab-witness.');
+  });
+
+  it('names every disconnected voter in one line', () => {
+    const votes = votesOf([lab3, lab4, witness], false);
+    votes.voters[1] = { ...votes.voters[1]!, connected: false };
+    votes.voters[2] = { ...votes.voters[2]!, connected: false };
+    expect(text(render(votes, nodes))).toContain('Make sure the node agent, quoro node, is running on lab-4 and lab-edge.');
+  });
+
+  it('adds no line while every voter is connected', () => {
+    const html = render(votesOf([lab3, lab4, witness], true), nodes);
+    expect(html).not.toContain('next-step');
+    expect(html).not.toContain('ha-quiet-rows');
+  });
+
+  it('keeps the quiet line when a refetch failed, with the line beside it', () => {
+    const html = render(votesOf([lab3, lab4, witness], true), nodes, {
+      stale: problemView(new TypeError('Failed to fetch'), 'see the voters'),
+    });
+    expect(html).toContain('HA is ready.');
+    expect(html).toContain('These votes may be out of date.');
+    expect(html).toContain('ha-quiet-rows');
+    const current = render(votesOf([lab3, lab4, witness], true), nodes);
+    expect(current).toContain('<p class="ha-stale sr-only" role="status"></p>');
+    expect(current).not.toContain('out of date');
+    expect(current).not.toContain('ha-quiet-rows');
+  });
+
   it('waits for a majority before ha_ready, still without an offer', () => {
     const html = render(votesOf([lab3, lab4, witness], false), nodes);
     expect(html).toContain('Waiting for a majority.');
     expect(html).toContain('n1-shift');
     expect(html).not.toContain('join token');
+  });
+});
+
+/*
+ * The container itself, rendered on the server: what it draws from the
+ * getCluster query, and the options it gives `useMutation`, run against the
+ * mock API. Effects do not run on the server, so dropping the token once HA
+ * has its votes (an effect that calls `dropTokenUnlessShort`) is pinned in
+ * lib/votes-calls.test.ts, not here.
+ */
+describe('the HaVotes container', () => {
+  const { requests } = serveMockApi();
+
+  const machines = (): Node[] => [db.node, ...db.extraNodes];
+  const mockEdge = (): Node => {
+    const found = db.extraNodes.find((machine) => machine.name === 'lab-edge');
+    if (!found) throw new Error('the seed has no lab-edge');
+    return found;
+  };
+
+  afterEach(() => {
+    mockEdge().roles = ['edge'];
+  });
+
+  /** A client signed in as the owner, with the votes and the node list when asked. */
+  const signedIn = <C extends QueryClient>(client: C, { votes = true } = {}): C => {
+    if (!db.owner) throw new Error('no owner');
+    const me: MeResponse = { type: 'user', user: db.owner };
+    client.setQueryData(getGetMeQueryKey(), me);
+    if (votes) {
+      client.setQueryData(getGetClusterQueryKey(), { votes: clusterVotes(), version: '0.1.0' } as Cluster);
+      client.setQueryData(getListNodesQueryKey(), { items: machines() });
+      client.setQueryData(getListNodesQueryKey({ limit: 500 }), { items: machines() });
+      client.setQueryData(getListVmsQueryKey(), { items: [] });
+    }
+    return client;
+  };
+
+  const renderContainer = (client: QueryClient): string =>
+    renderToStaticMarkup(
+      createElement(
+        QueryClientProvider,
+        { client },
+        createElement(SessionProvider, { children: createElement(HaVotes, { nodes: machines() }) }),
+      ),
+    );
+
+  it('draws the loading strip while the first votes are on their way', () => {
+    const html = renderContainer(signedIn(new QueryClient(), { votes: false }));
+    expect(html).toContain('ha-skel');
+    expect(html).toContain('Loading the voters');
+    expect(html).not.toContain('HA needs');
+  });
+
+  it('draws nothing for a session that is not signed in', () => {
+    expect(renderContainer(new QueryClient())).toBe('');
+  });
+
+  it('draws the votes from the cache, with the cluster\'s version in the offer', () => {
+    const html = renderContainer(signedIn(new QueryClient()));
+    expect(html).not.toContain('ha-skel');
+    expect(html).toContain('HA needs a third vote');
+    expect(text(html)).toContain('From the archive of release 0.1.0, the cluster’s version, put quoro in');
+    expect(html).toContain('href="https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0"');
+    expect(html).toContain('Add the witness role');
+    // The votes are current: the status element is there, empty.
+    expect(html).toContain('<p class="ha-stale sr-only" role="status"></p>');
+  });
+
+  it('keeps the cached votes when the newest read of the cluster failed, and says they may be out of date', () => {
+    const client = signedIn(new QueryClient());
+    const query = client.getQueryCache().find({ queryKey: getGetClusterQueryKey() });
+    if (!query) throw new Error('no cluster query in the cache');
+    query.setState({ status: 'error', fetchStatus: 'idle', error: new TypeError('Failed to fetch') });
+
+    const html = renderContainer(client);
+    expect(html).toContain('HA needs a third vote');
+    expect(html).toMatch(
+      /<p class="ha-stale" role="status">.*These votes may be out of date\. Could not reach the server\./,
+    );
+    expect(html).not.toContain('role="alert"');
+  });
+
+  /** The container's two mutations, in the order it calls `useMutation`. */
+  const containerMutations = () => {
+    const client = signedIn(new RecordingClient());
+    renderContainer(client);
+    expect(client.mutations).toHaveLength(2);
+    const [roles, joinToken] = [...client.mutations];
+    return { client, roles: roles!, joinToken: joinToken! };
+  };
+
+  it('asks for a new join token with a fresh Idempotency-Key on every click', async () => {
+    const { client, joinToken } = containerMutations();
+    const observer = new MutationObserver(client, joinToken);
+    await observer.mutate(undefined);
+    await observer.mutate(undefined);
+
+    const keys = requests
+      .filter((request) => request.method === 'POST' && request.path === '/api/v1/nodes/join-tokens')
+      .map((request) => request.headers.get('Idempotency-Key'));
+    expect(keys).toHaveLength(2);
+    for (const key of keys) expect(key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(keys[0]).not.toBe(keys[1]);
+    // An empty body, so the server's one-hour expiry applies.
+    const bodies = requests.filter((request) => request.path === '/api/v1/nodes/join-tokens').map((r) => r.body);
+    expect(await Promise.all(bodies)).toEqual(['{}', '{}']);
+  });
+
+  const invalidated = (client: QueryClient) =>
+    [getGetClusterQueryKey(), getListNodesQueryKey(), getListNodesQueryKey({ limit: 500 }), getListVmsQueryKey()].map(
+      (key) => client.getQueryState(key)?.isInvalidated,
+    );
+
+  it('reads the votes and the node list again after a roles call that answers 200', async () => {
+    const { client, roles } = containerMutations();
+    expect(invalidated(client)).toEqual([false, false, false, false]);
+
+    await new MutationObserver(client, roles).mutate(mockEdge());
+
+    expect(mockEdge().roles).toEqual(['edge', 'witness']);
+    expect(requests.some((request) => request.path === `/api/v1/nodes/${mockEdge().id}/roles`)).toBe(true);
+    expect(invalidated(client)).toEqual([true, true, true, false]);
+  });
+
+  it('reads them again after a roles call that answers 409', async () => {
+    const { client, roles } = containerMutations();
+    failNextRolesCall();
+
+    const refused = await new MutationObserver(client, roles).mutate(mockEdge()).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(isApiProblem(refused) && refused.status).toBe(409);
+    expect(invalidated(client)).toEqual([true, true, true, false]);
   });
 });

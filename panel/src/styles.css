@@ -4705,6 +4705,28 @@
   }
 
   /*
+   * What is still to do on a machine: under its join command (the HA view's
+   * witness offer, Add a node), and under a voter that is not connected. The
+   * plate's solid shift rule goes on below it dashed, as the panel draws what
+   * is still missing: the command is in hand, this step is not done yet. 1 px
+   * in, so the 2 px rule sits on the centre of the plate's 4 px one.
+   */
+  .next-step {
+    margin-left: 1px;
+    padding: 1px 0 1px 13px;
+    border-left: 2px dashed color-mix(in oklab, var(--shift) 60%, var(--line-2));
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--ink-2);
+    text-wrap: pretty;
+  }
+
+  .next-step code {
+    color: var(--ink);
+    white-space: nowrap;
+  }
+
+  /*
    * The HA view: the voters as seats against the votes HA needs. An empty
    * seat is dotted in the shift tone, the panel's dither for what is missing.
    * Below the seats, the two ways to a witness. Once HA has its votes the
@@ -4859,6 +4881,11 @@
     color: var(--ink-2);
   }
 
+  /* A name or a path in the offer stays whole: `quoro-node.service` does not break at its hyphen. */
+  .ha-way-p code {
+    white-space: nowrap;
+  }
+
   .ha-cands {
     display: grid;
     gap: 6px;
@@ -4910,6 +4937,67 @@
   .ha-quiet-v b {
     font-weight: 560;
     color: var(--ink);
+  }
+
+  /* Under a candidate that is not connected: what adding the role does now. */
+  .ha-cand-note {
+    flex-basis: 100%;
+    padding-left: 19px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--ink-2);
+  }
+
+  /*
+   * The newest refetch failed: the last votes stay on screen and this line
+   * says so, quietly, instead of a banner in their place.
+   */
+  .ha-stale {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    margin-top: 4px;
+    font-size: var(--type-small);
+    line-height: 1.45;
+    color: var(--ink-2);
+  }
+
+  .ha-stale > :first-child {
+    flex: none;
+    transform: translateY(1px);
+  }
+
+  /*
+   * Only a strip with a line under it wraps: what a disconnected voter needs,
+   * or that the votes may be out of date. Each line takes a row of its own,
+   * under the sentence.
+   */
+  .ha-quiet-rows {
+    flex-wrap: wrap;
+  }
+
+  .ha-quiet .ha-stale {
+    flex-basis: 100%;
+    margin-top: 0;
+    padding-left: 40px;
+  }
+
+  .ha-quiet .next-step {
+    flex-basis: calc(100% - 40px);
+    margin-left: 40px;
+  }
+
+  /* In a voter's seat, the step is as small as the seat's other words. */
+  .ha-seat .next-step {
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  /* While the first votes load: the strip HA settles into, as dither. */
+  .ha-skel .ha-skel-f {
+    min-width: 0;
+    flex: 1;
+    gap: 7px;
   }
 
   @media (max-width: 719.98px) {

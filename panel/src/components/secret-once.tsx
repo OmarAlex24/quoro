@@ -1,4 +1,5 @@
 import { secretParts } from '../lib/secret-words';
+import { cn } from '../lib/utils';
 import { CopyButton } from './copy-button';
 
 /**
@@ -26,33 +27,44 @@ export function SecretOnce({
   return (
     <div className="rounded-[10px] border border-line border-l-4 border-l-shift bg-surface px-3.5 py-3">
       <p className="type-body-medium text-[13px] text-ink">{label}</p>
-      <div className="mt-2 flow-root rounded-[7px] border border-line-2 bg-sunk px-[10px] py-[7px]">
-        {/*
-         * The 28 px button gives up 3 px above and below, so it takes exactly
-         * one 22 px line: centred on the first, clear of the second, 4 px
-         * from the edges of the well. Its focus ring sits on its edge, so it
-         * does not reach into the second line.
-         */}
-        <CopyButton
-          value={secret}
-          label={copyLabel}
-          variant="default"
-          className="float-right -my-[3px] -mr-[6px] ml-3 focus-visible:outline-offset-0"
-        />
-        <code className="block whitespace-pre-wrap wrap-anywhere type-code text-[12.5px] leading-[22px] text-ink select-all">
-          {secretParts(secret).map((part, index) =>
-            part.space ? (
-              part.text
-            ) : (
-              // `role="none"`: a screen reader reads the value as one text, not word by word.
-              <span key={index} role="none" className="inline-block max-w-full">
-                {part.text}
-              </span>
-            ),
-          )}
-        </code>
-      </div>
+      <CopyWell value={secret} copyLabel={copyLabel} className="mt-2" />
       <p className="mt-2 text-[13px] leading-snug text-ink-2">{note}</p>
+    </div>
+  );
+}
+
+/**
+ * A value to copy as is, in its well: `SecretOnce`'s, and a command that is
+ * not secret, such as the installer's. It wraps at its spaces as described
+ * above; copying copies the exact value.
+ */
+export function CopyWell({ value, copyLabel, className }: { value: string; copyLabel: string; className?: string }) {
+  return (
+    <div className={cn('flow-root rounded-[7px] border border-line-2 bg-sunk px-[10px] py-[7px]', className)}>
+      {/*
+       * The 28 px button gives up 3 px above and below, so it takes exactly
+       * one 22 px line: centred on the first, clear of the second, 4 px
+       * from the edges of the well. Its focus ring sits on its edge, so it
+       * does not reach into the second line.
+       */}
+      <CopyButton
+        value={value}
+        label={copyLabel}
+        variant="default"
+        className="float-right -my-[3px] -mr-[6px] ml-3 focus-visible:outline-offset-0"
+      />
+      <code className="block whitespace-pre-wrap wrap-anywhere type-code text-[12.5px] leading-[22px] text-ink select-all">
+        {secretParts(value).map((part, index) =>
+          part.space ? (
+            part.text
+          ) : (
+            // `role="none"`: a screen reader reads the value as one text, not word by word.
+            <span key={index} role="none" className="inline-block max-w-full">
+              {part.text}
+            </span>
+          ),
+        )}
+      </code>
     </div>
   );
 }
