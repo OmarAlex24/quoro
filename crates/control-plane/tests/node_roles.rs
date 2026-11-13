@@ -463,15 +463,20 @@ async fn the_roles_refusals_come_in_order_and_a_no_op_changes_nothing() {
     );
 
     // Rule 2: adding the edge's vote waits for a majority at the version.
-    assert_eq!(
-        roles_refused(
+    let (status, code, detail) = problem_detail(
+        roles(
             &owner,
             &server,
             &edge.node_id,
-            json!({ "add": ["witness"] })
+            json!({ "add": ["witness"] }),
         )
         .await,
-        (409, "conflict".to_string())
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(
+        detail.contains("has not reached a majority of voters"),
+        "{detail}"
     );
     assert_eq!(roles_of(&server, &edge.node_id).await, json!(["edge"]));
     assert_eq!(state_head(&server).await, head, "nothing written");
@@ -489,16 +494,19 @@ async fn the_roles_refusals_come_in_order_and_a_no_op_changes_nothing() {
         json!({ "remove": ["witness"] }),
     )
     .await;
-    assert_eq!(
-        roles_refused(
+    // The removed node's own refusal, not rule 2's, which still waits here.
+    let (status, code, detail) = problem_detail(
+        roles(
             &owner,
             &server,
             &edge.node_id,
-            json!({ "add": ["witness"] })
+            json!({ "add": ["witness"] }),
         )
         .await,
-        (409, "conflict".to_string())
-    );
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert_eq!(detail, "the node is removed");
 }
 
 /// Section 8.10 rule 2 for the roles operation: a vote is added only once a
