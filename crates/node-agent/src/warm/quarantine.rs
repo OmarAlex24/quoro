@@ -33,9 +33,10 @@
 //!   real one; and the record still has no SHA-256, so the primary never
 //!   recorded the copy. Only an `Ok` counts for the live file: `NotFound` is
 //!   a missing file, and `Conflict`, as while a VM attaches the file, is not
-//!   now. The path checks read one open handle of the clone's directory: the
-//!   clone is missing, the other kept snapshot or the live file is a regular
-//!   file there, and the clone is still missing. The engine's lookups and these reads run
+//!   now. The path checks read one open handle of the clone's directory, the
+//!   one the record and its kept snapshot both name: the clone is missing,
+//!   the other kept snapshot or the live file is a regular file there, and
+//!   the clone is still missing. The engine's lookups and these reads run
 //!   under the volume's lock ([`VolumeLocks`]), which the node agent's warm
 //!   calls on a volume share (`engine-trait.md` section 4), so a check of
 //!   the live file never makes the commit of a received copy fail with
@@ -459,7 +460,9 @@ impl<E: Engine> Inner<E> {
     /// snapshot or the live file is a regular file in it, and the clone is
     /// still missing. A volume directory that mounts or unmounts meanwhile
     /// cannot split those three reads. A copy with neither another kept
-    /// snapshot nor the live file in that directory is never forgotten.
+    /// snapshot nor the live file in that directory is never forgotten. The
+    /// directory opened is the one the engine looked the clone up in: a
+    /// record whose path is not its kept snapshot's location stays.
     ///
     /// The engine's lookups and the directory reads run under the volume's
     /// lock, which is only tried: this runs in the hash task, which never
@@ -479,6 +482,16 @@ impl<E: Engine> Inner<E> {
             Ok(None) => return Err("the copy's own kept snapshot is not recorded".to_owned()),
             Err(e) => return Err(format!("cannot read the kept snapshot: {e}")),
         };
+        // The engine places the clone by its kept snapshot's location, and
+        // the directory read below is the copy's path's: they must be one
+        // file. Recorded together from one clone, so not expected.
+        if record.path != kept.snapshot.location {
+            return Err(
+                "the copy's path is not its kept snapshot's location, so the directory the \
+                 engine looked the clone up in is not shown to be the clone's"
+                    .to_owned(),
+            );
+        }
         // Held to the end: the engine's lookups, the directory reads and the
         // forget. Whoever else holds it (a stream and its commit, a hand-over,
         // the reconciler's steps on a warm volume) is not interrupted.

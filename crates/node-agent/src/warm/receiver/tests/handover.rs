@@ -2820,3 +2820,103 @@ async fn a_lost_clone_s_record_stays_while_another_holds_the_volume_s_lock() {
     assert!(h.locks.try_lock(VOL).is_some(), "the lock is released");
     assert_live_kept(&h);
 }
+
+/// The directory the forget path reads is the one the engine looked the
+/// clone up in: a record whose path is not its kept snapshot's location
+/// stays, here although the path's own directory holds a file named by the
+/// volume id and no clone.
+#[tokio::test]
+async fn a_lost_clone_whose_record_and_kept_snapshot_name_different_files_keeps_its_record() {
+    let h = Harness::new("handover-clone-gone-elsewhere").await;
+    let quarantines = h.receiver.inner.quarantines.clone();
+    // The hash waits; each check below runs on its own.
+    let _gate = quarantines.inner.hash_gate.lock().await;
+    let lost = lost_clone_beside_the_live_file(&h).await;
+    let kept = h
+        .store
+        .kept_snapshot(&lost.snapshot_id)
+        .await
+        .expect("store")
+        .expect("kept");
+
+    // A second copy: its kept snapshot is in the volume directory, missing,
+    // and unknown to the engine, so the engine answers `NotFound` for it
+    // there; its record's path is in another directory, which holds a file
+    // named by the volume id and no clone.
+    let elsewhere = h._scratch.0.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("another directory");
+    let stray = elsewhere.join(VOL);
+    std::fs::write(&stray, b"not the live file").expect("a stray file");
+    let snapshot_id = format!("{}-other", kept.snapshot.snapshot_id);
+    let location = kept
+        .snapshot
+        .location
+        .with_file_name(format!("{VOL}.{snapshot_id}"));
+    assert!(!location.exists());
+    let twisted_kept = crate::store::KeptSnapshotRecord {
+        snapshot: VolumeSnapshot {
+            snapshot_id: snapshot_id.clone(),
+            location,
+            ..kept.snapshot.clone()
+        },
+        ..kept.clone()
+    };
+    let twisted = VolumeQuarantineRecord {
+        quarantine_id: crate::util::quarantine_id(),
+        path: elsewhere.join(lost.path.file_name().expect("a file name")),
+        snapshot_id,
+        ..lost.clone()
+    };
+    h.store
+        .record_volume_quarantine(&twisted_kept, &twisted)
+        .await
+        .expect("record");
+
+    let reason = quarantines
+        .inner
+        .forget_lost_clone(&twisted.quarantine_id)
+        .await
+        .expect_err("the record stays");
+    assert!(
+        reason.contains("not its kept snapshot's location"),
+        "{reason}"
+    );
+    assert_eq!(quarantined(&h).await, vec![lost.clone(), twisted.clone()]);
+    assert_eq!(
+        h.store
+            .kept_snapshot(&twisted.snapshot_id)
+            .await
+            .expect("store"),
+        Some(twisted_kept)
+    );
+
+    // The copy whose record and kept snapshot name one file is forgotten
+    // as before, and no file is touched.
+    assert_eq!(
+        quarantines
+            .inner
+            .forget_lost_clone(&lost.quarantine_id)
+            .await,
+        Ok(())
+    );
+    assert_record_forgotten_beside(&h, &lost, &twisted).await;
+    assert!(stray.exists());
+    assert_live_kept(&h);
+}
+
+/// The copy's record and its kept snapshot are gone, and `other` is the only
+/// record left.
+async fn assert_record_forgotten_beside(
+    h: &Harness,
+    lost: &VolumeQuarantineRecord,
+    other: &VolumeQuarantineRecord,
+) {
+    assert_eq!(quarantined(h).await, vec![other.clone()]);
+    assert_eq!(
+        h.store
+            .kept_snapshot(&lost.snapshot_id)
+            .await
+            .expect("store"),
+        None
+    );
+}
