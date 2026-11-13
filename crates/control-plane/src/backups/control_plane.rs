@@ -21,6 +21,9 @@
 //! pending migrations, with `trigger: upgrade`
 //! ([`backup_before_upgrade`], [`upgrade_before_start`]). It writes no row then:
 //! the seal carries what [`record_upgrade`] writes into the migrated database.
+//! A start runs the two halves apart ([`migrate_before_start`],
+//! [`record_after_migration`]), so the restored primary's first write comes
+//! before that record (`backup-format.md` section 8.2).
 
 use crate::AppState;
 use crate::api::backups::{
@@ -593,7 +596,10 @@ async fn record_skip(
 
 /// The whole pre-upgrade step of `backup-format.md` section 7.2, "Before an
 /// upgrade": when migrations are pending, back the database up (or honour the
-/// operator's skip), migrate, and record the result.
+/// operator's skip), migrate, and record the result. It is
+/// [`migrate_before_start`] followed by [`record_after_migration`]; a start
+/// runs the two apart, with the restored primary's first write between them
+/// (`backup-format.md` section 8.2, [`crate::restore_pending`]).
 ///
 /// A start with no pending migration does nothing, with or without the flag.
 ///
@@ -609,6 +615,43 @@ pub async fn upgrade_before_start(
     runtime: &Backups,
     skip: bool,
 ) -> Result<(), String> {
+    let migrated = migrate_before_start(store, data_dir, keys, data_key, runtime, skip).await?;
+    record_after_migration(store, keys, data_key, runtime, migrated).await
+}
+
+/// What [`migrate_before_start`] leaves to record in the migrated database.
+#[derive(Debug)]
+#[must_use]
+pub enum Migrated {
+    /// Nothing was pending, or there was no repository: nothing to record.
+    Nothing,
+    /// The operator migrated without the backup (`--skip-upgrade-backup`).
+    Skipped {
+        repository_id: String,
+        from: usize,
+        to: usize,
+    },
+    /// The pre-upgrade backup was sealed, then the migrations ran.
+    Sealed {
+        sealed: Box<SealedUpgrade>,
+        now: OffsetDateTime,
+    },
+}
+
+/// The first half of [`upgrade_before_start`]: the pre-upgrade backup (or the
+/// operator's skip) and the migrations. It writes no change-log entry.
+///
+/// # Errors
+///
+/// As [`upgrade_before_start`].
+pub async fn migrate_before_start(
+    store: &Store,
+    data_dir: &Path,
+    keys: &ClusterKeys,
+    data_key: &DataKey,
+    runtime: &Backups,
+    skip: bool,
+) -> Result<Migrated, String> {
     let pending = store
         .pending_migrations()
         .await
@@ -617,7 +660,7 @@ pub async fn upgrade_before_start(
         // A new database gets its schema here, and a migrated one nothing:
         // there is no backup to take either way (section 7.2 step 1).
         store.migrate().await.map_err(|error| error.to_string())?;
-        return Ok(());
+        return Ok(Migrated::Nothing);
     };
     let repository = repo::any_before_upgrade(store)
         .await
@@ -629,28 +672,64 @@ pub async fn upgrade_before_start(
             "migrating without a pre-upgrade backup: no repository"
         );
         store.migrate().await.map_err(|error| error.to_string())?;
-        return Ok(());
+        return Ok(Migrated::Nothing);
     };
     if skip {
         store.migrate().await.map_err(|error| error.to_string())?;
-        record_skip(store, &repository.id, from, to)
-            .await
-            .map_err(|error| reason_of(&error))?;
-        tracing::warn!(
+        return Ok(Migrated::Skipped {
+            repository_id: repository.id,
             from,
             to,
-            repository_id = %repository.id,
-            "migrated without a pre-upgrade backup: --skip-upgrade-backup"
-        );
-        return Ok(());
+        });
     }
     let now = OffsetDateTime::now_utc();
     let sealed = backup_before_upgrade(store, data_dir, keys, data_key, runtime, now).await?;
     store.migrate().await.map_err(|error| error.to_string())?;
-    if let Some(sealed) = sealed {
-        record_upgrade(store, keys, data_key, runtime, &sealed, now)
-            .await
-            .map_err(|error| reason_of(&error))?;
+    Ok(match sealed {
+        Some(sealed) => Migrated::Sealed {
+            sealed: Box::new(sealed),
+            now,
+        },
+        None => Migrated::Nothing,
+    })
+}
+
+/// The second half of [`upgrade_before_start`]: records in the migrated
+/// database what [`migrate_before_start`] did, with its change-log entry and
+/// audit records (section 7.2 step 3), or the skip's audit record.
+///
+/// # Errors
+///
+/// A one-line reason for a database error.
+pub async fn record_after_migration(
+    store: &Store,
+    keys: &ClusterKeys,
+    data_key: &DataKey,
+    runtime: &Backups,
+    migrated: Migrated,
+) -> Result<(), String> {
+    match migrated {
+        Migrated::Nothing => {}
+        Migrated::Skipped {
+            repository_id,
+            from,
+            to,
+        } => {
+            record_skip(store, &repository_id, from, to)
+                .await
+                .map_err(|error| reason_of(&error))?;
+            tracing::warn!(
+                from,
+                to,
+                repository_id = %repository_id,
+                "migrated without a pre-upgrade backup: --skip-upgrade-backup"
+            );
+        }
+        Migrated::Sealed { sealed, now } => {
+            record_upgrade(store, keys, data_key, runtime, &sealed, now)
+                .await
+                .map_err(|error| reason_of(&error))?;
+        }
     }
     Ok(())
 }

@@ -13,7 +13,8 @@ use quoro_backup::{
     BackupWriter, Chunker, FORMAT, Manifest, RecoveryKey, RepoConfig, RepoKey, Seal, SourceKind,
     chunks, layout, sign_seal, wrap_repo_key,
 };
-use quoro_control_plane::store::random_secret;
+use quoro_control_plane::restore_pending::{self, Head, Marker};
+use quoro_control_plane::store::{GENESIS_HASH, random_secret};
 use quoro_proto::sign;
 use quoro_providers::object_store::{MemoryStore, ObjectStore};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -204,6 +205,7 @@ async fn make_database(path: &Path, value: &str) -> Vec<u8> {
         .execute(&pool)
         .await
         .unwrap();
+    create_change_log(&pool, &[]).await;
     sqlx::query("INSERT INTO restored (value) VALUES (?)")
         .bind(value)
         .execute(&pool)
@@ -217,8 +219,18 @@ async fn make_database(path: &Path, value: &str) -> Vec<u8> {
 }
 
 /// A database with a `nodes` table holding `(id, status, cp_status)` rows,
-/// the columns `quoro restore` reads.
+/// the columns `quoro restore` reads, and an empty change log.
 async fn make_database_with_nodes(path: &Path, nodes: &[(&str, &str, Option<&str>)]) -> Vec<u8> {
+    make_database_with(path, nodes, &[]).await
+}
+
+/// [`make_database_with_nodes`] with the change-log entries `log`, as
+/// `(seq, hash)`.
+async fn make_database_with(
+    path: &Path,
+    nodes: &[(&str, &str, Option<&str>)],
+    log: &[(i64, &str)],
+) -> Vec<u8> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true);
@@ -240,11 +252,29 @@ async fn make_database_with_nodes(path: &Path, nodes: &[(&str, &str, Option<&str
             .await
             .unwrap();
     }
+    create_change_log(&pool, log).await;
     let _ = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
         .execute(&pool)
         .await;
     pool.close().await;
     std::fs::read(path).unwrap()
+}
+
+/// The `change_log` columns `quoro restore` reads, with the entries `log`
+/// as `(seq, hash)`.
+async fn create_change_log(pool: &sqlx::SqlitePool, log: &[(i64, &str)]) {
+    sqlx::query("CREATE TABLE change_log (seq INTEGER PRIMARY KEY, hash TEXT NOT NULL)")
+        .execute(pool)
+        .await
+        .unwrap();
+    for (seq, hash) in log {
+        sqlx::query("INSERT INTO change_log (seq, hash) VALUES (?, ?)")
+            .bind(seq)
+            .bind(hash)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 fn write_private(path: &Path, bytes: &[u8]) {
@@ -280,6 +310,10 @@ fn mode_of(path: &Path) -> u32 {
 fn assert_nothing_installed(dir: &Path) {
     assert!(!dir.join("quoro.db").exists(), "no database");
     assert!(!dir.join("primary-node").exists(), "no primary-node file");
+    assert!(
+        !dir.join(restore_pending::MARKER_FILE).exists(),
+        "no restore-pending marker"
+    );
     assert!(!dir.join(".restore-quoro.db.tmp").exists(), "no temp file");
     assert!(!dir.join("keys/signing.key").exists(), "no signing key");
     assert!(!dir.join("keys/data.key").exists(), "no data key");
@@ -512,12 +546,20 @@ async fn an_existing_database_in_the_data_dir_is_refused() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("quoro.db"), b"live").unwrap();
 
+    // The live primary's own marker, from the restore it was installed by.
+    std::fs::write(dir.join(restore_pending::MARKER_FILE), b"the live one's").unwrap();
+
     let error = restore::execute(&fixture.store, &fixture.options(&dir, None))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("already exists"), "{error}");
     assert_eq!(std::fs::read(dir.join("quoro.db")).unwrap(), b"live");
     assert!(!dir.join(".restore-quoro.db.tmp").exists());
+    assert_eq!(
+        std::fs::read(dir.join(restore_pending::MARKER_FILE)).unwrap(),
+        b"the live one's",
+        "a refused restore leaves a live primary's marker alone"
+    );
 }
 
 #[tokio::test]
@@ -831,4 +873,183 @@ fn the_command_refuses_a_malformed_node_id() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--node-id"), "{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// The restore-pending marker (section 8.2, "Detecting the first start")
+// ---------------------------------------------------------------------------
+
+/// Three entry hashes of a restored change log.
+fn hash(n: u8) -> String {
+    format!("{n:02x}").repeat(32)
+}
+
+#[cfg(unix)]
+fn owner_of(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path).unwrap().uid()
+}
+
+/// `quoro restore` writes `restore-pending` next to the database and to
+/// `primary-node`, mode `0600` and with their owner, naming the restored
+/// log's head: the newest entry's `seq` and hash. Nothing else is in it: no
+/// `--accept-loss`, no statement.
+#[tokio::test]
+async fn the_marker_names_the_restored_logs_head() {
+    let fixture = Fixture::new().await;
+    let (h1, h2, h3) = (hash(1), hash(2), hash(3));
+    let database = make_database_with(
+        &fixture.base.join("logged.db"),
+        &[
+            (OLD_NODE, "connected", Some("primary")),
+            (NEW_NODE, "pending", None),
+        ],
+        &[(1, h1.as_str()), (2, h2.as_str()), (3, h3.as_str())],
+    )
+    .await;
+    fixture
+        .add_backup("bkp_01JC9Z1A2B3C4D5E6F7G8H9J0K", &database, NEW)
+        .await;
+    let dir = fixture.data_dir("marker");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    let path = dir.join(restore_pending::MARKER_FILE);
+    let bytes = std::fs::read(&path).unwrap();
+    let marker = Marker::parse(&bytes).unwrap();
+    assert_eq!(marker, Marker::plain(Head { seq: 3, hash: h3 }));
+    assert_eq!(
+        bytes,
+        marker.to_bytes(),
+        "the file is the marker's own form"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(mode_of(&path), 0o600);
+        let primary_node = dir.join("primary-node");
+        assert!(primary_node.exists());
+        assert_eq!(owner_of(&path), owner_of(&primary_node));
+        assert_eq!(owner_of(&path), owner_of(&dir.join("quoro.db")));
+    }
+}
+
+/// An empty change log has no head entry: the marker names `seq` 0 and the
+/// genesis hash, which the primary reads for an empty log too.
+#[tokio::test]
+async fn an_empty_change_log_is_named_by_the_genesis_head() {
+    let fixture = Fixture::new().await;
+    fixture
+        .add_backup("bkp_01JC9Z1A2B3C4D5E6F7G8H9J0K", &fixture.database, NEW)
+        .await;
+    let dir = fixture.data_dir("genesis");
+
+    restore::execute(&fixture.store, &fixture.options(&dir, None))
+        .await
+        .unwrap();
+    let marker =
+        Marker::parse(&std::fs::read(dir.join(restore_pending::MARKER_FILE)).unwrap()).unwrap();
+    assert_eq!(
+        marker,
+        Marker::plain(Head {
+            seq: 0,
+            hash: GENESIS_HASH.to_string()
+        })
+    );
+}
+
+/// A database without a change log has no head to name, so no marker can
+/// be written, and a database is never installed without one.
+#[tokio::test]
+async fn a_backup_without_a_change_log_is_refused() {
+    let fixture = Fixture::new().await;
+    let path = fixture.base.join("no-log.db");
+    let options = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE restored (value TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let _ = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
+        .execute(&pool)
+        .await;
+    pool.close().await;
+    let database = std::fs::read(&path).unwrap();
+    fixture
+        .add_backup("bkp_01JC9Z1A2B3C4D5E6F7G8H9J0K", &database, NEW)
+        .await;
+    let dir = fixture.data_dir("no-log");
+
+    let error = restore::execute(&fixture.store, &fixture.options(&dir, None))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("change log"), "{error}");
+    assert_nothing_installed(&dir);
+}
+
+/// A restore that stops before the database is installed deletes the
+/// marker: one an interrupted earlier run left in the data directory, when
+/// a chunk fails, and its own, when the install fails after writing it (a
+/// `primary-node` that cannot be replaced).
+#[tokio::test]
+async fn a_restore_that_stops_before_installing_deletes_the_marker() {
+    let fixture = Fixture::new().await;
+    fixture
+        .add_backup("bkp_01JC9Z1A2B3C4D5E6F7G8H9J0K", &fixture.database, NEW)
+        .await;
+
+    // The install fails after the marker is written: `primary-node` is a
+    // directory, which the install cannot remove.
+    let dir = fixture.data_dir("install-fails");
+    std::fs::create_dir_all(dir.join("primary-node").join("in-the-way")).unwrap();
+    let error = restore::execute(&fixture.store, &fixture.options(&dir, None))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("primary-node"), "{error}");
+    assert!(!dir.join("quoro.db").exists(), "no database");
+    assert!(
+        !dir.join(restore_pending::MARKER_FILE).exists(),
+        "the marker is deleted"
+    );
+    assert!(!dir.join("keys/signing.key").exists(), "no signing key");
+
+    // A marker left by an earlier run, and a chunk that does not open.
+    let chunks: Vec<String> = fixture
+        .store
+        .list(&format!("{}chunks/", fixture.root))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|object| object.key)
+        .collect();
+    let mut object = fixture.store.get(&chunks[0]).await.unwrap();
+    object[24] ^= 0x01;
+    fixture
+        .store
+        .put_overwrite(&chunks[0], object)
+        .await
+        .unwrap();
+    let dir = fixture.data_dir("left-behind");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(restore_pending::MARKER_FILE),
+        Marker::plain(Head {
+            seq: 7,
+            hash: hash(7),
+        })
+        .to_bytes(),
+    )
+    .unwrap();
+    let error = restore::execute(&fixture.store, &fixture.options(&dir, None))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("chunk"), "{error}");
+    assert_nothing_installed(&dir);
 }

@@ -63,6 +63,9 @@ pub mod rebuild;
 /// agent protocol).
 pub(crate) mod removal;
 pub mod request;
+/// The `restore-pending` marker and the restored primary's first write
+/// (`backup-format.md` section 8.2, ADR 0280, ADR 0285).
+pub mod restore_pending;
 pub(crate) mod scheduler;
 pub mod service;
 pub mod session;
@@ -209,14 +212,16 @@ pub struct AppState {
 
 impl AppState {
     /// Opens the state: loads or generates the cluster key, takes the
-    /// pre-upgrade backup when a migration is pending, completes `meta`, moves
-    /// the primary status as `quoro restore` asked, and builds the session hub.
+    /// pre-upgrade backup when a migration is pending, completes `meta`, makes
+    /// the restored primary's first write or moves the primary status as
+    /// `quoro restore` asked, and builds the session hub.
     ///
     /// # Errors
     ///
     /// A message for the operator when the signing key cannot be loaded, the
-    /// pre-upgrade backup fails, the migrations cannot be applied or `meta`
-    /// cannot be completed.
+    /// pre-upgrade backup fails, the migrations cannot be applied, `meta`
+    /// cannot be completed, or a `restore-pending` marker stops the start
+    /// ([`restore_pending::apply`]).
     pub async fn open(
         store: store::Store,
         config: ServerConfig,
@@ -265,7 +270,7 @@ impl AppState {
         );
         // The backup needs the keys and the data key, and must run before any
         // migration touches the database.
-        backups::control_plane::upgrade_before_start(
+        let migrated = backups::control_plane::migrate_before_start(
             &store,
             &config.data_dir,
             &keys,
@@ -283,10 +288,21 @@ impl AppState {
         let cluster_id = keys::ensure_cluster_meta(&store)
             .await
             .map_err(|e| format!("cannot read the cluster identity: {e:?}"))?;
-        // After `quoro restore` onto another host, the node on this host takes
-        // the primary status before any session or request sees it
-        // (`backup-format.md` section 8.2).
-        primary_status::apply_marker(&store, &config.data_dir).await?;
+        // After `quoro restore`, the restored primary's first write is the
+        // first change-log write of its first start (`backup-format.md`
+        // section 8.2, ADR 0280, ADR 0285): it marks every `expiring` lease
+        // row unsettled and, when `primary-node` asks for it, moves the
+        // primary status to the node on this host, before any session or
+        // request sees either. It needs the migrated schema, so it comes
+        // right after the migrations and before the pre-upgrade backup's
+        // record. Without a `restore-pending` marker, `primary-node` is
+        // applied on its own, as before.
+        restore_pending::apply(&store, &config.data_dir).await?;
+        backups::control_plane::record_after_migration(
+            &store, &keys, &data_key, &backups, migrated,
+        )
+        .await
+        .map_err(|reason| format!("cannot record the pre-upgrade backup: {reason}"))?;
         // Nodes enrolled before the per-node subnet existed get theirs before
         // any session can ask for a desired state (ADR 0144).
         subnet::backfill(&store, &config.node_network).await?;
@@ -295,12 +311,8 @@ impl AppState {
         // current signing key in `signing_keys`, so a promoted primary
         // rebuilds both tables from the log (section 7.3 step 4). Without
         // them a promotion cannot rebuild, so a failure stops the start.
-        // `backup-format.md` section 8.2 (ADR 0280, ADR 0285) asks that a
-        // restored primary's first change-log write come before any other.
-        // That write is not implemented yet; only its move of the primary
-        // status exists, as `primary_status::apply_marker` above. Once it
-        // is, this step must stay after it, as it stays after `apply_marker`
-        // now.
+        // It stays after the restored primary's first write above, which
+        // `backup-format.md` section 8.2 asks to come before any other.
         match log_backfill::run(&store, &keys).await {
             Ok(done) if done != log_backfill::Backfilled::default() => tracing::info!(
                 credentials = done.credentials,

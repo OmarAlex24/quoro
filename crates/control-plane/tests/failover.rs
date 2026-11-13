@@ -14,6 +14,8 @@ use base64::Engine as _;
 use common::{Server, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::authority::VoterSupport;
+use quoro_control_plane::changelog::{self, Actor, Op};
+use quoro_control_plane::restore_pending::{self, Marker};
 use quoro_control_plane::session::Fault;
 use quoro_proto::wire::{
     self, Capacity as WireCapacity, Kvm as WireKvm, NodeMessage, StatusReport, WarmRole, WarmStatus,
@@ -746,6 +748,132 @@ async fn a_disconnected_source_holds_the_lease_until_its_gate_passed() {
     );
     s.unmoved(false, "lease_held").await;
     none_of(s.on_warm(), "lease_grant", "lease_held").await;
+}
+
+/// `backup-format.md` section 8.2 and section 8.4, "The mark" (issue #838):
+/// the control-plane database is restored while the app's lease row reads
+/// `expiring` for the source. The restored log may lack the write that ended
+/// the lease's renewals, so the source may run the app `local`. The restored
+/// primary's first write marks the row, and a failover before the source's
+/// next `hello` waits, also once the row's gate has passed. Without the mark,
+/// the passed gate would let the lease move to the warm node.
+#[tokio::test]
+async fn after_a_restore_a_failover_waits_for_the_holders_next_hello() {
+    let mut s = Setup::new().await;
+    s.expiring().await;
+    log_lease_row(&s).await;
+    // The primary stops; its database is restored as it stands, with the
+    // restore-pending marker naming its log head.
+    drop(s.on_source.take());
+    drop(s.on_warm.take());
+    disconnected(&s.server, &s.source.node_id).await;
+    disconnected(&s.server, &s.warm.node_id).await;
+    let head = settled_head(&s.server).await;
+    std::fs::write(
+        s.server.data_dir.join(restore_pending::MARKER_FILE),
+        Marker::plain(head.clone()).to_bytes(),
+    )
+    .unwrap();
+    s.server =
+        common::restart_with_resolver(&s.server, Arc::new(quoro_control_plane::ReferenceAsDigest))
+            .await;
+    let pool = s.server.state.store.pool();
+    let restored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM meta WHERE key = 'restore_marker'")
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+    assert!(
+        restored.is_some_and(|value| value.contains(&head.hash)),
+        "the first write consumed the marker"
+    );
+    let (mode, unsettled): (String, i64) =
+        sqlx::query_as("SELECT mode, unsettled FROM leases WHERE id = ?")
+            .bind(LEASE_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!((mode.as_str(), unsettled), ("expiring", 1), "the mark");
+
+    // The warm node comes back and reports its copy; the source does not.
+    let mut on_warm = connect(&s.server, &s.warm.credential).await;
+    send(&mut on_warm, hello(&s.warm.node_id, 2), None).await;
+    recv_type(&mut on_warm, "desired_state").await;
+    s.on_warm = Some(on_warm);
+    s.report_copy().await;
+    set_support(&s.server, true);
+    // The row's gate passes 5 s from now (3 s and two margins of 1 s).
+    s.server
+        .state
+        .hub
+        .authority()
+        .seed(LEASE_ID, &s.source.node_id, Some(3_000));
+    tokio::time::sleep(Duration::from_millis(5_100)).await;
+    assert!(s.server.state.hub.authority().passed(LEASE_ID));
+
+    let body = refused(s.failover().await, 409, "conflict", Some("lease_held")).await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("unsettled mark"), "{detail}");
+    s.unmoved(false, "restored").await;
+    none_of(s.on_warm(), "lease_grant", "restored").await;
+}
+
+/// Writes the lease row as it stands to the change log, as the write that
+/// gave it its token did: the tests write the row directly, and a restored
+/// log holds that entry.
+async fn log_lease_row(s: &Setup) {
+    let (holder, mode, token, duration_ms, granted_at): (String, String, i64, Option<i64>, String) =
+        sqlx::query_as(
+            "SELECT holder_node_id, mode, fencing_token, duration_ms, granted_at FROM leases \
+             WHERE id = ?",
+        )
+        .bind(LEASE_ID)
+        .fetch_one(s.server.state.store.pool())
+        .await
+        .unwrap();
+    let payload = json!({
+        "id": LEASE_ID,
+        "resource_type": "app",
+        "resource_id": s.app_id,
+        "holder_node_id": holder,
+        "mode": mode,
+        "fencing_token": token,
+        "duration_ms": duration_ms,
+        "granted_at": granted_at,
+        "renewed_at": null,
+        "expires_at": null,
+        "revoked_at": null,
+        "unsettled": false,
+    });
+    let mut w = s.server.state.store.begin_write().await.unwrap();
+    changelog::append(
+        &mut w.tx,
+        &Actor::system("test"),
+        "lease",
+        LEASE_ID,
+        Op::Create,
+        payload,
+    )
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+}
+
+/// The change log's head once no write has landed for a while: the stopped
+/// primary's sessions may still record their end.
+async fn settled_head(server: &Server) -> restore_pending::Head {
+    let mut last: Option<restore_pending::Head> = None;
+    loop {
+        let head = {
+            let mut conn = server.state.store.pool().acquire().await.unwrap();
+            restore_pending::log_head(&mut conn).await.unwrap()
+        };
+        if last.as_ref() == Some(&head) {
+            return head;
+        }
+        last = Some(head);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 }
 
 /// Section 8.4: a source that is not connected holds a `local` lease until

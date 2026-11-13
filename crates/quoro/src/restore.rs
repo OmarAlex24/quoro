@@ -14,6 +14,13 @@
 //! file. Its id goes to `<data_dir>/primary-node`, which the primary applies
 //! and deletes at its next start (section 8.2 step 6).
 //!
+//! Before it installs the database, it writes the `restore-pending` marker
+//! next to it (section 8.2, "Detecting the first start", ADR 0285): the
+//! restored log's head `seq` and that entry's hash
+//! ([`quoro_control_plane::restore_pending::Marker`]). The primary's first
+//! start makes the restored primary's first write from it and deletes it. A
+//! restore that stops before the database is installed deletes the marker.
+//!
 //! Every secret is read from a file whose mode refuses group and other access,
 //! never from a flag or the environment, and no error message carries a key, a
 //! credential or the recovery key. [`execute`] is generic over
@@ -32,6 +39,7 @@ use quoro_backup::{
     SourceKind, open_manifest, open_newest_config, verify_seal,
 };
 use quoro_control_plane::primary_status::MARKER_FILE;
+use quoro_control_plane::restore_pending::{self, Head, Marker};
 use quoro_providers::object_store::ObjectStore;
 use quoro_providers::s3::{S3Client, S3Config};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -257,6 +265,14 @@ pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Rep
     let signing_seed = read_signing_seed(&options.signing_key_file)?;
     let data_key = read_exact(&options.data_key_file, DATA_KEY_BYTES, "data key")?;
     ensure_data_dir(&options.data_dir)?;
+    // From here on, a restore that stops before the database is installed
+    // deletes the marker, also one an interrupted earlier run left in this
+    // data directory, which holds no database (section 8.2). A dry run
+    // installs nothing and leaves the marker alone.
+    let mut pending = PendingMarker {
+        path: options.data_dir.join(restore_pending::MARKER_FILE),
+        armed: !options.dry_run,
+    };
 
     let root = layout::root(&options.prefix, &options.cluster_id);
     let (config, repo_key) =
@@ -313,17 +329,29 @@ pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Rep
     // An unusable `--node-id` refuses the restore here, before anything is
     // installed (section 8.2).
     let primary = pick_primary(&temp, options).await?;
+    // The marker names the database by its log's head (section 8.2, ADR
+    // 0285); a file without a change log is no control-plane database.
+    let head = read_head(&temp).await?;
 
     let installed = !options.dry_run;
     if installed {
         // SQLite may have touched these while checking the file; they must not
         // be installed next to the database.
         remove_sidecars(&temp);
-        if let Err(error) = install(options, &temp, &signing_seed, &data_key, primary.node_id()) {
+        let marker = Marker::plain(head);
+        if let Err(error) = install(
+            options,
+            &temp,
+            &signing_seed,
+            &data_key,
+            &marker,
+            primary.node_id(),
+        ) {
             remove_install(&options.data_dir);
             return Err(error);
         }
         guard.keep = true;
+        pending.armed = false;
     }
 
     Ok(Report {
@@ -686,13 +714,17 @@ async fn check_integrity(path: &Path) -> Result<(), Error> {
 }
 
 /// Copies the two key files into `<data_dir>/keys` with mode `0600`, writes
-/// `primary-node` `0600` when a node was picked, and renames the checked
-/// database into place (section 8.2 steps 5 and 6).
+/// the `restore-pending` marker `0600` and syncs it into the directory,
+/// writes `primary-node` `0600` when a node was picked, and only then renames
+/// the checked database into place (section 8.2 steps 5 and 6, "Detecting
+/// the first start"). Every file is this process's, so the marker has the
+/// owner of `primary-node` and of the database.
 fn install(
     options: &Options,
     temp: &Path,
     signing_seed: &[u8; SIGNING_KEY_BYTES],
     data_key: &[u8],
+    marker: &Marker,
     primary_node: Option<&str>,
 ) -> Result<(), Error> {
     let keys_dir = options.data_dir.join("keys");
@@ -700,21 +732,19 @@ fn install(
     write_private_file(&keys_dir.join(SIGNING_KEY_FILE), signing_seed)?;
     write_private_file(&keys_dir.join(DATA_KEY_FILE), data_key)?;
 
-    // A file an interrupted earlier run left behind must not outlive this
-    // restore: no database was installed then, so it named nothing real.
-    let marker = options.data_dir.join(MARKER_FILE);
-    match std::fs::remove_file(&marker) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(failed(format!(
-                "cannot remove {}: {error}",
-                marker.display()
-            )));
-        }
-    }
+    // Files an interrupted earlier run left behind must not outlive this
+    // restore: no database was installed then, so they named nothing real.
+    let pending = options.data_dir.join(restore_pending::MARKER_FILE);
+    remove_if_present(&pending)?;
+    write_private_file(&pending, &marker.to_bytes())?;
+    // No restored database is installed without its marker, also after a
+    // power loss (section 8.2).
+    sync_dir(&options.data_dir)?;
+
+    let primary = options.data_dir.join(MARKER_FILE);
+    remove_if_present(&primary)?;
     if let Some(node_id) = primary_node {
-        write_private_file(&marker, format!("{node_id}\n").as_bytes())?;
+        write_private_file(&primary, format!("{node_id}\n").as_bytes())?;
     }
 
     let database = options.data_dir.join(DATABASE_FILE);
@@ -725,9 +755,18 @@ fn install(
     Ok(())
 }
 
+fn remove_if_present(path: &Path) -> Result<(), Error> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(failed(format!("cannot remove {}: {error}", path.display()))),
+    }
+}
+
 fn remove_install(data_dir: &Path) {
     let _ = std::fs::remove_file(data_dir.join(DATABASE_FILE));
     let _ = std::fs::remove_file(data_dir.join(MARKER_FILE));
+    let _ = std::fs::remove_file(data_dir.join(restore_pending::MARKER_FILE));
     let _ = std::fs::remove_file(data_dir.join("keys").join(SIGNING_KEY_FILE));
     let _ = std::fs::remove_file(data_dir.join("keys").join(DATA_KEY_FILE));
 }
@@ -815,6 +854,28 @@ async fn pick_primary(database: &Path, options: &Options) -> Result<PrimaryPick,
     })
 }
 
+/// The head of the change log in the database at `path`, read-only: the
+/// newest entry's `seq` and hash, or `seq` 0 and the genesis hash for an
+/// empty log.
+async fn read_head(path: &Path) -> Result<Head, Error> {
+    let options = SqliteConnectOptions::new().filename(path).read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|error| failed(format!("cannot open the restored database: {error}")))?;
+    let head = match pool.acquire().await {
+        Ok(mut conn) => restore_pending::log_head(&mut conn).await,
+        Err(error) => Err(error),
+    };
+    pool.close().await;
+    head.map_err(|error| {
+        failed(format!(
+            "cannot read the restored change log's head: {error}"
+        ))
+    })
+}
+
 /// The `status` of node `node_id` in the database at `path`, read-only.
 async fn node_status(path: &Path, node_id: &str) -> Result<Option<String>, Error> {
     let options = SqliteConnectOptions::new().filename(path).read_only(true);
@@ -835,6 +896,21 @@ async fn node_status(path: &Path, node_id: &str) -> Result<Option<String>, Error
 struct TempFile {
     path: PathBuf,
     keep: bool,
+}
+
+/// Deletes `<data_dir>/restore-pending` on drop while armed: the restore
+/// stopped before the database was installed (section 8.2).
+struct PendingMarker {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for PendingMarker {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 impl Drop for TempFile {

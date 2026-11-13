@@ -8,10 +8,16 @@
 //! `nodes.cp_status = 'primary'` to that node in one write transaction, through
 //! the change log, and records `cluster.primary_moved`
 //! (`audit-log-format.md` section 3.5). The file is deleted once it was read.
+//!
+//! From M5b that move is part of the restored primary's first write (ADR
+//! 0280): when a `restore-pending` marker names the installed database,
+//! [`crate::restore_pending`] makes the move with [`move_in`] inside that
+//! write, and [`apply_marker`] runs only when there is no such marker.
 
 use std::path::Path;
 
 use serde_json::{Value, json};
+use sqlx::SqliteConnection;
 
 use crate::audit::{Channel, Outcome, Record};
 use crate::changelog::{self, Actor, Op};
@@ -37,21 +43,54 @@ const ACTOR: &str = "cluster";
 /// A database error while reading the nodes or inside the move's transaction.
 /// The file is then left in place, so the next start tries again.
 pub async fn apply_marker(store: &Store, data_dir: &Path) -> Result<(), String> {
-    let path = data_dir.join(MARKER_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
+    let text = match read_file(data_dir) {
+        File::Missing => return Ok(()),
+        File::Unreadable(error) => {
             tracing::warn!(
-                path = %path.display(),
+                path = %data_dir.join(MARKER_FILE).display(),
                 error = %error,
                 "cannot read the primary-node file left by quoro restore; it stays for the next start (give it the database file's owner)"
             );
             return Ok(());
         }
+        File::Text(text) => text,
     };
     let node_id = text.trim();
-    match move_primary(store, node_id).await? {
+    let moved = move_primary(store, node_id).await?;
+    log_moved(node_id, &moved);
+    remove_file(data_dir);
+    Ok(())
+}
+
+/// What `<data_dir>/primary-node` holds.
+pub(crate) enum File {
+    /// No file: the status stays where it is.
+    Missing,
+    /// A file this process cannot read, for example one owned by root.
+    Unreadable(std::io::Error),
+    /// The file's text, untrimmed.
+    Text(String),
+}
+
+/// Reads `<data_dir>/primary-node`.
+pub(crate) fn read_file(data_dir: &Path) -> File {
+    match std::fs::read_to_string(data_dir.join(MARKER_FILE)) {
+        Ok(text) => File::Text(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => File::Missing,
+        Err(error) => File::Unreadable(error),
+    }
+}
+
+/// Whether the move was made, or why the named node could not take the
+/// status.
+pub(crate) enum Moved {
+    Yes { from: Option<String> },
+    No(&'static str),
+}
+
+/// Logs what became of the node `primary-node` named.
+pub(crate) fn log_moved(node_id: &str, moved: &Moved) {
+    match moved {
         Moved::Yes { from } => tracing::info!(
             from_node_id = from.as_deref().unwrap_or("none"),
             to_node_id = node_id,
@@ -63,29 +102,38 @@ pub async fn apply_marker(store: &Store, data_dir: &Path) -> Result<(), String> 
             "the primary-node file left by quoro restore was not used; the primary status stays where it is"
         ),
     }
-    remove_marker(&path);
-    Ok(())
 }
 
-enum Moved {
-    Yes { from: Option<String> },
-    No(&'static str),
-}
-
-/// The move itself: one write transaction with the two node updates, their
-/// change-log entries and the audit record.
+/// The move in its own write transaction, committed only when it moved.
 async fn move_primary(store: &Store, node_id: &str) -> Result<Moved, String> {
-    if !quoro_types::is_id(quoro_types::Prefix::Node, node_id) {
-        return Ok(Moved::No("the file does not hold a nod_ id"));
-    }
     let mut w = store
         .begin_write()
         .await
         .map_err(|error| format!("cannot move the primary status: {error}"))?;
+    let moved = move_in(&mut w.tx, node_id).await?;
+    if let Moved::Yes { .. } = moved {
+        w.commit()
+            .await
+            .map_err(|error| format!("cannot move the primary status: {error}"))?;
+    }
+    Ok(moved)
+}
+
+/// The move itself, inside the caller's write transaction, which it does not
+/// commit: the two node updates, their change-log entries and the audit
+/// record. It reads before it writes, so [`Moved::No`] has written nothing.
+///
+/// # Errors
+///
+/// A database error, after which the caller drops the transaction.
+pub(crate) async fn move_in(conn: &mut SqliteConnection, node_id: &str) -> Result<Moved, String> {
+    if !quoro_types::is_id(quoro_types::Prefix::Node, node_id) {
+        return Ok(Moved::No("the file does not hold a nod_ id"));
+    }
     let status: Option<(String, Option<String>)> =
         sqlx::query_as("SELECT status, cp_status FROM nodes WHERE id = ?")
             .bind(node_id)
-            .fetch_optional(&mut *w.tx)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(|error| format!("cannot read the node named by primary-node: {error}"))?;
     match status {
@@ -102,32 +150,32 @@ async fn move_primary(store: &Store, node_id: &str) -> Result<Moved, String> {
     let actor = Actor::system(ACTOR);
     let holders: Vec<(String,)> =
         sqlx::query_as("SELECT id FROM nodes WHERE cp_status = 'primary' ORDER BY id")
-            .fetch_all(&mut *w.tx)
+            .fetch_all(&mut *conn)
             .await
             .map_err(|error| format!("cannot read the primary node: {error}"))?;
     for (holder,) in &holders {
         sqlx::query("UPDATE nodes SET cp_status = NULL WHERE id = ?")
             .bind(holder)
-            .execute(&mut *w.tx)
+            .execute(&mut *conn)
             .await
             .map_err(|error| format!("cannot clear the primary status: {error}"))?;
-        let payload = crate::driver::node_payload(&mut w.tx, holder)
+        let payload = crate::driver::node_payload(&mut *conn, holder)
             .await
             .map_err(|error| format!("cannot read node {holder}: {error:?}"))?;
-        changelog::append(&mut w.tx, &actor, "node", holder, Op::Update, payload)
+        changelog::append(&mut *conn, &actor, "node", holder, Op::Update, payload)
             .await
             .map_err(|error| format!("cannot log the primary status move: {error}"))?;
     }
 
     sqlx::query("UPDATE nodes SET cp_status = 'primary' WHERE id = ?")
         .bind(node_id)
-        .execute(&mut *w.tx)
+        .execute(&mut *conn)
         .await
         .map_err(|error| format!("cannot set the primary status: {error}"))?;
-    let payload = crate::driver::node_payload(&mut w.tx, node_id)
+    let payload = crate::driver::node_payload(&mut *conn, node_id)
         .await
         .map_err(|error| format!("cannot read node {node_id}: {error:?}"))?;
-    let seq = changelog::append(&mut w.tx, &actor, "node", node_id, Op::Update, payload)
+    let seq = changelog::append(&mut *conn, &actor, "node", node_id, Op::Update, payload)
         .await
         .map_err(|error| format!("cannot log the primary status move: {error}"))?;
 
@@ -158,17 +206,16 @@ async fn move_primary(store: &Store, node_id: &str) -> Result<Moved, String> {
         result_detail: None,
         change_seq: Some(seq),
     };
-    crate::audit::append(&mut w.tx, &record)
+    crate::audit::append(&mut *conn, &record)
         .await
         .map_err(|error| format!("cannot record the primary status move: {error}"))?;
-    w.commit()
-        .await
-        .map_err(|error| format!("cannot move the primary status: {error}"))?;
     Ok(Moved::Yes { from })
 }
 
-fn remove_marker(path: &Path) {
-    if let Err(error) = std::fs::remove_file(path) {
+/// Deletes `<data_dir>/primary-node`; a failure is logged.
+pub(crate) fn remove_file(data_dir: &Path) {
+    let path = data_dir.join(MARKER_FILE);
+    if let Err(error) = std::fs::remove_file(&path) {
         tracing::warn!(
             path = %path.display(),
             error = %error,
