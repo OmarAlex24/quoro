@@ -2049,3 +2049,84 @@ async fn declaring_lost_a_node_whose_lease_is_at_the_cap_writes_nothing() {
     assert_eq!((token, revoked_at.is_some()), (4, true));
     assert!(lost_at(&server, &node_id).await.is_some());
 }
+
+/// Section 8.5 step 3 and section 8.6, "The cap": an acknowledgement that
+/// lists a lease another node holds at 2^53 − 1 answers `200` and stores
+/// that token for it, as for a lease with no row, not one above it, which
+/// the change log refuses (ADR 0247). The lease is left as it is; the node's
+/// change-log entry and its `fence_ack` carry the capped token.
+#[tokio::test]
+async fn an_ack_of_a_lease_another_node_holds_at_the_cap_stores_the_cap() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, mut socket, app_id, vm_id, lease_id) = node_with_lease(&server, &owner).await;
+    let node_id = node.node_id.clone();
+    let other = enrolled_node(&server, &owner, "node-beta").await;
+    send(
+        &mut socket,
+        fence_failed_event(&node_id, &lease_id, &app_id, &vm_id),
+    )
+    .await;
+    wait_for_node(
+        &owner,
+        &server,
+        Some(&mut socket),
+        &node_id,
+        "a fence_failure",
+        |node| !node["fence_failure"].is_null(),
+    )
+    .await;
+    // The lease moved on to another node meanwhile, which holds it at the
+    // cap.
+    sqlx::query("UPDATE leases SET holder_node_id = ?, fencing_token = ? WHERE id = ?")
+        .bind(&other.node_id)
+        .bind(MAX_TOKEN)
+        .bind(&lease_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+
+    let before = log_head(&server).await;
+    let res = ack(
+        &owner,
+        &server,
+        &node_id,
+        json!({ "lease_ids": [lease_id] }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    assert_eq!(
+        lease_row(&server, &lease_id).await,
+        (MAX_TOKEN, None, other.node_id.clone()),
+        "a lease another node holds is left as it is"
+    );
+    let tokens = json!({ lease_id.as_str(): MAX_TOKEN });
+    let pending = fence_ack_pending(&server, &node_id)
+        .await
+        .expect("fence_ack_pending");
+    assert_eq!(pending["lease_ids"], json!([lease_id]), "{pending}");
+    assert_eq!(pending["fencing_tokens"], tokens, "{pending}");
+    let entries = entries_after(&server, before).await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let (_, kind, id, payload) = &entries[0];
+    assert_eq!((kind.as_str(), id.as_str()), ("node", node_id.as_str()));
+    assert_eq!(
+        payload["fence_ack_pending"]["fencing_tokens"], tokens,
+        "{payload}"
+    );
+
+    let command = of_type(&recv_until(&mut socket, &["command"]).await, "command")[0].clone();
+    assert_eq!(command["body"]["kind"], "fence_ack", "{command}");
+    assert_eq!(
+        command["body"]["params"],
+        json!({ "lease_ids": [lease_id], "fencing_tokens": tokens }),
+        "{command}"
+    );
+    reply(
+        &mut socket,
+        ok_result(),
+        Some(command["id"].as_str().unwrap()),
+    )
+    .await;
+    wait_for_no_pending_ack(&server, &mut socket, &node_id).await;
+}
