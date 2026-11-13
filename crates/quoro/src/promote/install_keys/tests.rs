@@ -5,7 +5,7 @@
 
 use super::*;
 use std::collections::BTreeMap;
-use std::os::unix::fs::{MetadataExt as _, symlink};
+use std::os::unix::fs::symlink;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use quoro_control_plane::crypto::DataKey;
@@ -102,6 +102,7 @@ fn primary_keys() -> PrimaryKeys {
     PrimaryKeys {
         signing: vec![signing(SEED)],
         current_signing: Some(signing_key_id(&SEED)),
+        next_signing: BTreeSet::new(),
         data: DataKeyBytes {
             key_id: DEK_ID.to_string(),
             key: Zeroizing::new(DEK),
@@ -237,6 +238,73 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// The cluster signing key of `seed`, as a primary loads it from its file.
+fn cluster_keys(dir: &Path, seed: [u8; 32]) -> ClusterKeys {
+    fs::create_dir_all(dir.join(KEYS_DIR)).unwrap();
+    fs::write(dir.join(SIGNING_FILE), seed).unwrap();
+    ClusterKeys::load_or_generate(dir).unwrap()
+}
+
+/// This machine as a node: its agent's data directory with a custody key,
+/// and an identity that pins `fingerprint` and the signing key `pinned`.
+struct Node {
+    dir: PathBuf,
+    custody_key: CustodyKey,
+    identity: Identity,
+}
+
+impl Node {
+    fn new(scratch: &Scratch, pinned: &ClusterKeys, fingerprint: &str) -> Self {
+        let dir = scratch.path().join("quoro-node");
+        identity::ensure_data_dir(&dir).unwrap();
+        let custody_key = CustodyKey::generate(&mut custody::os_rng());
+        fs::write(dir.join(CUSTODY_KEY_FILE), &custody_key.to_bytes()[..]).unwrap();
+        let identity = Identity {
+            node_id: NODE_ID.to_string(),
+            cluster_id: CLUSTER_ID.to_string(),
+            primary_url: "https://192.0.2.10:8443".to_string(),
+            primary_urls: Vec::new(),
+            fingerprint: fingerprint.to_string(),
+            cluster_public_key: pinned.public_key_base64(),
+            cluster_key_id: pinned.key_id().to_string(),
+        };
+        Self {
+            dir,
+            custody_key,
+            identity,
+        }
+    }
+
+    fn recipient(&self) -> &CustodyPublicKey {
+        self.custody_key.public_key()
+    }
+
+    /// This machine's seals of each of `signing`, of the data key `DEK` and
+    /// of `tls`.
+    fn seals(&self, signing: &[&ClusterKeys], tls: &TlsIdentity) -> Vec<Change> {
+        let mut changes: Vec<Change> = signing
+            .iter()
+            .map(|keys| {
+                sealed(
+                    self.recipient(),
+                    KeyKind::Signing,
+                    keys.key_id(),
+                    &keys.signing_key().to_bytes(),
+                )
+            })
+            .collect();
+        changes.push(sealed(self.recipient(), KeyKind::Dek, DEK_ID, &DEK));
+        let pair = json!({ "cert_pem": tls.cert_pem(), "key_pem": tls.key_pem() }).to_string();
+        changes.push(sealed(
+            self.recipient(),
+            KeyKind::Tls,
+            tls.key_id(),
+            pair.as_bytes(),
+        ));
+        changes
+    }
+}
+
 /// The files are the four key files `prepare_host` requires before the
 /// control plane starts, and the signing key's is the control plane's.
 #[test]
@@ -260,20 +328,9 @@ async fn each_key_is_written_as_the_primary_wrote_it_and_reads_back() {
     let data_file = fs::read(primary.join(DATA_FILE)).unwrap();
     assert_eq!(data_file.len(), DATA_FILE_LEN);
 
-    let node_dir = scratch.path().join("quoro-node");
-    identity::ensure_data_dir(&node_dir).unwrap();
-    let custody_key = CustodyKey::generate(&mut custody::os_rng());
-    fs::write(node_dir.join(CUSTODY_KEY_FILE), &custody_key.to_bytes()[..]).unwrap();
-    let identity = Identity {
-        node_id: NODE_ID.to_string(),
-        cluster_id: CLUSTER_ID.to_string(),
-        primary_url: "https://192.0.2.10:8443".to_string(),
-        primary_urls: Vec::new(),
-        fingerprint: tls.fingerprint.clone(),
-        cluster_public_key: signing_key.public_key_base64(),
-        cluster_key_id: signing_key.key_id().to_string(),
-    };
-    let recipient = custody_key.public_key();
+    let node = Node::new(&scratch, &signing_key, &tls.fingerprint);
+    let identity = &node.identity;
+    let recipient = node.recipient();
     let tls_plaintext = json!({
         "cert_pem": tls.identity.cert_pem(),
         "key_pem": tls.identity.key_pem(),
@@ -301,7 +358,7 @@ async fn each_key_is_written_as_the_primary_wrote_it_and_reads_back() {
             tls_plaintext.as_bytes(),
         ),
     ]);
-    let opened = open_seals(&identity, &entries, &node_dir).await.unwrap();
+    let opened = open_seals(identity, &entries, &node.dir).await.unwrap();
     let keys = PrimaryKeys::from_opened(opened).unwrap();
 
     let data_dir = scratch.data_dir();
@@ -408,6 +465,45 @@ fn an_existing_file_that_holds_something_else_refuses_and_changes_nothing() {
         );
         assert_eq!(snapshot(scratch.path()), before, "{name}");
     }
+
+    // The key followed by more: only one byte past the key is read.
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    fs::create_dir(data_dir.join(KEYS_DIR)).unwrap();
+    let mut longer = SEED.to_vec();
+    longer.extend_from_slice(&[0; 4096]);
+    fs::write(data_dir.join(SIGNING_FILE), longer).unwrap();
+    let before = snapshot(scratch.path());
+    let refusal = install(&primary_keys(), &data_dir).unwrap_err();
+    assert!(
+        refusal.contains("exists and holds something else"),
+        "{refusal}"
+    );
+    assert_eq!(snapshot(scratch.path()), before);
+}
+
+/// A key file with another hard link refuses, even one that holds the same
+/// key, and nothing changes: its mode is not set through either name.
+#[test]
+fn a_key_file_with_another_hard_link_refuses_and_changes_nothing() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    let keys = primary_keys();
+    fs::create_dir(data_dir.join(KEYS_DIR)).unwrap();
+    let path = data_dir.join(SIGNING_FILE);
+    fs::write(&path, SEED).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::hard_link(&path, scratch.path().join("elsewhere")).unwrap();
+    let before = snapshot(scratch.path());
+
+    let refusal = install(&keys, &data_dir).unwrap_err();
+    assert!(
+        refusal.contains(&format!("{} has 2 hard links", path.display()))
+            && refusal.ends_with("nothing was changed"),
+        "{refusal}"
+    );
+    assert_eq!(snapshot(scratch.path()), before);
+    assert_eq!(keys.check(&pin(&keys), &data_dir).unwrap_err().len(), 1);
 }
 
 /// A key file that already holds what would be written is kept, as it is:
@@ -562,6 +658,7 @@ fn a_rotation_s_next_signing_key_refuses_and_changes_nothing() {
     let data_dir = scratch.data_dir();
     let mut keys = primary_keys();
     keys.signing.push(signing(NEXT_SEED));
+    keys.next_signing.insert(signing_key_id(&NEXT_SEED));
     let before = snapshot(scratch.path());
 
     let refusal = install(&keys, &data_dir).unwrap_err();
@@ -626,4 +723,158 @@ fn the_signing_key_file_holds_the_current_key_and_bad_keys_refuse() {
         refusal.contains("its key id is not 32 lowercase hex characters"),
         "{refusal}"
     );
+}
+
+/// The check makes every refusal of the installation and changes nothing:
+/// no directory, mode or file, also when it passes. Each problem is listed:
+/// one of the keys and one of the files together.
+#[test]
+fn the_check_writes_nothing_and_lists_what_the_installation_refuses() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    let mut keys = primary_keys();
+    let before = snapshot(scratch.path());
+    keys.check(&pin(&keys), &data_dir).unwrap();
+    assert_eq!(
+        snapshot(scratch.path()),
+        before,
+        "a passing check creates nothing"
+    );
+
+    fs::create_dir(data_dir.join(TLS_DIR)).unwrap();
+    fs::write(data_dir.join(CERT_FILE), b"another certificate").unwrap();
+    fs::set_permissions(data_dir.join(TLS_DIR), fs::Permissions::from_mode(0o755)).unwrap();
+    keys.signing.push(signing(NEXT_SEED));
+    keys.next_signing.insert(signing_key_id(&NEXT_SEED));
+    let other = format!("sha256:{}", tls_pair().key_id());
+    let before = snapshot(scratch.path());
+
+    let problems = keys.check(&other, &data_dir).unwrap_err();
+    assert_eq!(problems.len(), 3, "{problems:#?}");
+    assert!(
+        problems[0].contains("as the next key of a rotation"),
+        "{problems:#?}"
+    );
+    assert!(
+        problems[1].contains("but this machine pins"),
+        "{problems:#?}"
+    );
+    assert!(
+        problems[2].contains(&format!(
+            "{} exists and holds something else",
+            data_dir.join(CERT_FILE).display()
+        )),
+        "{problems:#?}"
+    );
+    assert!(problems.iter().all(|problem| !problem.contains(UNCHANGED)));
+    let refusal =
+        install_keys(&keys, &other, &data_dir, &RealKeyFs, &mut Out::quiet()).unwrap_err();
+    assert_eq!(refusal, format!("{}; {UNCHANGED}", problems.join("; ")));
+    assert_eq!(snapshot(scratch.path()), before);
+}
+
+/// A signing key in use beside the current one that is not a `next` row's
+/// is refused with a neutral reason, not as a rotation's.
+#[test]
+fn another_signing_key_in_use_is_not_called_a_rotation_s() {
+    let scratch = Scratch::new();
+    let mut keys = primary_keys();
+    keys.signing.push(signing(NEXT_SEED));
+    let refusal = install(&keys, &scratch.data_dir()).unwrap_err();
+    assert!(
+        refusal.contains(&format!(
+            "the signing key {} is in use beside the current key {}, as a signing key in use \
+             other than the current one",
+            signing_key_id(&NEXT_SEED),
+            signing_key_id(&SEED)
+        )) && !refusal.contains("rotation"),
+        "{refusal}"
+    );
+}
+
+/// `keys::open` takes the current signing key from the `current` row of
+/// `signing_keys` and a rotation's next key from the `next` row, whichever
+/// key id sorts first and whichever key the identity pins.
+#[tokio::test]
+async fn the_current_signing_key_is_the_current_row_s() {
+    for (current_seed, next_seed) in [(SEED, NEXT_SEED), (NEXT_SEED, SEED)] {
+        let scratch = Scratch::new();
+        let current = cluster_keys(&scratch.path().join("current"), current_seed);
+        let next = cluster_keys(&scratch.path().join("next"), next_seed);
+        let tls = tls_pair();
+        let node = Node::new(&scratch, &next, &format!("sha256:{}", tls.key_id()));
+        let mut changes = vec![signing_row(&next, "next"), signing_row(&current, "current")];
+        changes.extend(node.seals(&[&current, &next], &tls));
+
+        let opened = open_seals(&node.identity, &log(changes), &node.dir)
+            .await
+            .unwrap();
+        assert_eq!(opened.current_signing.as_deref(), Some(current.key_id()));
+        assert_eq!(
+            opened.next_signing,
+            BTreeSet::from([next.key_id().to_string()])
+        );
+    }
+}
+
+/// With no `signing_keys` row in the followed log, `keys::open` names no
+/// current key, and the installation writes the one key in use, the
+/// identity's.
+#[tokio::test]
+async fn without_a_signing_keys_row_no_key_is_current() {
+    let scratch = Scratch::new();
+    let pinned = cluster_keys(&scratch.path().join("pinned"), SEED);
+    let tls = tls_pair();
+    let node = Node::new(&scratch, &pinned, &format!("sha256:{}", tls.key_id()));
+    let entries = log(node.seals(&[&pinned], &tls));
+
+    let opened = open_seals(&node.identity, &entries, &node.dir)
+        .await
+        .unwrap();
+    assert_eq!(opened.current_signing, None);
+    assert!(opened.next_signing.is_empty());
+
+    let keys = PrimaryKeys::from_opened(opened).unwrap();
+    let data_dir = scratch.data_dir();
+    install(&keys, &data_dir).unwrap();
+    assert_eq!(fs::read(data_dir.join(SIGNING_FILE)).unwrap(), SEED);
+}
+
+/// A rotation's `next` row in the followed log, opened through `keys::open`,
+/// refuses the installation as a rotation's next key, and nothing is
+/// written.
+#[tokio::test]
+async fn a_next_row_in_the_followed_log_refuses_the_installation() {
+    let scratch = Scratch::new();
+    let current = cluster_keys(&scratch.path().join("current"), SEED);
+    let next = cluster_keys(&scratch.path().join("next"), NEXT_SEED);
+    let tls = tls_pair();
+    let pinned = format!("sha256:{}", tls.key_id());
+    let node = Node::new(&scratch, &current, &pinned);
+    let mut changes = vec![signing_row(&current, "current"), signing_row(&next, "next")];
+    changes.extend(node.seals(&[&current, &next], &tls));
+    let opened = open_seals(&node.identity, &log(changes), &node.dir)
+        .await
+        .unwrap();
+    let keys = PrimaryKeys::from_opened(opened).unwrap();
+    let data_dir = scratch.data_dir();
+    let before = snapshot(&data_dir);
+
+    let expected = format!(
+        "the signing key {} is in use beside the current key {}, as the next key of a rotation",
+        next.key_id(),
+        current.key_id()
+    );
+    let problems = keys.check(&pinned, &data_dir).unwrap_err();
+    assert!(
+        problems.len() == 1 && problems[0].contains(&expected),
+        "{problems:#?}"
+    );
+    let refusal =
+        install_keys(&keys, &pinned, &data_dir, &RealKeyFs, &mut Out::quiet()).unwrap_err();
+    assert!(
+        refusal.contains(&expected) && refusal.ends_with("nothing was changed"),
+        "{refusal}"
+    );
+    assert_eq!(snapshot(&data_dir), before);
 }

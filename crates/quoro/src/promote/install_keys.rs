@@ -17,14 +17,15 @@
 //! written the database (steps 4 and 5) and before `prepare::prepare_host`,
 //! which then hands the data directory to `quoro-api`.
 //!
-//! Before it writes anything, it refuses, listing every problem:
+//! It refuses, listing every problem:
 //!
 //! - a signing key in use other than the one `keys/signing.key` holds,
 //!   which is the key of the `current` row of `signing_keys` or, when the
 //!   followed log holds no `current` row, the one signing key in use. During
 //!   a rotation the next key is in use too (section 7.5), but the control
 //!   plane of this binary reads one signing key and keeps no file for
-//!   another, so a primary promoted then would lose it;
+//!   another, so a primary promoted then would lose it. The refusal says
+//!   whether the key is a `next` row's;
 //! - a signing seed whose public key is not the key its id names, and a
 //!   data key id that is not 32 lowercase hex characters;
 //! - a TLS pair the listener cannot load, or whose certificate's
@@ -32,26 +33,46 @@
 //!   primary that serves it;
 //! - a data directory that is missing, not a directory or a symbolic link;
 //!   a `keys/` or `tls/` that is a symbolic link or not a directory; and a
-//!   key file that is a symbolic link, is not a regular file, or holds
-//!   anything other than what would be written. A key file is never
-//!   overwritten.
+//!   key file that is a symbolic link, is not a regular file, has more than
+//!   one hard link, or holds anything other than what would be written. A
+//!   key file is never overwritten, and only as many bytes of it are read
+//!   as tell whether it holds what would be written.
+//!
+//! These refusals depend only on the keys, the pinned fingerprint and the
+//! files, so [`PrimaryKeys::check`] makes them all and writes nothing: the
+//! command runs it among the refusals it makes before it changes anything
+//! (section 7.3), before the term, the freeze and the database. Step 6
+//! comes after those, so [`install_keys`] makes the same checks again
+//! before it writes anything.
+//!
+//! The checks look at the tree as it is when they run, and the writes find
+//! each path by its name again. So the guarantee that no key is written or
+//! read through a symbolic link holds for the tree as checked, which is
+//! enough while the data directory and everything below it are root's, as
+//! they are when the command runs and until `prepare::prepare_host` hands
+//! them to `quoro-api`.
 //!
 //! A key file that already holds exactly what would be written is kept, so
-//! a run stopped part-way can be run again. `keys/` and `tls/` are created
-//! `0700`, or made `0700`. Each new file is written under a partial name
-//! next to it, `.<name>.promote-partial`, created exclusively `0600`,
-//! written and synced, then renamed into place without replacing any file
-//! ([`KeyFs`]), and its directory synced. A kept file is made `0600`. A
-//! partial file a stopped run left is removed first. Modes are set through
-//! descriptors opened without following a link.
+//! a run of this function stopped part-way can be run again; when the
+//! command as a whole may be run again is section 7.3's to say.
+//!
+//! `keys/` and `tls/` are created `0700`, or made `0700`. Each new file is
+//! written under a partial name next to it, `.<name>.promote-partial`,
+//! created exclusively `0600`, written and synced, then renamed into place
+//! without replacing any file ([`KeyFs`]), and its directory synced. A kept
+//! file is made `0600`. A partial file a stopped run left is removed first.
+//! Modes are set through descriptors opened without following a link.
 //!
 //! The rename into place goes through [`KeyFs`], so a test can stop a run
 //! between two files. Nothing here needs root: the files are the running
 //! process's, which is root's when the command runs.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::path::{Path, PathBuf};
 
 use quoro_control_plane::custody::TlsIdentity;
@@ -112,6 +133,8 @@ pub(crate) struct PrimaryKeys {
     /// The key id of the `current` row of `signing_keys` in the followed
     /// log, when it holds one.
     pub(crate) current_signing: Option<String>,
+    /// The key id of every `next` row of `signing_keys` in the followed log.
+    pub(crate) next_signing: BTreeSet<String>,
     /// The one data-encryption key in use.
     pub(crate) data: DataKeyBytes,
     /// The TLS certificate chain and private key.
@@ -179,9 +202,46 @@ impl PrimaryKeys {
         Ok(Self {
             signing,
             current_signing: opened.current_signing,
+            next_signing: opened.next_signing,
             data: data.ok_or("no data-encryption key was opened")?,
             tls: tls.ok_or("no TLS key was opened")?,
         })
+    }
+
+    /// Makes every refusal of [`install_keys`] (module documentation) for
+    /// installing these keys into `data_dir`, with `pinned`, the
+    /// fingerprint this machine pins, `sha256:<hex>`. It writes nothing,
+    /// creates nothing and changes no mode.
+    ///
+    /// The command calls it among the refusals it makes before it changes
+    /// anything (`node-agent-protocol.md` section 7.3), so that a key or a
+    /// file step 6 would refuse stops the promotion before the term, the
+    /// freeze and the database. [`install_keys`] makes the same checks again
+    /// before it writes.
+    ///
+    /// # Errors
+    ///
+    /// Every problem found, one message each, without the closing "nothing
+    /// was changed".
+    pub(crate) fn check(&self, pinned: &str, data_dir: &Path) -> Result<(), Vec<String>> {
+        self.plan(pinned, data_dir).map(|_| ())
+    }
+
+    /// The checks of [`Self::check`], returning what to do with each key
+    /// file when they pass, in the order the files are written.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::check`].
+    fn plan(&self, pinned: &str, data_dir: &Path) -> Result<Vec<Step>, Vec<String>> {
+        let mut problems = Vec::new();
+        let files = key_files(self, pinned, &mut problems);
+        let steps = check_tree(data_dir, files, &mut problems);
+        if problems.is_empty() {
+            Ok(steps)
+        } else {
+            Err(problems)
+        }
     }
 }
 
@@ -239,22 +299,33 @@ struct KeyFile {
     dir: &'static str,
     /// Its path under the data directory.
     name: &'static str,
-    /// What it holds, wiped when dropped.
-    bytes: Zeroizing<Vec<u8>>,
+    /// What it holds, wiped when dropped. `None` when its key was refused:
+    /// an existing file is then checked but not compared.
+    bytes: Option<Zeroizing<Vec<u8>>>,
+}
+
+/// What the writes do with one key file.
+struct Step {
+    /// Its directory under the data directory.
+    dir: &'static str,
+    /// Its path under the data directory.
+    name: &'static str,
+    /// What to do with it.
+    action: Action,
 }
 
 /// What the writes do with a key file.
-#[derive(Clone, Copy)]
 enum Action {
-    /// There is none: write it.
-    Write,
+    /// There is none: write these bytes, wiped when dropped.
+    Write(Zeroizing<Vec<u8>>),
     /// It already holds what would be written: keep it.
     Keep,
 }
 
 /// Writes `keys` into `data_dir` where a primary keeps them (module
 /// documentation). `pinned` is the fingerprint this machine pins,
-/// `sha256:<hex>`. Every check runs before anything is written.
+/// `sha256:<hex>`. Every check of [`PrimaryKeys::check`] runs again first,
+/// and nothing is written unless they all pass.
 ///
 /// # Errors
 ///
@@ -268,8 +339,9 @@ pub(crate) fn install_keys(
     fs_calls: &dyn KeyFs,
     out: &mut Out,
 ) -> Result<Installed, String> {
-    let files = key_files(keys, pinned).map_err(|problems| refusal(&problems))?;
-    let actions = check_tree(data_dir, &files).map_err(|problems| refusal(&problems))?;
+    let steps = keys
+        .plan(pinned, data_dir)
+        .map_err(|problems| refusal(&problems))?;
 
     let mut created = false;
     for dir in [KEYS_DIR, TLS_DIR] {
@@ -283,11 +355,11 @@ pub(crate) fn install_keys(
         sync_dir(data_dir)?;
     }
     let mut installed = Installed::default();
-    for (file, action) in files.iter().zip(actions) {
-        let path = data_dir.join(file.name);
+    for step in &steps {
+        let path = data_dir.join(step.name);
         let partial = partial_of(&path);
         remove_if_present(&partial)?;
-        match action {
+        match &step.action {
             Action::Keep => {
                 if keep_private(&path)? {
                     out.say(format!(
@@ -300,13 +372,13 @@ pub(crate) fn install_keys(
                         path.display()
                     ));
                 }
-                installed.kept.push(file.name);
+                installed.kept.push(step.name);
             }
-            Action::Write => {
-                let dir = data_dir.join(file.dir);
-                place(fs_calls, &partial, &path, &dir, &file.bytes)?;
+            Action::Write(bytes) => {
+                let dir = data_dir.join(step.dir);
+                place(fs_calls, &partial, &path, &dir, bytes)?;
                 out.say(format!("wrote {} (0600)", path.display()));
-                installed.written.push(file.name);
+                installed.written.push(step.name);
             }
         }
     }
@@ -319,13 +391,10 @@ fn refusal(problems: &[String]) -> String {
 }
 
 /// The four key files and what each holds, in the order they are written.
-///
-/// # Errors
-///
-/// Every problem with the keys (module documentation).
-fn key_files(keys: &PrimaryKeys, pinned: &str) -> Result<Vec<KeyFile>, Vec<String>> {
-    let mut problems = Vec::new();
-    let seed = signing_seed(keys, &mut problems);
+/// Every problem with the keys (module documentation) is pushed to
+/// `problems`; a file whose key was refused holds `None`.
+fn key_files(keys: &PrimaryKeys, pinned: &str, problems: &mut Vec<String>) -> Vec<KeyFile> {
+    let seed = signing_seed(keys, problems).map(|seed| Zeroizing::new(seed.to_vec()));
     let data = match data_key_bytes(&keys.data) {
         Ok(bytes) => Some(bytes),
         Err(problem) => {
@@ -336,38 +405,36 @@ fn key_files(keys: &PrimaryKeys, pinned: &str) -> Result<Vec<KeyFile>, Vec<Strin
     if let Err(problem) = check_tls(&keys.tls, pinned) {
         problems.push(problem);
     }
-    match (seed, data) {
-        (Some(seed), Some(data)) if problems.is_empty() => Ok(vec![
-            KeyFile {
-                dir: KEYS_DIR,
-                name: SIGNING_FILE,
-                bytes: Zeroizing::new(seed.to_vec()),
-            },
-            KeyFile {
-                dir: KEYS_DIR,
-                name: DATA_FILE,
-                bytes: data,
-            },
-            KeyFile {
-                dir: TLS_DIR,
-                name: CERT_FILE,
-                bytes: Zeroizing::new(keys.tls.cert_pem().as_bytes().to_vec()),
-            },
-            KeyFile {
-                dir: TLS_DIR,
-                name: KEY_FILE,
-                bytes: Zeroizing::new(keys.tls.key_pem().as_bytes().to_vec()),
-            },
-        ]),
-        _ => Err(problems),
-    }
+    vec![
+        KeyFile {
+            dir: KEYS_DIR,
+            name: SIGNING_FILE,
+            bytes: seed,
+        },
+        KeyFile {
+            dir: KEYS_DIR,
+            name: DATA_FILE,
+            bytes: data,
+        },
+        KeyFile {
+            dir: TLS_DIR,
+            name: CERT_FILE,
+            bytes: Some(Zeroizing::new(keys.tls.cert_pem().as_bytes().to_vec())),
+        },
+        KeyFile {
+            dir: TLS_DIR,
+            name: KEY_FILE,
+            bytes: Some(Zeroizing::new(keys.tls.key_pem().as_bytes().to_vec())),
+        },
+    ]
 }
 
 /// The seed `keys/signing.key` holds: the key of the `current` row of
 /// `signing_keys` or, when the followed log holds no `current` row, the one
 /// signing key in use. A seed that is not the key its id names, and every
-/// other signing key in use, is pushed to `problems`, and then there is
-/// none. `None` always comes with a problem.
+/// other signing key in use, with its reason (a rotation's next key or not),
+/// is pushed to `problems`, and then there is none. `None` always comes with
+/// a problem.
 fn signing_seed<'k>(
     keys: &'k PrimaryKeys,
     problems: &mut Vec<String>,
@@ -402,15 +469,20 @@ fn signing_seed<'k>(
         return None;
     };
     for key in &keys.signing {
-        if key.key_id != current.key_id {
-            problems.push(format!(
-                "the signing key {} is in use beside the current key {}, as the next key of a \
-                 rotation (section 7.5); the control plane of this binary reads one signing key, \
-                 {SIGNING_FILE}, and keeps no file for another, so a primary promoted now would \
-                 lose it",
-                key.key_id, current.key_id
-            ));
+        if key.key_id == current.key_id {
+            continue;
         }
+        let reason = if keys.next_signing.contains(&key.key_id) {
+            "as the next key of a rotation (section 7.5)"
+        } else {
+            "as a signing key in use other than the current one"
+        };
+        problems.push(format!(
+            "the signing key {} is in use beside the current key {}, {reason}; the control plane \
+             of this binary reads one signing key, {SIGNING_FILE}, and keeps no file for \
+             another, so a primary promoted now would lose it",
+            key.key_id, current.key_id
+        ));
     }
     (problems.len() == before).then_some(&current.seed)
 }
@@ -441,13 +513,13 @@ fn data_key_bytes(data: &DataKeyBytes) -> Result<Zeroizing<Vec<u8>>, String> {
 
 /// The 16 bytes of a data key id: 32 lowercase hex characters.
 fn key_id_bytes(text: &str) -> Option<[u8; 16]> {
-    let digits = text.as_bytes();
-    if digits.len() != 32 {
+    let (pairs, rest) = text.as_bytes().as_chunks::<2>();
+    if pairs.len() != 16 || !rest.is_empty() {
         return None;
     }
     let mut bytes = [0u8; 16];
-    for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
-        *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    for (byte, [high, low]) in bytes.iter_mut().zip(pairs) {
+        *byte = (nibble(*high)? << 4) | nibble(*low)?;
     }
     Some(bytes)
 }
@@ -504,37 +576,39 @@ fn bare_fingerprint(fingerprint: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Checks `data_dir` and what it holds before anything is written, and
-/// returns what to do with each of `files`.
-///
-/// # Errors
-///
-/// Every problem found (module documentation). A data directory or a
-/// `keys/` or `tls/` that cannot be used stops the checks there.
-fn check_tree(data_dir: &Path, files: &[KeyFile]) -> Result<Vec<Action>, Vec<String>> {
+/// Checks `data_dir` and what it holds, writing nothing, and returns what
+/// to do with each of `files`. Every problem found is pushed to `problems`
+/// (module documentation); the steps hold for the files only when there is
+/// none. A data directory or a `keys/` or `tls/` that cannot be used stops
+/// the checks there.
+fn check_tree(data_dir: &Path, files: Vec<KeyFile>, problems: &mut Vec<String>) -> Vec<Step> {
     let shown = data_dir.display();
     match fs::symlink_metadata(data_dir) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(metadata) if metadata.is_symlink() => {
-            return Err(vec![format!(
+            problems.push(format!(
                 "the data directory {shown} is a symbolic link, and the keys are never written \
                  through a link"
-            )]);
+            ));
+            return Vec::new();
         }
         Ok(_) => {
-            return Err(vec![format!(
-                "the data directory {shown} is not a directory"
-            )]);
+            problems.push(format!("the data directory {shown} is not a directory"));
+            return Vec::new();
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(vec![format!(
+            problems.push(format!(
                 "the data directory {shown} does not exist; the promotion writes the database \
                  there before the keys"
-            )]);
+            ));
+            return Vec::new();
         }
-        Err(e) => return Err(vec![format!("cannot read {shown}: {e}")]),
+        Err(e) => {
+            problems.push(format!("cannot read {shown}: {e}"));
+            return Vec::new();
+        }
     }
-    let mut problems = Vec::new();
+    let before = problems.len();
     for dir in [KEYS_DIR, TLS_DIR] {
         let path = data_dir.join(dir);
         match fs::symlink_metadata(&path) {
@@ -548,23 +622,35 @@ fn check_tree(data_dir: &Path, files: &[KeyFile]) -> Result<Vec<Action>, Vec<Str
             Err(e) => problems.push(format!("cannot read {}: {e}", path.display())),
         }
     }
-    if !problems.is_empty() {
-        return Err(problems);
+    if problems.len() != before {
+        return Vec::new();
     }
-    let mut actions = Vec::with_capacity(files.len());
+    let mut steps = Vec::with_capacity(files.len());
     for file in files {
         let path = data_dir.join(file.name);
-        match existing(&path) {
-            Ok(None) => actions.push(Action::Write),
-            Ok(Some(bytes)) if bytes.as_slice() == file.bytes.as_slice() => {
-                actions.push(Action::Keep);
+        // Read one byte more than the file must hold, so a longer file
+        // differs; with no key to compare, read nothing.
+        let limit = file.bytes.as_ref().map_or(0, |bytes| bytes.len() + 1);
+        match (existing(&path, limit), file.bytes) {
+            (Err(problem), _) => problems.push(problem),
+            (Ok(_), None) => {}
+            (Ok(None), Some(bytes)) => steps.push(Step {
+                dir: file.dir,
+                name: file.name,
+                action: Action::Write(bytes),
+            }),
+            (Ok(Some(held)), Some(bytes)) if held.as_slice() == bytes.as_slice() => {
+                steps.push(Step {
+                    dir: file.dir,
+                    name: file.name,
+                    action: Action::Keep,
+                });
             }
-            Ok(Some(_)) => problems.push(format!(
+            (Ok(Some(_)), Some(_)) => problems.push(format!(
                 "{} exists and holds something else, and a key file is never overwritten: move \
                  it away if it is stale and run this again",
                 path.display()
             )),
-            Err(problem) => problems.push(problem),
         }
         let partial = partial_of(&path);
         if fs::symlink_metadata(&partial).is_ok_and(|metadata| metadata.is_dir()) {
@@ -575,20 +661,17 @@ fn check_tree(data_dir: &Path, files: &[KeyFile]) -> Result<Vec<Action>, Vec<Str
             ));
         }
     }
-    if problems.is_empty() {
-        Ok(actions)
-    } else {
-        Err(problems)
-    }
+    steps
 }
 
-/// What the key file at `path` holds, or `None` when there is none.
+/// The first `limit` bytes of the key file at `path`, or `None` when there
+/// is none.
 ///
 /// # Errors
 ///
-/// A symbolic link, a name that is not a regular file, or a read that
-/// failed.
-fn existing(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+/// A symbolic link, a name that is not a regular file, a file with more
+/// than one hard link, or a read that failed.
+fn existing(path: &Path, limit: usize) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -607,13 +690,38 @@ fn existing(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
         ));
     }
     let unreadable = |e: io::Error| format!("cannot read {}: {e}", path.display());
-    let mut file = open_no_follow(path, OFlags::empty()).map_err(unreadable)?;
-    let capacity = usize::try_from(metadata.len())
-        .unwrap_or(0)
-        .saturating_add(1);
-    let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
-    file.read_to_end(&mut bytes).map_err(unreadable)?;
+    let file = open_no_follow(path, OFlags::empty()).map_err(unreadable)?;
+    let metadata = file.metadata().map_err(unreadable)?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{} exists and is not a regular file",
+            path.display()
+        ));
+    }
+    one_link(path, &metadata)?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(limit));
+    file.take(u64::try_from(limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
     Ok(Some(bytes))
+}
+
+/// Checks that the key file at `path`, of `metadata`, has no name but its
+/// own: a mode set or a key kept through one name would reach the other.
+///
+/// # Errors
+///
+/// A file with more than one hard link.
+fn one_link(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    if metadata.nlink() > 1 {
+        return Err(format!(
+            "{} has {} hard links, and a key file must have only its own name: remove the other \
+             links and run this again",
+            path.display(),
+            metadata.nlink()
+        ));
+    }
+    Ok(())
 }
 
 /// Opens `path` read-only with `flags` added, without following a link at
@@ -658,7 +766,7 @@ fn private_dir(path: &Path) -> Result<bool, String> {
 /// # Errors
 ///
 /// A failed open or mode change, or a name that is no longer a regular
-/// file.
+/// file with one link.
 fn keep_private(path: &Path) -> Result<bool, String> {
     let file = open_no_follow(path, OFlags::empty())
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
@@ -668,6 +776,7 @@ fn keep_private(path: &Path) -> Result<bool, String> {
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
+    one_link(path, &metadata)?;
     if metadata.permissions().mode() & 0o7777 == FILE_MODE {
         return Ok(false);
     }

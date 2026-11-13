@@ -23,7 +23,9 @@
 //!
 //! [`install_keys`] holds the start of step 6: it writes the keys opened
 //! from this machine's seals where a primary keeps them, in the form its
-//! readers read. [`prepare`] holds step 6's host preparation: the control
+//! readers read. Its refusals depend only on the keys and the files, and
+//! its pure check is for the command to run among the refusals before any
+//! change; it is not wired in yet. [`prepare`] holds step 6's host preparation: the control
 //! plane's system user, the hand-over of its data directory, `quoro.toml`,
 //! its unit and its start, then pointing this machine's agent at it.
 //!

@@ -32,8 +32,9 @@
 //! the log and is base64.
 //!
 //! [`open`] makes the same checks and returns what each seal holds, with
-//! the key id of the `current` row of `signing_keys`, for the key
-//! installation of step 6 (`install_keys`); [`check`] returns only the keys.
+//! the key ids of the `current` and `next` rows of `signing_keys`, for the
+//! key installation of step 6 (`install_keys`); [`check`] returns only the
+//! keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -65,6 +66,9 @@ const FINGERPRINT_PREFIX: &str = "sha256:";
 /// The `state` of the `signing_keys` row of the key in use outside a
 /// rotation (section 7.5).
 const CURRENT: &str = "current";
+/// The `state` of the `signing_keys` row of the next key, during a rotation
+/// (section 7.5).
+const NEXT: &str = "next";
 
 /// What the followed log says about the keys.
 #[derive(Debug, Default)]
@@ -73,6 +77,8 @@ struct Ledger {
     signing_keys: BTreeSet<String>,
     /// The key id of the `current` row of `signing_keys`, if there is one.
     current_signing: Option<String>,
+    /// The key id of every `next` row of `signing_keys`.
+    next_signing: BTreeSet<String>,
     /// This machine's seals: `(key_kind, key_id)` to `sealed`, the base64
     /// text a change-log payload carries.
     seals: BTreeMap<(String, String), String>,
@@ -104,6 +110,9 @@ pub(crate) struct Opened {
     /// The key id of the `current` row of `signing_keys` in the followed
     /// log, when it holds one.
     pub(crate) current_signing: Option<String>,
+    /// The key id of every `next` row of `signing_keys` in the followed log:
+    /// during a rotation, the next key (section 7.5).
+    pub(crate) next_signing: BTreeSet<String>,
 }
 
 /// Checks that this machine can open a seal of every key in use, each to
@@ -134,8 +143,8 @@ pub(crate) async fn check(
     })
 }
 
-/// [`check`], returning what each seal holds and the key id of the
-/// `current` row of `signing_keys`.
+/// [`check`], returning what each seal holds and the key ids of the
+/// `current` and `next` rows of `signing_keys`.
 ///
 /// # Errors
 ///
@@ -174,6 +183,7 @@ pub(crate) async fn open(
         Ok(Opened {
             keys,
             current_signing: ledger.current_signing,
+            next_signing: ledger.next_signing,
         })
     } else {
         Err(problems)
@@ -345,8 +355,12 @@ async fn read_ledger(node_id: &str, entries: &[LogEntry]) -> Result<Ledger, Stri
     if let Some(rows) = folded.tables.get(SIGNING_TABLE) {
         for (entity_id, row) in rows {
             let key_id = text(&row.cells, "key_id").unwrap_or(entity_id.as_str());
-            if text(&row.cells, "state") == Some(CURRENT) {
-                ledger.current_signing = Some(key_id.to_string());
+            match text(&row.cells, "state") {
+                Some(CURRENT) => ledger.current_signing = Some(key_id.to_string()),
+                Some(NEXT) => {
+                    ledger.next_signing.insert(key_id.to_string());
+                }
+                _ => {}
             }
             ledger.signing_keys.insert(key_id.to_string());
         }
