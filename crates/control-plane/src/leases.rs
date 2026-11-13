@@ -751,12 +751,15 @@ pub(crate) async fn raise_for_other_lister(
 /// the row when it changed; a lease with no row, or one whose stored
 /// duration is already at least as long, is left as it is.
 ///
-/// Every `expiring` grant calls it, even one no longer than the stored
-/// value, inside the single-writer transaction `w` in which it records the
-/// grant ([`Authority::record_grant`]). The caller commits `w` before it
-/// sends the grant, so a restart after the send counts the raised value,
-/// and a lowering ([`lower_duration`]) never runs between the raise and the
-/// record.
+/// An ordinary answer to a renewal calls it, even one no longer than the
+/// stored value, inside the single-writer transaction `w` in which it
+/// records the grant ([`Authority::record_grant`]). The caller commits `w`
+/// before it sends the grant, so a restart after the send counts the raised
+/// value, and a lowering ([`lower_duration`]) never runs between the raise
+/// and the record. The conversion grant and a maintenance window's `W`
+/// call it in a transaction of their own, which records no grant, and send
+/// the longer grant only once that raise is replicated (section 8.4,
+/// "Changing the mode", section 8.11; ADR 0268).
 ///
 /// [`Authority::record_grant`]: crate::authority::Authority::record_grant
 ///
@@ -1123,10 +1126,12 @@ pub(crate) async fn grant_app_lease(
 /// The answer to a converted lease's first renewal writes the row's `mode`
 /// `expiring`, in the single-writer transaction it commits before the answer
 /// is sent (section 8.4, "Changing the mode", ADR 0244). Nothing else
-/// changes: the token stays (ADR 0258), the stored duration was raised
-/// before the conversion grant went out (ADR 0254), and the mark, which a
-/// converted row does not carry, is kept as any other write keeps it
-/// ("The mark"). Returns the row as written.
+/// changes: the token stays (ADR 0258), the stored duration is already at
+/// least the conversion grant's `D` (a row that stored none, or less, was
+/// raised to `D` and the raise replicated before the grant went out, ADR
+/// 0254, ADR 0268), and the mark, which a converted row does not carry, is
+/// kept as any other write keeps it ("The mark"). Returns the row as
+/// written.
 ///
 /// # Errors
 ///
@@ -1308,6 +1313,29 @@ pub(crate) async fn leave_warm(
         from_expiring,
         hold,
     }))
+}
+
+/// What a policy change onto `warm` finds for the conversion grant (section
+/// 8.4, "Changing the mode": "When the policy becomes `warm`, the primary
+/// sends the holder a `lease_grant` with `mode` `expiring`, the current token
+/// and a duration"), the mirror of [`leave_warm`]. Read in the transaction of
+/// a policy change from a policy that is neither `warm` nor `hot` to `warm`
+/// or `hot`: the app's lease row when it is unrevoked and reads `local`,
+/// marked or not, `None` otherwise. It writes nothing. The raise of
+/// `leases.duration_ms` that the grant may need is made where the grant is
+/// sent, and a marked row's conversion waits there until the mark clears.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn enter_warm(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+) -> Result<Option<Lease>, ApiError> {
+    let Some(lease) = app_lease(conn, app_id).await? else {
+        return Ok(None);
+    };
+    Ok((!lease.is_revoked() && lease.mode == "local").then_some(lease))
 }
 
 /// The write that precedes the resend of the same-token `local` grant when

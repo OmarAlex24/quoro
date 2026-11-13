@@ -271,7 +271,12 @@ mod tests {
     /// holder lists `local` `held` at the row's token, loses the mark in
     /// one change-log entry: `Lease.local_pending` turns false, and a
     /// failover with the holder away finds the lease held because it is
-    /// `local`, not because of the mark.
+    /// `local`, not because of the mark. The unmarked row, listed `local` at
+    /// its token while the policy is `warm`, is then owed the conversion
+    /// grant ("Changing the mode"); as it stores no duration, the
+    /// conversion's first step raises it to `D` in its own entry (ADR 0289,
+    /// [`super::super::convert`]). The test runs that attempt itself, so the
+    /// count does not race the hub's held-grant task.
     #[tokio::test]
     async fn a_marked_local_row_the_holder_reports_local_loses_its_mark() {
         let f = fixture("warm", "local", None, true).await;
@@ -280,11 +285,12 @@ mod tests {
         assert!(marked.contains("unsettled mark"), "{marked}");
         let writes = f.writes().await;
         let (_session, start) = f.session(Some(("held", LeaseMode::Local, 3))).await;
+        f.state.hub.attempt_held().await;
         assert_eq!(
             state(&f).await,
-            ("local".to_string(), 3, None, false, false)
+            ("local".to_string(), 3, Some(15_000), false, false)
         );
-        assert_eq!(f.writes().await, writes + 1);
+        assert_eq!(f.writes().await, writes + 2, "the report, then the raise");
         assert!(!local_pending(&f).await);
         let held = f.held_while_away().await.unwrap();
         assert!(held.contains("its lease is local"), "{held}");
@@ -296,7 +302,10 @@ mod tests {
     /// Test 3: the holder lists the lease `local` at a token above the
     /// row's while the row names it. A row that reads `expiring`, marked or
     /// not, or `local` with the mark, is written `local` at the holder's
-    /// token, unmarked, and the repeat carries that token.
+    /// token, unmarked, and the repeat carries that token. A row that
+    /// stored no duration then has it raised to `D` for the conversion grant
+    /// it is owed (ADR 0289), in its own entry; the test runs that attempt
+    /// itself, so the count does not race the hub's held-grant task.
     #[tokio::test]
     async fn a_holder_above_the_rows_token_is_recorded_at_its_own_token() {
         for (mode, stored, marked) in [
@@ -308,12 +317,14 @@ mod tests {
             let f = fixture("warm", mode, stored, marked).await;
             let writes = f.writes().await;
             let (_session, start) = f.session(Some(("held", LeaseMode::Local, 5))).await;
+            f.state.hub.attempt_held().await;
             assert_eq!(
                 state(&f).await,
-                ("local".to_string(), 5, stored, false, false),
+                ("local".to_string(), 5, Some(15_000), false, false),
                 "{case}"
             );
-            assert_eq!(f.writes().await, writes + 1, "{case}");
+            let raised = i64::from(stored.is_none());
+            assert_eq!(f.writes().await, writes + 1 + raised, "{case}");
             assert_local_repeat(&start, 5);
             f.done().await;
         }

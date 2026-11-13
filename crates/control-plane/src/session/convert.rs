@@ -1,0 +1,1776 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! The conversion grant: the same-token `expiring` grant that converts a
+//! `local` lease when the app's HA policy becomes `warm`
+//! (`node-agent-protocol.md` section 8.4, "Changing the mode", "From R until
+//! the holder has taken the grant", "Settling a lease", "The mark", "Grants
+//! of a marked row" and "What the authority must enforce"; ADR 0241, ADR
+//! 0244, ADR 0254, ADR 0257, ADR 0268, ADR 0289; issue #555).
+//!
+//! - **Held.** The grant is held in the held-grant registry
+//!   ([`super::held`], [`Kind::Convert`]), eligible on one session of the
+//!   holder: the current one after its `hello` when `updateApp` changes the
+//!   policy to `warm` ([`NodeHub::hold_conversion`]), or the session whose
+//!   `hello` listed the lease `local` at the row's token while the policy
+//!   is `warm` ([`NodeHub::hold_conversion_on`]): "When the holder's `hello`
+//!   reports the lease as `local`, the primary sends the conversion grant
+//!   again". A holder with no session holds nothing: its next session start
+//!   decides. A waiting conversion is no wait: it shows no `grant_pending`
+//!   and makes no failover answer `in_progress`, because the lease stays
+//!   `local` until the first answer after it.
+//! - **When it goes.** One pure function ([`convert_step`]) decides from
+//!   the row and the session: no conversion over a marked row; ADR 0257's
+//!   barrier first, the same-token `local` grant and its `ping` sent by the
+//!   entry itself when the session has not shown the holder's mode; a row
+//!   that stores no duration, or one shorter than `D`, raised to `D` first,
+//!   in its own committed write (ADR 0254, ADR 0289); then every conversion
+//!   grant, which carries `D`, only once the row's newest change-log write
+//!   is replicated over the required set, never at once (ADR 0268).
+//! - **The send.** Under the writer gate, the row found again unrevoked,
+//!   naming the entry and reading `local`, the policy `warm`, no failed
+//!   fence, the session ready, its start's grants queued, no conversion in
+//!   flight on it, and majority support for the duration sent (for `D`
+//!   before the barrier or the raise). The grant carries the row's token,
+//!   `mode` `expiring`, the duration and no `re` (ADR 0256). It is queued
+//!   and recorded on the session in one hold of the sessions lock
+//!   ([`NodeHub::queue_conversion`]), which checks the start's grants queued
+//!   and the barrier again, so the session start's same-token `local` repeat
+//!   never reaches the node after it: its first renewal is then answered as
+//!   the first one, writing the row `expiring` ([`super::conversion`]). The
+//!   send writes nothing; the raise is a step of its own, committed before
+//!   any send. The conversion grant counts toward no gate (ADR 0241).
+//! - **A refusal.** A refusal of the grant drops what its send recorded and
+//!   the held entry, writes nothing, and sends no other on that session
+//!   ([`NodeHub::conversion_refused`]): the holder's next `hello` decides.
+//! - **A same-token `local` grant** sent after it ends the conversion in
+//!   flight ([`NodeHub::queue_local_end`]), as R does.
+
+use super::conversion::{self, InFlight};
+use super::held::{Attempt, HeldGrant, Kind};
+use super::local_end::{Barrier, local_end_entry};
+use super::{ControlMessage, NodeHub, lease_token, new_msg_id};
+use crate::authority::DEFAULT_DURATION_MS;
+use crate::changelog::{Actor, ActorType};
+use crate::error::ApiError;
+use crate::leases::{self, Lease};
+
+/// What [`convert_step`] reads, gathered under the writer gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ConvertFacts {
+    /// The row carries the unsettled mark.
+    pub marked: bool,
+    /// ADR 0257's barrier passed for the lease at the row's token on this
+    /// session ([`NodeHub::barrier_passed`]).
+    pub barrier_passed: bool,
+    /// This entry already sent its barrier `local` grant on this session.
+    pub barrier_sent_here: bool,
+    /// The lease row's newest change-log write is replicated over the
+    /// required set.
+    pub newest_replicated: bool,
+    /// The row's stored `duration_ms` ([`stored_ms`]), or `None` for NULL or
+    /// a negative value. A value outside 3 000 to 600 000 ms is kept as it
+    /// is.
+    pub stored_ms: Option<u64>,
+}
+
+/// What one attempt at a conversion does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConvertStep {
+    /// Nothing now; the entry waits.
+    Wait,
+    /// Send the same-token `local` grant and its `ping` first.
+    Barrier,
+    /// Raise `leases.duration_ms` to `D`, commit, and wait for that raise
+    /// to be replicated.
+    RaiseAndWait,
+    /// Send the conversion with `duration_ms`, `D`, writing nothing.
+    Send { duration_ms: u64 },
+}
+
+/// Whether the conversion grant goes out now, and how, in this order
+/// (section 8.4, "Changing the mode" and "From R until the holder has taken
+/// the grant"):
+///
+/// 1. **A marked row waits.** "The primary sends no conversion grant to a
+///    holder whose mode it has not learned on the current session, and none
+///    over a row that carries the mark: the mark clears first ("The mark"
+///    below), by the `pong` after a same-token `local` grant or by the
+///    holder's `local` report, and the conversion goes after that."
+/// 2. **The barrier.** "After it sends a same-token `local` grant for a
+///    lease, the primary therefore sends the node a `ping` (section 5.19),
+///    and it sends no conversion grant for that lease until the node's
+///    `pong` arrives" (ADR 0257); "the holder's next `hello` stands in for
+///    the `pong`" (ADR 0261). "When the policy becomes `warm` on a live
+///    session where neither happened, as when the lease was granted after
+///    the session's `hello`, the primary first sends the holder the
+///    same-token `local` grant and its `ping`, and sends the conversion grant
+///    only after that `pong`. It does so only over a row that carries no
+///    mark. [...] A refusal of the grant before the `pong` ends the
+///    conversion on that session: the primary sends no second such grant on
+///    it, and the holder's next `hello` decides."
+/// 3. **The raise.** "Before it sends a conversion grant, the primary raises
+///    `leases.duration_ms` to at least that grant's duration [...] A grant
+///    longer than the stored duration needs the raise first, so it goes once
+///    that raise is replicated (ADR 0268). A grant no longer than the stored
+///    duration needs no raise and may go without one. A row that stores none
+///    waits for the raise (ADR 0289)." Every conversion grant carries `D`. A
+///    row that stores less than `D`, or none, is raised to `D` in a committed
+///    write of its own, and the entry waits. A row that stores `D` or more,
+///    above 600 000 ms included, needs no raise.
+///
+///    A shorter stored duration is raised rather than sent, which "may"
+///    allows. Sent as it is, the row would read `expiring` with that
+///    duration from the first answer on, and the next ordinary answer would
+///    raise the stored duration to `D` and send `D` at once, in one
+///    transaction (issue #794): a successor promoted with the `expiring`
+///    write but not that raise would count a gate of the shorter duration
+///    while the holder runs on `D` (ADR 0268). Raised here, the raise is
+///    older than the first answer's `expiring` write, so every machine that
+///    holds that write holds `D`, and no later answer of the
+///    converted lease needs a raise.
+/// 4. **The newest write.** "Every conversion grant goes only once the lease
+///    row's newest change-log write is replicated over the required set
+///    ("When R is replicated" below), never at once: the primary may not
+///    have written the stored duration for this conversion, as after its
+///    restart." That holds for a row that needed no raise too. A raise, this
+///    entry's or an earlier primary's, is the row's newest write or older, so
+///    this one wait covers it.
+#[must_use]
+pub(super) fn convert_step(facts: ConvertFacts) -> ConvertStep {
+    if facts.marked {
+        return ConvertStep::Wait;
+    }
+    if !facts.barrier_passed {
+        return if facts.barrier_sent_here {
+            ConvertStep::Wait
+        } else {
+            ConvertStep::Barrier
+        };
+    }
+    if !facts
+        .stored_ms
+        .is_some_and(|stored| stored >= DEFAULT_DURATION_MS)
+    {
+        return ConvertStep::RaiseAndWait;
+    }
+    if facts.newest_replicated {
+        ConvertStep::Send {
+            duration_ms: DEFAULT_DURATION_MS,
+        }
+    } else {
+        ConvertStep::Wait
+    }
+}
+
+/// The row's stored `duration_ms`, or `None` when it stores none or a
+/// negative value. A value outside the range the authority may grant is
+/// kept: one above it covers `D`, one below it is raised ([`convert_step`]).
+fn stored_ms(row: &Lease) -> Option<u64> {
+    row.duration_ms.and_then(|ms| u64::try_from(ms).ok())
+}
+
+/// Whether `row` still owes the conversion `held`: it names the entry
+/// (holder and token), unrevoked, and reads `local`.
+fn owes(row: &Lease, held: &HeldGrant) -> bool {
+    held.names(row) && !row.is_revoked() && row.mode == "local"
+}
+
+impl NodeHub {
+    /// Holds the conversion grant of `lease`, a row that reads `local`, as
+    /// `updateApp` commits a policy change to `warm`
+    /// ([`leases::enter_warm`]): eligible on the holder's current session
+    /// after its `hello`. With no such session it holds nothing: the
+    /// holder's next session start decides, from what its `hello` lists.
+    pub(crate) fn hold_conversion(&self, lease: &Lease) {
+        let live = {
+            let sessions = self.0.sessions.lock().expect("session lock");
+            sessions
+                .get(&lease.holder_node_id)
+                .filter(|handle| handle.hello_recorded)
+                .map(|handle| handle.generation)
+        };
+        let Some(generation) = live else {
+            tracing::info!(
+                lease_id = %lease.id,
+                holder = %lease.holder_node_id,
+                "the holder has no session; its next session start decides the conversion"
+            );
+            return;
+        };
+        self.register_conversion(lease, generation);
+    }
+
+    /// The resend from `hello`: the conversion grant may go out on
+    /// `generation`, whose `hello` listed the lease `local` at the row's
+    /// token while the policy is `warm`.
+    pub(super) fn hold_conversion_on(&self, lease: &Lease, generation: u64) {
+        self.register_conversion(lease, generation);
+    }
+
+    /// Holds the conversion afresh, eligible on `generation`, as
+    /// [`NodeHub::register_local_end`] holds the `local` grant: a grant held
+    /// for a newer token stays, and so does a grant with a new token not
+    /// sent yet for this very row ("Grants of a marked row"); anything else
+    /// is replaced.
+    fn register_conversion(&self, lease: &Lease, generation: u64) {
+        let (held, replaced) = {
+            let mut registry = self.0.held.lock().expect("held grant lock");
+            match registry.entries.get(&lease.id) {
+                Some(held) if held.token > lease.fencing_token => (false, None),
+                Some(held)
+                    if held.kind == Kind::NewToken
+                        && held.names(lease)
+                        && held.sent_on.is_none() =>
+                {
+                    (false, None)
+                }
+                _ => {
+                    let mut held = HeldGrant::of(lease, Some(generation));
+                    held.kind = Kind::Convert;
+                    held.support_ms = DEFAULT_DURATION_MS;
+                    (true, registry.insert(lease.id.clone(), held))
+                }
+            }
+        };
+        if let Some(replaced) = replaced {
+            self.release_held_revoke(&replaced);
+        }
+        if !held {
+            tracing::info!(
+                lease_id = %lease.id,
+                token = lease.fencing_token,
+                "another grant is held for the row; no conversion is held over it"
+            );
+            return;
+        }
+        tracing::info!(
+            lease_id = %lease.id,
+            holder = %lease.holder_node_id,
+            token = lease.fencing_token,
+            generation,
+            "the conversion grant is held"
+        );
+        self.wake_held();
+    }
+
+    /// Whether the held conversion `held` of `lease_id`, not sent yet, is
+    /// owed no more: there is no row, the row no longer names it (holder and
+    /// token), is revoked or no longer reads `local`, or the app's policy is
+    /// no longer `warm`. A marked row still owes it: it waits. With the
+    /// policy off `warm`, R's `local` grant may take its place first
+    /// ([`NodeHub::conversion_off_warm`]).
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub(super) async fn convert_obsolete(
+        &self,
+        lease_id: &str,
+        held: &HeldGrant,
+    ) -> Result<bool, ApiError> {
+        let mut conn = self.0.store.pool().acquire().await?;
+        let Some(row) = leases::by_id(&mut conn, lease_id).await? else {
+            return Ok(true);
+        };
+        if !owes(&row, held) {
+            return Ok(true);
+        }
+        if conversion::app_is_warm(&mut conn, &row.resource_id).await? {
+            return Ok(false);
+        }
+        self.conversion_off_warm(&mut conn, lease_id, held, &row)
+            .await?;
+        Ok(true)
+    }
+
+    /// The policy is off `warm` over `row`, which still owes the held
+    /// conversion `held` of `lease_id`: the conversion is owed no more, and
+    /// the caller drops it. When R's same-token `local` grant is owed for
+    /// `row` (marked, its newest write gave it no new token, as
+    /// [`leases::leave_warm`] reads it), that grant takes the conversion's
+    /// place, in one hold of the registry lock and only while the entry is
+    /// still `held`: a grant held since stays, the conversion of a later
+    /// change back to `warm` included. The caller's drop then finds nothing
+    /// left to drop.
+    ///
+    /// R's commit holds that grant itself ([`NodeHub::end_renewals_committed`]).
+    /// This covers two `updateApp` calls that race: a change to `warm`
+    /// commits, a change off `warm` commits R and holds its grant, and only
+    /// then does the first call hold its conversion, after its own commit,
+    /// replacing R's grant ([`NodeHub::hold_conversion`]). Without this, R's
+    /// grant would wait for the holder's next `hello`.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    async fn conversion_off_warm(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        lease_id: &str,
+        held: &HeldGrant,
+        row: &Lease,
+    ) -> Result<(), ApiError> {
+        if !row.unsettled || leases::newest_write_gave_new_token(conn, lease_id).await? {
+            return Ok(());
+        }
+        let eligible = self.local_end_evidenced(row);
+        let replaced = {
+            let mut registry = self.0.held.lock().expect("held grant lock");
+            if registry.entries.get(lease_id) == Some(held) {
+                registry.insert(lease_id.to_string(), local_end_entry(row, eligible))
+            } else {
+                None
+            }
+        };
+        let Some(replaced) = replaced else {
+            return Ok(());
+        };
+        self.release_held_revoke(&replaced);
+        tracing::info!(
+            lease_id,
+            holder = %row.holder_node_id,
+            token = row.fencing_token,
+            eligible_on = ?eligible,
+            "the policy is off warm: the local grant that ends the renewals takes the held \
+             conversion's place"
+        );
+        self.wake_held();
+        Ok(())
+    }
+
+    /// What [`convert_step`] reads of `row` on `generation`, on `conn`, with
+    /// the entry's `barrier_on`. A row the change log has no entry of has no
+    /// newest write to be replicated, and reads as not replicated.
+    async fn convert_facts(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        row: &Lease,
+        generation: u64,
+        barrier_on: Option<u64>,
+    ) -> Result<ConvertFacts, ApiError> {
+        let newest_replicated = match leases::newest_write_seq(conn, &row.id).await? {
+            Some(seq) => self
+                .replicated(conn, seq)
+                .await
+                .map_err(|e| ApiError::internal(&e))?
+                .is_ok(),
+            None => false,
+        };
+        Ok(ConvertFacts {
+            marked: row.unsettled,
+            barrier_passed: self.barrier_passed(
+                &row.holder_node_id,
+                generation,
+                &row.id,
+                lease_token(row),
+            ),
+            barrier_sent_here: barrier_on == Some(generation),
+            newest_replicated,
+            stored_ms: stored_ms(row),
+        })
+    }
+
+    /// Changes the live entry of `lease_id` in place, keeping its
+    /// registration, only while it is still the conversion registered as
+    /// `registration`. The registry lock is held only for the change.
+    fn change_conversion(
+        &self,
+        lease_id: &str,
+        registration: u64,
+        change: impl FnOnce(&mut HeldGrant),
+    ) {
+        let mut registry = self.0.held.lock().expect("held grant lock");
+        if let Some(entry) = registry
+            .entries
+            .get_mut(lease_id)
+            .filter(|entry| entry.kind == Kind::Convert && entry.registration == registration)
+        {
+            change(entry);
+        }
+    }
+
+    /// One attempt at the conversion `held` of `lease_id` on `generation`
+    /// ([module docs](self)): a read on a pool connection first, which
+    /// leaves a conversion that waits without the writer gate, then every
+    /// condition again under it, where the step is decided and acted on.
+    pub(super) async fn try_send_conversion(
+        &self,
+        lease_id: &str,
+        held: &HeldGrant,
+        generation: u64,
+    ) -> Result<Attempt, ApiError> {
+        {
+            let mut conn = self.0.store.pool().acquire().await?;
+            let Some(row) = leases::by_id(&mut conn, lease_id).await? else {
+                return Ok(Attempt::Drop);
+            };
+            if !owes(&row, held) {
+                return Ok(Attempt::Drop);
+            }
+            if !conversion::app_is_warm(&mut conn, &row.resource_id).await? {
+                self.conversion_off_warm(&mut conn, lease_id, held, &row)
+                    .await?;
+                return Ok(Attempt::Drop);
+            }
+            let facts = self
+                .convert_facts(&mut conn, &row, generation, held.barrier_on)
+                .await?;
+            // Without majority support for what the step would send, or
+            // for `D` before the barrier or the raise, the conversion waits
+            // without taking the writer gate.
+            let needs_ms = match convert_step(facts) {
+                ConvertStep::Wait => return Ok(Attempt::Wait),
+                ConvertStep::Barrier | ConvertStep::RaiseAndWait => DEFAULT_DURATION_MS,
+                ConvertStep::Send { duration_ms } => duration_ms,
+            };
+            if !self.0.authority.supports(needs_ms) {
+                return Ok(Attempt::Wait);
+            }
+        }
+        let mut w = self.0.store.begin_write().await?;
+        let Some(row) = leases::by_id(&mut w.tx, lease_id).await? else {
+            return Ok(Attempt::Drop);
+        };
+        if !owes(&row, held) {
+            return Ok(Attempt::Drop);
+        }
+        // "Changing the mode": the conversion goes while the policy is
+        // `warm`; a policy off `warm` ends it, and R holds the `local` grant.
+        if !conversion::app_is_warm(&mut w.tx, &row.resource_id).await? {
+            self.conversion_off_warm(&mut w.tx, lease_id, held, &row)
+                .await?;
+            return Ok(Attempt::Drop);
+        }
+        // Neither the conversion nor the barrier `local` grant before it is
+        // queued until the session start's grants are, so the start's
+        // same-token `local` repeat cannot follow it on the wire
+        // ([`NodeHub::mark_start_grants_queued`]).
+        if leases::fenced(&mut w.tx, &self.0.unrecorded_failures, &row).await?
+            || !self.session_ready(&row.holder_node_id, generation)
+            || !self.start_grants_queued(&row.holder_node_id, generation)
+        {
+            return Ok(Attempt::Wait);
+        }
+        // Two attempts may read the same entry: only one acts, the one that
+        // finds it still unsent on this session under the writer gate. What
+        // the entry knows is read from the live entry, not from the copy
+        // this attempt took.
+        let live = {
+            let registry = self.0.held.lock().expect("held grant lock");
+            registry
+                .entries
+                .get(lease_id)
+                .filter(|entry| {
+                    entry.kind == Kind::Convert
+                        && entry.registration == held.registration
+                        && entry.names(&row)
+                        && entry.eligible_on == Some(generation)
+                        && entry.sent_on != Some(generation)
+                })
+                .map(|entry| entry.barrier_on)
+        };
+        let Some(barrier_on) = live else {
+            return Ok(Attempt::Wait);
+        };
+        if self
+            .conversion_in_flight(&row.holder_node_id, generation, lease_id)
+            .is_some()
+        {
+            return Ok(Attempt::Wait);
+        }
+        let facts = self
+            .convert_facts(&mut w.tx, &row, generation, barrier_on)
+            .await?;
+        let token = lease_token(&row);
+        let actor = Actor {
+            kind: ActorType::Node,
+            id: row.holder_node_id.clone(),
+        };
+        let full = i64::try_from(DEFAULT_DURATION_MS).unwrap_or(i64::MAX);
+        let step = convert_step(facts);
+        // The barrier and the raise are made only while the grant they
+        // precede could go: a grant of `D` needs majority support (section
+        // 8.8), as the same-token `local` grant that ends the renewals does.
+        if matches!(step, ConvertStep::Barrier | ConvertStep::RaiseAndWait)
+            && !self.0.authority.supports(DEFAULT_DURATION_MS)
+        {
+            return Ok(Attempt::Wait);
+        }
+        let duration_ms = match step {
+            ConvertStep::Wait => return Ok(Attempt::Wait),
+            ConvertStep::Barrier => {
+                let seq = leases::newest_write_seq(&mut w.tx, lease_id).await?;
+                // Section 8.5: a `bad_message` refusal gives the lease back
+                // only on a session whose `hello` listed it `held` or
+                // `uncertain` at the token.
+                let regrant = self.hello_listed(&row.holder_node_id, generation, lease_id, token);
+                let grant_id = new_msg_id();
+                let ping_id = new_msg_id();
+                let grant = ControlMessage::LeaseGrant(row.grant())
+                    .to_frame(&grant_id, None)
+                    .to_text();
+                let ping = ControlMessage::Ping.to_frame(&ping_id, None).to_text();
+                let queued = self.queue_local_end(
+                    &row.holder_node_id,
+                    generation,
+                    &Barrier {
+                        lease_id: lease_id.to_string(),
+                        token,
+                        seq,
+                    },
+                    &grant_id,
+                    regrant,
+                    true,
+                    &ping_id,
+                    &[grant, ping],
+                );
+                if queued {
+                    self.change_conversion(lease_id, held.registration, |entry| {
+                        entry.barrier_on = Some(generation);
+                    });
+                }
+                drop(w);
+                if queued {
+                    tracing::info!(
+                        lease_id,
+                        node_id = %row.holder_node_id,
+                        token,
+                        "the same-token local grant and its ping went out before the conversion"
+                    );
+                }
+                // The `pong` wakes the held grants ([`Session::on_barrier_pong`]).
+                return Ok(Attempt::Wait);
+            }
+            ConvertStep::RaiseAndWait => {
+                // The raise is committed on its own; no grant goes with it.
+                // It is the row's newest write, so the next attempt sends
+                // only once it is replicated ([`convert_step`]).
+                let raised = leases::raise_duration(&mut w, lease_id, full, &actor).await?;
+                if raised.is_none() {
+                    tracing::warn!(
+                        lease_id,
+                        duration_ms = ?row.duration_ms,
+                        "the stored duration cannot be raised; the conversion waits"
+                    );
+                    return Ok(Attempt::Wait);
+                }
+                let seq = leases::newest_write_seq(&mut w.tx, lease_id).await?;
+                w.commit().await?;
+                tracing::info!(
+                    lease_id,
+                    seq = ?seq,
+                    "the stored duration is raised before the conversion; it waits for the raise \
+                     to be replicated"
+                );
+                return Ok(Attempt::Wait);
+            }
+            ConvertStep::Send { duration_ms } => {
+                if !self.0.authority.supports(duration_ms) {
+                    return Ok(Attempt::Wait);
+                }
+                // The row's newest write is replicated, read under this
+                // writer gate ([`convert_step`]); nothing is written.
+                let sent = self.send_conversion(&row, generation, duration_ms);
+                drop(w);
+                if !sent {
+                    return Ok(Attempt::Wait);
+                }
+                duration_ms
+            }
+        };
+        self.change_conversion(lease_id, held.registration, |entry| {
+            entry.sent_on = Some(generation);
+        });
+        tracing::info!(
+            lease_id,
+            node_id = %row.holder_node_id,
+            token,
+            duration_ms,
+            "the conversion grant went out"
+        );
+        Ok(Attempt::Sent)
+    }
+
+    /// Builds the conversion grant of `row` for `duration_ms` and queues and
+    /// records it on `generation` ([`NodeHub::queue_conversion`]): the row's
+    /// grant with `mode` `expiring`, the row's token, the duration, the
+    /// authority's wall-clock time, and no `re` (ADR 0256). Returns whether
+    /// it was queued and recorded.
+    fn send_conversion(&self, row: &Lease, generation: u64, duration_ms: u64) -> bool {
+        let token = lease_token(row);
+        let mut grant = row.grant();
+        grant.mode = quoro_proto::LeaseMode::Expiring;
+        grant.fencing_token = token;
+        grant.duration_ms = Some(duration_ms);
+        grant.granted_at = crate::store::format_rfc3339(time::OffsetDateTime::now_utc());
+        let grant_id = new_msg_id();
+        let frame = ControlMessage::LeaseGrant(grant)
+            .to_frame(&grant_id, None)
+            .to_text();
+        self.queue_conversion(
+            &row.holder_node_id,
+            generation,
+            &row.id,
+            InFlight { token, duration_ms },
+            &grant_id,
+            frame,
+        )
+    }
+
+    /// Queues `frame`, the conversion grant `grant_id` of `lease_id`, on
+    /// `generation`'s channel and records it on the session, in one hold of
+    /// the sessions lock that finds `generation` still the node's session,
+    /// its start's grants queued ([`NodeHub::mark_start_grants_queued`]),
+    /// and ADR 0257's barrier passed for the lease at `in_flight`'s token
+    /// under that same lock. The channel goes out after the outbox, so the
+    /// session start's same-token `local` repeat, queued on the outbox,
+    /// cannot follow the conversion and end it. Recorded only once the
+    /// frame is queued: the conversion in flight, so its first renewal is
+    /// answered as the first one ([`super::conversion`]); the end of the
+    /// `local` grant's refusal of renewals ("From R …", Renewals: "until a
+    /// conversion grant follows"); and the grant's message id, for a refusal
+    /// of it. Every reader of these takes this lock, so none sees the frame
+    /// queued without the record. Returns whether it was queued and
+    /// recorded.
+    pub(super) fn queue_conversion(
+        &self,
+        node_id: &str,
+        generation: u64,
+        lease_id: &str,
+        in_flight: InFlight,
+        grant_id: &str,
+        frame: String,
+    ) -> bool {
+        let mut sessions = self.0.sessions.lock().expect("session lock");
+        let Some(handle) = sessions
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+        else {
+            return false;
+        };
+        if !handle.start_grants_queued {
+            tracing::debug!(
+                lease_id,
+                node_id,
+                "no conversion grant before the session start's grants are queued"
+            );
+            return false;
+        }
+        if !handle.local_end.barrier_passed(lease_id, in_flight.token) {
+            tracing::warn!(
+                lease_id,
+                node_id,
+                "no conversion grant before the barrier's pong (ADR 0257)"
+            );
+            return false;
+        }
+        if handle.tx.send(frame).is_err() {
+            return false;
+        }
+        handle.conversions.insert(lease_id.to_string(), in_flight);
+        handle.local_sent.remove(lease_id);
+        handle
+            .conversion_grants
+            .insert(grant_id.to_string(), (lease_id.to_string(), in_flight));
+        true
+    }
+
+    /// The conversion grant `re` that `generation` sent, if it is one, taken
+    /// off the session: the lease and what it carried.
+    pub(super) fn take_conversion_grant(
+        &self,
+        node_id: &str,
+        generation: u64,
+        re: &str,
+    ) -> Option<(String, InFlight)> {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+            .and_then(|handle| handle.conversion_grants.remove(re))
+    }
+
+    /// The holder refused the conversion grant of `lease_id` that
+    /// `generation` sent with `in_flight`: the conversion is no longer in
+    /// flight on that session (a later one recorded since stays), and the
+    /// lease's held conversion eligible on that session at that token is
+    /// dropped, so no other goes out there. Nothing is written: the row
+    /// still reads `local`, and the holder's next `hello` decides. The
+    /// sessions lock and the registry lock are taken one after the other.
+    pub(super) fn conversion_refused(
+        &self,
+        node_id: &str,
+        generation: u64,
+        lease_id: &str,
+        in_flight: InFlight,
+    ) {
+        self.conversion_answered(node_id, generation, lease_id, in_flight);
+        let dropped = {
+            let mut registry = self.0.held.lock().expect("held grant lock");
+            let refused = registry.entries.get(lease_id).is_some_and(|entry| {
+                entry.kind == Kind::Convert
+                    && entry.holder == node_id
+                    && entry.eligible_on == Some(generation)
+                    && u64::try_from(entry.token).ok() == Some(in_flight.token)
+            });
+            if refused {
+                registry.entries.remove(lease_id)
+            } else {
+                None
+            }
+        };
+        if let Some(dropped) = dropped {
+            self.release_held_revoke(&dropped);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::conversion::InFlight;
+    use super::super::conversion::tests::{
+        EverySupport, Fixture, LEASE, assert_answer, end_renewals, fixture, of_type, ping_of, pong,
+        renew, restart, set_policy, write_row,
+    };
+    use super::super::held::{HeldGrant, Kind};
+    use super::super::local_end::tests::{
+        Live, NoSupport, ack, created, grant_then_ping, live, queued, r, refuse, view,
+    };
+    use super::{ConvertFacts, ConvertStep, convert_step};
+    use crate::AppState;
+    use crate::authority::{DEFAULT_DURATION_MS, VoterSupport};
+    use quoro_proto::{ErrorCode, LeaseMode};
+    use serde_json::Value;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    const D: u64 = DEFAULT_DURATION_MS;
+
+    /// Support for the first question asked from the task that built it,
+    /// none after it and none for any other task: the hub's own held-grant
+    /// task, which may attempt alongside the test's, never takes it.
+    #[derive(Debug)]
+    struct SupportOnce {
+        asker: Option<tokio::task::Id>,
+        given: AtomicBool,
+    }
+
+    impl SupportOnce {
+        fn here() -> Self {
+            Self {
+                asker: tokio::task::try_id(),
+                given: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl VoterSupport for SupportOnce {
+        fn supports(&self, _duration_ms: u64) -> bool {
+            tokio::task::try_id() == self.asker && !self.given.swap(true, Ordering::SeqCst)
+        }
+    }
+
+    /// The conversion grants among `frames`: `lease_grant`s of the lease
+    /// with `mode` `expiring`.
+    fn conversions(frames: &[Value]) -> Vec<&Value> {
+        frames
+            .iter()
+            .filter(|frame| {
+                frame["type"] == "lease_grant"
+                    && frame["body"]["lease_id"] == LEASE
+                    && frame["body"]["mode"] == "expiring"
+            })
+            .collect()
+    }
+
+    /// The `local` grants of the lease among `frames`.
+    fn local_grants(frames: &[Value]) -> Vec<&Value> {
+        frames
+            .iter()
+            .filter(|frame| {
+                frame["type"] == "lease_grant"
+                    && frame["body"]["lease_id"] == LEASE
+                    && frame["body"]["mode"] == "local"
+            })
+            .collect()
+    }
+
+    /// The one conversion grant among `frames`: the row's `token`,
+    /// `duration_ms`, and no `re`. Returns its message id. The hub's own
+    /// held-grant task may attempt alongside the test's; one entry sends
+    /// one conversion per session, so the count holds.
+    fn the_conversion(frames: &[Value], token: u64, duration_ms: u64) -> String {
+        let grants = conversions(frames);
+        assert_eq!(grants.len(), 1, "{frames:?}");
+        let grant = grants[0];
+        assert!(grant["re"].is_null(), "{grant}");
+        assert_eq!(grant["body"]["fencing_token"], token, "{grant}");
+        assert_eq!(grant["body"]["duration_ms"], duration_ms, "{grant}");
+        grant["id"].as_str().unwrap().to_string()
+    }
+
+    /// The held entry of the lease, if any.
+    fn entry(state: &AppState) -> Option<HeldGrant> {
+        state.hub.0.held.lock().unwrap().entries.get(LEASE).cloned()
+    }
+
+    /// The message ids of the conversion grants the node's session recorded.
+    fn grant_ids(state: &AppState, node_id: &str) -> Vec<String> {
+        state
+            .hub
+            .0
+            .sessions
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .map(|handle| handle.conversion_grants.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The `seq` of the lease's newest change-log write.
+    async fn newest(f: &Fixture) -> u64 {
+        let mut conn = f.state.store.pool().acquire().await.unwrap();
+        crate::leases::newest_write_seq(&mut conn, LEASE)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The first renewal after the conversion at `token` is answered, the
+    /// row reads `expiring`, and the gate counts `D`: `T_grant + D + 2 x
+    /// 1.5 s` on the primary's monotonic clock.
+    async fn first_answer_counts_d(f: &Fixture, on: &mut Live, token: u64) {
+        let answer = renew(&mut on.session, "msg_first", token).await;
+        assert_answer(&answer, "msg_first", token, D);
+        assert_eq!(f.row().await.mode, "expiring");
+        let authority = f.state.hub.authority();
+        f.clock.advance(Duration::from_millis(17_999));
+        assert!(!authority.passed(LEASE), "the gate counts D");
+        f.clock.advance(Duration::from_millis(1));
+        assert!(authority.passed(LEASE));
+    }
+
+    /// A live session whose `hello` listed the lease `local` at 3, over the
+    /// fixture's row (with its creation entry), the conversion sent on it.
+    async fn converted(f: &Fixture) -> Live {
+        created(f).await;
+        let mut on = live(&f.state, f, Some(("held", LeaseMode::Local, 3))).await;
+        ack(&f.state, f, &on).await;
+        f.state.hub.attempt_held().await;
+        the_conversion(&queued(&mut on), 3, D);
+        on
+    }
+
+    fn facts() -> ConvertFacts {
+        ConvertFacts {
+            marked: false,
+            barrier_passed: true,
+            barrier_sent_here: false,
+            newest_replicated: true,
+            stored_ms: Some(D),
+        }
+    }
+
+    /// Test 1: [`convert_step`] over every branch, in its order: the mark,
+    /// the barrier, a row that stores no duration or one below `D`, which is
+    /// raised, then the row's newest write, which every conversion grant
+    /// waits for, one over a row that needed no raise included (section 8.4,
+    /// "Changing the mode").
+    #[test]
+    fn convert_step_decides_in_its_order() {
+        let send = ConvertStep::Send { duration_ms: D };
+        assert_eq!(convert_step(facts()), send);
+
+        // A marked row waits, whatever else holds.
+        for marked in [
+            ConvertFacts {
+                marked: true,
+                ..facts()
+            },
+            ConvertFacts {
+                marked: true,
+                barrier_passed: false,
+                stored_ms: None,
+                ..facts()
+            },
+        ] {
+            assert_eq!(convert_step(marked), ConvertStep::Wait, "{marked:?}");
+        }
+
+        // The barrier: sent once on a session, then waited on.
+        for before in [
+            ConvertFacts {
+                barrier_passed: false,
+                ..facts()
+            },
+            ConvertFacts {
+                barrier_passed: false,
+                stored_ms: None,
+                newest_replicated: false,
+                ..facts()
+            },
+        ] {
+            assert_eq!(convert_step(before), ConvertStep::Barrier, "{before:?}");
+        }
+        assert_eq!(
+            convert_step(ConvertFacts {
+                barrier_passed: false,
+                barrier_sent_here: true,
+                ..facts()
+            }),
+            ConvertStep::Wait
+        );
+
+        // A row that stores no duration, or one below `D` (below the
+        // shortest valid one included), is raised to `D` first, whether or
+        // not its newest write is replicated: no grant goes with the stored
+        // duration.
+        for stored in [
+            None,
+            Some(1),
+            Some(1_000),
+            Some(3_000),
+            Some(5_000),
+            Some(D - 1),
+        ] {
+            for newest_replicated in [true, false] {
+                assert_eq!(
+                    convert_step(ConvertFacts {
+                        stored_ms: stored,
+                        newest_replicated,
+                        ..facts()
+                    }),
+                    ConvertStep::RaiseAndWait,
+                    "stored {stored:?}, newest replicated: {newest_replicated}"
+                );
+            }
+        }
+
+        // A row that stores `D` or more, above the longest valid duration
+        // included, needs no raise: it waits for its newest write, then
+        // sends `D`.
+        for stored in [D, 30_000, 600_000, 700_000, u64::MAX] {
+            assert_eq!(
+                convert_step(ConvertFacts {
+                    stored_ms: Some(stored),
+                    newest_replicated: false,
+                    ..facts()
+                }),
+                ConvertStep::Wait,
+                "stored {stored}, the newest write not replicated"
+            );
+            assert_eq!(
+                convert_step(ConvertFacts {
+                    stored_ms: Some(stored),
+                    ..facts()
+                }),
+                ConvertStep::Send { duration_ms: D },
+                "stored {stored}, the newest write replicated"
+            );
+        }
+    }
+
+    /// Test 2: no conversion goes while the row's newest write is not
+    /// acknowledged by a machine of the required set, nor without majority
+    /// support for `D`, also when support goes between the attempt's first
+    /// read and its send. Then it goes, `expiring` at the row's token for `D`
+    /// with no `re`, recorded on the session in flight, with its message id,
+    /// and the row is not written. Before the barrier passed, the hold of the
+    /// sessions lock that queues it refuses it.
+    #[tokio::test]
+    async fn no_conversion_goes_before_its_conditions() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let writes = f.writes().await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        let generation = on.session.generation;
+        let held = entry(&f.state).expect("the hello's listing holds the conversion");
+        assert_eq!(
+            (held.kind, held.eligible_on, held.sent_on),
+            (Kind::Convert, Some(generation), None)
+        );
+
+        hub.attempt_held().await;
+        assert!(conversions(&queued(&mut on)).is_empty(), "not replicated");
+
+        hub.set_voter_support(Arc::new(NoSupport));
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        assert!(conversions(&queued(&mut on)).is_empty(), "no support");
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+
+        // Support lost between the attempt's first read and its send under
+        // the writer gate: the send asks again, and nothing goes.
+        let once = Arc::new(SupportOnce::here());
+        hub.set_voter_support(once.clone());
+        hub.attempt_held().await;
+        assert!(
+            once.given.load(Ordering::SeqCst),
+            "the attempt's first read had support"
+        );
+        assert!(
+            conversions(&queued(&mut on)).is_empty(),
+            "support lost before the send"
+        );
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+
+        hub.set_voter_support(Arc::new(EverySupport));
+        hub.attempt_held().await;
+        let id = the_conversion(&queued(&mut on), 3, D);
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            Some(InFlight {
+                token: 3,
+                duration_ms: D
+            })
+        );
+        assert_eq!(grant_ids(&f.state, &f.node_id), vec![id]);
+        assert_eq!(entry(&f.state).unwrap().sent_on, Some(generation));
+        assert_eq!(f.row().await.mode, "local", "the send writes nothing");
+        assert_eq!(f.writes().await, writes);
+        f.done().await;
+
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, None).await;
+        let generation = on.session.generation;
+        assert!(!hub.barrier_passed(&f.node_id, generation, LEASE, 3));
+        let in_flight = InFlight {
+            token: 3,
+            duration_ms: D,
+        };
+        assert!(!hub.queue_conversion(
+            &f.node_id,
+            generation,
+            LEASE,
+            in_flight,
+            "msg_before_the_barrier",
+            "{}".to_string(),
+        ));
+        assert!(queued(&mut on).is_empty());
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+        assert!(grant_ids(&f.state, &f.node_id).is_empty());
+        f.done().await;
+    }
+
+    /// Test 3, the barrier on a live session: the session's `hello` did not
+    /// list the lease (as when it was granted after the `hello`), so no
+    /// barrier has passed. The entry sends the same-token `local` grant and
+    /// its `ping` first, once; no conversion goes before the `pong`. After
+    /// the `pong`, the conversion goes, with no second barrier grant. A
+    /// refusal of the barrier grant before the `pong` passes no barrier:
+    /// no conversion, and no second barrier grant on that session.
+    #[tokio::test]
+    async fn the_barrier_goes_first_on_a_session_that_has_not_shown_the_mode() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, None).await;
+        let generation = on.session.generation;
+        assert!(!hub.barrier_passed(&f.node_id, generation, LEASE, 3));
+        hub.hold_conversion(&f.row().await);
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        let (_grant, ping) = grant_then_ping(&queued(&mut on), 3);
+        assert_eq!(entry(&f.state).unwrap().barrier_on, Some(generation));
+        hub.attempt_held().await;
+        assert!(
+            queued(&mut on).is_empty(),
+            "one barrier grant, and no conversion before its pong"
+        );
+
+        pong(&mut on.session, &ping).await;
+        assert!(hub.barrier_passed(&f.node_id, generation, LEASE, 3));
+        hub.attempt_held().await;
+        let sent = queued(&mut on);
+        the_conversion(&sent, 3, D);
+        assert!(local_grants(&sent).is_empty(), "no second barrier grant");
+        assert_eq!(f.row().await.mode, "local");
+        f.done().await;
+
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, None).await;
+        let generation = on.session.generation;
+        hub.hold_conversion(&f.row().await);
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        let (grant, ping) = grant_then_ping(&queued(&mut on), 3);
+        refuse(&mut on.session, &grant, ErrorCode::NotFound).await;
+        pong(&mut on.session, &ping).await;
+        assert!(!hub.barrier_passed(&f.node_id, generation, LEASE, 3));
+        hub.attempt_held().await;
+        assert!(
+            queued(&mut on).is_empty(),
+            "no conversion, and no second barrier grant on this session"
+        );
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+        f.done().await;
+    }
+
+    /// Test 4, R after the conversion: a conversion in flight, then R, then
+    /// the same-token `local` grant on the same session. The conversion is
+    /// no longer in flight and its message id is gone; no renewal is
+    /// answered after the grant, and the row is never written `expiring`.
+    #[tokio::test]
+    async fn the_local_grant_after_r_ends_a_conversion_in_flight() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        let mut on = converted(&f).await;
+        let hub = &f.state.hub;
+        let generation = on.session.generation;
+        assert!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE)
+                .is_some()
+        );
+        assert_eq!(grant_ids(&f.state, &f.node_id).len(), 1);
+
+        r(&f).await;
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        grant_then_ping(&queued(&mut on), 3);
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+        assert!(grant_ids(&f.state, &f.node_id).is_empty());
+
+        let writes = f.writes().await;
+        let answer = renew(&mut on.session, "msg_r1", 3).await;
+        assert!(of_type(&answer, "lease_grant").is_empty(), "{answer:?}");
+        assert_eq!(f.row().await.mode, "local");
+        assert_eq!(f.writes().await, writes);
+        f.done().await;
+    }
+
+    /// Test 5: a conversion whose frame is not queued, on a moved
+    /// generation or a closed channel, records nothing: no conversion in
+    /// flight, the session's same-token `local` grant still refuses
+    /// renewals, no message id, and the held entry is not marked sent.
+    #[tokio::test]
+    async fn a_conversion_not_queued_records_nothing() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let Live { session, rx, .. } =
+            live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        let generation = session.generation;
+        let local_sent = hub.local_grant_sent(&f.node_id, generation, LEASE);
+        assert!(local_sent.is_some(), "the session start's local repeat");
+        let in_flight = InFlight {
+            token: 3,
+            duration_ms: D,
+        };
+        assert!(!hub.queue_conversion(
+            &f.node_id,
+            generation + 1,
+            LEASE,
+            in_flight,
+            "msg_moved",
+            "{}".to_string(),
+        ));
+        drop(rx);
+        assert!(!hub.queue_conversion(
+            &f.node_id,
+            generation,
+            LEASE,
+            in_flight,
+            "msg_closed",
+            "{}".to_string(),
+        ));
+        hub.count_log_ack(&f.node_id, generation, newest(&f).await);
+        hub.attempt_held().await;
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+        assert_eq!(
+            hub.local_grant_sent(&f.node_id, generation, LEASE),
+            local_sent
+        );
+        assert!(grant_ids(&f.state, &f.node_id).is_empty());
+        assert_eq!(entry(&f.state).unwrap().sent_on, None);
+        drop(session);
+        f.done().await;
+    }
+
+    /// Test 6, the raise, from a session start: a row that reads `local`
+    /// under `warm` and stores no duration has nothing shorter to send
+    /// (ADR 0289). The conversion held from the `hello`'s listing raises
+    /// `duration_ms` to `D` in its own entry and waits, with no second
+    /// raise, until that raise is acknowledged. The wait is for the row's
+    /// newest write, not for the entry's own raise: with a later write of
+    /// the row, an acknowledged raise sends nothing until that write is
+    /// acknowledged too. Then it sends `D`. The first renewal is answered
+    /// and the gate counts `D`.
+    #[tokio::test]
+    async fn a_row_with_no_duration_is_raised_then_converted_once_the_raise_is_replicated() {
+        let f = fixture("warm", "local", None, false).await;
+        created(&f).await;
+        let writes = f.writes().await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        hub.attempt_held().await;
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.duration_ms),
+            ("local", Some(D as i64))
+        );
+        assert_eq!(f.writes().await, writes + 1, "the raise, in its own entry");
+        assert!(conversions(&queued(&mut on)).is_empty(), "not replicated");
+        hub.attempt_held().await;
+        assert!(conversions(&queued(&mut on)).is_empty(), "not replicated");
+        assert_eq!(f.writes().await, writes + 1, "raised once");
+
+        // Another write of the row lands after the raise, and the raise is
+        // acknowledged only then, so the hub's own held-grant task never
+        // sees the raise acknowledged as the newest write.
+        let raise = newest(&f).await;
+        created(&f).await;
+        hub.count_log_ack(&f.node_id, on.session.generation, raise);
+        hub.attempt_held().await;
+        assert!(
+            conversions(&queued(&mut on)).is_empty(),
+            "the raise is acknowledged, the row's newest write is not"
+        );
+
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        the_conversion(&queued(&mut on), 3, D);
+        first_answer_counts_d(&f, &mut on, 3).await;
+        f.done().await;
+    }
+
+    /// Test 6, the raise, after a `local` grant with a new token (as a
+    /// restore or `grant_app_lease` with `keep_local` writes it): the row
+    /// reads `local` at 4 with the mark and no duration. The holder's
+    /// `hello` lists it `local` at 4: the report clears the mark, then the
+    /// conversion raises the duration, waits for the raise, and sends `D`
+    /// at 4. The first renewal is answered and the gate counts `D`.
+    #[tokio::test]
+    async fn a_new_token_local_row_is_raised_then_converted() {
+        let f = fixture("warm", "local", None, true).await;
+        created(&f).await;
+        write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
+        let writes = f.writes().await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 4))).await;
+        hub.attempt_held().await;
+        let row = f.row().await;
+        assert_eq!(
+            (
+                row.mode.as_str(),
+                row.fencing_token,
+                row.unsettled,
+                row.duration_ms
+            ),
+            ("local", 4, false, Some(D as i64))
+        );
+        assert_eq!(
+            f.writes().await,
+            writes + 2,
+            "the report clears the mark, then the raise"
+        );
+        assert!(conversions(&queued(&mut on)).is_empty(), "not replicated");
+
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        the_conversion(&queued(&mut on), 4, D);
+        first_answer_counts_d(&f, &mut on, 4).await;
+        f.done().await;
+    }
+
+    /// Test 7: a refused conversion. What its send recorded goes, the held
+    /// entry is dropped, nothing is written, and nothing is sent again on
+    /// that session. The next session's `hello`, listing the lease `local`,
+    /// sends it again.
+    #[tokio::test]
+    async fn a_refused_conversion_goes_again_only_after_the_next_hello() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        let mut on = converted(&f).await;
+        let hub = &f.state.hub;
+        let generation = on.session.generation;
+        let id = grant_ids(&f.state, &f.node_id).pop().unwrap();
+        let writes = f.writes().await;
+        refuse(&mut on.session, &id, ErrorCode::NotFound).await;
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+        assert!(grant_ids(&f.state, &f.node_id).is_empty());
+        assert!(entry(&f.state).is_none(), "the held conversion is dropped");
+        assert_eq!(f.writes().await, writes, "nothing is written");
+        assert_eq!(f.row().await.mode, "local");
+        hub.attempt_held().await;
+        assert!(queued(&mut on).is_empty(), "no retry on this session");
+
+        let mut next = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        ack(&f.state, &f, &next).await;
+        hub.attempt_held().await;
+        the_conversion(&queued(&mut next), 3, D);
+        f.done().await;
+    }
+
+    /// Test 8: a conversion that waits (here on its raise) is no wait: no
+    /// `grant_pending`, nothing in `grant_waiting_on`, and `failoverApp`'s
+    /// `in_progress` check finds nothing.
+    #[tokio::test]
+    async fn a_waiting_conversion_is_no_wait() {
+        let f = fixture("warm", "local", None, false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let _on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        hub.attempt_held().await;
+        assert_eq!(entry(&f.state).map(|held| held.kind), Some(Kind::Convert));
+        assert_eq!(view(&f.state, &f).await, (false, Vec::new(), false));
+        assert!(!hub.row_grant_pending(&f.row().await));
+        assert!(!hub.grant_pending(LEASE));
+        f.done().await;
+    }
+
+    /// Test 9: a `local` row under `warm` that carries the mark (R's, the
+    /// policy back on `warm`) gets no conversion: neither the barrier nor
+    /// the grant goes, and the entry waits. The next `hello`'s `local`
+    /// report clears the mark, and the conversion goes.
+    #[tokio::test]
+    async fn a_marked_local_row_waits_for_its_mark_to_clear() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, None).await;
+        end_renewals(&f).await;
+        set_policy(&f, "warm").await;
+        let row = f.row().await;
+        assert!(row.unsettled);
+        hub.hold_conversion(&row);
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        assert!(
+            queued(&mut on).is_empty(),
+            "no barrier and no conversion over a marked row"
+        );
+        assert_eq!(entry(&f.state).map(|held| held.kind), Some(Kind::Convert));
+        // The waiting conversion is no wait, on a marked row too: the row
+        // shows `local_pending`, as any marked `local` row does, but no
+        // `grant_pending` and nothing in `grant_waiting_on`.
+        assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
+        assert!(!hub.row_grant_pending(&f.row().await));
+        assert!(!hub.grant_pending(LEASE));
+        drop(on);
+
+        let mut next = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        assert!(!f.row().await.unsettled, "the local report clears the mark");
+        ack(&f.state, &f, &next).await;
+        hub.attempt_held().await;
+        the_conversion(&queued(&mut next), 3, D);
+        f.done().await;
+    }
+
+    /// Test 10: the policy leaves `warm` before the conversion went out:
+    /// R's same-token `local` grant replaces the held conversion, and only
+    /// that grant and its `ping` go out.
+    #[tokio::test]
+    async fn leaving_warm_before_the_send_replaces_the_conversion() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        assert_eq!(entry(&f.state).map(|held| held.kind), Some(Kind::Convert));
+        r(&f).await;
+        assert_eq!(entry(&f.state).map(|held| held.kind), Some(Kind::LocalEnd));
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        grant_then_ping(&queued(&mut on), 3);
+        f.done().await;
+    }
+
+    /// Test 11: a holder with no session holds nothing; its next session
+    /// start, whose `hello` lists the lease `local`, holds the conversion on
+    /// that session, and it goes.
+    #[tokio::test]
+    async fn a_holder_away_gets_the_conversion_from_its_next_session_start() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        hub.hold_conversion(&f.row().await);
+        assert!(entry(&f.state).is_none());
+
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        let held = entry(&f.state).unwrap();
+        assert_eq!(
+            (held.kind, held.eligible_on),
+            (Kind::Convert, Some(on.session.generation))
+        );
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        the_conversion(&queued(&mut on), 3, D);
+        f.done().await;
+    }
+
+    /// Test 12, a session cut between the conversion and its first answer.
+    /// The next `hello` lists the lease `expiring`: the lease is settled,
+    /// and the row reads `expiring` only after the `pong`, with no second
+    /// conversion. It lists it `local`: the conversion goes again. It lists
+    /// it `expired`: the existing regrant gives it back at a new token, and
+    /// no conversion goes at the old one.
+    #[tokio::test]
+    async fn a_session_cut_before_the_first_answer_is_decided_by_the_next_hello() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        drop(converted(&f).await);
+        let mut next = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
+        let answer = renew(&mut next.session, "msg_r1", 3).await;
+        assert_answer(&answer, "msg_r1", 3, D);
+        let ping = ping_of(&answer);
+        assert_eq!(f.row().await.mode, "local", "not before the pong");
+        pong(&mut next.session, &ping).await;
+        assert_eq!(f.row().await.mode, "expiring");
+        f.state.hub.attempt_held().await;
+        assert!(conversions(&queued(&mut next)).is_empty());
+        f.done().await;
+
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        drop(converted(&f).await);
+        let mut next = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        ack(&f.state, &f, &next).await;
+        f.state.hub.attempt_held().await;
+        the_conversion(&queued(&mut next), 3, D);
+        f.done().await;
+
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        drop(converted(&f).await);
+        let mut next = live(&f.state, &f, Some(("expired", LeaseMode::Local, 3))).await;
+        assert!(f.row().await.fencing_token > 3, "{:?}", next.start);
+        f.state.hub.attempt_held().await;
+        assert!(
+            conversions(&queued(&mut next))
+                .iter()
+                .all(|grant| grant["body"]["fencing_token"] != 3),
+            "no conversion at the old token"
+        );
+        f.done().await;
+    }
+
+    /// Test 12, a primary restart between the raise and the send: the
+    /// restarted primary knows nothing of the raise it did not write, and
+    /// waits until the row's newest write, that raise, is acknowledged by
+    /// the required set; it raises nothing again. Then the conversion goes.
+    #[tokio::test]
+    async fn after_a_restart_the_conversion_waits_for_the_newest_write() {
+        let f = fixture("warm", "local", None, false).await;
+        created(&f).await;
+        let on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        f.state.hub.attempt_held().await;
+        assert_eq!(f.row().await.duration_ms, Some(D as i64), "raised");
+        let writes = f.writes().await;
+        drop(on);
+
+        let (after, _clock) = restart(&f).await;
+        after.hub.set_voter_support(Arc::new(EverySupport));
+        let mut next = live(&after, &f, Some(("held", LeaseMode::Local, 3))).await;
+        after.hub.attempt_held().await;
+        assert!(
+            conversions(&queued(&mut next)).is_empty(),
+            "the raise is not acknowledged on this primary"
+        );
+        assert_eq!(f.writes().await, writes, "no second raise");
+        ack(&after, &f, &next).await;
+        after.hub.attempt_held().await;
+        the_conversion(&queued(&mut next), 3, D);
+        f.done().await;
+    }
+
+    /// The stored duration of the row this module's tests use when it is
+    /// shorter than `D`.
+    const SHORTER: u64 = 5_000;
+
+    /// Test 14, a row that stores a duration below `D` (section 8.4,
+    /// "Changing the mode": "A grant longer than the stored duration needs
+    /// the raise first, so it goes once that raise is replicated (ADR
+    /// 0268)"). The conversion raises the stored duration to `D` in its own
+    /// entry, once, and sends nothing until that raise, the row's newest
+    /// write, is acknowledged: an acknowledgement of the write before it is
+    /// not enough. Then it carries `D`, and the send writes nothing. The
+    /// first answer carries `D` too, writes only the row's `expiring`, and
+    /// its gate counts `D`: every machine that holds that `expiring` write
+    /// holds the raise, and no later answer needs one (issue #794).
+    #[tokio::test]
+    async fn a_shorter_stored_duration_is_raised_then_converted_once_the_raise_is_replicated() {
+        let f = fixture("warm", "local", Some(SHORTER as i64), false).await;
+        created(&f).await;
+        let before = newest(&f).await;
+        let writes = f.writes().await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        hub.attempt_held().await;
+        hub.attempt_held().await;
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.duration_ms),
+            ("local", Some(D as i64))
+        );
+        assert_eq!(
+            f.writes().await,
+            writes + 1,
+            "the raise, once, in its own entry"
+        );
+        assert!(
+            conversions(&queued(&mut on)).is_empty(),
+            "the raise is not replicated"
+        );
+        assert_eq!(entry(&f.state).unwrap().sent_on, None);
+
+        hub.count_log_ack(&f.node_id, on.session.generation, before);
+        hub.attempt_held().await;
+        assert!(
+            conversions(&queued(&mut on)).is_empty(),
+            "only the write before the raise is acknowledged"
+        );
+
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        the_conversion(&queued(&mut on), 3, D);
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, on.session.generation, LEASE),
+            Some(InFlight {
+                token: 3,
+                duration_ms: D
+            })
+        );
+        assert_eq!(f.writes().await, writes + 1, "the send writes nothing");
+
+        first_answer_counts_d(&f, &mut on, 3).await;
+        assert_eq!(f.row().await.duration_ms, Some(D as i64));
+        assert_eq!(
+            f.writes().await,
+            writes + 2,
+            "the first answer writes only the row's expiring"
+        );
+        f.done().await;
+    }
+
+    /// Test 14 across a primary restart: "the primary may not have written
+    /// the stored duration for this conversion, as after its restart"
+    /// (section 8.4, "Changing the mode"). The first primary raises a stored
+    /// duration below `D` to `D` and restarts before the raise is
+    /// acknowledged. The restarted primary writes no second raise and sends
+    /// nothing until the row's newest write, that raise, is acknowledged on
+    /// it: an acknowledgement of the write before it is not enough. Then it
+    /// sends `D`.
+    #[tokio::test]
+    async fn after_a_restart_a_raised_shorter_duration_waits_for_the_raise() {
+        let f = fixture("warm", "local", Some(SHORTER as i64), false).await;
+        created(&f).await;
+        let before = newest(&f).await;
+        let writes = f.writes().await;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        f.state.hub.attempt_held().await;
+        assert_eq!(f.row().await.duration_ms, Some(D as i64), "raised");
+        assert_eq!(f.writes().await, writes + 1);
+        assert!(conversions(&queued(&mut on)).is_empty(), "not replicated");
+        drop(on);
+
+        let (after, _clock) = restart(&f).await;
+        after.hub.set_voter_support(Arc::new(EverySupport));
+        let mut next = live(&after, &f, Some(("held", LeaseMode::Local, 3))).await;
+        after.hub.attempt_held().await;
+        after
+            .hub
+            .count_log_ack(&f.node_id, next.session.generation, before);
+        after.hub.attempt_held().await;
+        assert!(
+            conversions(&queued(&mut next)).is_empty(),
+            "the raise is not acknowledged on this primary"
+        );
+        assert_eq!(f.writes().await, writes + 1, "no second raise");
+
+        ack(&after, &f, &next).await;
+        after.hub.attempt_held().await;
+        the_conversion(&queued(&mut next), 3, D);
+        assert_eq!(f.writes().await, writes + 1, "the send writes nothing");
+        assert_eq!(f.row().await.duration_ms, Some(D as i64));
+        f.done().await;
+    }
+
+    /// Test 15, a row that stores a duration above the longest valid one,
+    /// 600 000 ms: it covers `D`, so no raise is tried, and the conversion
+    /// does not wait on a raise that writes nothing. It waits for the row's
+    /// newest write, then sends `D`, writing nothing.
+    #[tokio::test]
+    async fn a_stored_duration_above_the_maximum_sends_d_with_no_raise() {
+        const ABOVE: i64 = 700_000;
+        let f = fixture("warm", "local", Some(ABOVE), false).await;
+        created(&f).await;
+        let writes = f.writes().await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        hub.attempt_held().await;
+        assert!(conversions(&queued(&mut on)).is_empty(), "not replicated");
+        assert_eq!(f.writes().await, writes, "no raise");
+
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        the_conversion(&queued(&mut on), 3, D);
+        assert_eq!(f.writes().await, writes, "the send writes nothing");
+        assert_eq!(f.row().await.duration_ms, Some(ABOVE));
+        f.done().await;
+    }
+
+    /// Test 16, two `updateApp` calls that race: a change to `warm`
+    /// commits, then a change off `warm` commits R and holds its same-token
+    /// `local` grant, and only then does the first call hold its conversion,
+    /// which replaces R's grant. The conversion goes no more, the policy
+    /// being off `warm`, and R's grant takes its place again: once R is
+    /// acknowledged, the grant and its `ping` go out on the holder's
+    /// session, with no conversion, rather than at its next `hello`.
+    #[tokio::test]
+    async fn a_conversion_held_after_r_gives_rs_local_grant_back() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        // The change to `warm` read the row unmarked, `local` at 3.
+        let entering = f.row().await;
+        r(&f).await;
+        assert_eq!(entry(&f.state).map(|held| held.kind), Some(Kind::LocalEnd));
+        hub.hold_conversion(&entering);
+        assert_eq!(entry(&f.state).map(|held| held.kind), Some(Kind::Convert));
+
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        hub.attempt_held().await;
+        let sent = queued(&mut on);
+        grant_then_ping(&sent, 3);
+        assert!(conversions(&sent).is_empty());
+        assert_eq!(f.row().await.mode, "local");
+        f.done().await;
+    }
+
+    /// The swap of [`NodeHub::conversion_off_warm`] happens only while the
+    /// registry still holds the conversion the attempt read: a conversion
+    /// held since, as a later change back to `warm` holds, stays, and R's
+    /// `local` grant does not replace it.
+    #[tokio::test]
+    async fn the_swap_leaves_a_conversion_held_after_the_attempts_read() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let _on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        let entering = f.row().await;
+        hub.hold_conversion(&entering);
+        let read = entry(&f.state).expect("the conversion is held");
+        assert_eq!(read.kind, Kind::Convert);
+        // R marks the row and holds its `local` grant; a later change back
+        // to `warm` holds a new conversion after the attempt's read.
+        r(&f).await;
+        set_policy(&f, "warm").await;
+        hub.hold_conversion(&entering);
+        let later = entry(&f.state).expect("a conversion is held");
+        assert_eq!(later.kind, Kind::Convert);
+        assert_ne!(later.registration, read.registration);
+
+        let row = f.row().await;
+        assert!(row.unsettled, "R marked the row");
+        let mut conn = f.state.store.pool().acquire().await.unwrap();
+        hub.conversion_off_warm(&mut conn, LEASE, &read, &row)
+            .await
+            .unwrap();
+        drop(conn);
+        assert_eq!(entry(&f.state), Some(later));
+        f.done().await;
+    }
+
+    /// Test 13: no conversion, and no barrier `local` grant, is queued on a
+    /// session before its start's grants are: the start's same-token
+    /// `local` repeat goes on the outbox, which goes out before the
+    /// session's channel, so a conversion queued first would reach the node
+    /// before that repeat and be ended by it. Here every other condition
+    /// holds (the `hello` listed the lease `local` at 3, the row stores `D`,
+    /// its newest write is acknowledged, support); the conversion goes only
+    /// once the start's grants are marked queued. On a session whose
+    /// `hello` did not list the lease, the barrier grant waits the same way.
+    #[tokio::test]
+    async fn no_conversion_goes_before_the_session_starts_grants_are_queued() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        let generation = on.session.generation;
+        assert!(hub.start_grants_queued(&f.node_id, generation));
+        hub.unmark_start_grants_queued(&f.node_id, generation);
+        assert!(hub.barrier_passed(&f.node_id, generation, LEASE, 3));
+        // The hold of the sessions lock that queues the conversion refuses
+        // it on its own, the barrier passed and the channel open.
+        assert!(!hub.queue_conversion(
+            &f.node_id,
+            generation,
+            LEASE,
+            InFlight {
+                token: 3,
+                duration_ms: D,
+            },
+            "msg_before_the_start_grants",
+            "{}".to_string(),
+        ));
+        assert!(queued(&mut on).is_empty());
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+        assert!(grant_ids(&f.state, &f.node_id).is_empty());
+        ack(&f.state, &f, &on).await;
+        hub.hold_conversion(&f.row().await);
+        hub.attempt_held().await;
+        assert!(
+            queued(&mut on).is_empty(),
+            "no conversion before the start's grants are queued"
+        );
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+        assert!(grant_ids(&f.state, &f.node_id).is_empty());
+        let held = entry(&f.state).unwrap();
+        assert_eq!((held.kind, held.sent_on), (Kind::Convert, None));
+
+        hub.mark_start_grants_queued(&f.node_id, generation);
+        hub.attempt_held().await;
+        the_conversion(&queued(&mut on), 3, D);
+        f.done().await;
+
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, None).await;
+        let generation = on.session.generation;
+        hub.unmark_start_grants_queued(&f.node_id, generation);
+        hub.hold_conversion(&f.row().await);
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        assert!(
+            queued(&mut on).is_empty(),
+            "no barrier grant before the start's grants are queued"
+        );
+        assert_eq!(entry(&f.state).unwrap().barrier_on, None);
+
+        hub.mark_start_grants_queued(&f.node_id, generation);
+        hub.attempt_held().await;
+        grant_then_ping(&queued(&mut on), 3);
+        f.done().await;
+    }
+}

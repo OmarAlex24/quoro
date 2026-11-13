@@ -1898,3 +1898,458 @@ async fn create_app_named(
     );
     res.json().await.unwrap()
 }
+
+#[cfg(feature = "dev-warm-policy")]
+/// The conversion grant over real HTTP and WebSocket (node-agent-protocol.md
+/// section 8.4, "Changing the mode"; ADR 0241, ADR 0244, ADR 0257): an
+/// `updateApp` that changes `ha_policy` from `none` to `warm` sends the
+/// holder of the app's `local` lease the same-token `expiring` grant, after
+/// the barrier `local` grant and its `pong`, and the lease moves only as a
+/// `local` lease does until the first renewal after it is answered.
+///
+/// `updateApp` accepts `ha_policy: warm` only in a test-lab build with the
+/// dev-only `dev-warm-policy` feature (ADR 0277), so these tests run only
+/// with it.
+mod conversion {
+    use crate::common;
+    use crate::common::machine::{Machine, Node, hello_body};
+    use crate::common::{Server, start_with_patient_node_session};
+    use base64::Engine as _;
+    use quoro_control_plane::authority::VoterSupport;
+    use quoro_proto::wire::{
+        Capacity as WireCapacity, NodeMessage, StatusReport, WarmRole, WarmStatus,
+    };
+    use quoro_proto::{LeaseId, LeaseRenew};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    const IMAGE: &str = "ghcr.io/example/db@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    const VM_ID: &str = "vm_0000000000000000000000000V";
+    const VOLUME_ID: &str = "vol_0000000000000000000000000V";
+    const LEASE_ID: &str = "lse_0000000000000000000000000V";
+    const SNAPSHOT_TAKEN_AT: &str = "2026-11-09T10:00:00Z";
+    const D: u64 = 15_000;
+
+    /// A majority of voters supports every duration.
+    #[derive(Debug)]
+    struct EverySupport;
+
+    impl VoterSupport for EverySupport {
+        fn supports(&self, _duration_ms: u64) -> bool {
+            true
+        }
+    }
+
+    /// Enrolls a node with the `node` role whose identity key comes from `seed`.
+    async fn enroll(server: &Server, owner: &reqwest::Client, name: &str, seed: u8) -> Node {
+        // Section 8.10 rule 2: these tests enroll voters back to back.
+        common::settle_voters(server).await;
+        let token: Value = owner
+            .post(server.url("/api/v1/nodes/join-tokens"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let res = server
+            .client()
+            .post(server.url("/api/v1/nodes/enroll"))
+            .json(&json!({
+                "join_token": token["token"].as_str().unwrap(),
+                "name": name,
+                "public_key": quoro_proto::sign::public_key_to_base64(
+                    &quoro_proto::sign::signing_key_from_seed(&[seed; 32]).verifying_key()
+                ),
+                "roles": ["node"],
+                "capacity": { "cpus": 8, "memory_mb": 16_384, "disk_gb": 200 },
+                "kvm": { "available": true, "kernel": "6.9.0", "nested": true }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201, "enroll: {}", res.text().await.unwrap());
+        let body: Value = res.json().await.unwrap();
+        Node {
+            node_id: body["node_id"].as_str().unwrap().to_string(),
+            credential: body["credential"].as_str().unwrap().to_string(),
+        }
+    }
+
+    /// A session of `node` that follows the change log from its start and
+    /// acknowledges each `desired_state`, with a mesh key (so the primary gives
+    /// it a mesh address) and `reflink` snapshots, listing no lease.
+    async fn follower(server: &Server, node: &Node, mesh_seed: u8) -> Machine {
+        let mut hello = hello_body(&node.node_id);
+        hello.mesh_public_key =
+            Some(base64::engine::general_purpose::STANDARD.encode([mesh_seed; 32]));
+        Machine::connect_with(server, node, hello, true, true).await
+    }
+
+    /// The warm node's report: a complete copy of the app's volume, snapshot 3.
+    fn copy_report(app_id: &str) -> NodeMessage {
+        NodeMessage::StatusReport(StatusReport {
+            applied_rev: 0,
+            vms: Vec::new(),
+            routes: Vec::new(),
+            capacity: WireCapacity {
+                cpus: 8,
+                memory_mb: 16_384,
+                disk_gb: 200,
+            },
+            allocated: WireCapacity::default(),
+            disk_free_gb: 90.0,
+            builds: Vec::new(),
+            edge_backends: Vec::new(),
+            backups: Vec::new(),
+            images: Vec::new(),
+            warm: vec![WarmStatus {
+                volume_id: VOLUME_ID.to_string(),
+                app_id: app_id.to_string(),
+                role: WarmRole::Target,
+                snapshot_seq: Some(3),
+                snapshot_taken_at: Some(SNAPSHOT_TAKEN_AT.to_string()),
+                completed_at: Some(SNAPSHOT_TAKEN_AT.to_string()),
+                allocated_bytes: None,
+                extent_count: None,
+                frozen: None,
+                rejected_token: None,
+                rejected_at: None,
+                error: None,
+            }],
+            volumes: Vec::new(),
+            quarantines: Vec::new(),
+        })
+    }
+
+    /// Waits until the primary sees `node_id`'s session gone.
+    async fn disconnected(server: &Server, node_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while server.state.hub.is_connected(node_id) {
+            assert!(Instant::now() < deadline, "the session never ended");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The problem body of a refusal, with its status, code and reason checked.
+    async fn refused(
+        res: reqwest::Response,
+        status: u16,
+        code: &str,
+        reason: Option<&str>,
+    ) -> Value {
+        assert_eq!(res.status().as_u16(), status);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["code"], code, "{body}");
+        assert_eq!(body["reason"].as_str(), reason, "{body}");
+        body
+    }
+
+    /// The lease row: its holder, token, `mode` and `duration_ms`.
+    async fn lease_row(server: &Server) -> (String, i64, String, Option<i64>) {
+        sqlx::query_as(
+            "SELECT holder_node_id, fencing_token, mode, duration_ms FROM leases WHERE id = ?",
+        )
+        .bind(LEASE_ID)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap()
+    }
+
+    /// A stateful app of policy `none` running on the source, whose `local`
+    /// lease at token 4 the source holds, granted on its live session after its
+    /// `hello` (so no barrier has passed on that session) and storing no
+    /// duration, as a `local` grant leaves it. Both nodes follow the change log,
+    /// and the primary holds support.
+    struct Setup {
+        server: Server,
+        owner: reqwest::Client,
+        app_id: String,
+        source: Node,
+        warm: Node,
+        on_source: Option<Machine>,
+        on_warm: Machine,
+    }
+
+    impl Setup {
+        async fn new() -> Self {
+            let server = start_with_patient_node_session().await;
+            let owner = server.owner().await;
+            let source = enroll(&server, &owner, "source", 3).await;
+            let warm = enroll(&server, &owner, "warm", 4).await;
+            let on_source = follower(&server, &source, 1).await;
+            let on_warm = follower(&server, &warm, 2).await;
+
+            let project: Value = owner
+                .post(server.url("/api/v1/projects"))
+                .json(&json!({ "slug": "conversion", "name": "conversion" }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let project_id = project["id"].as_str().unwrap().to_string();
+            let res = owner
+            .post(server.url("/api/v1/apps"))
+            .json(&json!({ "project_id": project_id, "name": "db", "image": IMAGE, "port": 8080 }))
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+            let app_id = res.json::<Value>().await.unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            let pool = server.state.store.pool();
+            let now = quoro_control_plane::store::now_rfc3339();
+            sqlx::query(
+            "INSERT INTO vms (id, project_id, app_id, node_id, name, vcpus, memory_mb, disk_gb, \
+             image, desired_status, observed_status, ip, restart_generation, restart_count, \
+             last_exit_code, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'db-1', 1, 512, 4, ?, 'running', 'running', NULL, 0, 0, NULL, \
+             ?, ?)",
+        )
+        .bind(VM_ID)
+        .bind(&project_id)
+        .bind(&app_id)
+        .bind(&source.node_id)
+        .bind(IMAGE)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+            sqlx::query(
+                "INSERT INTO volumes (id, app_id, node_id, size_gb, mount_path, state, \
+             allocated_bytes, restored_from_backup_id, error, created_at, updated_at) \
+             VALUES (?, ?, ?, 2, '/data', 'ready', NULL, NULL, NULL, ?, ?)",
+            )
+            .bind(VOLUME_ID)
+            .bind(&app_id)
+            .bind(&source.node_id)
+            .bind(&now)
+            .bind(&now)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+             fencing_token, granted_at) VALUES (?, 'app', ?, ?, 'local', 4, ?)",
+            )
+            .bind(LEASE_ID)
+            .bind(&app_id)
+            .bind(&source.node_id)
+            .bind(&now)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE apps SET stateful = 1, ha_policy = 'none' WHERE id = ?")
+                .bind(&app_id)
+                .execute(pool)
+                .await
+                .unwrap();
+            server
+                .state
+                .hub
+                .set_voter_support(Arc::new(EverySupport) as Arc<dyn VoterSupport>);
+            Self {
+                server,
+                owner,
+                app_id,
+                source,
+                warm,
+                on_source: Some(on_source),
+                on_warm,
+            }
+        }
+
+        fn on_source(&mut self) -> &mut Machine {
+            self.on_source.as_mut().expect("the source is connected")
+        }
+
+        /// `updateApp` changes the policy from `none` to `warm`.
+        async fn to_warm(&self) {
+            let res = self
+                .owner
+                .patch(self.server.url(&format!("/api/v1/apps/{}", self.app_id)))
+                .json(&json!({ "ha_policy": "warm" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200, "warm: {}", res.text().await.unwrap());
+            let app: Value = res.json().await.unwrap();
+            assert_eq!(app["ha_policy"], "warm", "{app}");
+            assert_eq!(app["warm"]["node_id"], self.warm.node_id.as_str(), "{app}");
+        }
+
+        /// The barrier: the same-token `local` grant at 4 with no duration, then
+        /// its `ping`, which the source answers with a `pong`. No conversion
+        /// goes before it.
+        async fn barrier(&mut self) {
+            let grant = loop {
+                let frame = self.on_source().next().await;
+                if frame["type"] == "lease_grant" {
+                    break frame;
+                }
+            };
+            assert_eq!(grant["body"]["lease_id"], LEASE_ID, "{grant}");
+            assert_eq!(
+                grant["body"]["mode"], "local",
+                "no conversion first: {grant}"
+            );
+            assert_eq!(grant["body"]["fencing_token"], 4, "{grant}");
+            assert!(grant["body"].get("duration_ms").is_none(), "{grant}");
+            assert!(grant["re"].is_null(), "{grant}");
+            let ping = self.on_source().until("ping").await;
+            let ping_id = ping["id"].as_str().unwrap().to_string();
+            self.on_source()
+                .send(NodeMessage::Pong, Some(&ping_id))
+                .await;
+        }
+
+        /// The conversion grant, once the raise of the stored duration to `D`
+        /// is acknowledged by both nodes: `expiring` at 4 for `D`, with no
+        /// `re`. The row still reads `local`.
+        async fn conversion(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let grant = loop {
+                assert!(Instant::now() < deadline, "no conversion grant");
+                self.on_warm.settle().await;
+                let frames = self.on_source().settle().await;
+                if let Some(grant) = frames
+                    .into_iter()
+                    .find(|frame| frame["type"] == "lease_grant")
+                {
+                    break grant;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            assert_eq!(grant["body"]["lease_id"], LEASE_ID, "{grant}");
+            assert_eq!(grant["body"]["mode"], "expiring", "{grant}");
+            assert_eq!(grant["body"]["fencing_token"], 4, "{grant}");
+            assert_eq!(grant["body"]["duration_ms"], D, "{grant}");
+            assert!(grant["re"].is_null(), "{grant}");
+            let (holder, token, mode, duration) = lease_row(&self.server).await;
+            assert_eq!(
+                (holder.as_str(), token, mode.as_str(), duration),
+                (self.source.node_id.as_str(), 4, "local", Some(15_000)),
+                "raised, and still local before the first answer"
+            );
+        }
+
+        /// The warm node reports its complete copy, and the primary applied it.
+        async fn report_copy(&mut self) {
+            let report = copy_report(&self.app_id);
+            self.on_warm.send(report, None).await;
+            self.on_warm.settle().await;
+        }
+
+        /// Ends the source's session, without declaring it lost, and waits
+        /// until the primary sees it gone.
+        async fn cut_source(&mut self) {
+            drop(self.on_source.take());
+            disconnected(&self.server, &self.source.node_id).await;
+        }
+
+        async fn failover(&self) -> reqwest::Response {
+            self.owner
+                .post(
+                    self.server
+                        .url(&format!("/api/v1/apps/{}/failover", self.app_id)),
+                )
+                .json(&json!({ "node_id": self.warm.node_id }))
+                .send()
+                .await
+                .unwrap()
+        }
+    }
+
+    /// Test A. `updateApp` changes a running app's policy from `none` to
+    /// `warm` while the source holds its `local` lease on a live session whose
+    /// `hello` did not list it. The source gets the barrier `local` grant and
+    /// its `ping` first; after its `pong`, the conversion grant. Its session is
+    /// cut before any renewal, and it is not declared lost: the lease is still
+    /// `local` (ADR 0241), so `failoverApp` answers `lease_held` and the row
+    /// still reads `local`.
+    #[tokio::test]
+    async fn a_conversion_with_no_answer_leaves_the_lease_held() {
+        let mut s = Setup::new().await;
+        s.to_warm().await;
+        s.barrier().await;
+        s.conversion().await;
+
+        s.report_copy().await;
+        s.cut_source().await;
+        let body = refused(s.failover().await, 409, "conflict", Some("lease_held")).await;
+        let detail = body["detail"].as_str().unwrap();
+        assert!(detail.contains("its lease is local"), "{detail}");
+        let (holder, token, mode, _) = lease_row(&s.server).await;
+        assert_eq!(
+            (holder.as_str(), token, mode.as_str()),
+            (s.source.node_id.as_str(), 4, "local")
+        );
+    }
+
+    /// Test B. As test A up to the conversion grant; then the source's first
+    /// renewal is answered: the row reads `expiring`, and the gate counts the
+    /// longer of the conversion's and the answer's duration, `D` (ADR 0244, ADR
+    /// 0254). The session is cut: `failoverApp` does not move the lease before
+    /// the gate has passed, and moves it once it has.
+    #[tokio::test]
+    async fn a_conversion_answered_moves_only_once_its_gate_passed() {
+        let mut s = Setup::new().await;
+        s.to_warm().await;
+        s.barrier().await;
+        s.conversion().await;
+
+        let renewal = s
+            .on_source()
+            .send(
+                NodeMessage::LeaseRenew(LeaseRenew {
+                    lease_id: LeaseId(LEASE_ID.to_string()),
+                    fencing_token: 4,
+                }),
+                None,
+            )
+            .await;
+        let answer = s.on_source().until("lease_grant").await;
+        assert_eq!(answer["re"], renewal.as_str(), "{answer}");
+        assert_eq!(answer["body"]["mode"], "expiring", "{answer}");
+        assert_eq!(answer["body"]["fencing_token"], 4, "{answer}");
+        assert_eq!(answer["body"]["duration_ms"], D, "{answer}");
+        let (_, _, mode, _) = lease_row(&s.server).await;
+        assert_eq!(mode, "expiring", "written before the answer");
+        let gate = s
+            .server
+            .state
+            .hub
+            .authority()
+            .gate_remaining(LEASE_ID)
+            .expect("the first answer opened the source's gate");
+        let passes = Instant::now() + gate;
+        // `D` and two margins of 1.5 s, less the time since the answer.
+        assert!(gate > Duration::from_secs(15), "{gate:?}");
+        assert!(gate <= Duration::from_secs(18), "{gate:?}");
+
+        s.report_copy().await;
+        s.cut_source().await;
+        let body = refused(s.failover().await, 409, "conflict", Some("lease_held")).await;
+        let detail = body["detail"].as_str().unwrap();
+        assert!(detail.contains("gate"), "{detail}");
+        assert!(Instant::now() < passes, "the test ran too slowly");
+        let (holder, token, _, _) = lease_row(&s.server).await;
+        assert_eq!((holder.as_str(), token), (s.source.node_id.as_str(), 4));
+
+        tokio::time::sleep_until(passes).await;
+        let res = s.failover().await;
+        assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+        let (holder, token, _, _) = lease_row(&s.server).await;
+        assert_eq!(holder, s.warm.node_id, "moved once the gate passed");
+        assert!(token > 4, "{token}");
+    }
+}

@@ -59,7 +59,7 @@
 //!   report does, if the row's newest write is still the one recorded with
 //!   the `ping` and every other check holds again. It also passes ADR 0257's
 //!   barrier for the lease on that session: a conversion grant may follow
-//!   ([`NodeHub::note_conversion_sent`]). A barrier that passed on the
+//!   ([`super::convert`]). A barrier that passed on the
 //!   session before this grant no longer counts, nor does the `pong` of an
 //!   older grant's `ping`: only the newest grant's `pong` passes it. A later
 //!   policy change off `warm` on the same session holds the grant afresh, so
@@ -148,6 +148,15 @@ impl SessionState {
     fn evidence(&self, lease_id: &str, token: u64) -> bool {
         self.listed.get(lease_id) == Some(&token) || self.renewed.get(lease_id) == Some(&token)
     }
+
+    /// Whether ADR 0257's barrier has passed for `lease_id` at `token` on
+    /// the session: the `pong` of the `ping` after its newest same-token
+    /// `local` grant arrived with no refusal before it, or the session's
+    /// `hello` listed the lease `local` at that token, which stands in for
+    /// it (ADR 0261).
+    pub(super) fn barrier_passed(&self, lease_id: &str, token: u64) -> bool {
+        self.passed.get(lease_id) == Some(&token) || self.listed_local.get(lease_id) == Some(&token)
+    }
 }
 
 /// What a barrier `ping` stands for.
@@ -157,6 +166,15 @@ pub(super) struct Barrier {
     pub token: u64,
     /// The row's newest change-log write when the grant was queued.
     pub seq: Option<u64>,
+}
+
+/// The held entry of the same-token `local` grant that ends the renewals of
+/// `lease`, eligible on `eligible` ([`NodeHub::hold_local_end`]).
+pub(super) fn local_end_entry(lease: &Lease, eligible: Option<u64>) -> HeldGrant {
+    let mut held = HeldGrant::of(lease, eligible);
+    held.kind = Kind::LocalEnd;
+    held.support_ms = DEFAULT_DURATION_MS;
+    held
 }
 
 impl NodeHub {
@@ -368,17 +386,20 @@ impl NodeHub {
     /// holder holds the lease at the row's token; otherwise it waits for
     /// such evidence: a renewal, or the holder's next `hello`.
     fn hold_local_end(&self, lease: &Lease) {
+        self.register_local_end(lease, self.local_end_evidenced(lease));
+    }
+
+    /// The holder's current session, after its `hello`, when that session
+    /// has evidence that the holder holds `lease` at the row's token: the
+    /// session the `local` grant that ends the renewals may go out on
+    /// ([`NodeHub::hold_local_end`]). Takes the sessions lock alone.
+    pub(super) fn local_end_evidenced(&self, lease: &Lease) -> Option<u64> {
         let token = u64::try_from(lease.fencing_token).unwrap_or(0);
-        let evidenced = {
-            let sessions = self.0.sessions.lock().expect("session lock");
-            sessions
-                .get(&lease.holder_node_id)
-                .filter(|handle| {
-                    handle.hello_recorded && handle.local_end.evidence(&lease.id, token)
-                })
-                .map(|handle| handle.generation)
-        };
-        self.register_local_end(lease, evidenced);
+        let sessions = self.0.sessions.lock().expect("session lock");
+        sessions
+            .get(&lease.holder_node_id)
+            .filter(|handle| handle.hello_recorded && handle.local_end.evidence(&lease.id, token))
+            .map(|handle| handle.generation)
     }
 
     /// The resend from `hello`: the grant may go out on `generation`, whose
@@ -408,12 +429,10 @@ impl NodeHub {
                 {
                     (false, None)
                 }
-                _ => {
-                    let mut held = HeldGrant::of(lease, eligible);
-                    held.kind = Kind::LocalEnd;
-                    held.support_ms = DEFAULT_DURATION_MS;
-                    (true, registry.insert(lease.id.clone(), held))
-                }
+                _ => (
+                    true,
+                    registry.insert(lease.id.clone(), local_end_entry(lease, eligible)),
+                ),
             }
         };
         if let Some(replaced) = replaced {
@@ -464,7 +483,13 @@ impl NodeHub {
 
     /// Whether `generation`'s `hello` listed `lease_id` `held` or
     /// `uncertain` at `token`, in either mode.
-    fn hello_listed(&self, node_id: &str, generation: u64, lease_id: &str, token: u64) -> bool {
+    pub(super) fn hello_listed(
+        &self,
+        node_id: &str,
+        generation: u64,
+        lease_id: &str,
+        token: u64,
+    ) -> bool {
         self.0
             .sessions
             .lock()
@@ -655,6 +680,15 @@ impl NodeHub {
             .or_insert(0);
         *sent = (*sent).max(barrier.token);
         handle.settles.forget(&barrier.lease_id);
+        // A conversion of the lease in flight on the session ends here: the
+        // node takes this grant after it, so no renewal it sends from now on
+        // is a first renewal after the conversion (ADR 0256), and none is
+        // answered at that token ([`super::conversion`]). A refusal of that
+        // conversion grant, still on its way, finds nothing to drop.
+        handle.conversions.remove(&barrier.lease_id);
+        handle
+            .conversion_grants
+            .retain(|_, (lease_id, _)| *lease_id != barrier.lease_id);
         if fresh {
             // A grant sent after the session start has its own barrier: one
             // that passed before it, by a `pong` or the `hello`'s listing,
@@ -728,11 +762,8 @@ impl NodeHub {
     /// `generation`: the `pong` of the `ping` after its same-token `local`
     /// grant arrived with no refusal before it, or the session's `hello`
     /// listed the lease `local` at that token, which stands in for it (ADR
-    /// 0261). A conversion grant of the lease may go out only then.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "nothing sends a conversion grant yet (#555)")
-    )]
+    /// 0261). A conversion grant of the lease may go out only then
+    /// ([`super::convert`]).
     pub(crate) fn barrier_passed(
         &self,
         node_id: &str,
@@ -746,10 +777,7 @@ impl NodeHub {
             .expect("session lock")
             .get(node_id)
             .filter(|handle| handle.generation == generation)
-            .is_some_and(|handle| {
-                handle.local_end.passed.get(lease_id) == Some(&token)
-                    || handle.local_end.listed_local.get(lease_id) == Some(&token)
-            })
+            .is_some_and(|handle| handle.local_end.barrier_passed(lease_id, token))
     }
 }
 
@@ -897,6 +925,9 @@ impl Session {
                 tracing::warn!(code = %e.code.as_str(), lease_id = %barrier.lease_id, "cannot record the pong after a local grant");
             }
         }
+        // The barrier passed: a conversion grant held for the lease may go
+        // out now ([`super::convert`]).
+        self.hub.wake_held();
     }
 
     /// The `pong`'s write, in one single-writer transaction that finds
@@ -944,7 +975,7 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::conversion::tests::{
         APP, EverySupport, Fixture, LEASE, actor, assert_answer, end_renewals, fixture, frames,
         hello, of_type, ping_of, pong, renew, restart, set_policy, write_row,
@@ -964,7 +995,7 @@ mod tests {
     const D: u64 = 15_000;
 
     #[derive(Debug)]
-    struct NoSupport;
+    pub(in crate::session) struct NoSupport;
     impl VoterSupport for NoSupport {
         fn supports(&self, _duration_ms: u64) -> bool {
             false
@@ -974,13 +1005,17 @@ mod tests {
     /// A session of the fixture's node on `state` whose `hello` lists the
     /// lease as `listed`, past its start, keeping the channel the hub queues
     /// on and the grants and `ping`s its start queued on its outbox.
-    struct Live {
-        session: Session,
-        rx: mpsc::UnboundedReceiver<String>,
-        start: Vec<Value>,
+    pub(in crate::session) struct Live {
+        pub(in crate::session) session: Session,
+        pub(in crate::session) rx: mpsc::UnboundedReceiver<String>,
+        pub(in crate::session) start: Vec<Value>,
     }
 
-    async fn live(state: &AppState, f: &Fixture, listed: Option<(&str, LeaseMode, u64)>) -> Live {
+    pub(in crate::session) async fn live(
+        state: &AppState,
+        f: &Fixture,
+        listed: Option<(&str, LeaseMode, u64)>,
+    ) -> Live {
         let hub = &state.hub;
         let (generation, rx, _closed, _changed) = hub.attach(&f.node_id);
         let mut session = Session::new(hub.clone(), f.node_id.clone(), generation);
@@ -998,7 +1033,7 @@ mod tests {
     }
 
     /// The grants and `ping`s the hub queued on the session's channel.
-    fn queued(live: &mut Live) -> Vec<Value> {
+    pub(in crate::session) fn queued(live: &mut Live) -> Vec<Value> {
         let mut texts = Vec::new();
         while let Ok(text) = live.rx.try_recv() {
             texts.push(text);
@@ -1011,7 +1046,7 @@ mod tests {
 
     /// The row's creation entry, as every row written by the primary has
     /// one: the fixture inserts its row with none.
-    async fn created(f: &Fixture) {
+    pub(in crate::session) async fn created(f: &Fixture) {
         write_row(
             f,
             "UPDATE leases SET fencing_token = fencing_token WHERE id = ?",
@@ -1020,7 +1055,7 @@ mod tests {
     }
 
     /// The node acknowledges the lease's newest write on `live`.
-    async fn ack(state: &AppState, f: &Fixture, live: &Live) {
+    pub(in crate::session) async fn ack(state: &AppState, f: &Fixture, live: &Live) {
         let mut conn = state.store.pool().acquire().await.unwrap();
         let seq = crate::leases::newest_write_seq(&mut conn, LEASE)
             .await
@@ -1034,7 +1069,7 @@ mod tests {
     /// A policy change off `warm` as `updateApp` commits it: R, what follows
     /// it and `app.left_stopped` in the transaction, then the hub's part
     /// once it commits.
-    async fn r(f: &Fixture) {
+    pub(in crate::session) async fn r(f: &Fixture) {
         r_on(&f.state, f).await;
     }
 
@@ -1119,7 +1154,10 @@ mod tests {
         )
     }
 
-    async fn view(state: &AppState, f: &Fixture) -> (bool, Vec<String>, bool) {
+    pub(in crate::session) async fn view(
+        state: &AppState,
+        f: &Fixture,
+    ) -> (bool, Vec<String>, bool) {
         let row = f.row().await;
         let mut conn = state.store.pool().acquire().await.unwrap();
         let (pending, waiting) = state.hub.grant_view(&mut conn, &row).await.unwrap();
@@ -1131,7 +1169,7 @@ mod tests {
 
     /// The `local` grant at `token` and its `ping`, in that order, as the
     /// only frames: their ids.
-    fn grant_then_ping(frames: &[Value], token: u64) -> (String, String) {
+    pub(in crate::session) fn grant_then_ping(frames: &[Value], token: u64) -> (String, String) {
         assert_eq!(frames.len(), 2, "{frames:?}");
         let grant = &frames[0];
         assert_eq!(grant["type"], "lease_grant", "{frames:?}");
@@ -1147,7 +1185,7 @@ mod tests {
         )
     }
 
-    async fn state(f: &Fixture) -> (String, i64, Option<i64>, bool, bool) {
+    pub(in crate::session) async fn state(f: &Fixture) -> (String, i64, Option<i64>, bool, bool) {
         let row = f.row().await;
         let revoked = row.is_revoked();
         (
@@ -1614,7 +1652,7 @@ mod tests {
     }
 
     /// The holder's refusal `code` of the grant `grant` on `session`.
-    async fn refuse(session: &mut Session, grant: &str, code: ErrorCode) {
+    pub(in crate::session) async fn refuse(session: &mut Session, grant: &str, code: ErrorCode) {
         let refusal = NodeMessage::Error(ProtocolError {
             code,
             message: "refused".to_string(),
@@ -2754,10 +2792,11 @@ mod tests {
         let hub = &f.state.hub;
         hub.hold_grant(&f.row().await);
         assert!(hub.grant_pending(LEASE));
-        let ((_app, _vms, _warm, ended, dropped), actor) = update_app_off_warm(&f).await;
-        let ended = ended.expect("the app has a lease");
+        let (updated, actor) = update_app_off_warm(&f).await;
+        assert!(updated.converting.is_none(), "the policy left warm");
+        let ended = updated.ended.expect("the app has a lease");
         assert!(ended.wrote && ended.from_expiring);
-        let dropped = dropped.expect("R drops the held grant");
+        let dropped = updated.left_stopped.expect("R drops the held grant");
         assert_eq!(
             (dropped.node_id.as_str(), dropped.fencing_token),
             (f.node_id.as_str(), 4)

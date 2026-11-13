@@ -39,10 +39,11 @@
 //! at its next session start ([`super::local_report`]). The same-token
 //! `local` grant that ends the renewals after R, and its resend, are held
 //! here too, as [`Kind::LocalEnd`]; its send and the `pong` after it are
-//! [`super::local_end`]. Out of scope (issue #555): the conversion grant.
-//! Until the holder reports or renews, a row marked here stays marked after
-//! its grant is taken, and moves only as a `local` lease does, which is
-//! safe. `failoverApp` ([`crate::failover`]) holds its
+//! [`super::local_end`]. The conversion grant that converts a `local` lease
+//! when the policy becomes `warm` is held here too, as [`Kind::Convert`]; its
+//! send is [`super::convert`]. Until the holder reports or renews, a row
+//! marked here stays marked after its grant is taken, and moves only as a
+//! `local` lease does, which is safe. `failoverApp` ([`crate::failover`]) holds its
 //! waiting grant with [`NodeHub::hold_grant`] and answers `in_progress` while
 //! [`NodeHub::row_grant_pending`] (ADR 0292).
 
@@ -96,6 +97,10 @@ pub(super) enum Kind {
     /// renewals after R, and its resend ("Ending the renewals" steps 2 and
     /// 3; [`super::local_end`]).
     LocalEnd,
+    /// The same-token `expiring` grant that converts a `local` lease when
+    /// the app's policy becomes `warm` ("Changing the mode";
+    /// [`super::convert`]).
+    Convert,
 }
 
 /// One held grant.
@@ -130,6 +135,11 @@ pub(super) struct HeldGrant {
     /// held again for the same row is never equal to the one before it,
     /// though every other field may match.
     pub(super) registration: u64,
+    /// A conversion ([`Kind::Convert`]): the session generation on which
+    /// this entry already sent its barrier, the same-token `local` grant
+    /// and its `ping` ([`super::convert`]). Changed in place, keeping the
+    /// registration.
+    pub(super) barrier_on: Option<u64>,
 }
 
 /// The grant length a held grant of `lease` needs majority support for:
@@ -158,6 +168,7 @@ impl HeldGrant {
             revoke_first: None,
             grant_dropped: false,
             registration: 0,
+            barrier_on: None,
         }
     }
 
@@ -174,7 +185,10 @@ impl HeldGrant {
     /// until the grant is sent on it"); while it waits for such a session,
     /// it is not ("`grant_pending` stays false for it"), and "When that
     /// session ends first, the grant again waits for such a session and is
-    /// not pending".
+    /// not pending". A conversion that waits is no wait at all: the lease
+    /// stays `local` until the first answer after it ("Changing the mode"),
+    /// so it shows no `grant_pending`, no `grant_waiting_on`, and makes no
+    /// failover answer `in_progress`.
     fn pending(&self, live: Option<u64>) -> bool {
         if self.sent_on.is_some() || self.grant_dropped {
             return false;
@@ -182,6 +196,7 @@ impl HeldGrant {
         match self.kind {
             Kind::NewToken => true,
             Kind::LocalEnd => self.eligible_on.is_some() && self.eligible_on == live,
+            Kind::Convert => false,
         }
     }
 }
@@ -763,6 +778,55 @@ impl NodeHub {
         }
     }
 
+    /// `generation`'s start queued its grants on the outbox
+    /// ([`Session::send_grants`](super::Session::send_grants)), the
+    /// same-token `local` repeat and its `ping` among them: a conversion
+    /// grant may be queued on it from now on ([`super::convert`]).
+    pub(super) fn mark_start_grants_queued(&self, node_id: &str, generation: u64) {
+        let newly = {
+            let mut sessions = self.0.sessions.lock().expect("session lock");
+            sessions
+                .get_mut(node_id)
+                .filter(|handle| handle.generation == generation && !handle.start_grants_queued)
+                .is_some_and(|handle| {
+                    handle.start_grants_queued = true;
+                    true
+                })
+        };
+        if newly {
+            self.wake_held();
+        }
+    }
+
+    /// Whether `generation` is the node's live session and its start queued
+    /// its grants ([`NodeHub::mark_start_grants_queued`]). Takes the
+    /// sessions lock alone.
+    pub(super) fn start_grants_queued(&self, node_id: &str, generation: u64) -> bool {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(node_id)
+            .filter(|handle| handle.generation == generation)
+            .is_some_and(|handle| handle.start_grants_queued)
+    }
+
+    /// Test seam: `generation` reads as a session whose start has not
+    /// queued its grants yet.
+    #[cfg(test)]
+    pub(super) fn unmark_start_grants_queued(&self, node_id: &str, generation: u64) {
+        if let Some(handle) = self
+            .0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+        {
+            handle.start_grants_queued = false;
+        }
+    }
+
     /// Whether `generation` is the node's live session, has finished its
     /// start, and has no `lease_revoke` unanswered and none held back. A
     /// grant goes out only then: the node holds a grant back until it has
@@ -842,6 +906,7 @@ impl NodeHub {
                     _ if held.grant_dropped => Ok(true),
                     Kind::LocalEnd => self.local_end_obsolete(&lease_id, &held).await,
                     Kind::NewToken => self.new_token_obsolete(&lease_id, &held).await,
+                    Kind::Convert => self.convert_obsolete(&lease_id, &held).await,
                 };
                 match obsolete {
                     Ok(false) => {}
@@ -879,6 +944,7 @@ impl NodeHub {
             let attempt = match held.kind {
                 Kind::NewToken => self.try_send_held(&lease_id, &held, generation).await,
                 Kind::LocalEnd => self.try_send_local_end(&lease_id, &held, generation).await,
+                Kind::Convert => self.try_send_conversion(&lease_id, &held, generation).await,
             };
             match attempt {
                 Ok(Attempt::Sent | Attempt::Wait) => {}
