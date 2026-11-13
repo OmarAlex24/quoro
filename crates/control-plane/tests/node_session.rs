@@ -325,6 +325,51 @@ async fn a_session_receives_welcome_and_a_verifiable_snapshot() {
     assert_eq!(events, 1);
 }
 
+/// Section 8.8, "The term ceiling": a `meta.term` that holds no term, above
+/// 2^53 - 1 or not a plain decimal integer, starts no session. The `hello`
+/// is answered `bad_message` and no `welcome` goes out. Once `meta` holds a
+/// term again, the next `hello` on the same socket gets a `welcome`, and its
+/// `desired_state`, at that term.
+#[tokio::test]
+async fn a_bad_meta_term_sends_no_welcome() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    let set_term = |value: &'static str| {
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES ('term', ?) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(value)
+        .execute(server.state.store.pool())
+    };
+
+    for value in ["9007199254740992", "+7", "007"] {
+        set_term(value).await.unwrap();
+        let mut socket = connect(&server, &node.credential).await;
+        let hello_id = send(&mut socket, hello(&node.node_id)).await;
+        let error = loop {
+            let frame = recv_frame(&mut socket).await;
+            assert_ne!(frame["type"], "welcome", "{value:?}: {frame}");
+            assert_ne!(frame["type"], "desired_state", "{value:?}: {frame}");
+            if frame["type"] == "error" {
+                break frame;
+            }
+        };
+        assert_eq!(error["re"], hello_id, "{value:?}: {error}");
+        assert_eq!(error["body"]["code"], "bad_message", "{value:?}: {error}");
+        assert_eq!(error["body"]["fatal"], false, "{value:?}: {error}");
+
+        set_term("7").await.unwrap();
+        send(&mut socket, hello(&node.node_id)).await;
+        let welcome = recv_type(&mut socket, "welcome").await;
+        assert_eq!(welcome["body"]["term"], 7, "{value:?}: {welcome}");
+        let snapshot = recv_type(&mut socket, "desired_state").await;
+        assert_eq!(snapshot["body"]["term"], 7, "{value:?}: {snapshot}");
+        drop(socket);
+    }
+}
+
 #[tokio::test]
 async fn vm_changes_push_snapshots_and_observations_land() {
     // Not a timeout test: the fake node must not lose its session while the

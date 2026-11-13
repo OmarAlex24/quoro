@@ -5,7 +5,6 @@
 //! numbered migrations in `docs/contracts/migrations/`, compiled into the
 //! binary so the database and the contract cannot drift (D-0015).
 
-use quoro_proto::wire::MAX_TERM;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
@@ -41,6 +40,78 @@ const MIGRATIONS: &[&str] = &[
 
 /// 64 zeros: `prev_hash` of the first entry of a chain.
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The term ceiling, 2^53 - 1: no machine sends, stores or adopts a higher
+/// term (`node-agent-protocol.md` section 8.8).
+pub(crate) const MAX_TERM: i64 = (1 << 53) - 1;
+
+/// Why [`read_term`] gives no term.
+#[derive(Debug)]
+pub(crate) enum TermError {
+    /// The database could not be read.
+    Database(sqlx::Error),
+    /// `meta.term` holds no term: its text is not a plain decimal integer
+    /// from 1 to [`MAX_TERM`]. It holds the stored text.
+    Bad(String),
+}
+
+impl From<sqlx::Error> for TermError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl std::fmt::Display for TermError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => write!(f, "cannot read meta.term: {error}"),
+            Self::Bad(value) => {
+                write!(f, "meta.term {value:?} is not a term from 1 to {MAX_TERM}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TermError {}
+
+/// The cluster's current term, `meta.term`, read through `executor`. Every
+/// reader of the term goes through here, so all of them read the same text
+/// the same way: the change log, the `welcome`, `desired_state` and
+/// `support_request` a session sends, the cluster API and a demotion.
+///
+/// A missing `meta.term` reads as 1, the term before the first promotion
+/// (`db-schema.sql`, `meta`).
+///
+/// # Errors
+///
+/// [`TermError::Database`] for a database error, and [`TermError::Bad`] for
+/// a stored value that is not a plain decimal integer from 1 to
+/// [`MAX_TERM`]: a sign, a leading zero, a space, a fraction or a value
+/// above the ceiling makes it bad (section 8.8).
+pub(crate) async fn read_term<'e, E>(executor: E) -> Result<i64, TermError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let stored: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'term'")
+        .fetch_optional(executor)
+        .await?;
+    match stored {
+        None => Ok(1),
+        Some(value) => parse_term(&value).ok_or(TermError::Bad(value)),
+    }
+}
+
+/// `value` as a term: a plain decimal integer from 1 to [`MAX_TERM`], digits
+/// only, with no leading zero.
+fn parse_term(value: &str) -> Option<i64> {
+    if value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|term| (1..=MAX_TERM).contains(term))
+}
 
 /// The control-plane database.
 #[derive(Clone)]
@@ -768,10 +839,10 @@ impl Store {
 }
 
 /// The term a demotion records, read through `tx`: `node_term` when it is
-/// present and above `meta.term`, or present while `meta.term` cannot be read
-/// as a number. Otherwise `meta.term + 1` (a missing `meta.term` reads as 1),
-/// logged at `error` because the `stale_term` carried no usable term. With
-/// neither usable there is no term, and nothing is recorded.
+/// present and above `meta.term`, or present while `meta.term` holds no term
+/// ([`read_term`]). Otherwise `meta.term + 1` (a missing `meta.term` reads as
+/// 1), logged at `error` because the `stale_term` carried no usable term.
+/// With neither usable there is no term, and nothing is recorded.
 ///
 /// No term above [`MAX_TERM`] is recorded (section 8.8 "The term ceiling"):
 /// a `node_term` above it is not usable (a session never passes one: such an
@@ -781,28 +852,26 @@ async fn demotion_term(
     tx: &mut Transaction<'_, Sqlite>,
     node_term: Option<u64>,
 ) -> Result<u64, sqlx::Error> {
-    let stored: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'term'")
-        .fetch_optional(&mut **tx)
-        .await?;
-    let current = match &stored {
-        None => Some(1),
-        Some(value) => value.parse::<u64>().ok(),
+    let (current, bad) = match read_term(&mut **tx).await {
+        Ok(term) => (Some(term.unsigned_abs()), None),
+        Err(TermError::Database(error)) => return Err(error),
+        Err(TermError::Bad(value)) => (None, Some(value)),
     };
-    if let Some(term) = node_term.filter(|term| *term > MAX_TERM) {
+    if let Some(term) = node_term.filter(|term| *term > quoro_proto::wire::MAX_TERM) {
         tracing::error!(
             node_term = term,
-            max_term = MAX_TERM,
+            max_term = quoro_proto::wire::MAX_TERM,
             "the stale_term's term is above the term ceiling; it is not recorded"
         );
     }
-    let node_term = node_term.filter(|term| *term <= MAX_TERM);
+    let node_term = node_term.filter(|term| *term <= quoro_proto::wire::MAX_TERM);
     match (node_term, current) {
         (Some(term), Some(current)) if term > current => Ok(term),
         (Some(term), None) => {
             tracing::error!(
                 node_term = term,
-                meta_term = ?stored,
-                "meta.term is not a number; recording the stale_term's term"
+                meta_term = ?bad,
+                "meta.term holds no term; recording the stale_term's term"
             );
             Ok(term)
         }
@@ -812,10 +881,11 @@ async fn demotion_term(
                 meta_term = current,
                 "the stale_term carried no term above this primary's; recording meta.term + 1"
             );
-            Ok(current.saturating_add(1).min(MAX_TERM))
+            Ok(current.saturating_add(1).min(quoro_proto::wire::MAX_TERM))
         }
         (None, None) => Err(sqlx::Error::Protocol(format!(
-            "the stale_term carried no term and meta.term {stored:?} is not a number: no term to record"
+            "the stale_term carried no term and meta.term {:?} holds no term: no term to record",
+            bad.unwrap_or_default()
         ))),
     }
 }
@@ -918,6 +988,57 @@ pub fn random_secret() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Section 8.8: `meta.term` reads as a plain decimal integer from 1 to
+    /// 2^53 - 1, and a missing one as 1. Any other text is no term.
+    #[tokio::test]
+    async fn meta_term_reads_only_as_a_plain_decimal_term() {
+        let store = Store::open_in_memory().await.unwrap();
+        let read = || async { read_term(store.pool()).await };
+        assert_eq!(read().await.unwrap(), 1, "a missing meta.term");
+        for (value, term) in [
+            ("1", 1),
+            ("7", 7),
+            ("10", 10),
+            ("9007199254740991", MAX_TERM),
+        ] {
+            sqlx::query(
+                "INSERT INTO meta (key, value) VALUES ('term', ?) \
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(value)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(read().await.unwrap(), term, "{value:?}");
+        }
+        for value in [
+            "0",
+            "-1",
+            "+5",
+            "007",
+            "05",
+            "",
+            " 5",
+            "5 ",
+            "1.5",
+            "1e3",
+            "seven",
+            "9007199254740992",
+            "18446744073709551616",
+        ] {
+            sqlx::query("UPDATE meta SET value = ? WHERE key = 'term'")
+                .bind(value)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            let refused = read().await;
+            assert!(
+                matches!(&refused, Err(TermError::Bad(stored)) if stored == value),
+                "{value:?}: {refused:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn schema_and_migrations_apply_and_reopen() {

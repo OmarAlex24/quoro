@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::start;
+use common::{problem, start};
 use quoro_control_plane::driver::{self, Capacity, Kvm, LocalNode};
 use quoro_types::{Prefix, is_id};
 use serde_json::Value;
@@ -73,6 +73,53 @@ async fn get_cluster_returns_identity_and_log_position() {
         .await
         .unwrap();
     assert!(node["lost_at"].is_null(), "{node}");
+}
+
+/// Sets `meta.term` to `value`.
+async fn set_term(server: &common::Server, value: &str) {
+    sqlx::query(
+        "INSERT INTO meta (key, value) VALUES ('term', ?) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(value)
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
+}
+
+/// `term` is the term `meta` stores, which a promotion raises
+/// (`node-agent-protocol.md` section 7.3 step 5). A stored value that holds
+/// no term answers `500`, so no term above 2^53 - 1 is reported (section
+/// 8.8).
+#[tokio::test]
+async fn get_cluster_reports_the_term_in_meta() {
+    let server = start().await;
+    let owner = server.owner().await;
+    driver::register_local_node(&server.state.store, &local_node())
+        .await
+        .unwrap();
+
+    set_term(&server, "7").await;
+    let cluster: Value = owner
+        .get(server.url("/api/v1/cluster"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cluster["term"], 7, "{cluster}");
+
+    for value in ["9007199254740992", "+7", "007", "seven"] {
+        set_term(&server, value).await;
+        let res = owner
+            .get(server.url("/api/v1/cluster"))
+            .send()
+            .await
+            .unwrap();
+        let (status, code, _) = problem(res).await;
+        assert_eq!((status, code.as_str()), (500, "internal"), "{value:?}");
+    }
 }
 
 #[tokio::test]

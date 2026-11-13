@@ -622,7 +622,9 @@ async fn a_demotion_never_records_a_term_above_the_ceiling() {
     for (meta_term, node_term, recorded) in [
         (ceiling.as_str(), None, Some(ceiling.as_str())),
         (ceiling.as_str(), Some(MAX_TERM), Some(ceiling.as_str())),
-        ("18446744073709551615", Some(5), Some(ceiling.as_str())),
+        // A meta.term above the ceiling holds no term (read_term), so the
+        // node's usable term is recorded.
+        ("18446744073709551615", Some(5), Some("5")),
         ("3", Some(MAX_TERM + 1), Some("4")),
         ("bad", Some(MAX_TERM + 1), None),
     ] {
@@ -1089,29 +1091,43 @@ async fn a_failed_meta_write_is_retried_until_it_is_recorded() {
     assert!(store.begin_write().await.is_err());
 }
 
-/// A `meta.term` that is not a number cannot rule the term: the error's own
+/// A `meta.term` that holds no term cannot rule the term: the error's own
 /// term is recorded. Without one there is no term to record, so nothing is
 /// recorded, the process is demoted all the same, and a later `stale_term`
-/// with a term records it.
+/// with a term records it. `meta.term` is read as every reader of the term
+/// reads it: a sign, a leading zero or a value above 2^53 - 1 holds no term
+/// either, so no `demoted_by_term` above the ceiling is recorded from it
+/// (section 8.8).
 #[tokio::test]
 async fn a_bad_meta_term_records_the_errors_term_or_nothing() {
-    for node_term in [Some(5), None] {
-        let server = start_with_patient_node_session().await;
-        sqlx::query("UPDATE meta SET value = 'bad' WHERE key = 'term'")
-            .execute(server.state.store.pool())
-            .await
-            .unwrap();
-        server.state.hub.stale_term(node_term).await;
-        assert!(server.state.store.is_demoted(), "{node_term:?}");
-        assert!(server.state.store.begin_write().await.is_err());
-        match node_term {
-            Some(_) => {
-                assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
-            }
-            None => {
-                assert_eq!(meta(&server, "demoted_by_term").await, None);
-                server.state.hub.stale_term(Some(8)).await;
-                assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("8"));
+    for bad in ["bad", "+3", "003", "9007199254740992"] {
+        for node_term in [Some(5), None] {
+            let server = start_with_patient_node_session().await;
+            sqlx::query("UPDATE meta SET value = ? WHERE key = 'term'")
+                .bind(bad)
+                .execute(server.state.store.pool())
+                .await
+                .unwrap();
+            server.state.hub.stale_term(node_term).await;
+            assert!(server.state.store.is_demoted(), "{bad:?} {node_term:?}");
+            assert!(server.state.store.begin_write().await.is_err());
+            match node_term {
+                Some(_) => {
+                    assert_eq!(
+                        meta(&server, "demoted_by_term").await.as_deref(),
+                        Some("5"),
+                        "{bad:?}"
+                    );
+                }
+                None => {
+                    assert_eq!(meta(&server, "demoted_by_term").await, None, "{bad:?}");
+                    server.state.hub.stale_term(Some(8)).await;
+                    assert_eq!(
+                        meta(&server, "demoted_by_term").await.as_deref(),
+                        Some("8"),
+                        "{bad:?}"
+                    );
+                }
             }
         }
     }

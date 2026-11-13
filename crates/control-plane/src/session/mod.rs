@@ -3449,10 +3449,11 @@ impl Session {
             // Section 8.8, "Terms": `welcome` carries the cluster term as
             // `meta` stores it. A term below the node's would end the session
             // with `stale_term` and stop this primary's support, so a term
-            // that cannot be read starts no session. A missing or unparseable
-            // `meta.term` reads as 1 (`cluster_term`): that can only be at or
-            // below the real term, so at worst it draws `stale_term` and
-            // stops support, never a grant.
+            // that cannot be read starts no session. A missing `meta.term`
+            // reads as 1 (`cluster_term`), the term before the first
+            // promotion. A stored value that is not a term from 1 to
+            // 2^53 - 1 is an error here, so no `welcome` goes out with a
+            // term above the ceiling ("The term ceiling").
             let term = match cluster_term(&self.hub).await {
                 Ok(term) => term,
                 Err(e) => {
@@ -6419,13 +6420,15 @@ async fn insert_node_event(
     Ok(())
 }
 
-/// The current cluster term from `meta` (1 until elections exist).
+/// The current cluster term, `meta.term` ([`crate::store::read_term`]): 1
+/// until the first promotion writes its term (`node-agent-protocol.md`
+/// section 7.3 step 5). A stored value that holds no term is an error, so no
+/// frame carries a term above the ceiling (section 8.8).
 async fn cluster_term(hub: &NodeHub) -> Result<u64, String> {
-    let value: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = 'term'")
-        .fetch_optional(hub.0.store.pool())
+    crate::store::read_term(hub.0.store.pool())
         .await
-        .map_err(|e| format!("cannot read the cluster term: {e}"))?;
-    Ok(value.and_then(|(value,)| value.parse().ok()).unwrap_or(1))
+        .map(i64::unsigned_abs)
+        .map_err(|e| format!("cannot read the cluster term: {e}"))
 }
 
 /// The node that holds the primary status, or `node_id` when nobody does.
