@@ -167,6 +167,14 @@ pub struct SetOnWrite {
     pub disagreement: Option<Disagreement>,
 }
 
+impl SetOnWrite {
+    /// Whether the `nodes` rows make `node_id` a voter.
+    #[must_use]
+    pub fn contains_row_voter(&self, node_id: &str) -> bool {
+        self.voters.iter().any(|voter| voter.node_id == node_id)
+    }
+}
+
 /// What the replay knows of one node.
 #[derive(Clone, Debug, Default)]
 struct NodeFacts {

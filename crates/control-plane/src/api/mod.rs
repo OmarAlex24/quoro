@@ -127,7 +127,10 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/nodes/session",
             get(crate::session::open_node_session),
         )
-        .route("/api/v1/nodes/{node_id}", get(nodes::get_node))
+        .route(
+            "/api/v1/nodes/{node_id}",
+            get(nodes::get_node).delete(nodes::remove_node),
+        )
         .route(
             "/api/v1/nodes/{node_id}/tunnel",
             put(nodes::set_node_tunnel).delete(nodes::delete_node_tunnel),

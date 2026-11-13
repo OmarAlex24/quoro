@@ -25,6 +25,7 @@ pub mod serving;
 mod votes;
 
 pub(crate) use local_end::{LeftStopped, PolicyChange};
+pub(crate) use votes::VoterRemoval;
 
 use crate::AppState;
 use crate::changelog::{self, Actor, ActorType, Op};
@@ -432,6 +433,17 @@ fn not_primary_frame() -> String {
     )
 }
 
+/// The fatal `error` `node_removed` that ends a removed node's session
+/// (sections 5.18 and 10). `re` is the `hello` it answers, when one does.
+fn node_removed_frame(re: Option<&str>) -> String {
+    protocol_error(
+        quoro_proto::ErrorCode::NodeRemoved,
+        "this node was removed from the cluster; it must stop dialing",
+        true,
+        re,
+    )
+}
+
 fn decode_failure(error: &wire::DecodeError, outbox: &mut Vec<String>) -> bool {
     outbox.push(protocol_error(
         error.code(),
@@ -453,6 +465,9 @@ struct SessionHandle {
     closed: watch::Sender<bool>,
     /// Wakes the task when the node's desired state may have changed.
     changed: Arc<Notify>,
+    /// Ends the session with the fatal `error` `node_removed` once the node
+    /// is removed ([`NodeHub::node_removed`], section 10).
+    removed: Arc<Notify>,
     /// Commands and streams waiting on this session.
     pending: Arc<Mutex<Pending>>,
     /// Whether this session's `hello` is recorded (`nodes.status` set to
@@ -997,6 +1012,34 @@ impl NodeHub {
     /// What the holders' answers released ([`leases::is_released`]).
     pub(crate) fn releases(&self) -> &leases::Releases {
         &self.0.releases
+    }
+
+    /// Called once the write that turned `node_id` `removed` committed
+    /// (`removeNode`, section 10):
+    ///
+    /// - its live session, if any, ends with the fatal `error`
+    ///   `node_removed` and nothing after it;
+    /// - the held grants check again, since the required set of section 8.4
+    ///   now counts the machine only until its removal entry is replicated
+    ///   over the others (ADR 0261, ADR 0280), and so does the end of an
+    ///   `expiring` lease's renewals;
+    /// - a failover or restore waiting on one of its leases checks again
+    ///   ([`leases::is_released`] reads a removed holder as gone);
+    /// - every live session rebuilds its desired state: `spec.votes` and the
+    ///   mesh peers no longer name the machine.
+    pub(crate) fn node_removed(&self, node_id: &str) {
+        let removed = {
+            let sessions = self.0.sessions.lock().expect("session lock");
+            sessions
+                .get(node_id)
+                .map(|handle| Arc::clone(&handle.removed))
+        };
+        if let Some(removed) = removed {
+            removed.notify_one();
+        }
+        self.wake_held();
+        self.0.revoke_answers.notify_waiters();
+        self.nodes_changed_all();
     }
 
     /// Whether a `lease_revoke` of `lease_id` waits for its answer on the
@@ -2047,6 +2090,7 @@ impl NodeHub {
                 tx,
                 closed,
                 changed: Arc::clone(&changed),
+                removed: Arc::new(Notify::new()),
                 pending: Arc::new(Mutex::new(Pending::default())),
                 hello_recorded: false,
                 revokes: 0,
@@ -2062,6 +2106,19 @@ impl NodeHub {
             },
         );
         (generation, rx, closed_rx, changed)
+    }
+
+    /// The notifier that ends `generation`'s session once its node is
+    /// removed ([`NodeHub::node_removed`]), or `None` when a newer session
+    /// already replaced it.
+    fn removed_notify(&self, node_id: &str, generation: u64) -> Option<Arc<Notify>> {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(node_id)
+            .filter(|handle| handle.generation == generation)
+            .map(|handle| Arc::clone(&handle.removed))
     }
 
     /// Sets `generation`'s position in the change log: the start of follow,
@@ -2936,6 +2993,11 @@ async fn run_session(
     peer_ip: Option<IpAddr>,
 ) {
     let (generation, mut rx, mut closed, changed) = hub.attach(&node_id);
+    // A session a newer one already replaced gets a notifier nobody wakes:
+    // its `closed` signal ends it.
+    let removed = hub
+        .removed_notify(&node_id, generation)
+        .unwrap_or_else(|| Arc::new(Notify::new()));
     // ADR 0144, ADR 0266: the WireGuard endpoint of the edge and of every
     // voter is the source address of its session, so a changed address
     // changes its peers' entries.
@@ -2956,6 +3018,8 @@ async fn run_session(
     let mut superseded = false;
     let mut reason = "session_closed";
     let mut close_after_error = false;
+    // Set once the node is removed ([`NodeHub::node_removed`]).
+    let mut removed_end = false;
     // When the last sends after a demotion give up (`DEMOTED_SEND_TIMEOUT`).
     let mut demoted_until: Option<Instant> = None;
     let retry = tokio::time::sleep(SNAPSHOT_RETRY);
@@ -2977,6 +3041,23 @@ async fn run_session(
                 socket.send(Message::Text(not_primary_frame().into())),
             )
             .await;
+            break;
+        }
+        // Section 10: once the node is removed, it receives the fatal
+        // `node_removed` and nothing after it. What was queued for it is
+        // dropped: its leases were fenced, or their tokens raised, before
+        // the removal committed. The removed row is never written back to
+        // `disconnected` ([`disconnect_node`] changes only a `connected`
+        // row). A node that stops reading does not hold the session open.
+        if removed_end {
+            outbox.clear();
+            while rx.try_recv().is_ok() {}
+            let _ = tokio::time::timeout(
+                DEMOTED_SEND_TIMEOUT,
+                socket.send(Message::Text(node_removed_frame(None).into())),
+            )
+            .await;
+            reason = "node_removed";
             break;
         }
         while let Ok(text) = rx.try_recv() {
@@ -3058,6 +3139,9 @@ async fn run_session(
                     superseded = true;
                     break;
                 }
+            }
+            () = removed.notified() => {
+                removed_end = true;
             }
             () = changed.notified(), if session.connected && session.start_wait.is_none() => {
                 let was_pending = session.retry_pending;
@@ -3241,11 +3325,17 @@ impl Session {
             )
             .await
             {
-                Ok(start) => {
+                Ok(Connected::Started(start)) => {
                     if start.mesh_changed {
                         self.hub.nodes_changed_all();
                     }
                     start.stored_log_seq
+                }
+                // Section 10: the node was removed after its credential
+                // was checked; the removal committed first.
+                Ok(Connected::Removed) => {
+                    outbox.push(node_removed_frame(Some(&raw.id)));
+                    return true;
                 }
                 Err(e) => {
                     tracing::warn!(%e, node_id = %self.node_id, "cannot record the session start");
@@ -5365,6 +5455,26 @@ struct SessionStart {
     stored_log_seq: u64,
 }
 
+/// What [`connect_node`] found.
+enum Connected {
+    /// The session start is recorded.
+    Started(SessionStart),
+    /// The node is removed: nothing is recorded, and the session ends with
+    /// the fatal `node_removed` (section 10).
+    Removed,
+}
+
+#[cfg(test)]
+impl Connected {
+    /// The recorded start; panics for a removed node.
+    fn started(self) -> SessionStart {
+        match self {
+            Self::Started(start) => start,
+            Self::Removed => panic!("the node is removed"),
+        }
+    }
+}
+
 /// Records the start of a session and emits `node.connected` (section 5.1).
 ///
 /// `nodes.log_seq` takes the `hello`'s `log_seq` in the same write: from M5b
@@ -5388,12 +5498,17 @@ struct SessionStart {
 /// the newer session's own start write by the writer gate, as in
 /// [`disconnect_node`] and [`reset_log_seq`] (issue #324). The superseded
 /// session never counts as connected, so its end records nothing.
+///
+/// Records nothing either for a removed node (section 10): its credential
+/// passed before `removeNode` committed, and the `removed` row must not be
+/// written back to `connected`. The status is read under the writer gate,
+/// so it is ordered against the removal's own write.
 async fn connect_node(
     hub: &NodeHub,
     node_id: &str,
     generation: u64,
     hello: &wire::Hello,
-) -> Result<SessionStart, String> {
+) -> Result<Connected, String> {
     let actor = Actor {
         kind: ActorType::Node,
         id: node_id.to_string(),
@@ -5414,12 +5529,21 @@ async fn connect_node(
     if !hub.is_current(node_id, generation) {
         return Err("a newer session of the node took over before this hello was recorded".into());
     }
-    let stored_log_seq: Option<i64> = sqlx::query_scalar("SELECT log_seq FROM nodes WHERE id = ?")
-        .bind(node_id)
-        .fetch_optional(&mut *w.tx)
-        .await
-        .map_err(|e| e.to_string())?;
-    let stored_log_seq = stored_log_seq.map_or(0, |seq| u64::try_from(seq).unwrap_or(0));
+    let stored: Option<(Option<i64>, String)> =
+        sqlx::query_as("SELECT log_seq, status FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(&mut *w.tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    if stored
+        .as_ref()
+        .is_some_and(|(_, status)| status == "removed")
+    {
+        return Ok(Connected::Removed);
+    }
+    let stored_log_seq = stored
+        .and_then(|(seq, _)| seq)
+        .map_or(0, |seq| u64::try_from(seq).unwrap_or(0));
     // Held in memory before the write below replaces it, so neither this
     // session's end nor a later session's check reads this hello's own
     // log_seq as the stored acknowledgement (ADR 0261).
@@ -5480,10 +5604,10 @@ async fn connect_node(
         hub.set_hello_recorded(node_id, generation, false);
         return Err(e.to_string());
     }
-    Ok(SessionStart {
+    Ok(Connected::Started(SessionStart {
         mesh_changed,
         stored_log_seq,
-    })
+    }))
 }
 
 /// Records the end of a session and emits `node.disconnected`.
@@ -6537,6 +6661,34 @@ mod tests {
         close_and_remove(&[&state], &data_dir).await;
     }
 
+    /// Section 10: a node removed after its credential was checked, and
+    /// before its `hello` is recorded, is not written back to `connected`.
+    /// Its `hello` records nothing, emits no `node.connected`, and the
+    /// session's end writes no disconnect over the `removed` row.
+    #[tokio::test]
+    async fn the_hello_of_a_removed_node_records_nothing() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (a, _rx_a, _closed_a, _) = hub.attach(&node_id);
+        sqlx::query("UPDATE nodes SET status = 'removed' WHERE id = ?")
+            .bind(&node_id)
+            .execute(state.store.pool())
+            .await
+            .unwrap();
+        let before = connects_and_entries(&state, &node_id).await;
+        let connected = connect_node(hub, &node_id, a, &hello(&node_id))
+            .await
+            .unwrap();
+        assert!(matches!(connected, Connected::Removed));
+        assert_eq!(connects_and_entries(&state, &node_id).await, before);
+        end_session(hub, &node_id, a, true, "node_removed").await;
+        assert_eq!(
+            status_and_disconnects(&state, &node_id).await,
+            ("removed".to_string(), 0)
+        );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_disconnect_before_the_new_hello_is_recorded() {
         let (state, node_id, data_dir) = hub_with_node().await;
@@ -6613,7 +6765,10 @@ mod tests {
         // A's end writes nothing either.
         assert_eq!(hub.end_log_seq(&node_id, a), None);
 
-        let start = connect_node(hub, &node_id, b, &below).await.unwrap();
+        let start = connect_node(hub, &node_id, b, &below)
+            .await
+            .unwrap()
+            .started();
         assert_eq!(start.stored_log_seq, 7);
         assert_eq!(hub.newest_log_ack(&node_id), 7);
         assert_eq!(node_log_seq(&state, &node_id).await, 3);
@@ -6621,7 +6776,10 @@ mod tests {
         assert_eq!(hub.end_log_seq(&node_id, b), Some(7));
         // A lower stored value never lowers the memory.
         let (c, _rx_c, _closed_c, _) = hub.attach(&node_id);
-        let start = connect_node(hub, &node_id, c, &below).await.unwrap();
+        let start = connect_node(hub, &node_id, c, &below)
+            .await
+            .unwrap()
+            .started();
         assert_eq!(start.stored_log_seq, 3);
         assert_eq!(hub.newest_log_ack(&node_id), 7);
         close_and_remove(&[&state], &data_dir).await;

@@ -333,13 +333,6 @@ async fn delete_seal(
 ///
 /// A database error, which the caller's transaction rolls back with the
 /// rest.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "removeNode, not built yet, calls it in its transaction"
-    )
-)]
 pub(crate) async fn delete_seals(
     conn: &mut SqliteConnection,
     node_id: &str,
