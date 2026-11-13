@@ -46,21 +46,35 @@
 //! records; `unchanged`, on proof; or `gone`. A run that finds the mark skips
 //! the comparison and the quarantine and goes on with step 4: for a copy,
 //! once the copy the mark names still has its clone; for `unchanged` and
-//! `gone`, once another file the node records for the volume shows the
-//! volume directory to be the real one, as it did when the mark was written.
+//! `gone`, once the volume directory shows itself to be the real one again
+//! (below), as it did when the mark was written.
 //!
 //! **A missing file proves nothing by itself**: a volume directory that did
-//! not mount, or a new empty pool, looks exactly like it. So the live file
-//! counts as gone, and a missing clone clears its mark, only while another
-//! file the node records for the volume (a kept snapshot, a quarantined
-//! copy's clone among them) is on disk and in the engine's current volume
-//! directory. Without one, the run fails with the warm copy's error and
-//! changes nothing, and a later pass tries again. A mark cleared
-//! for a missing clone keeps the copy's record, reported without a hash: no
-//! record is ever forgotten here. A record goes by `quarantine_deletes`, or,
-//! while it has no hash, when its hash shows the clone to be gone
-//! ([`crate::warm::quarantine`], section 9 step 2). The next pass compares
-//! the live file again.
+//! not mount, or a new empty pool, looks exactly like it. What shows the
+//! directory to be the real one is a file in the engine's current volume
+//! directory (section 9): the volume's own live file, which the engine
+//! finds when it compares the file alone, or another file the node records
+//! for the volume (a kept snapshot, a quarantined copy's clone among them)
+//! that is on disk and that the engine takes as a snapshot of the volume.
+//! The store alone does not count, and neither does the disk alone. So the
+//! live file counts as gone only while another file the node records for
+//! the volume is there; a missing clone clears its mark, and a file marked
+//! `unchanged` goes, while the live file or such a file is there. A file
+//! marked `gone` goes only while the live file is still missing and another
+//! file shows the directory. The mark was written because the live file was
+//! missing, so a live file the engine finds now was put back since, and
+//! nothing proved it unchanged: that run deletes nothing, the mark goes,
+//! and the next pass compares the file again, which keeps it as a
+//! quarantined copy unless it proves it unchanged. No copy stands behind a
+//! `gone` mark, so clearing it loses nothing. Without evidence, the run
+//! fails with the warm copy's error and changes nothing, and a later pass
+//! tries again. An engine that refuses the live file, as while a
+//! VM it holds attaches it, holds the run as any refusal does (step 1). A
+//! mark cleared for a missing clone keeps the copy's record, reported
+//! without a hash: no record is ever forgotten here. A record goes by
+//! `quarantine_deletes`, or, while it has no hash, when its hash shows the
+//! clone to be gone ([`crate::warm::quarantine`], section 9 step 2). The
+//! next pass compares the live file again.
 //!
 //! The mark holds only while no VM writes to the file: a node that runs the
 //! volume again before the hand-over finished clears it (the reconciler,
@@ -129,6 +143,15 @@ enum Compared {
     /// The live file is missing, and nothing shows the volume directory to
     /// be the real one; with why.
     Unproved(String),
+}
+
+/// What the engine finds of the volume's own live file, when it neither
+/// refuses it nor fails.
+enum LiveFile {
+    /// The file is in the engine's current volume directory.
+    Present,
+    /// The engine answers `NotFound`: the file is missing.
+    Missing,
 }
 
 /// What a quarantine kept.
@@ -297,8 +320,8 @@ impl<E: Engine + 'static> Inner<E> {
             Some(HandOverMark::Copy(quarantine_id)) => {
                 self.copy_kept(volume_id, quarantine_id).await
             }
-            Some(HandOverMark::Unchanged | HandOverMark::Gone) => {
-                self.marked_on_real_directory(volume_id).await
+            Some(mark @ (HandOverMark::Unchanged | HandOverMark::Gone)) => {
+                self.marked_on_real_directory(volume_id, mark).await
             }
             None => Ok(()),
         };
@@ -372,13 +395,18 @@ impl<E: Engine + 'static> Inner<E> {
     /// forgotten here.
     ///
     /// - Its clone is there: the file may go.
-    /// - Its clone is missing while another file the node records for the
-    ///   volume is there, so the volume directory is the real one: the mark
-    ///   goes, the record stays (reported without a hash, and hashed if the
-    ///   file comes back), and the next pass compares the live file again.
-    /// - Its clone is missing and so is every other recorded file of the
-    ///   volume: a volume directory that did not mount looks exactly like
-    ///   that. Nothing changes, and the run fails until the files are back.
+    /// - Its clone is missing while the live file, or another file the node
+    ///   records for the volume, is there, so the volume directory is the
+    ///   real one ([`Self::directory_shown`]): the mark goes, the record
+    ///   stays (reported without a hash, and hashed if the file comes back),
+    ///   and the next pass compares the live file again, which is still
+    ///   there to keep its writes.
+    /// - Its clone is missing, and so are the live file and every other
+    ///   recorded file of the volume: a volume directory that did not mount
+    ///   looks exactly like that. Nothing changes, and the run fails until
+    ///   the files are back. So does an engine that fails to check the live
+    ///   file; one that refuses it holds the run instead
+    ///   ([`Self::live_file`]).
     /// - The copy's record is gone before the file went: an operator deleted
     ///   it (`quarantine_deletes`), or its clone was shown to be gone before
     ///   it was hashed (section 9 step 2). The live file is all that keeps
@@ -412,15 +440,11 @@ impl<E: Engine + 'static> Inner<E> {
                 )));
             }
         }
-        if !self
-            .volume_files_present(volume_id)
-            .await
-            .map_err(HandOver::Failed)?
-        {
+        if !self.directory_shown(volume_id).await? {
             return Err(HandOver::Failed(format!(
-                "the clone of the quarantined copy {quarantine_id} is missing, and so is every \
-                 other file the node records for the volume: the volume directory may not be \
-                 the real one, so nothing changes until the files are back"
+                "the clone of the quarantined copy {quarantine_id} is missing, and so are the \
+                 live file and every other file the node records for the volume: the volume \
+                 directory may not be the real one, so nothing changes until the files are back"
             )));
         }
         self.clear_mark(volume_id).await?;
@@ -431,26 +455,64 @@ impl<E: Engine + 'static> Inner<E> {
     }
 
     /// Before a file marked `unchanged` or `gone` goes. The mark was written
-    /// while another file the node records for the volume showed the volume
-    /// directory to be the real one; this run may not see that directory, as
+    /// on the real volume directory; this run may not see that directory, as
     /// after a restart with a state disk that did not mount. The engine
     /// deletes a missing file without an error, so the row would go while
-    /// the real file comes back with no row. The file goes only while such a
-    /// file shows the directory to be the real one again; otherwise nothing
+    /// the real file comes back with no row. The file goes only while the
+    /// directory shows itself to be the real one again; otherwise nothing
     /// changes, the mark stands, and the run fails until the files are back.
-    async fn marked_on_real_directory(&self, volume_id: &str) -> Result<(), HandOver> {
-        if self
-            .volume_files_present(volume_id)
-            .await
-            .map_err(HandOver::Failed)?
-        {
+    ///
+    /// - `unchanged`: the live file, or another file the node records for
+    ///   the volume, shows it ([`Self::directory_shown`]). The mark proved
+    ///   the live file to hold no write the target lacks, and no VM has
+    ///   written to it since, or the mark would be gone.
+    /// - `gone`: the live file is asked about first ([`Self::live_file`]).
+    ///   The mark was written because the live file was missing, so a live
+    ///   file the engine finds now was put back since, as by an operator,
+    ///   and nothing proved it unchanged: it is no evidence for its own
+    ///   delete, and it may hold writes the target lacks. Nothing is
+    ///   deleted: the mark goes, and the next pass compares the file again,
+    ///   which keeps it as a quarantined copy unless it proves it unchanged
+    ///   (section 9 step 2). No copy stands behind a `gone` mark, so
+    ///   clearing it loses nothing. While the live file is still missing,
+    ///   only another file the node records for the volume shows the
+    ///   directory.
+    async fn marked_on_real_directory(
+        &self,
+        volume_id: &str,
+        mark: &HandOverMark,
+    ) -> Result<(), HandOver> {
+        let unchanged = matches!(mark, HandOverMark::Unchanged);
+        let shown = if unchanged {
+            self.directory_shown(volume_id).await?
+        } else {
+            if matches!(self.live_file(volume_id).await?, LiveFile::Present) {
+                self.clear_mark(volume_id).await?;
+                return Err(HandOver::Failed(
+                    "the hand-over mark says the live file was missing, but the live file is \
+                     back: nothing is deleted, the mark goes, and the next pass compares the \
+                     live file again"
+                        .to_owned(),
+                ));
+            }
+            self.volume_files_present(volume_id)
+                .await
+                .map_err(HandOver::Failed)?
+        };
+        if shown {
             return Ok(());
         }
         Err(HandOver::Failed(
-            "the hand-over mark stands, but no other file the node records for the volume is \
-             there: the volume directory may not be the real one, so nothing changes until the \
-             files are back"
-                .to_owned(),
+            if unchanged {
+                "the hand-over mark stands, but the live file and every other file the node \
+                 records for the volume are missing: the volume directory may not be the real \
+                 one, so nothing changes until the files are back"
+            } else {
+                "the hand-over mark stands, but no other file the node records for the volume is \
+                 there: the volume directory may not be the real one, so nothing changes until \
+                 the files are back"
+            }
+            .to_owned(),
         ))
     }
 
@@ -459,6 +521,63 @@ impl<E: Engine + 'static> Inner<E> {
             .clear_volume_handing_over(volume_id)
             .await
             .map_err(|e| HandOver::Failed(format!("cannot clear the hand-over mark: {e}")))
+    }
+
+    /// Whether the engine's current volume directory shows itself to be the
+    /// real one (section 9): another file the node records for `volume_id`
+    /// is there ([`Self::volume_files_present`]), or the volume's own live
+    /// file is ([`Self::live_file`]).
+    ///
+    /// # Errors
+    ///
+    /// `Failed` when the kept snapshots cannot be read, and, when no other
+    /// file shows the directory, what [`Self::live_file`] answers for an
+    /// engine that neither finds the live file nor answers `NotFound` for
+    /// it. Either leaves the caller's run with nothing changed.
+    async fn directory_shown(&self, volume_id: &str) -> Result<bool, HandOver> {
+        if self
+            .volume_files_present(volume_id)
+            .await
+            .map_err(HandOver::Failed)?
+        {
+            return Ok(true);
+        }
+        Ok(matches!(
+            self.live_file(volume_id).await?,
+            LiveFile::Present
+        ))
+    }
+
+    /// What the engine finds of the volume's own live file, through a
+    /// comparison of the file alone, which it runs on the file in its
+    /// current volume directory. `Ok` is the file there, which shows the
+    /// directory to be the real one (section 9). `NotFound` is a missing
+    /// file, which shows nothing.
+    ///
+    /// # Errors
+    ///
+    /// Any other answer shows nothing either, and the caller's run changes
+    /// nothing. `Refused` for `Conflict`: a VM the engine holds attaches the
+    /// file, another task holds it, or the path is not one it takes. A
+    /// later pass waits that out, as it does a refusal of the comparison or
+    /// the delete, and reports it only once it lasts. `Failed` for anything
+    /// else, as an engine that cannot read the file.
+    async fn live_file(&self, volume_id: &str) -> Result<LiveFile, HandOver> {
+        match self
+            .engine
+            .volume_changed_ranges(&RangesOf::Volume(VolumeId(volume_id.to_owned())), None)
+            .await
+        {
+            Ok(_) => Ok(LiveFile::Present),
+            Err(EngineError::NotFound) => Ok(LiveFile::Missing),
+            Err(EngineError::Conflict(reason)) => Err(HandOver::Refused(format!(
+                "the engine would not check the live file: {reason}"
+            ))),
+            Err(e) => Err(HandOver::Failed(format!(
+                "the live volume file could not be checked, so the volume directory may not be \
+                 the real one, and nothing changes: {e}"
+            ))),
+        }
     }
 
     /// Whether a file the node records for `volume_id` is where the engine

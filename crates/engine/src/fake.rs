@@ -1952,6 +1952,21 @@ impl Engine for FakeEngine {
             },
             None => None,
         };
+        // The files themselves, as the real engine opens them (section 3.22):
+        // a volume's live file first, then the base. A file missing from the
+        // volume directory is `NotFound`, and a path that is not a regular
+        // file is `Conflict`. Without a volume directory the fake keeps no
+        // files, so the records are all there is to check. Unlike the real
+        // engine, the fake does not open a newer snapshot's own file: receiver
+        // tests rely on a recorded snapshot answering from its record alone.
+        if state.volume_dir.is_some() {
+            if matches!(newer, RangesOf::Volume(_)) {
+                check_regular_file(&newer_path)?;
+            }
+            if let Some(base_path) = &base_path {
+                check_regular_file(base_path)?;
+            }
+        }
         if let Some(pushed) = state.changed_ranges.pop_front() {
             return Ok(pushed);
         }
@@ -2387,6 +2402,25 @@ fn volume_info(id: &VolumeId, volume: &FakeVolume) -> VolumeInfo {
         size_gb: volume.size_gb,
         allocated_bytes,
         path: volume.path.clone(),
+    }
+}
+
+/// Checks that `path` is a regular file, as the real engine does before it
+/// opens a file it compares (section 3.22).
+///
+/// # Errors
+///
+/// `NotFound` for a missing file, `Conflict` for anything but a regular
+/// file, and `Io` when the file cannot be looked up.
+fn check_regular_file(path: &Path) -> Result<(), EngineError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(EngineError::Conflict(format!(
+            "{} is not a regular file",
+            path.display()
+        ))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(EngineError::NotFound),
+        Err(err) => Err(io_error(err)),
     }
 }
 

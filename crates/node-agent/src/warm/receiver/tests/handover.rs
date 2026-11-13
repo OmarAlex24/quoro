@@ -715,7 +715,9 @@ async fn a_marked_unchanged_or_gone_run_changes_nothing_until_the_volume_directo
         );
 
         // The state disk did not mount: the volume directory is empty, while
-        // the store and the engine still name every file.
+        // the store and the engine still name every file. Neither the base
+        // nor the live file shows the directory: the engine answers
+        // `NotFound` for the live file it no longer finds.
         let mut paths = vec![base.location.as_path()];
         if !gone {
             paths.push(path.as_path());
@@ -750,6 +752,182 @@ async fn a_marked_unchanged_or_gone_run_changes_nothing_until_the_volume_directo
         assert_eq!(hand_over(&h).await, HandOver::Done(None), "gone {gone}");
         assert_handed_over(&h).await;
         assert!(quarantined(&h).await.is_empty());
+    }
+}
+
+/// A marked run that fails with nothing changed: the row and the mark stay,
+/// and so does the live file when there is one.
+async fn assert_marked_run_changes_nothing(h: &Harness, mark: &HandOverMark, what: &str) {
+    let outcome = hand_over(h).await;
+    assert!(
+        matches!(&outcome, HandOver::Failed(reason) if reason.contains("may not be the real one")),
+        "{what}: {outcome:?}"
+    );
+    assert!(
+        h.store.volume(VOL).await.expect("store").is_some(),
+        "{what}: the row stays"
+    );
+    assert_eq!(
+        h.store.volume_hand_over_mark(VOL).await.expect("store"),
+        Some(mark.clone()),
+        "{what}: the mark stands"
+    );
+    let error = h.row().await.error.expect("an error is shown");
+    assert!(error.contains("may not be the real one"), "{what}: {error}");
+}
+
+/// A marked run the engine refuses, as while a VM it holds attaches the
+/// live file: nothing changes, the live file stays, and the refusal adds no
+/// error of its own, as any refusal until it lasts
+/// [`REFUSALS_BEFORE_ERROR`] passes. Returns the refusal's reason.
+async fn assert_marked_run_refused(h: &Harness, mark: &HandOverMark, what: &str) -> String {
+    let error = h.row().await.error;
+    let HandOver::Refused(reason) = hand_over(h).await else {
+        panic!("{what}: the run is refused");
+    };
+    assert!(
+        h.store.volume(VOL).await.expect("store").is_some(),
+        "{what}: the row stays"
+    );
+    assert_eq!(
+        h.store.volume_hand_over_mark(VOL).await.expect("store"),
+        Some(mark.clone()),
+        "{what}: the mark stands"
+    );
+    assert!(h.volume_path.exists(), "{what}: the live file stays");
+    assert_eq!(h.row().await.error, error, "{what}: no error of its own");
+    reason
+}
+
+#[tokio::test]
+async fn a_file_marked_unchanged_whose_base_is_lost_goes_on_the_evidence_of_the_live_file() {
+    let h = Harness::new("handover-unchanged-lost-base").await;
+    returning_source(&h).await;
+    let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+    // The run that writes the mark fails to delete the live file.
+    h.engine
+        .fail_next(FakeOp::DeleteVolume, EngineError::Io("injected".to_owned()));
+    assert!(matches!(hand_over(&h).await, HandOver::Failed(_)));
+    let mark = HandOverMark::Unchanged;
+    assert_eq!(
+        h.store.volume_hand_over_mark(VOL).await.expect("store"),
+        Some(mark.clone())
+    );
+    // The base is lost out of band (disk damage, removed by hand); the
+    // store and the engine still name it. No other file of the volume is
+    // left, so only the live file can show the directory.
+    std::fs::remove_file(&base.location).expect("lose the base");
+
+    // An engine that neither finds nor misses the live file shows nothing.
+    // A VM it holds attaches the file, which only the engine sees: the run
+    // waits, as for any VM that attaches the volume, with no error yet.
+    let attaching = engine_vm(&h.engine, "vm_01JD0WARM0000000000000002", true).await;
+    for _ in 0..2 {
+        let reason = assert_marked_run_refused(&h, &mark, "a VM attaches the live file").await;
+        assert!(reason.contains("attached"), "{reason}");
+    }
+    h.engine.delete(&attaching).await.expect("delete");
+    // It cannot read the file: the run fails, and says why.
+    h.engine.fail_next(
+        FakeOp::VolumeChangedRanges,
+        EngineError::Io("injected".to_owned()),
+    );
+    assert_marked_run_changes_nothing(&h, &mark, "an I/O error").await;
+    assert!(h.volume_path.exists());
+
+    // The engine finds the live file in its volume directory: that shows
+    // the directory to be the real one, and the file the mark proved
+    // unchanged goes.
+    assert_eq!(hand_over(&h).await, HandOver::Done(None));
+    assert_handed_over(&h).await;
+    assert!(quarantined(&h).await.is_empty());
+}
+
+/// A `gone` mark was written because the live file was missing; the delete
+/// or the row's drop then failed, and the live file was put back since, as
+/// by an operator. Nothing proved it unchanged, so it is compared again
+/// before anything goes: the marked run deletes nothing and clears the
+/// mark, and the next run keeps the file as a quarantined copy. That holds
+/// whether the base is still there or was lost too.
+#[tokio::test]
+async fn a_live_file_back_after_a_gone_mark_is_compared_again_before_anything_goes() {
+    for lose_base in [true, false] {
+        let what = format!("base lost {lose_base}");
+        let h = Harness::new(if lose_base {
+            "handover-gone-back-lost-base"
+        } else {
+            "handover-gone-back"
+        })
+        .await;
+        let path = returning_source(&h).await;
+        let base = keep_snapshot(&h, KeepPurpose::WarmBase, 1).await;
+        let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
+        h.engine.delete_volume(&vol()).await.expect("delete");
+        // The run that writes the mark fails before the row goes.
+        h.engine
+            .fail_next(FakeOp::DeleteVolume, EngineError::Io("injected".to_owned()));
+        assert!(matches!(hand_over(&h).await, HandOver::Failed(_)), "{what}");
+        let mark = HandOverMark::Gone;
+        assert_eq!(
+            h.store.volume_hand_over_mark(VOL).await.expect("store"),
+            Some(mark.clone()),
+            "{what}"
+        );
+        if lose_base {
+            std::fs::remove_file(&base.location).expect("lose the base");
+        }
+        // A live file with data the target never got is put back.
+        h.engine
+            .ensure_volume(&vol(), 1)
+            .await
+            .expect("the file is back");
+        write_at(&path, 0, &[9_u8; 4096]);
+
+        // A VM the engine holds attaches the file: the run waits, and the
+        // mark stands.
+        let attaching = engine_vm(&h.engine, "vm_01JD0WARM0000000000000002", true).await;
+        let reason = assert_marked_run_refused(&h, &mark, &what).await;
+        assert!(reason.contains("attached"), "{what}: {reason}");
+        h.engine.delete(&attaching).await.expect("delete");
+
+        // The engine finds the file: nothing is deleted, and the mark goes.
+        let outcome = hand_over(&h).await;
+        assert!(
+            matches!(&outcome, HandOver::Failed(reason) if reason.contains("compares the live file again")),
+            "{what}: {outcome:?}"
+        );
+        assert_eq!(
+            h.store.volume_hand_over_mark(VOL).await.expect("store"),
+            None,
+            "{what}: the mark goes"
+        );
+        assert!(
+            h.store.volume(VOL).await.expect("store").is_some(),
+            "{what}: the row stays"
+        );
+        assert_eq!(
+            read_at(&path, 0, 4096),
+            vec![9_u8; 4096],
+            "{what}: the file stays"
+        );
+        assert!(quarantined(&h).await.is_empty(), "{what}");
+        let error = h.row().await.error.expect("an error is shown");
+        assert!(error.contains("compares the live file again"), "{error}");
+
+        // The next run compares the file and keeps it as a quarantined copy
+        // before it goes.
+        let HandOver::Done(Some(id)) = hand_over(&h).await else {
+            panic!("{what}: the hand-over ends with a copy");
+        };
+        let records = quarantined(&h).await;
+        assert_eq!(records.len(), 1, "{what}: {records:?}");
+        assert_eq!(records[0].quarantine_id, id, "{what}");
+        assert_eq!(
+            read_at(&records[0].path, 0, 4096),
+            vec![9_u8; 4096],
+            "{what}: the copy holds the put-back data"
+        );
+        assert_handed_over(&h).await;
     }
 }
 
@@ -969,21 +1147,49 @@ async fn an_own_row_without_a_live_file_hands_over_only_where_another_file_shows
 
     // No other file of the volume: the directory may not be the real one,
     // as after a state disk that did not mount. Nothing changes, and the
-    // error says why.
-    let h = Harness::new("handover-gone-unproved").await;
-    returning_source(&h).await;
-    h.engine.delete_volume(&vol()).await.expect("delete");
-    for _ in 0..2 {
-        assert!(matches!(hand_over(&h).await, HandOver::Failed(_)));
-        assert!(
-            h.store.volume(VOL).await.expect("store").is_some(),
-            "the row stays"
-        );
-        assert!(!h.store.volume_handing_over(VOL).await.expect("store"));
-        let error = h.row().await.error.expect("an error is shown");
-        assert!(error.contains("may not be the real one"), "{error}");
+    // error says why. The live file is lost through the engine, or removed
+    // by hand while the engine still names the volume; either way the
+    // engine answers `NotFound` for it, and a missing live file shows
+    // nothing of the directory it is missing from (issue #762 case 1(b)).
+    // Only the volume's own files count as evidence: whether another
+    // volume's live file or kept snapshot may count too awaits a ruling
+    // (#762), so this case keeps refusing until a file is back.
+    for by_hand in [false, true] {
+        let h = Harness::new(if by_hand {
+            "handover-gone-unproved-by-hand"
+        } else {
+            "handover-gone-unproved"
+        })
+        .await;
+        let path = returning_source(&h).await;
+        if by_hand {
+            std::fs::remove_file(&path).expect("remove the live file");
+            assert!(
+                h.engine.volumes().iter().any(|(id, _)| *id == vol()),
+                "the engine still names the volume"
+            );
+        } else {
+            h.engine.delete_volume(&vol()).await.expect("delete");
+        }
+        for _ in 0..2 {
+            assert!(
+                matches!(hand_over(&h).await, HandOver::Failed(_)),
+                "by hand {by_hand}"
+            );
+            assert!(
+                h.store.volume(VOL).await.expect("store").is_some(),
+                "by hand {by_hand}: the row stays"
+            );
+            assert!(!h.store.volume_handing_over(VOL).await.expect("store"));
+            let error = h.row().await.error.expect("an error is shown");
+            assert!(
+                error.contains("may not be the real one"),
+                "by hand {by_hand}: {error}"
+            );
+        }
+        assert!(quarantined(&h).await.is_empty());
+        assert!(h.engine.volume_snapshots().is_empty(), "no copy taken");
     }
-    assert!(quarantined(&h).await.is_empty());
 
     // A snapshot that answers `NotFound` while the live file is there is
     // not taken for a missing file: nothing goes, and the next run keeps it.
@@ -1247,6 +1453,79 @@ async fn a_missing_clone_of_an_older_copy_leaves_the_newer_copy_s_mark_standing(
         h.engine.volume_snapshots().len(),
         snapshots,
         "no extra copy"
+    );
+    assert_handed_over(&h).await;
+}
+
+/// Issue #762 case 1(a): no base is kept, so once the copy's clone is
+/// removed by hand the live file is the only file of the volume left. It
+/// shows the volume directory to be the real one: the mark goes, and the
+/// next run takes a new copy, where every run used to fail.
+#[tokio::test]
+async fn with_no_kept_base_the_live_file_shows_the_directory_once_the_clone_is_missing() {
+    let h = Harness::new("handover-no-base-live").await;
+    let path = returning_source(&h).await;
+    diverge(&path);
+    let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
+    // The live file is quarantined, and its delete fails once.
+    let copy = marked_copy(&h).await;
+    assert_eq!(kept_purposes(&h).await, vec!["quarantine"], "no base");
+    std::fs::remove_file(&copy.path).expect("remove the clone");
+    let mark = HandOverMark::Copy(copy.quarantine_id.clone());
+
+    // An engine that neither finds nor misses the live file shows nothing.
+    // A refusal holds the run without an error of its own; any other error
+    // fails it.
+    h.engine.fail_next(
+        FakeOp::VolumeChangedRanges,
+        EngineError::Conflict("injected".to_owned()),
+    );
+    let reason = assert_marked_run_refused(&h, &mark, "a refusal").await;
+    assert!(reason.contains("injected"), "{reason}");
+    assert_live_kept(&h);
+    assert_eq!(quarantined(&h).await, vec![copy.clone()]);
+    h.engine.fail_next(
+        FakeOp::VolumeChangedRanges,
+        EngineError::Io("injected".to_owned()),
+    );
+    assert_marked_run_changes_nothing(&h, &mark, "an I/O error").await;
+    assert_live_kept(&h);
+    assert_eq!(quarantined(&h).await, vec![copy.clone()]);
+
+    // The engine finds the live file: the mark goes, the record stays, and
+    // the live file stays to keep its writes.
+    let outcome = hand_over(&h).await;
+    assert!(
+        matches!(&outcome, HandOver::Failed(reason) if reason.contains("compares the live file again")),
+        "{outcome:?}"
+    );
+    assert_live_kept(&h);
+    assert_eq!(
+        h.store.volume_hand_over_mark(VOL).await.expect("store"),
+        None
+    );
+    assert_eq!(
+        quarantined(&h).await,
+        vec![copy.clone()],
+        "nothing forgotten"
+    );
+
+    // The next run compares again and keeps one new copy beside it.
+    let HandOver::Done(Some(id)) = hand_over(&h).await else {
+        panic!("the hand-over ends");
+    };
+    assert_ne!(id, copy.quarantine_id);
+    let records = quarantined(&h).await;
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.quarantine_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![copy.quarantine_id.as_str(), id.as_str()]
+    );
+    assert_eq!(
+        read_at(&records[1].path, 7 * CELL + 512, 8192),
+        pattern(8192, 4)
     );
     assert_handed_over(&h).await;
 }
