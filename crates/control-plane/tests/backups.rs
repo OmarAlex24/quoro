@@ -1053,8 +1053,9 @@ async fn rotating_the_recovery_key_writes_config_2() {
 /// Section 7.3 step 4 (ADR 0297): the change-log entry of a provider created
 /// over the API rebuilds its row when replayed into an empty database, its
 /// settings included as `config_json`. The backup repository the provider
-/// serves is not replayed: `repo_key_enc` stays out of the log until the
-/// maintainer decides how a promoted primary gets the repository key.
+/// serves is not replayed here: `repo_key_enc` stays out of the log, and a
+/// promoted primary gets the repository key back from the recovery key
+/// (ADR 0322).
 #[tokio::test]
 async fn a_provider_entry_rebuilds_its_row() {
     let server = start_with_patient_node_session().await;
@@ -1226,6 +1227,422 @@ async fn a_volume_backup_reaches_the_node_and_the_primary_seals_it() {
 fn base64_of(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// A primary without the repository key
+// ---------------------------------------------------------------------------
+
+/// Empties `repo_key_enc`, which is how a promoted primary rebuilds the row
+/// from the change log (`node-agent-protocol.md` section 7.3, step 4), and
+/// returns the blob it held.
+async fn drop_repository_key(server: &Server, repo_id: &str) -> Vec<u8> {
+    let blob: Vec<u8> =
+        sqlx::query_scalar("SELECT repo_key_enc FROM backup_repositories WHERE id = ?")
+            .bind(repo_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert!(!blob.is_empty());
+    sqlx::query("UPDATE backup_repositories SET repo_key_enc = X'' WHERE id = ?")
+        .bind(repo_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    blob
+}
+
+/// Asserts a `409 conflict` that names the absent key, and returns its detail.
+async fn key_absent_conflict(res: reqwest::Response) -> String {
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["code"], "conflict", "{body}");
+    let detail = body["detail"].as_str().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("does not hold the backup repository key"),
+        "{body}"
+    );
+    detail
+}
+
+/// The audit records of calls refused with `conflict`.
+async fn conflicts(server: &Server) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE result = 'error' AND result_detail = 'conflict'",
+    )
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap()
+}
+
+/// Every key of the in-memory bucket, sorted.
+async fn bucket_keys(memory: &MemoryStore) -> Vec<String> {
+    let mut keys: Vec<String> = memory
+        .list("")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|object| object.key)
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// `node-agent-protocol.md` section 7.3, step 4 (ADR 0322): until the key is
+/// back on this primary, the repository shows `repository_key_present: false`,
+/// `createBackup`, `restoreBackup` and `rotateBackupRecoveryKey` answer
+/// `conflict`, the pre-upgrade backup fails, and garbage collection does not
+/// run. Nothing in the bucket changes.
+#[tokio::test]
+async fn a_primary_without_the_repository_key_refuses_backup_work() {
+    let mut setup = setup().await;
+    let backup_id = run_backup(&mut setup, &vec![5u8; 300 * 1024]).await;
+    let node_id: String = sqlx::query_scalar("SELECT node_id FROM backups WHERE id = ?")
+        .bind(&backup_id)
+        .fetch_one(setup.server.state.store.pool())
+        .await
+        .unwrap();
+    let res = setup
+        .owner
+        .get(
+            setup
+                .server
+                .url(&format!("/api/v1/backup-repositories/{}", setup.repo_id)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.json::<Value>().await.unwrap()["repository_key_present"],
+        true
+    );
+
+    drop_repository_key(&setup.server, &setup.repo_id).await;
+    let fingerprint: String =
+        sqlx::query_scalar("SELECT recovery_key_fingerprint FROM backup_repositories WHERE id = ?")
+            .bind(&setup.repo_id)
+            .fetch_one(setup.server.state.store.pool())
+            .await
+            .unwrap();
+    // A dead chunk a sweep with the key would delete
+    // (`a_sweep_deletes_only_dead_old_chunks`).
+    let dead_key = format!(
+        "{}{}",
+        root(&setup.server),
+        layout::chunk(&ChunkId([0xaa; 32]))
+    );
+    setup
+        .memory
+        .put_new(&dead_key, b"dead".to_vec(), None)
+        .await
+        .unwrap();
+    let objects = bucket_keys(&setup.memory).await;
+    let backups: i64 = sqlx::query_scalar("SELECT count(*) FROM backups")
+        .fetch_one(setup.server.state.store.pool())
+        .await
+        .unwrap();
+    let conflicts_before = conflicts(&setup.server).await;
+
+    // The repository shows the absence, read alone and in the list.
+    let res = setup
+        .owner
+        .get(
+            setup
+                .server
+                .url(&format!("/api/v1/backup-repositories/{}", setup.repo_id)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.json::<Value>().await.unwrap()["repository_key_present"],
+        false
+    );
+    let res = setup
+        .owner
+        .get(setup.server.url("/api/v1/backup-repositories"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let list: Value = res.json().await.unwrap();
+    assert_eq!(list["items"][0]["id"], setup.repo_id.as_str());
+    assert_eq!(list["items"][0]["repository_key_present"], false);
+
+    // `createBackup` queues nothing.
+    key_absent_conflict(
+        setup
+            .owner
+            .post(
+                setup
+                    .server
+                    .url(&format!("/api/v1/apps/{}/backups", setup.app_id)),
+            )
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    // `restoreBackup` of a succeeded backup onto its own, connected node
+    // starts nothing.
+    key_absent_conflict(
+        setup
+            .owner
+            .post(
+                setup
+                    .server
+                    .url(&format!("/api/v1/backups/{backup_id}/restore")),
+            )
+            .json(&json!({ "node_id": node_id }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let restoring: i64 = sqlx::query_scalar("SELECT count(*) FROM volumes WHERE state <> 'ready'")
+        .fetch_one(setup.server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(restoring, 0);
+    // `rotateBackupRecoveryKey` writes no config object and keeps the key.
+    key_absent_conflict(
+        setup
+            .owner
+            .post(setup.server.url(&format!(
+                "/api/v1/backup-repositories/{}/recovery-key",
+                setup.repo_id
+            )))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let after: String =
+        sqlx::query_scalar("SELECT recovery_key_fingerprint FROM backup_repositories WHERE id = ?")
+            .bind(&setup.repo_id)
+            .fetch_one(setup.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(after, fingerprint);
+    assert_eq!(
+        setup
+            .memory
+            .get(&format!("{}config-2.json", root(&setup.server)))
+            .await,
+        Err(ObjectStoreError::NotFound)
+    );
+    assert_eq!(
+        conflicts(&setup.server).await,
+        conflicts_before + 3,
+        "each refusal is audited"
+    );
+
+    // The pre-upgrade backup fails before it touches the bucket
+    // (`backup-format.md` section 7.2 step 4).
+    let upgrade = quoro_control_plane::backups::control_plane::backup_before_upgrade(
+        &setup.server.state.store,
+        &setup.server.data_dir,
+        &setup.server.state.keys,
+        &setup.server.state.data_key,
+        &setup.server.state.backups,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await;
+    assert_eq!(upgrade.err().as_deref(), Some("repository key absent"));
+
+    // Garbage collection does not run: no error, nothing deleted, no record.
+    let counts = quoro_control_plane::backups::prune::sweep(
+        &setup.server.state.store,
+        &setup.server.state.data_key,
+        &setup.server.state.keys,
+        &setup.server.state.backups,
+        &setup.repo_id,
+        time::OffsetDateTime::now_utc() + time::Duration::days(3),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        counts,
+        quoro_control_plane::backups::prune::GcCounts::default()
+    );
+    assert!(!setup.server.state.backups.is_sweeping());
+    let sweeps: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE operation = 'backup.gc'")
+            .fetch_one(setup.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(sweeps, 0);
+
+    assert_eq!(bucket_keys(&setup.memory).await, objects);
+    let now_backups: i64 = sqlx::query_scalar("SELECT count(*) FROM backups")
+        .fetch_one(setup.server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(now_backups, backups);
+}
+
+/// The `(source_kind, status, error)` of every scheduled backup, oldest first.
+async fn scheduled_rows(server: &Server) -> Vec<(String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT source_kind, status, error FROM backups WHERE \"trigger\" = 'schedule' \
+         ORDER BY created_at, source_kind",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap()
+}
+
+/// `node-agent-protocol.md` section 7.3, step 4: without the repository key, a
+/// scheduled backup of a volume or of the control-plane database is recorded
+/// `failed` at once with `repository key absent` and emits `backup.failed`.
+/// It counts as the last attempt, so the next interval tries again, and once
+/// the key is back the next interval takes a real backup.
+#[tokio::test]
+async fn a_scheduled_backup_without_the_repository_key_fails_at_once() {
+    let setup = setup().await;
+    let pool = setup.server.state.store.pool();
+    sqlx::query("UPDATE apps SET ha_policy = 'cold', backup_schedule = ? WHERE id = ?")
+        .bind(r#"{"interval_h":1,"keep":2}"#)
+        .bind(&setup.app_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE backup_repositories SET control_plane_schedule = ? WHERE id = ?")
+        .bind(r#"{"interval_h":6,"keep":7}"#)
+        .bind(&setup.repo_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let blob = drop_repository_key(&setup.server, &setup.repo_id).await;
+    let objects = bucket_keys(&setup.memory).await;
+    let absent = Some("repository key absent".to_string());
+    let failed = |kind: &str| ("failed".to_string(), kind.to_string(), absent.clone());
+    let shape = |rows: Vec<(String, String, Option<String>)>| {
+        rows.into_iter()
+            .map(|(kind, status, error)| (status, kind, error))
+            .collect::<Vec<_>>()
+    };
+    let state = &setup.server.state;
+    let now = time::OffsetDateTime::now_utc();
+
+    // Both sources are due: each is recorded failed at once and no node hears
+    // of a job.
+    let tick = quoro_control_plane::backups::dispatch::run(state, now)
+        .await
+        .unwrap();
+    assert_eq!(tick.queued, 0);
+    assert_eq!(
+        shape(scheduled_rows(&setup.server).await),
+        vec![failed("control_plane"), failed("volume")]
+    );
+    let ids: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, source_kind FROM backups ORDER BY source_kind")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    for (backup_id, source_kind) in &ids {
+        let data: String = sqlx::query_scalar(
+            "SELECT data FROM events WHERE type = 'backup.failed' \
+             AND json_extract(subject, '$.id') = ?",
+        )
+        .bind(backup_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let data: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["backup_id"], backup_id.as_str());
+        assert_eq!(data["repository_id"], setup.repo_id.as_str());
+        assert_eq!(data["source_kind"], source_kind.as_str());
+        assert_eq!(data["trigger"], "schedule");
+        assert_eq!(data["error"], "repository key absent");
+        let records: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT operation, result, result_detail FROM audit_log WHERE target_id = ? \
+             ORDER BY seq",
+        )
+        .bind(backup_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            records,
+            vec![
+                ("backup.dispatch".to_string(), "ok".to_string(), None),
+                (
+                    "backup.seal".to_string(),
+                    "error".to_string(),
+                    absent.clone()
+                ),
+            ]
+        );
+    }
+    let volume_backup = &ids.iter().find(|(_, kind)| kind == "volume").unwrap().0;
+    let res = setup
+        .owner
+        .get(
+            setup
+                .server
+                .url(&format!("/api/v1/backups/{volume_backup}")),
+        )
+        .send()
+        .await
+        .unwrap();
+    let backup: Value = res.json().await.unwrap();
+    assert_eq!(backup["status"], "failed");
+    assert_eq!(backup["error"], "repository key absent");
+
+    // Not again before the next interval.
+    quoro_control_plane::backups::dispatch::run(state, now + time::Duration::minutes(30))
+        .await
+        .unwrap();
+    assert_eq!(scheduled_rows(&setup.server).await.len(), 2);
+    // The volume's next interval tries again, and fails again.
+    quoro_control_plane::backups::dispatch::run(state, now + time::Duration::hours(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        shape(scheduled_rows(&setup.server).await),
+        vec![failed("control_plane"), failed("volume"), failed("volume")]
+    );
+    // So does the control plane's.
+    quoro_control_plane::backups::dispatch::run(state, now + time::Duration::hours(6))
+        .await
+        .unwrap();
+    assert_eq!(
+        shape(scheduled_rows(&setup.server).await),
+        vec![
+            failed("control_plane"),
+            failed("volume"),
+            failed("volume"),
+            failed("control_plane"),
+            failed("volume"),
+        ]
+    );
+    let events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE type = 'backup.failed'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(events, 5);
+    assert_eq!(bucket_keys(&setup.memory).await, objects);
+
+    // With the key back, the volume's next interval queues a real backup.
+    sqlx::query("UPDATE backup_repositories SET repo_key_enc = ? WHERE id = ?")
+        .bind(&blob)
+        .bind(&setup.repo_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let tick = quoro_control_plane::backups::dispatch::run(state, now + time::Duration::hours(7))
+        .await
+        .unwrap();
+    assert_eq!(tick.queued, 1);
+    let rows = scheduled_rows(&setup.server).await;
+    assert_eq!(
+        rows.last().unwrap(),
+        &("volume".to_string(), "queued".to_string(), None)
+    );
 }
 
 #[tokio::test]

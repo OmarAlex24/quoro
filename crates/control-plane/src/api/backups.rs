@@ -588,7 +588,7 @@ pub(crate) fn repository_to_api(repository: &crate::backups::repo::Repository) -
         prefix: repository.prefix.clone(),
         recovery_key_fingerprint: repository.recovery_key_fingerprint.clone(),
         recovery_key_rotated_at: repository.recovery_key_rotated_at.clone(),
-        repository_key_present: !repository.repo_key_enc.is_empty(),
+        repository_key_present: repository.holds_key(),
         control_plane_schedule: repository.control_plane_schedule,
         created_by: repository.created_by.clone(),
         created_at: repository.created_at.clone(),
@@ -890,8 +890,9 @@ pub async fn get_backup(
 ///
 /// `forbidden` without `backup:write` or a justification for an agent,
 /// `not_found` for an unknown app, `conflict` when the app has no `ready`
-/// volume, the cluster has no repository, the volume already has an active
-/// backup or a garbage-collection sweep runs, or a database error.
+/// volume, the cluster has no repository, this primary does not hold the
+/// repository key after a promotion, the volume already has an active backup
+/// or a garbage-collection sweep runs, or a database error.
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/backups",
@@ -1017,6 +1018,11 @@ async fn queue_backup(
     let repository = crate::backups::repo::any(&state.store)
         .await?
         .ok_or_else(|| ApiError::conflict("the cluster has no backup repository"))?;
+    // `node-agent-protocol.md` section 7.3, step 4: no backup until the key is
+    // back on this primary.
+    if !repository.holds_key() {
+        return Err(crate::backups::key_absent_conflict());
+    }
     let volume = sqlx::query(
         "SELECT id, node_id FROM volumes WHERE app_id = ? AND state = 'ready' \
          ORDER BY id DESC LIMIT 1",
@@ -1320,8 +1326,9 @@ pub async fn update_backup_repository(
 /// # Errors
 ///
 /// `forbidden` for an agent (`reason: human_only`) or without
-/// `backup:manage`, `not_found` for an unknown repository, `conflict` when the
-/// next config object exists, or a database error.
+/// `backup:manage`, `not_found` for an unknown repository, `conflict` while
+/// this primary does not hold the repository key (ADR 0322) or when the next
+/// config object exists, or a database error.
 #[utoipa::path(
     post,
     path = "/api/v1/backup-repositories/{repository_id}/recovery-key",
@@ -1387,7 +1394,8 @@ pub async fn rotate_backup_recovery_key(
 /// `forbidden` without `backup:restore` or with `approval_required` for an
 /// agent, `not_found` for an unknown backup, `validation_failed` for a
 /// `node_id` that is not a node with the `node` role, `conflict` for a backup
-/// that cannot be restored right now, or a database error.
+/// that cannot be restored right now, including while this primary does not
+/// hold the repository key, or a database error.
 #[utoipa::path(
     post,
     path = "/api/v1/backups/{backup_id}/restore",

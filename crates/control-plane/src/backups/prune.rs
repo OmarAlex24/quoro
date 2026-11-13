@@ -203,6 +203,12 @@ async fn keep_for(
 /// non-live chunks. Any failed listing stops the sweep without deleting
 /// anything.
 ///
+/// A primary that does not hold the repository key, after a promotion, cannot
+/// read the manifests, so it does not start the sweep: it logs, deletes
+/// nothing, writes no record and answers zero counts (`backup-format.md`
+/// section 9, `node-agent-protocol.md` section 7.3, step 4). The sweep time is
+/// not noted, so a pruning after the key is back can sweep at once.
+///
 /// # Errors
 ///
 /// A database error for the repository row or the audit record. A bucket
@@ -218,6 +224,14 @@ pub async fn sweep(
     let Some(repository) = repo::by_id(store, repository_id).await? else {
         return Err(ApiError::not_found("backup repository"));
     };
+    if !repository.holds_key() {
+        tracing::info!(
+            repository_id,
+            reason = super::KEY_ABSENT,
+            "the garbage-collection sweep does not run"
+        );
+        return Ok(GcCounts::default());
+    }
     let active: Option<(String,)> = sqlx::query_as(
         "SELECT id FROM backups WHERE repository_id = ? AND status IN ('queued', 'running') LIMIT 1",
     )

@@ -23,6 +23,7 @@ use quoro_backup::{FORMAT, Seal, layout, sign_seal, verify_seal};
 use quoro_proto::wire;
 use serde_json::{Value, json};
 use sqlx::Row;
+use sqlx::SqliteConnection;
 
 use super::{
     BACKUP_TIMEOUT, Backups, Bucket, RepositoryTarget, object_key, parse_time, repo, time_after,
@@ -142,18 +143,40 @@ pub(crate) async fn fail(
     reason: &str,
 ) -> Result<bool, ApiError> {
     let mut w = store.begin_write().await?;
+    if fail_in(&mut w.tx, backup_id, node_id, reason)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    w.commit().await?;
+    Ok(true)
+}
+
+/// [`fail`] inside the caller's write transaction. Returns the failed row, or
+/// `None` when the row is gone, on another node or already terminal.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn fail_in(
+    conn: &mut SqliteConnection,
+    backup_id: &str,
+    node_id: &str,
+    reason: &str,
+) -> Result<Option<BackupRecord>, ApiError> {
     let row = sqlx::query(&format!(
         "SELECT {BACKUP_COLUMNS} FROM backups WHERE id = ?"
     ))
     .bind(backup_id)
-    .fetch_optional(&mut *w.tx)
+    .fetch_optional(&mut *conn)
     .await?;
     let Some(row) = row else {
-        return Ok(false);
+        return Ok(None);
     };
     let before = backup_from_row(&row)?;
     if before.node_id != node_id || before.status.is_terminal() {
-        return Ok(false);
+        return Ok(None);
     }
     let mut after = before.clone();
     let reason = one_line(reason);
@@ -164,10 +187,10 @@ pub(crate) async fn fail(
         .bind(&after.error)
         .bind(&after.finished_at)
         .bind(&after.id)
-        .execute(&mut *w.tx)
+        .execute(&mut *conn)
         .await?;
     let seq = changelog::append(
-        &mut w.tx,
+        &mut *conn,
         &changelog::Actor::system("backups"),
         "backup",
         &after.id,
@@ -176,7 +199,7 @@ pub(crate) async fn fail(
     )
     .await?;
     events::emit(
-        &mut w.tx,
+        &mut *conn,
         NewEvent {
             kind: "backup.failed",
             source: Source::ControlPlane,
@@ -198,9 +221,8 @@ pub(crate) async fn fail(
         Some(reason),
         Some(seq),
     );
-    crate::audit::append(&mut w.tx, &record).await?;
-    w.commit().await?;
-    Ok(true)
+    crate::audit::append(&mut *conn, &record).await?;
+    Ok(Some(after))
 }
 
 /// Seals a reported `succeeded` backup. Returns whether the row left the
