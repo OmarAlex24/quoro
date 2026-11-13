@@ -2053,7 +2053,7 @@ Issued for the HA policies where no other copy of the app can start (`none`, `co
 
 **Declaring a node lost (M5b, ADR 0183).** The operator states that a disconnected node is gone, so the apps it held may start elsewhere. In one transaction the primary:
 
-1. increments the `fencing_token` of every lease row that names the node as its holder, `local` and `expiring`, revoked rows included, and records each one revoked in its own view (`leases.revoked_at`, keeping an earlier value), with the node still named as the last holder. A row already revoked at the token cap, 2^53 - 1, is left as it is: it can never be granted again (section 8.6). An unrevoked row at the cap refuses the declaration (section 8.6, ADR 0325). A returning node then gets a `declared_lost` revoke for every raised row, one it had already released included;
+1. increments the `fencing_token` of every lease row that names the node as its holder, `local` and `expiring`, revoked rows included, and records each one revoked in its own view (`leases.revoked_at`, keeping an earlier value), with the node still named as the last holder. A row already revoked at the token cap, 2^53 - 1, is left as it is: it can never be granted again (section 8.6). An unrevoked row at the cap refuses the declaration (section 8.6, ADR 0325);
 2. sets `nodes.lost_at`; the node stays enrolled, and stays a voter until it is removed (section 6.12);
 3. writes one audit record, `declareNodeLost`.
 
