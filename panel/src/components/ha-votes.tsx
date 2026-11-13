@@ -233,7 +233,7 @@ function WitnessOffer({
               copyLabel="Copy command"
               note={`The token is shown only this once and expires ${expiryWords(joinToken.expires_at)}.`}
             />
-            <Button size="sm" variant="ghost" className="justify-self-start" onClick={onDropToken}>
+            <Button size="sm" className="justify-self-start" onClick={onDropToken}>
               Done
             </Button>
           </div>

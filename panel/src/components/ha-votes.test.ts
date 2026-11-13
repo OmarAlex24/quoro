@@ -73,7 +73,10 @@ describe('HaVotesView with two voters', () => {
       join_command: 'quoro join https://10.0.0.3:8443 --token njt_secret --fingerprint 4f1c',
     };
     const html = render(votes, nodes, { joinToken: token });
-    expect(html).toContain('quoro join https://10.0.0.3:8443 --token njt_secret --fingerprint 4f1c --role witness');
+    // The command is set word by word, so read its text without the markup.
+    expect(html.replace(/<[^>]*>/g, '')).toContain(
+      'quoro join https://10.0.0.3:8443 --token njt_secret --fingerprint 4f1c --role witness',
+    );
     expect(html).toContain('Copy command');
     expect(html).not.toContain('Create a join token');
   });
