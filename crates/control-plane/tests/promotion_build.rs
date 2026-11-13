@@ -251,6 +251,7 @@ fn hello(node_id: &str, custody_public_key: String) -> NodeMessage {
         volume_snapshot: Some(wire::SnapshotMethod::Reflink),
         custody_public_key: Some(custody_public_key),
         mesh_rules: None,
+        control_plane_urls: Vec::new(),
     })
 }
 
