@@ -34,6 +34,11 @@
 //! agent identity file when that file names this cluster, even one the
 //! restored database does not hold; otherwise the host has no node.
 //!
+//! With `--accept-loss`, the restore also refuses, before anything is
+//! installed, when a lease that the first write would raise is already at the
+//! token cap (node-agent-protocol.md section 8.6, ADR 0325), naming each
+//! lease and its token ([`leases_at_cap`]).
+//!
 //! Every secret is read from a file whose mode refuses group and other access,
 //! never from a flag or the environment, and no error message carries a key, a
 //! credential or the recovery key. [`execute`] is generic over
@@ -338,7 +343,8 @@ pub async fn run(args: &[String], node_data_dir: &Path) -> Result<(), Error> {
 ///
 /// [`Error::Usage`] for a statement [`check_statement`] refuses;
 /// [`Error::Failed`] when a refused input, a seal or manifest check, a chunk,
-/// the integrity check, the refusal of ADR 0261 or the install fails.
+/// the integrity check, the refusal of ADR 0261, with `--accept-loss` a lease
+/// at the token cap, or the install fails.
 pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Report, Error> {
     if let Some(statement) = &options.accept_loss {
         check_statement(statement)?;
@@ -421,6 +427,21 @@ pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Rep
     let survivors = find_survivors(&temp, options, host_node.as_deref()).await?;
     if options.accept_loss.is_none() && !survivors.is_empty() {
         return Err(refusal(&survivors, host_node.as_deref()));
+    }
+    // The token cap (node-agent-protocol.md section 8.6, ADR 0325): the
+    // first write of `--accept-loss` raises the lease tokens of the machines
+    // it removes, so a lease already at the cap refuses here, before anything
+    // is installed, as `promote --ack-fence` checks before it changes
+    // anything. The first write refuses it too, as a backstop.
+    if options.accept_loss.is_some() {
+        let at_cap = leases_at_cap(&temp, primary.node_id()).await?;
+        if !at_cap.is_empty() {
+            return Err(failed(format!(
+                "refusing to restore with --accept-loss: the primary's first write raises the \
+                 lease tokens of the machines it removes, and {}; nothing was installed",
+                restore_pending::token_cap_refusal(&at_cap)
+            )));
+        }
     }
 
     let installed = !options.dry_run;
@@ -1200,6 +1221,36 @@ async fn agent_voters(node_data_dir: &Path) -> Result<Vec<StoredVoter>, Error> {
         .votes
         .map(|votes| votes.voters)
         .unwrap_or_default())
+}
+
+/// Every lease the first write of a restore with `--accept-loss` would raise
+/// that is already at the token cap, as `(lease id, token)`, read-only from
+/// the restored database at `path`: the leases held, not revoked, by the
+/// machines that write removes when `primary-node` names `host_node`
+/// ([`restore_pending::to_remove`], [`restore_pending::leases_at_cap`], the
+/// same reads the primary's start makes).
+///
+/// # Errors
+///
+/// [`Error::Failed`] when the restored nodes or leases cannot be read.
+async fn leases_at_cap(path: &Path, host_node: Option<&str>) -> Result<Vec<(String, i64)>, Error> {
+    let options = SqliteConnectOptions::new().filename(path).read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|error| failed(format!("cannot open the restored database: {error}")))?;
+    let at_cap = match pool.acquire().await {
+        Ok(mut conn) => match restore_pending::to_remove(&mut conn, host_node).await {
+            Ok(lost) => restore_pending::leases_at_cap(&mut conn, &lost)
+                .await
+                .map_err(|error| format!("cannot read the restored lease tokens: {error}")),
+            Err(reason) => Err(reason),
+        },
+        Err(error) => Err(format!("cannot read the restored database: {error}")),
+    };
+    pool.close().await;
+    at_cap.map_err(failed)
 }
 
 /// The head of the change log in the database at `path`, read-only: the

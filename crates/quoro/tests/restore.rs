@@ -219,6 +219,7 @@ async fn make_database(path: &Path, value: &str) -> Vec<u8> {
         .unwrap();
     create_nodes(&pool, &[]).await;
     create_change_log(&pool, &[]).await;
+    create_leases(&pool, &[]).await;
     sqlx::query("INSERT INTO restored (value) VALUES (?)")
         .bind(value)
         .execute(&pool)
@@ -259,6 +260,16 @@ async fn make_database_of(
     machines: &[(&str, &str, &str, Option<&str>)],
     log: &[(i64, &str)],
 ) -> Vec<u8> {
+    make_database_with_leases(path, machines, log, &[]).await
+}
+
+/// [`make_database_of`] with the `leases` rows `leases`, as [`LeaseRow`]s.
+async fn make_database_with_leases(
+    path: &Path,
+    machines: &[(&str, &str, &str, Option<&str>)],
+    log: &[(i64, &str)],
+    leases: &[LeaseRow<'_>],
+) -> Vec<u8> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true);
@@ -269,6 +280,7 @@ async fn make_database_of(
         .unwrap();
     create_nodes(&pool, machines).await;
     create_change_log(&pool, log).await;
+    create_leases(&pool, leases).await;
     let _ = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
         .execute(&pool)
         .await;
@@ -312,6 +324,34 @@ async fn create_change_log(pool: &sqlx::SqlitePool, log: &[(i64, &str)]) {
             .execute(pool)
             .await
             .unwrap();
+    }
+}
+
+/// A row of the restored `leases` table: `(id, holder_node_id,
+/// fencing_token, revoked)`.
+type LeaseRow<'a> = (&'a str, &'a str, i64, bool);
+
+/// The `leases` columns `quoro restore --accept-loss` reads, with the rows
+/// `leases`.
+async fn create_leases(pool: &sqlx::SqlitePool, leases: &[LeaseRow<'_>]) {
+    sqlx::query(
+        "CREATE TABLE leases (id TEXT PRIMARY KEY, holder_node_id TEXT NOT NULL, \
+         fencing_token INTEGER NOT NULL, revoked_at TEXT)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    for (id, holder, token, revoked) in leases {
+        sqlx::query(
+            "INSERT INTO leases (id, holder_node_id, fencing_token, revoked_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(holder)
+        .bind(token)
+        .bind(revoked.then_some(OLD))
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }
 
@@ -1481,4 +1521,88 @@ fn the_command_checks_accept_loss_and_its_statement() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains(expected), "{extra:?}: {stderr}");
     }
+}
+
+/// The highest fencing token (node-agent-protocol.md section 8.6, "The cap").
+const MAX_TOKEN: i64 = (1 << 53) - 1;
+
+/// With `--accept-loss`, a lease the primary's first write would raise that
+/// is already at the token cap refuses the restore before anything is
+/// installed, a dry run too (node-agent-protocol.md section 8.6, ADR 0325).
+/// The refusal names each such lease with its token. A revoked lease, which
+/// the raise skips, a lease of the new host's node, which is not removed,
+/// and a lease below the cap are not named; without them the restore goes
+/// on.
+#[tokio::test]
+async fn accept_loss_refuses_a_lease_at_the_token_cap_before_installing() {
+    const AT_CAP: &str = "lse_01JC9Z1A2B3C4D5E6F7G8H9J0A";
+    const ALSO_AT_CAP: &str = "lse_01JC9Z1A2B3C4D5E6F7G8H9J0B";
+    const REVOKED_AT_CAP: &str = "lse_01JC9Z1A2B3C4D5E6F7G8H9J0C";
+    const HOSTS_AT_CAP: &str = "lse_01JC9Z1A2B3C4D5E6F7G8H9J0D";
+    const BELOW: &str = "lse_01JC9Z1A2B3C4D5E6F7G8H9J0E";
+    let machines: [Machine<'_>; 3] = [
+        (OLD_NODE, r#"["node"]"#, "connected", Some("primary")),
+        (NEW_NODE, r#"["node"]"#, "connected", None),
+        (OTHER_NODE, r#"["node"]"#, "disconnected", None),
+    ];
+    let leases: [LeaseRow<'_>; 5] = [
+        (AT_CAP, OLD_NODE, MAX_TOKEN, false),
+        (ALSO_AT_CAP, OTHER_NODE, MAX_TOKEN, false),
+        (REVOKED_AT_CAP, OLD_NODE, MAX_TOKEN, true),
+        (HOSTS_AT_CAP, NEW_NODE, MAX_TOKEN, false),
+        (BELOW, OTHER_NODE, MAX_TOKEN - 1, false),
+    ];
+    let fixture = Fixture::new().await;
+    let database =
+        make_database_with_leases(&fixture.base.join("capped.db"), &machines, &[], &leases).await;
+    fixture
+        .add_backup("bkp_01JC9Z1A2B3C4D5E6F7G8H9J0K", &database, NEW)
+        .await;
+    let identity = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+
+    for dry_run in [false, true] {
+        let dir = fixture.data_dir(&format!("capped-{dry_run}"));
+        let mut options = fixture.forced_options(&dir);
+        options.identity_file = identity.clone();
+        options.dry_run = dry_run;
+        let error = restore::execute(&fixture.store, &options)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, restore::Error::Failed(_)), "{error:?}");
+        let text = error.to_string();
+        assert!(text.contains("--accept-loss"), "{text}");
+        for id in [AT_CAP, ALSO_AT_CAP] {
+            assert!(
+                text.contains(&format!("lease {id} is at fencing token {MAX_TOKEN}")),
+                "{id}: {text}"
+            );
+        }
+        for id in [REVOKED_AT_CAP, HOSTS_AT_CAP, BELOW] {
+            assert!(!text.contains(id), "{id} is not raised: {text}");
+        }
+        assert!(text.contains("nothing was installed"), "{text}");
+        assert_nothing_installed(&dir);
+    }
+
+    // The same cluster without the capped leases restores.
+    let fixture = Fixture::new().await;
+    let database = make_database_with_leases(
+        &fixture.base.join("uncapped.db"),
+        &machines,
+        &[],
+        &leases[2..],
+    )
+    .await;
+    fixture
+        .add_backup("bkp_01JC9Z1A2B3C4D5E6F7G8H9J0K", &database, NEW)
+        .await;
+    let dir = fixture.data_dir("uncapped");
+    let mut options = fixture.forced_options(&dir);
+    options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    assert_eq!(
+        report.survivors.in_database,
+        vec![OLD_NODE.to_string(), OTHER_NODE.to_string()]
+    );
 }
