@@ -776,6 +776,29 @@ async fn assert_marked_run_changes_nothing(h: &Harness, mark: &HandOverMark, wha
     assert!(error.contains("may not be the real one"), "{what}: {error}");
 }
 
+/// A marked run the engine refuses, as while a VM it holds attaches the
+/// live file: nothing changes, the live file stays, and the refusal adds no
+/// error of its own, as any refusal until it lasts
+/// [`REFUSALS_BEFORE_ERROR`] passes. Returns the refusal's reason.
+async fn assert_marked_run_refused(h: &Harness, mark: &HandOverMark, what: &str) -> String {
+    let error = h.row().await.error;
+    let HandOver::Refused(reason) = hand_over(h).await else {
+        panic!("{what}: the run is refused");
+    };
+    assert!(
+        h.store.volume(VOL).await.expect("store").is_some(),
+        "{what}: the row stays"
+    );
+    assert_eq!(
+        h.store.volume_hand_over_mark(VOL).await.expect("store"),
+        Some(mark.clone()),
+        "{what}: the mark stands"
+    );
+    assert!(h.volume_path.exists(), "{what}: the live file stays");
+    assert_eq!(h.row().await.error, error, "{what}: no error of its own");
+    reason
+}
+
 #[tokio::test]
 async fn a_file_marked_unchanged_whose_base_is_lost_goes_on_the_evidence_of_the_live_file() {
     let h = Harness::new("handover-unchanged-lost-base").await;
@@ -795,15 +818,16 @@ async fn a_file_marked_unchanged_whose_base_is_lost_goes_on_the_evidence_of_the_
     // left, so only the live file can show the directory.
     std::fs::remove_file(&base.location).expect("lose the base");
 
-    // An engine that neither finds nor misses the live file shows nothing:
-    // a VM it holds attaches the file, which only the engine sees, or it
-    // cannot read the file.
+    // An engine that neither finds nor misses the live file shows nothing.
+    // A VM it holds attaches the file, which only the engine sees: the run
+    // waits, as for any VM that attaches the volume, with no error yet.
     let attaching = engine_vm(&h.engine, "vm_01JD0WARM0000000000000002", true).await;
     for _ in 0..2 {
-        assert_marked_run_changes_nothing(&h, &mark, "a VM attaches the live file").await;
-        assert!(h.volume_path.exists());
+        let reason = assert_marked_run_refused(&h, &mark, "a VM attaches the live file").await;
+        assert!(reason.contains("attached"), "{reason}");
     }
     h.engine.delete(&attaching).await.expect("delete");
+    // It cannot read the file: the run fails, and says why.
     h.engine.fail_next(
         FakeOp::VolumeChangedRanges,
         EngineError::Io("injected".to_owned()),
@@ -1391,16 +1415,23 @@ async fn with_no_kept_base_the_live_file_shows_the_directory_once_the_clone_is_m
     let mark = HandOverMark::Copy(copy.quarantine_id.clone());
 
     // An engine that neither finds nor misses the live file shows nothing.
-    for error in [
+    // A refusal holds the run without an error of its own; any other error
+    // fails it.
+    h.engine.fail_next(
+        FakeOp::VolumeChangedRanges,
         EngineError::Conflict("injected".to_owned()),
+    );
+    let reason = assert_marked_run_refused(&h, &mark, "a refusal").await;
+    assert!(reason.contains("injected"), "{reason}");
+    assert_live_kept(&h);
+    assert_eq!(quarantined(&h).await, vec![copy.clone()]);
+    h.engine.fail_next(
+        FakeOp::VolumeChangedRanges,
         EngineError::Io("injected".to_owned()),
-    ] {
-        h.engine
-            .fail_next(FakeOp::VolumeChangedRanges, error.clone());
-        assert_marked_run_changes_nothing(&h, &mark, &format!("{error:?}")).await;
-        assert_live_kept(&h);
-        assert_eq!(quarantined(&h).await, vec![copy.clone()]);
-    }
+    );
+    assert_marked_run_changes_nothing(&h, &mark, "an I/O error").await;
+    assert_live_kept(&h);
+    assert_eq!(quarantined(&h).await, vec![copy.clone()]);
 
     // The engine finds the live file: the mark goes, the record stays, and
     // the live file stays to keep its writes.

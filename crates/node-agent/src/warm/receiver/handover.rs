@@ -64,12 +64,13 @@
 //! the live file was missing, so a live file the engine finds now was put
 //! back since, and it is no evidence for its own delete. Without evidence,
 //! the run fails with the warm copy's error and changes nothing, and a
-//! later pass tries again. A mark cleared
-//! for a missing clone keeps the copy's record, reported without a hash: no
-//! record is ever forgotten here. A record goes by `quarantine_deletes`, or,
-//! while it has no hash, when its hash shows the clone to be gone
-//! ([`crate::warm::quarantine`], section 9 step 2). The next pass compares
-//! the live file again.
+//! later pass tries again. An engine that refuses the live file, as while a
+//! VM it holds attaches it, holds the run as any refusal does (step 1). A
+//! mark cleared for a missing clone keeps the copy's record, reported
+//! without a hash: no record is ever forgotten here. A record goes by
+//! `quarantine_deletes`, or, while it has no hash, when its hash shows the
+//! clone to be gone ([`crate::warm::quarantine`], section 9 step 2). The
+//! next pass compares the live file again.
 //!
 //! The mark holds only while no VM writes to the file: a node that runs the
 //! volume again before the hand-over finished clears it (the reconciler,
@@ -138,6 +139,15 @@ enum Compared {
     /// The live file is missing, and nothing shows the volume directory to
     /// be the real one; with why.
     Unproved(String),
+}
+
+/// What the engine finds of the volume's own live file, when it neither
+/// refuses it nor fails.
+enum LiveFile {
+    /// The file is in the engine's current volume directory.
+    Present,
+    /// The engine answers `NotFound`: the file is missing.
+    Missing,
 }
 
 /// What a quarantine kept.
@@ -390,8 +400,9 @@ impl<E: Engine + 'static> Inner<E> {
     /// - Its clone is missing, and so are the live file and every other
     ///   recorded file of the volume: a volume directory that did not mount
     ///   looks exactly like that. Nothing changes, and the run fails until
-    ///   the files are back. So does an engine that neither finds nor misses
-    ///   the live file.
+    ///   the files are back. So does an engine that fails to check the live
+    ///   file; one that refuses it holds the run instead
+    ///   ([`Self::live_file`]).
     /// - The copy's record is gone before the file went: an operator deleted
     ///   it (`quarantine_deletes`), or its clone was shown to be gone before
     ///   it was hashed (section 9 step 2). The live file is all that keeps
@@ -425,11 +436,7 @@ impl<E: Engine + 'static> Inner<E> {
                 )));
             }
         }
-        if !self
-            .directory_shown(volume_id)
-            .await
-            .map_err(HandOver::Failed)?
-        {
+        if !self.directory_shown(volume_id).await? {
             return Err(HandOver::Failed(format!(
                 "the clone of the quarantined copy {quarantine_id} is missing, and so are the \
                  live file and every other file the node records for the volume: the volume \
@@ -466,11 +473,13 @@ impl<E: Engine + 'static> Inner<E> {
     ) -> Result<(), HandOver> {
         let unchanged = matches!(mark, HandOverMark::Unchanged);
         let shown = if unchanged {
-            self.directory_shown(volume_id).await
+            self.directory_shown(volume_id).await?
         } else {
-            self.volume_files_present(volume_id).await
+            self.volume_files_present(volume_id)
+                .await
+                .map_err(HandOver::Failed)?
         };
-        if shown.map_err(HandOver::Failed)? {
+        if shown {
             return Ok(());
         }
         Err(HandOver::Failed(
@@ -497,44 +506,57 @@ impl<E: Engine + 'static> Inner<E> {
     /// Whether the engine's current volume directory shows itself to be the
     /// real one (section 9): another file the node records for `volume_id`
     /// is there ([`Self::volume_files_present`]), or the volume's own live
-    /// file is ([`Self::live_file_present`]).
+    /// file is ([`Self::live_file`]).
     ///
     /// # Errors
     ///
-    /// The store's error when the kept snapshots cannot be read, and the
-    /// engine's when no other file shows the directory and the engine
-    /// neither finds the live file nor answers `NotFound` for it. Either
-    /// leaves the caller's run failed, with nothing changed.
-    async fn directory_shown(&self, volume_id: &str) -> Result<bool, String> {
-        if self.volume_files_present(volume_id).await? {
+    /// `Failed` when the kept snapshots cannot be read, and, when no other
+    /// file shows the directory, what [`Self::live_file`] answers for an
+    /// engine that neither finds the live file nor answers `NotFound` for
+    /// it. Either leaves the caller's run with nothing changed.
+    async fn directory_shown(&self, volume_id: &str) -> Result<bool, HandOver> {
+        if self
+            .volume_files_present(volume_id)
+            .await
+            .map_err(HandOver::Failed)?
+        {
             return Ok(true);
         }
-        self.live_file_present(volume_id).await
+        Ok(matches!(
+            self.live_file(volume_id).await?,
+            LiveFile::Present
+        ))
     }
 
-    /// Whether the volume's own live file is in the engine's current volume
-    /// directory: the engine answers `Ok` to a comparison of the file alone,
-    /// which it runs on the file in that directory. That shows the
+    /// What the engine finds of the volume's own live file, through a
+    /// comparison of the file alone, which it runs on the file in its
+    /// current volume directory. `Ok` is the file there, which shows the
     /// directory to be the real one (section 9). `NotFound` is a missing
     /// file, which shows nothing.
     ///
     /// # Errors
     ///
-    /// Any other error of the engine: a VM it holds attaches the file,
-    /// another task holds it, or it cannot read it. That shows nothing
-    /// either.
-    async fn live_file_present(&self, volume_id: &str) -> Result<bool, String> {
+    /// Any other answer shows nothing either, and the caller's run changes
+    /// nothing. `Refused` for `Conflict`: a VM the engine holds attaches the
+    /// file, another task holds it, or the path is not one it takes. A
+    /// later pass waits that out, as it does a refusal of the comparison or
+    /// the delete, and reports it only once it lasts. `Failed` for anything
+    /// else, as an engine that cannot read the file.
+    async fn live_file(&self, volume_id: &str) -> Result<LiveFile, HandOver> {
         match self
             .engine
             .volume_changed_ranges(&RangesOf::Volume(VolumeId(volume_id.to_owned())), None)
             .await
         {
-            Ok(_) => Ok(true),
-            Err(EngineError::NotFound) => Ok(false),
-            Err(e) => Err(format!(
+            Ok(_) => Ok(LiveFile::Present),
+            Err(EngineError::NotFound) => Ok(LiveFile::Missing),
+            Err(EngineError::Conflict(reason)) => Err(HandOver::Refused(format!(
+                "the engine would not check the live file: {reason}"
+            ))),
+            Err(e) => Err(HandOver::Failed(format!(
                 "the live volume file could not be checked, so the volume directory may not be \
                  the real one, and nothing changes: {e}"
-            )),
+            ))),
         }
     }
 
