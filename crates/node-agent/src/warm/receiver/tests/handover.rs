@@ -2645,7 +2645,11 @@ async fn a_hashed_copy_whose_clone_is_gone_waits_for_its_delete_beside_the_live_
         .forget_lost_clone(&lost.quarantine_id)
         .await
         .expect_err("the record stays");
-    assert!(reason.contains("hashed"), "{reason}");
+    // The forget path's own check, not the store's fallback.
+    assert!(
+        reason.contains("hashed meanwhile") && !reason.contains("or deleted"),
+        "{reason}"
+    );
     assert!(
         !h.store
             .forget_unhashed_volume_quarantine(&lost.quarantine_id, &lost.snapshot_id)
