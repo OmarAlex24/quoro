@@ -875,9 +875,9 @@ components:
             `expiring` leases (ADR 0169, node-agent-protocol.md section 8.8). A
             voter with `mesh_error` answers no promotion vote
             (node-agent-protocol.md section 6.9). The count is a sizing check
-            only: a voter that has not yet applied its mesh successfully
-            reports no `mesh_error` and still counts, although it answers no
-            vote either (section 8.9). A primary that does not track
+            only: a voter that has not yet applied its mesh successfully and
+            reports no `mesh_error` still counts, although it answers no vote
+            either (node-agent-protocol.md section 8.9). A primary that does not track
             support yet reports false.
     ClusterVoter:
       type: object
