@@ -1759,6 +1759,219 @@ async fn a_connected_sources_lease_moves_once_its_gate_passed() {
     assert_eq!(grant_of(s.on_warm()).await["body"]["fencing_token"], 5);
 }
 
+/// The failover of issue #965 up to the declaration: with the lease's gate
+/// open, the source answers its revoke `ok`, so the change waits for the
+/// gate; meanwhile the source's session ends and it is declared lost, which
+/// raises the revoked row from token 4 to 5 (section 8.3, ADR 0202).
+/// Returns the call and when the gate passes, which is still ahead.
+async fn declared_while_the_change_waits(
+    s: &mut Setup,
+) -> (
+    tokio::task::JoinHandle<reqwest::Response>,
+    tokio::time::Instant,
+) {
+    s.ready().await;
+    // The gate passes 5 s from now (3 s and two margins of 1 s).
+    s.server
+        .state
+        .hub
+        .authority()
+        .seed(LEASE_ID, &s.source.node_id, Some(3_000));
+    let passes = tokio::time::Instant::now() + Duration::from_millis(5_000);
+    let call = s.call(&s.warm.node_id);
+    let revoke = recv_type(s.on_source(), "lease_revoke").await;
+    assert_eq!(revoke["body"]["fencing_token"], 4, "{revoke}");
+    let revoke_id = revoke["id"].as_str().unwrap().to_string();
+    send(s.on_source(), ok_result(), Some(&revoke_id)).await;
+    // The session handles messages in order: the answer is handled once the
+    // pings are answered, and the change then finds the gate open.
+    frames_until_settled(s.on_source()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!call.is_finished(), "the call waits for the gate");
+    assert_eq!(lease_now(s).await, (s.source.node_id.clone(), 4, true));
+
+    s.disconnect_source().await;
+    declare_source_lost(s).await;
+    assert_eq!(
+        lease_now(s).await,
+        (s.source.node_id.clone(), 5, true),
+        "the declaration raised the revoked row"
+    );
+    assert!(
+        tokio::time::Instant::now() < passes,
+        "the test ran too slowly"
+    );
+    (call, passes)
+}
+
+/// Issue #965, sections 8.3 and 8.4: a source declared lost while the
+/// change waits for the lease's gate does not stop the failover. Once the
+/// gate passed, the change finds the row still revoked at the source, at the
+/// token the declaration raised it to, and released through that
+/// declaration: the lease moves to the warm node at token 6, above the
+/// declaration's, and the standby VM turns `running` there.
+#[tokio::test]
+async fn a_source_declared_lost_while_the_change_waits_on_the_gate_lets_the_failover_go_on() {
+    let mut s = Setup::new().await;
+    let (call, passes) = declared_while_the_change_waits(&mut s).await;
+
+    let res = call.await.unwrap();
+    assert!(tokio::time::Instant::now() >= passes, "not before the gate");
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let app: Value = res.json().await.unwrap();
+    let lease = &app["lease"];
+    assert_eq!(lease["holder_node_id"], s.warm.node_id.as_str(), "{lease}");
+    assert_eq!(
+        lease["fencing_token"], 6,
+        "above the declaration's: {lease}"
+    );
+    assert_eq!(lease_now(&s).await, (s.warm.node_id.clone(), 6, false));
+    let grant = grant_of(s.on_warm()).await;
+    assert_eq!(grant["body"]["lease_id"], LEASE_ID, "{grant}");
+    assert_eq!(grant["body"]["fencing_token"], 6, "{grant}");
+    let data = event_data(&s.server, "app.failed_over").await;
+    assert_eq!(data["fencing_token"], 6, "{data}");
+    let warm_id = s.warm.node_id.clone();
+    assert_eq!(
+        vm_and_app(&s).await,
+        (warm_id, "running".to_string(), "deploying".to_string())
+    );
+}
+
+/// Issue #965: a refusal after the declaration still says that the source's
+/// lease stays revoked and its app stopped, though the declaration raised
+/// the row's token. The warm node leaves while the change waits for the
+/// gate, so the call answers `node_disconnected` and nothing moves.
+#[tokio::test]
+async fn a_refusal_after_a_declaration_during_the_gate_wait_says_the_lease_stays_revoked() {
+    let mut s = Setup::new().await;
+    let (call, _) = declared_while_the_change_waits(&mut s).await;
+    drop(s.on_warm.take());
+    disconnected(&s.server, &s.warm.node_id).await;
+
+    let body = refused(
+        call.await.unwrap(),
+        409,
+        "conflict",
+        Some("node_disconnected"),
+    )
+    .await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("stays revoked and its app stopped"),
+        "{detail}"
+    );
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 5, true));
+    assert_eq!(events_of(&s.server, "app.failed_over").await, 0);
+}
+
+/// The source declared lost in [`declared_while_the_change_waits`] comes
+/// back: a new session says `hello`, listing no lease, which stamps its
+/// `last_seen_at` after `lost_at`, so the declaration no longer releases
+/// the lease (`leases::declaration_releases`). The primary sends it the
+/// `declared_lost` revoke of the raised row at token 5 (section 8.3).
+/// Returns that revoke, unanswered.
+async fn source_returns(s: &mut Setup) -> Value {
+    let mut on_source = connect(&s.server, &s.source.credential).await;
+    send(&mut on_source, hello(&s.source.node_id, 1), None).await;
+    let revoke = recv_type(&mut on_source, "lease_revoke").await;
+    assert_eq!(revoke["body"]["lease_id"], LEASE_ID, "{revoke}");
+    assert_eq!(revoke["body"]["fencing_token"], 5, "{revoke}");
+    assert_eq!(revoke["body"]["reason"], "declared_lost", "{revoke}");
+    frames_until_settled(&mut on_source).await;
+    s.on_source = Some(on_source);
+    let (lost_at, last_seen_at): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT lost_at, last_seen_at FROM nodes WHERE id = ?")
+            .bind(&s.source.node_id)
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    let lost_at = lost_at.expect("not cleared before the answer");
+    assert!(
+        last_seen_at.as_deref() > Some(lost_at.as_str()),
+        "seen since the declaration: {last_seen_at:?}"
+    );
+    assert_eq!(lease_now(s).await, (s.source.node_id.clone(), 5, true));
+    revoke
+}
+
+/// Issue #965, sections 8.3 and 8.4: the source declared lost while the
+/// change waits for the lease's gate comes back before the gate passed and
+/// leaves its `declared_lost` revoke unanswered. The change takes the row
+/// the declaration raised as the plan's, but the lease is not released at
+/// token 5: the source's `ok` was at 4, and its `hello` came after the
+/// declaration. The call answers `lease_held`, saying that the source came
+/// back and has not answered its revoke, and that the lease stays revoked;
+/// no grant reaches the warm node and the row stays the source's, revoked,
+/// at 5.
+#[tokio::test]
+async fn a_source_back_before_the_gate_passed_with_its_revoke_unanswered_holds_the_lease() {
+    let mut s = Setup::new().await;
+    let (call, passes) = declared_while_the_change_waits(&mut s).await;
+    source_returns(&mut s).await;
+    assert!(
+        tokio::time::Instant::now() < passes,
+        "the test ran too slowly"
+    );
+    assert!(!call.is_finished(), "the call waits for the gate");
+
+    let body = refused(call.await.unwrap(), 409, "conflict", Some("lease_held")).await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("the source came back and has not answered its revoke yet"),
+        "{detail}"
+    );
+    assert!(!detail.contains("holds the lease again"), "{detail}");
+    assert!(
+        detail.contains("stays revoked and its app stopped"),
+        "{detail}"
+    );
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 5, true));
+    assert_eq!(events_of(&s.server, "app.failed_over").await, 0);
+    none_of(
+        s.on_warm(),
+        "lease_grant",
+        "a source back with its revoke unanswered",
+    )
+    .await;
+}
+
+/// Issue #965, sections 8.3 and 8.4: as above, but the returning source
+/// answers its `declared_lost` revoke `ok` before the gate passed. That
+/// answer releases the lease at token 5, the declaration's, so once the
+/// gate passed the move goes on and the warm node gets the lease at 6.
+#[tokio::test]
+async fn a_source_back_before_the_gate_passed_that_answers_its_revoke_lets_the_failover_go_on() {
+    let mut s = Setup::new().await;
+    let (call, passes) = declared_while_the_change_waits(&mut s).await;
+    let revoke = source_returns(&mut s).await;
+    let revoke_id = revoke["id"].as_str().unwrap().to_string();
+    send(s.on_source(), ok_result(), Some(&revoke_id)).await;
+    frames_until_settled(s.on_source()).await;
+    assert!(
+        tokio::time::Instant::now() < passes,
+        "the test ran too slowly"
+    );
+    assert!(!call.is_finished(), "the call waits for the gate");
+
+    let res = call.await.unwrap();
+    assert!(tokio::time::Instant::now() >= passes, "not before the gate");
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let app: Value = res.json().await.unwrap();
+    let lease = &app["lease"];
+    assert_eq!(lease["holder_node_id"], s.warm.node_id.as_str(), "{lease}");
+    assert_eq!(
+        lease["fencing_token"], 6,
+        "above the declaration's: {lease}"
+    );
+    assert_eq!(lease_now(&s).await, (s.warm.node_id.clone(), 6, false));
+    let grant = grant_of(s.on_warm()).await;
+    assert_eq!(grant["body"]["lease_id"], LEASE_ID, "{grant}");
+    assert_eq!(grant["body"]["fencing_token"], 6, "{grant}");
+    let data = event_data(&s.server, "app.failed_over").await;
+    assert_eq!(data["fencing_token"], 6, "{data}");
+}
+
 /// Section 8.5: a revoke answered `fence_failed` keeps the lease where it is
 /// until an operator acknowledges the failure.
 #[tokio::test]
@@ -3185,6 +3398,69 @@ async fn a_source_that_leaves_after_the_revoke_with_no_gate_open_moves() {
     assert_eq!(data["from_node_id"], s.source.node_id.as_str(), "{data}");
     assert_eq!(data["to_node_id"], s.warm.node_id.as_str(), "{data}");
     assert_eq!(data["snapshot_seq"], 9, "{data}");
+    assert_eq!(events_of(&s.server, "app.switchover_failed").await, 0);
+}
+
+/// Issue #965 for `switchoverApp`, which shares the wait and the change with
+/// `failoverApp`: with the lease's gate open, the source answers its revoke
+/// `ok`, so the change waits for the gate; meanwhile the source's session
+/// ends and it is declared lost, which raises the revoked row from token 4
+/// to 5 (section 8.3, ADR 0202). Once the gate passed the switchover
+/// completes: the warm node gets the lease at token 6, above the
+/// declaration's, and `app.switched_over` names that token.
+#[tokio::test]
+async fn a_source_declared_lost_while_a_switchovers_change_waits_on_the_gate_lets_it_complete() {
+    let mut s = Setup::new().await;
+    s.in_sync().await;
+    let freeze = s.started().await;
+    s.report_fresh_copy(9).await;
+    let freeze_id = freeze["id"].as_str().unwrap().to_string();
+    send(s.on_source(), freeze_ok(Some(9)), Some(&freeze_id)).await;
+    let revoke = recv_type(s.on_source(), "lease_revoke").await;
+    assert_eq!(revoke["body"]["fencing_token"], 4, "{revoke}");
+    // The gate passes 5 s from now (3 s and two margins of 1 s).
+    s.server
+        .state
+        .hub
+        .authority()
+        .seed(LEASE_ID, &s.source.node_id, Some(3_000));
+    let passes = tokio::time::Instant::now() + Duration::from_millis(5_000);
+    let revoke_id = revoke["id"].as_str().unwrap().to_string();
+    send(s.on_source(), ok_result(), Some(&revoke_id)).await;
+    frames_until_settled(s.on_source()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 4, true));
+    assert_eq!(events_of(&s.server, "app.switched_over").await, 0);
+
+    s.disconnect_source().await;
+    declare_source_lost(&s).await;
+    assert_eq!(
+        lease_now(&s).await,
+        (s.source.node_id.clone(), 5, true),
+        "the declaration raised the revoked row"
+    );
+    assert!(
+        tokio::time::Instant::now() < passes,
+        "the test ran too slowly"
+    );
+
+    // A switchover that stops after its revoke emits nothing: the event is
+    // waited for first, so a stop says so instead of waiting for a grant.
+    let data = event_data(&s.server, "app.switched_over").await;
+    assert!(tokio::time::Instant::now() >= passes, "not before the gate");
+    let grant = grant_of(s.on_warm()).await;
+    assert_eq!(grant["body"]["fencing_token"], 6, "{grant}");
+    assert_eq!(
+        data,
+        json!({
+            "app_id": s.app_id,
+            "from_node_id": s.source.node_id,
+            "to_node_id": s.warm.node_id,
+            "fencing_token": 6,
+            "snapshot_seq": 9,
+        })
+    );
+    assert_eq!(lease_now(&s).await, (s.warm.node_id.clone(), 6, false));
     assert_eq!(events_of(&s.server, "app.switchover_failed").await, 0);
 }
 

@@ -258,10 +258,29 @@ pub(crate) async fn release_and_change(
     change(state, ctx, plan, outcome).await
 }
 
+/// Whether `lease`, the app's lease row read again, is still the row `plan`
+/// moves: it names the plan's source at the plan's token, or, revoked, at a
+/// higher one. Declaring the source lost while the call waits raises its
+/// revoked row to the token + 1 (section 8.3, ADR 0202), and the row is
+/// still the source's, revoked. Any other raise of the revoked row while the
+/// call waits is taken the same way: the source's removal, an operator's
+/// acknowledgement of its failed fence, or the marked-row raise of ADR 0285.
+/// Whether such a row may move is not decided here: [`leases::is_released`]
+/// decides on the row as read, at its current token, and the grant takes a
+/// token above it. A row that names another holder, carries a lower token,
+/// or is not revoked at a token other than the plan's is not this plan's
+/// row.
+fn still_planned(plan: &Plan, lease: &Lease) -> bool {
+    lease.holder_node_id == plan.source
+        && (lease.fencing_token == plan.lease.fencing_token
+            || (lease.is_revoked() && lease.fencing_token > plan.lease.fencing_token))
+}
+
 /// `error`, a refusal after this call revoked the source, with
 /// [`STAYS_REVOKED`] added when the lease row still reads revoked at the
-/// plan's holder and token. The read is best-effort: it never replaces
-/// `error`.
+/// plan's holder, at the plan's token or one a declaration or another raise
+/// of the revoked row took it to ([`still_planned`]). The read is
+/// best-effort: it never replaces `error`.
 async fn stays_revoked(state: &AppState, plan: &Plan, mut error: ApiError) -> ApiError {
     if error.reason.is_none() {
         return error;
@@ -273,11 +292,7 @@ async fn stays_revoked(state: &AppState, plan: &Plan, mut error: ApiError) -> Ap
             .flatten(),
         Err(_) => None,
     };
-    let still = lease.is_some_and(|lease| {
-        lease.is_revoked()
-            && lease.holder_node_id == plan.source
-            && lease.fencing_token == plan.lease.fencing_token
-    });
+    let still = lease.is_some_and(|lease| lease.is_revoked() && still_planned(plan, &lease));
     if still && let Some(detail) = error.detail.as_mut() {
         detail.push_str("; ");
         detail.push_str(STAYS_REVOKED);
@@ -724,11 +739,15 @@ async fn change(
 
         // The lease may still move: checked again under the writer gate,
         // so a source that came back and was given its lease again in the
-        // meantime keeps it.
+        // meantime keeps it. A declaration of the source while the call
+        // waited (on its gate, below) raised the revoked row's token; the
+        // row is still the plan's, and `is_released` decides on it as read.
+        // Any other raise of the revoked row (the source's removal, a fence
+        // acknowledgement, a marked-row raise) is taken the same way.
         let lease = leases::app_lease(&mut w.tx, &plan.app_id)
             .await?
             .ok_or_else(|| ApiError::conflict("the app has no lease to move"))?;
-        if lease.holder_node_id != plan.source || lease.fencing_token != plan.lease.fencing_token {
+        if !still_planned(plan, &lease) {
             return Err(conflict(
                 Reason::LeaseHeld,
                 "the app's lease changed while the failover waited",
@@ -759,6 +778,17 @@ async fn change(
         if !free {
             if unanswered && !connected {
                 return Err(unrecorded_fence_failure());
+            }
+            // Connected, with a revoke of the revoked row waiting for its
+            // answer: the source came back while the call waited and got
+            // one at the row's token, such as the `declared_lost` revoke of
+            // its return (section 8.3). The row stays revoked; the source
+            // does not hold the lease again.
+            if unanswered && lease.is_revoked() {
+                return Err(conflict(
+                    Reason::LeaseHeld,
+                    "the source came back and has not answered its revoke yet",
+                ));
             }
             return Err(conflict(
                 Reason::LeaseHeld,
@@ -1002,4 +1032,65 @@ pub(crate) async fn answer(state: &AppState, mut app: App, operation: &str) -> A
         tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "{operation} answers without the app's warm copy");
     }
     app
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Plan, still_planned};
+    use crate::leases::Lease;
+
+    const SOURCE: &str = "nod_0000000000000000000000000S";
+    const WARM: &str = "nod_0000000000000000000000000W";
+
+    fn lease(holder: &str, token: i64, revoked: bool) -> Lease {
+        Lease {
+            id: "lse_0000000000000000000000000L".to_string(),
+            resource_type: "app".to_string(),
+            resource_id: "app_0000000000000000000000000A".to_string(),
+            holder_node_id: holder.to_string(),
+            mode: "expiring".to_string(),
+            fencing_token: token,
+            duration_ms: Some(15_000),
+            granted_at: "2026-11-09T10:00:00.000Z".to_string(),
+            renewed_at: None,
+            expires_at: None,
+            revoked_at: revoked.then(|| "2026-11-09T10:01:00.000Z".to_string()),
+            unsettled: false,
+        }
+    }
+
+    /// Issue #965: the change and the refusal's hint take a row as the
+    /// plan's when it names the plan's source at the plan's token, revoked
+    /// or not, or revoked at a higher token, as a declaration of the source
+    /// leaves it. A row that names another holder, carries a lower token, or
+    /// is not revoked at a token other than the plan's is not the plan's.
+    #[test]
+    fn a_row_is_the_plans_at_its_token_or_revoked_above_it() {
+        let plan = Plan {
+            app_id: "app_0000000000000000000000000A".to_string(),
+            warm: WARM.to_string(),
+            source: SOURCE.to_string(),
+            volume_id: "vol_0000000000000000000000000V".to_string(),
+            lease: lease(SOURCE, 4, false),
+        };
+        for (holder, token, revoked, planned) in [
+            (SOURCE, 4, false, true),
+            (SOURCE, 4, true, true),
+            (SOURCE, 5, true, true),
+            (SOURCE, 9, true, true),
+            (SOURCE, 5, false, false),
+            (SOURCE, 3, true, false),
+            (SOURCE, 3, false, false),
+            (WARM, 4, false, false),
+            (WARM, 4, true, false),
+            (WARM, 5, true, false),
+            (WARM, 5, false, false),
+        ] {
+            assert_eq!(
+                still_planned(&plan, &lease(holder, token, revoked)),
+                planned,
+                "holder {holder}, token {token}, revoked {revoked}"
+            );
+        }
+    }
 }
