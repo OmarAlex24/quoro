@@ -74,19 +74,31 @@
 //!   copies it keeps are dropped ([`crate::quarantines::drop_node_copies`]),
 //!   as a removal does (section 10).
 //!
-//! With no `primary-node`, the write then clears `cp_status` on every machine
-//! that still holds it, whatever its roles, each row with its node entry
-//! ([`clear_cp_status`]), so no machine holds the primary status and the next
-//! local enrollment of the new host's agent takes it, and adopts no old row.
-//! A machine the write removed reads no `cp_status` in its removal entry
-//! already and is not written again. With `primary-node`, nothing more
-//! follows: the move gives the status to the new host's node.
+//! When the new host's node does not hold the primary status after the
+//! write, because no `primary-node` file is present or it names a node the
+//! primary cannot use (one the database does not hold, a `removed` one, or
+//! text that is no `nod_` id, [`crate::primary_status::read_named`]), the
+//! write then clears `cp_status` on every machine that still holds it,
+//! whatever its roles, each row with its node entry ([`clear_cp_status`]), so
+//! no machine holds the primary status and the next local enrollment of the
+//! new host's agent takes it, and adopts no old row. A machine the write
+//! removed reads no `cp_status` in its removal entry already and is not
+//! written again. The clear records no `cluster.primary_moved`;
+//! `cluster.restored` stands for it. When the new host's node holds the
+//! status after the write, because it held it already or the move gives it,
+//! nothing more follows.
 //!
 //! Then the write records `cluster.restored` (`audit-log-format.md` section
 //! 3.9), before the move's `cluster.primary_moved`, so it is the first record
 //! of the write. That write may remove more than one voter at once and runs
 //! no gate: it is exempt from node-agent-protocol.md section 8.10 rules 1 and
 //! 2.
+//!
+//! Until that enrollment no node holds the primary status. Nothing this
+//! module or the start after it runs needs a holder: the move names a null
+//! `from_node_id` when none held it, the start writes the local join file
+//! while no holder has a credential, and the local enrollment then makes the
+//! new host's node the holder.
 //!
 //! The token cap (node-agent-protocol.md section 8.6, ADR 0325): [`check`]
 //! reads every lease that write would raise and stops the start, before the
@@ -500,7 +512,7 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
         .map_err(|error| format!("cannot read the primary node: {error}"))?,
         _ => None,
     };
-    let removed = match (marker.accept_loss, marker.statement.as_deref()) {
+    let (removed, cleared) = match (marker.accept_loss, marker.statement.as_deref()) {
         (true, Some(statement)) => {
             remove_the_lost(
                 &mut w.tx,
@@ -511,7 +523,7 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
             )
             .await?
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), false),
     };
     // After `cluster.restored`, so that record is the write's first.
     let moved = match &node_id {
@@ -534,7 +546,15 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
         .map_err(|error| format!("cannot commit the restored primary's first write: {error}"))?;
 
     if let (Some(node_id), Some(moved)) = (&node_id, &moved) {
-        primary_status::log_moved(node_id, moved);
+        match moved {
+            // The status did not stay where it was: the write cleared it.
+            Moved::No(reason) if cleared => tracing::warn!(
+                node_id = node_id.as_str(),
+                reason = reason,
+                "the primary-node file left by quoro restore was not used; the --accept-loss first write cleared the primary status on every machine"
+            ),
+            _ => primary_status::log_moved(node_id, moved),
+        }
         primary_status::remove_file(data_dir);
     }
     tracing::info!(
@@ -548,6 +568,11 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
             "the restore was made with --accept-loss: its first write removed every other machine with the node role and recorded cluster.restored"
         );
     }
+    if cleared {
+        tracing::warn!(
+            "no machine holds the primary status: the next local enrollment of this host's node agent takes it"
+        );
+    }
     remove(&path);
     Ok(Applied::FirstWrite {
         marked: marked.len(),
@@ -559,10 +584,12 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
 /// The `--accept-loss` part of the first write ([module docs](self)), in the
 /// first write's transaction `conn`, after the mark: removes every machine
 /// with the `node` role that the database holds, not `removed`, other than
-/// `host_node`, the node `primary-node` names; with no `host_node`, clears
-/// `cp_status` on every machine that still holds it ([`clear_cp_status`]);
-/// then records `cluster.restored` with the operator's `statement`. Returns
-/// the removed ids, by id.
+/// `host_node`, the node `primary-node` names; when `host_node` will not hold
+/// the primary status after the write (none, or a node the primary cannot
+/// use, [`primary_status::read_named`]), clears `cp_status` on every machine
+/// that still holds it ([`clear_cp_status`]); then records `cluster.restored`
+/// with the operator's `statement`. Returns the removed ids, by id, and
+/// whether it cleared `cp_status` on every machine.
 ///
 /// `cluster.restored`'s `params.term` is the term the database holds when
 /// the write runs (`meta.term`), and its `change_seq` is the removal entry of
@@ -581,7 +608,7 @@ async fn remove_the_lost(
     head: &Head,
     host_node: Option<&str>,
     statement: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, bool), String> {
     let term = read_term(&mut *conn)
         .await
         .map_err(|error| format!("cannot read the term for {RESTORED_OPERATION}: {error}"))?;
@@ -631,12 +658,23 @@ async fn remove_the_lost(
                 )
             })?;
     }
-    // Without `primary-node` nothing moves the primary status to the new
-    // host's node, so no machine keeps it, whatever its roles: the next local
-    // enrollment of the new host's agent takes it, and adopts no old row. A
-    // machine removed above reads no `cp_status` already, in its removal
-    // entry, and is not written again.
-    if host_node.is_none() {
+    // When the new host's node does not hold the primary status after the
+    // write, no machine keeps it, whatever its roles (`backup-format.md`
+    // section 8.2): with no `primary-node`, or with one that names a node the
+    // primary cannot use, which the move that follows leaves as it is. The
+    // next local enrollment of the new host's agent then takes it, and adopts
+    // no old row. The host's node is never removed above, so it reads the
+    // same now as when the move runs. A machine removed above reads no
+    // `cp_status` already, in its removal entry, and is not written again.
+    // The clear records no `cluster.primary_moved`: `cluster.restored` below
+    // stands for it (`audit-log-format.md` section 3.9).
+    let host_holds = match host_node {
+        Some(node_id) => primary_status::read_named(&mut *conn, node_id)
+            .await?
+            .holds_after_move(),
+        None => false,
+    };
+    if !host_holds {
         clear_cp_status(conn, actor).await?;
     }
 
@@ -677,14 +715,15 @@ async fn remove_the_lost(
     crate::audit::append(&mut *conn, &record)
         .await
         .map_err(|error| format!("cannot record {RESTORED_OPERATION}: {error}"))?;
-    Ok(lost)
+    Ok((lost, !host_holds))
 }
 
 /// Clears `cp_status` on every machine that still holds it, whatever its
 /// roles, each row with its whole-row node entry, as a move of the primary
 /// status clears it ([`primary_status::move_in`]). Run on the first write's
-/// transaction `conn` after `--accept-loss`'s removals when no `primary-node`
-/// asks for a move.
+/// transaction `conn` after `--accept-loss`'s removals when the new host's
+/// node will not hold the status after the write: no `primary-node`, or one
+/// that names a node the primary cannot use. It writes no audit record.
 ///
 /// # Errors
 ///
