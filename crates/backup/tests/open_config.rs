@@ -249,3 +249,69 @@ async fn an_unknown_format_ends_the_search() {
         format!("the config object names unknown format {}", FORMAT + 1)
     );
 }
+
+/// When the listing names config objects but none of them can be read, the
+/// error says so, with the last read error, rather than that the key opens
+/// none. A config read and not opened, or no config object at all, is still
+/// `NoneOpens`.
+#[tokio::test]
+async fn config_objects_that_cannot_be_read_are_unreadable() {
+    let recovery = RecoveryKey::generate();
+    let repo = RepoKey::generate();
+    let mut objects = Objects::default();
+    objects.put_config(
+        "config-1.json",
+        &config(&repo, &recovery, CLUSTER, REPOSITORY),
+    );
+    objects.put_config(
+        "config-2.json",
+        &config(&repo, &recovery, CLUSTER, REPOSITORY),
+    );
+
+    let error = open_newest_config(
+        ROOT,
+        objects.keys(),
+        CLUSTER,
+        Some(REPOSITORY),
+        &recovery,
+        |_key| async { Err::<Vec<u8>, _>("denied: reads are refused") },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error,
+        OpenConfigError::Unreadable("denied: reads are refused".to_string())
+    );
+    assert_eq!(
+        error.to_string(),
+        "no config object could be read: denied: reads are refused"
+    );
+    assert!(!format!("{error:?}").contains(&recovery.to_text()));
+
+    // config-2 cannot be read, config-1 is read and does not open.
+    let other = RecoveryKey::generate();
+    let error = open_newest_config(ROOT, objects.keys(), CLUSTER, None, &other, |key| {
+        let object = objects
+            .map
+            .get(&key)
+            .filter(|_| key.ends_with("config-1.json"))
+            .cloned();
+        async move { object.ok_or("denied") }
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(error, OpenConfigError::NoneOpens);
+
+    // Nothing listed that is a config object.
+    let error = open_newest_config(
+        ROOT,
+        vec![format!("{ROOT}seals/x.json")],
+        CLUSTER,
+        None,
+        &recovery,
+        |_key| async { Err::<Vec<u8>, _>("denied") },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, OpenConfigError::NoneOpens);
+}

@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use quoro_backup::layout;
 use quoro_backup::{
-    ChunkId, FORMAT, Manifest, RecoveryKey, RepoConfig, RepoKey, Restorer, Seal, SourceKind,
-    open_manifest, open_newest_config, verify_seal,
+    ChunkId, FORMAT, Manifest, OpenConfigError, RecoveryKey, RepoConfig, RepoKey, Restorer, Seal,
+    SourceKind, open_manifest, open_newest_config, verify_seal,
 };
 use quoro_control_plane::primary_status::MARKER_FILE;
 use quoro_providers::object_store::ObjectStore;
@@ -505,7 +505,12 @@ async fn choose_config<S: ObjectStore>(
         |key| async move { store.get(&key).await },
     )
     .await
-    .map_err(|error| failed(error.to_string()))
+    .map_err(|error| match error {
+        // `quoro restore` reports config objects it cannot read as ones the
+        // key does not open, as it always has.
+        OpenConfigError::Unreadable(_) => failed(OpenConfigError::NoneOpens.to_string()),
+        other => failed(other.to_string()),
+    })
 }
 
 /// The config's `cluster_public_key` must be the public half of the given

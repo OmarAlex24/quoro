@@ -695,7 +695,15 @@ pub(crate) async fn restore_key(
         },
     )
     .await
-    .map_err(|error| ApiError::validation(error.to_string()))?;
+    .map_err(|error| {
+        if matches!(error, quoro_backup::OpenConfigError::Unreadable(_)) {
+            // The listing named config objects, but none could be read.
+            let reason: String = error.to_string().chars().take(200).collect();
+            ApiError::validation(format!("cannot read the bucket: {reason}"))
+        } else {
+            ApiError::validation(error.to_string())
+        }
+    })?;
 
     // Step 3: this row only, with no change-log entry, and only while no other
     // call restored the key first.

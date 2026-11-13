@@ -37,8 +37,9 @@ pub struct RepoConfig {
     pub created_at: String,
 }
 
-/// Why [`open_newest_config`] returned no repository key. Neither variant
-/// carries key material or the content of an object.
+/// Why [`open_newest_config`] returned no repository key. No variant carries
+/// key material or the content of an object: [`Self::Unreadable`] carries
+/// only the text of the caller's own read error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpenConfigError {
     /// The newest config object the recovery key opens names a format
@@ -46,6 +47,9 @@ pub enum OpenConfigError {
     UnknownFormat(u32),
     /// The recovery key opens no config object of this repository.
     NoneOpens,
+    /// The listing named config objects, but `fetch` could read none of
+    /// them. It holds the text of the last read error, as `fetch` gave it.
+    Unreadable(String),
 }
 
 impl fmt::Display for OpenConfigError {
@@ -56,6 +60,9 @@ impl fmt::Display for OpenConfigError {
             }
             Self::NoneOpens => {
                 f.write_str("the recovery key opens no config object of this repository")
+            }
+            Self::Unreadable(error) => {
+                write!(f, "no config object could be read: {error}")
             }
         }
     }
@@ -100,8 +107,10 @@ pub fn config_keys_newest_first(
 /// # Errors
 ///
 /// [`OpenConfigError::UnknownFormat`] when the newest config the key opens
-/// names an unknown format, and [`OpenConfigError::NoneOpens`] when the key
-/// opens none.
+/// names an unknown format, [`OpenConfigError::Unreadable`] when the listing
+/// names config objects but `fetch` reads none of them, and
+/// [`OpenConfigError::NoneOpens`] when the key opens none of those read,
+/// or there is no config object at all.
 pub async fn open_newest_config<F, Fut, E>(
     root: &str,
     listed: impl IntoIterator<Item = String>,
@@ -113,12 +122,20 @@ pub async fn open_newest_config<F, Fut, E>(
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<Vec<u8>, E>>,
+    E: fmt::Display,
 {
+    let mut read_any = false;
+    let mut last_error = None;
     for key in config_keys_newest_first(root, listed) {
         // A config object that cannot be read is not one this key opens.
-        let Ok(bytes) = fetch(key).await else {
-            continue;
+        let bytes = match fetch(key).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
         };
+        read_any = true;
         let Ok(config) = serde_json::from_slice::<RepoConfig>(&bytes) else {
             continue;
         };
@@ -139,5 +156,8 @@ where
         }
         return Ok((config, repo_key));
     }
-    Err(OpenConfigError::NoneOpens)
+    match last_error {
+        Some(error) if !read_any => Err(OpenConfigError::Unreadable(error)),
+        _ => Err(OpenConfigError::NoneOpens),
+    }
 }
