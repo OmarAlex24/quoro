@@ -1002,6 +1002,7 @@ async fn an_operator_s_delete_removes_the_copy_and_its_records_once() {
     let (restarted, restarted_statuses) = Quarantines::new(
         Arc::clone(&h.engine),
         h.store.clone(),
+        h.locks.clone(),
         Duration::from_millis(50),
     );
     restarted.refresh().await.expect("the records");
@@ -1055,6 +1056,7 @@ async fn a_restart_resumes_the_hash_of_a_copy_without_one() {
     let (restarted, mut statuses) = Quarantines::new(
         Arc::clone(&h.engine),
         h.store.clone(),
+        h.locks.clone(),
         Duration::from_millis(50),
     );
     restarted.refresh().await.expect("the records");
@@ -2179,8 +2181,9 @@ async fn the_target_is_reported_only_once_the_returning_flag_is_durable() {
 
 // Section 9 step 2: the record of a copy whose clone is gone before it was
 // hashed is forgotten only when the engine answers `NotFound` for the clone,
-// another kept snapshot of the volume answers it, and one open handle of the
-// clone's directory shows the clone missing and that snapshot there.
+// another kept snapshot of the volume answers it or, when none does, the
+// engine finds the volume's live file, and one open handle of the clone's
+// directory shows the clone missing and that snapshot or live file there.
 
 #[tokio::test]
 async fn an_unhashed_copy_whose_clone_is_gone_is_forgotten() {
@@ -2278,12 +2281,14 @@ async fn a_lost_clone_keeps_its_record_while_the_engine_cannot_tell_or_no_other_
     .await;
     kept_as_is(&h).await;
 
-    // No other file of the volume answers the engine: the directory is not
-    // shown to be the real one.
+    // No other file of the volume answers the engine: no other kept
+    // snapshot, and the live file is missing while the engine still names
+    // the volume. The directory is not shown to be the real one.
     h.engine
         .delete_volume_snapshot(&base)
         .await
         .expect("delete the base");
+    let moved = move_away(&h, &[&path]);
     quarantines.hash(&lost);
     wait_for("the second hash to end", || async {
         !quarantines.hashing(&lost.quarantine_id)
@@ -2291,6 +2296,7 @@ async fn a_lost_clone_keeps_its_record_while_the_engine_cannot_tell_or_no_other_
     .await;
     assert!(quarantines.hash_failed(&lost.quarantine_id));
     kept_as_is(&h).await;
+    move_back(&moved);
     assert!(path.exists());
 }
 
@@ -2426,4 +2432,495 @@ async fn a_lost_clone_is_checked_through_one_open_volume_directory() {
     );
     assert!(base.location.exists());
     assert!(path.exists());
+}
+
+/// A copy kept from a returning source with no kept base, whose clone the
+/// engine no longer has: the volume's live file is the only other file of
+/// the volume. The caller holds the hash gate, so the copy's hash waits.
+async fn lost_clone_beside_the_live_file(h: &Harness) -> VolumeQuarantineRecord {
+    let path = returning_source(h).await;
+    diverge(&path);
+    let lost = marked_copy(h).await;
+    assert_eq!(kept_purposes(h).await, vec!["quarantine"], "no base");
+    let clone = h
+        .store
+        .kept_snapshot(&lost.snapshot_id)
+        .await
+        .expect("store")
+        .expect("kept");
+    // The engine answers `NotFound` for the clone from here on.
+    h.engine
+        .delete_volume_snapshot(&clone.snapshot)
+        .await
+        .expect("delete the clone");
+    assert!(!lost.path.exists());
+    lost
+}
+
+/// The copy's record and its kept snapshot are still there, as they were.
+async fn assert_record_kept(h: &Harness, lost: &VolumeQuarantineRecord, what: &str) {
+    assert_eq!(quarantined(h).await, vec![lost.clone()], "{what}");
+    assert!(
+        h.store
+            .kept_snapshot(&lost.snapshot_id)
+            .await
+            .expect("store")
+            .is_some(),
+        "{what}"
+    );
+}
+
+/// The copy's record and its kept snapshot are gone.
+async fn assert_record_forgotten(h: &Harness, lost: &VolumeQuarantineRecord) {
+    assert!(quarantined(h).await.is_empty());
+    assert_eq!(
+        h.store
+            .kept_snapshot(&lost.snapshot_id)
+            .await
+            .expect("store"),
+        None
+    );
+}
+
+/// Issue #762: with no other kept snapshot of the volume, the live file the
+/// engine finds shows the directory to be the real one, so an unhashed copy
+/// whose clone is gone is forgotten, where its record used to stay until
+/// another kept file appeared. A missing live file shows nothing.
+#[tokio::test]
+async fn with_no_kept_base_the_live_file_lets_a_lost_clone_s_record_go() {
+    let h = Harness::new("handover-clone-gone-live").await;
+    let quarantines = h.receiver.inner.quarantines.clone();
+    let mut statuses = h.receiver.quarantine_statuses();
+    let gate = quarantines.inner.hash_gate.lock().await;
+    let lost = lost_clone_beside_the_live_file(&h).await;
+    assert_eq!(statuses.borrow_and_update().len(), 1);
+
+    // The live file is missing too, while the engine still names the
+    // volume: the record stays, and the hash waits to be tried again.
+    let moved = move_away(&h, &[&h.volume_path]);
+    drop(gate);
+    wait_for("the hash to fail", || async {
+        quarantines.hash_failed(&lost.quarantine_id) && !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert_record_kept(&h, &lost, "a missing live file").await;
+    let reason = quarantines
+        .inner
+        .forget_lost_clone(&lost.quarantine_id)
+        .await
+        .expect_err("the record stays");
+    assert!(reason.contains("live file is missing"), "{reason}");
+    assert_record_kept(&h, &lost, "a missing live file").await;
+
+    // The live file is back: the record and its kept snapshot go, and no
+    // file is touched.
+    move_back(&moved);
+    quarantines.hash(&lost);
+    quarantines_where(&mut statuses, Vec::is_empty).await;
+    assert_record_forgotten(&h, &lost).await;
+    wait_for("the hash to end", || async {
+        !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert!(!quarantines.hash_failed(&lost.quarantine_id));
+    assert_live_kept(&h);
+
+    // The mark stood for the copy: the next run clears it and keeps the
+    // live file, and the one after takes a new copy and ends the hand-over.
+    let _gate = quarantines.inner.hash_gate.lock().await;
+    assert!(matches!(hand_over(&h).await, HandOver::Failed(_)));
+    assert_eq!(
+        h.store.volume_hand_over_mark(VOL).await.expect("store"),
+        None
+    );
+    assert_live_kept(&h);
+    let HandOver::Done(Some(id)) = hand_over(&h).await else {
+        panic!("the hand-over ends");
+    };
+    assert_ne!(id, lost.quarantine_id);
+    let records = quarantined(&h).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        read_at(&records[0].path, 7 * CELL + 512, 8192),
+        pattern(8192, 4)
+    );
+    assert_handed_over(&h).await;
+}
+
+/// A VM the engine holds that attaches the live file keeps the engine from
+/// checking the file: not now. The record stays, its hash waits as any
+/// failed hash does and does not start again before that, and the record
+/// goes once the VM is gone.
+#[tokio::test]
+async fn a_live_file_a_vm_attaches_keeps_a_lost_clone_s_record_for_now() {
+    let h = Harness::new("handover-clone-gone-attached").await;
+    // The receiver's own hash of the copy never runs here.
+    let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
+    let lost = lost_clone_beside_the_live_file(&h).await;
+    let attaching = engine_vm(&h.engine, "vm_01JD0WARM0000000000000002", true).await;
+    // The copies on the same engine and store, with a failed hash waiting
+    // an hour before it is tried again.
+    let (quarantines, _statuses) = Quarantines::new(
+        Arc::clone(&h.engine),
+        h.store.clone(),
+        h.locks.clone(),
+        Duration::from_secs(3600),
+    );
+
+    quarantines.hash(&lost);
+    wait_for("the hash to fail", || async {
+        quarantines.hash_failed(&lost.quarantine_id) && !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert_record_kept(&h, &lost, "a VM attaches the live file").await;
+    let reason = quarantines
+        .inner
+        .forget_lost_clone(&lost.quarantine_id)
+        .await
+        .expect_err("the record stays");
+    assert!(
+        reason.contains("would not check the volume's live file now"),
+        "{reason}"
+    );
+    assert!(reason.contains("attached"), "{reason}");
+    assert_live_kept(&h);
+
+    // No loop: a pass before the wait ends starts no hash of the copy.
+    {
+        let _held = quarantines.inner.hash_gate.lock().await;
+        quarantines.refresh().await.expect("refresh");
+        assert!(!quarantines.hashing(&lost.quarantine_id), "the hash waits");
+    }
+    assert!(quarantines.hash_failed(&lost.quarantine_id));
+    assert_record_kept(&h, &lost, "before the wait ends").await;
+
+    // Once the VM is gone, the next try forgets the record.
+    h.engine.delete(&attaching).await.expect("delete the VM");
+    quarantines.hash(&lost);
+    wait_for("the record to go", || async {
+        quarantined(&h).await.is_empty() && !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert_record_forgotten(&h, &lost).await;
+    assert!(!quarantines.hash_failed(&lost.quarantine_id));
+    assert_live_kept(&h);
+}
+
+/// A record with a SHA-256 waits for `quarantine_deletes`, also with its
+/// clone gone and the live file there for the engine to find: the primary
+/// recorded the copy, and only an operator deletes it.
+#[tokio::test]
+async fn a_hashed_copy_whose_clone_is_gone_waits_for_its_delete_beside_the_live_file() {
+    let h = Harness::new("handover-clone-gone-hashed").await;
+    let quarantines = h.receiver.inner.quarantines.clone();
+    let gate = quarantines.inner.hash_gate.lock().await;
+    let lost = lost_clone_beside_the_live_file(&h).await;
+    let sha256 = "ab".repeat(32);
+    assert!(
+        h.store
+            .set_quarantine_sha256(&lost.quarantine_id, &sha256)
+            .await
+            .expect("store")
+    );
+    let hashed = VolumeQuarantineRecord {
+        sha256: Some(sha256),
+        ..lost.clone()
+    };
+
+    // The hash the hand-over started reads the record again and hashes
+    // nothing, and a pass starts no hash of it.
+    drop(gate);
+    wait_for("the hash to end", || async {
+        !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    quarantines.refresh().await.expect("refresh");
+    assert!(!quarantines.hashing(&lost.quarantine_id));
+    assert!(!quarantines.hash_failed(&lost.quarantine_id));
+    assert_record_kept(&h, &hashed, "a hashed copy").await;
+
+    // Asked directly, the forget path keeps it too, and so does the store.
+    let reason = quarantines
+        .inner
+        .forget_lost_clone(&lost.quarantine_id)
+        .await
+        .expect_err("the record stays");
+    // The forget path's own check, not the store's fallback.
+    assert!(
+        reason.contains("hashed meanwhile") && !reason.contains("or deleted"),
+        "{reason}"
+    );
+    assert!(
+        !h.store
+            .forget_unhashed_volume_quarantine(&lost.quarantine_id, &lost.snapshot_id)
+            .await
+            .expect("store")
+    );
+    assert_record_kept(&h, &hashed, "a hashed copy").await;
+    assert_live_kept(&h);
+
+    // An operator's delete removes it.
+    quarantines
+        .delete(std::slice::from_ref(&lost.quarantine_id))
+        .await;
+    assert_record_forgotten(&h, &lost).await;
+    assert_live_kept(&h);
+}
+
+/// The live file the engine found is read through the same open handle of
+/// the clone's directory as the clone's absence, as another kept snapshot
+/// is.
+#[tokio::test]
+async fn a_lost_clone_s_live_file_is_read_through_one_open_volume_directory() {
+    let h = Harness::new("handover-clone-live-one-dir").await;
+    let quarantines = h.receiver.inner.quarantines.clone();
+    // The hash waits; each check below runs on its own.
+    let _gate = quarantines.inner.hash_gate.lock().await;
+    let lost = lost_clone_beside_the_live_file(&h).await;
+    let live = h.volume_path.clone();
+    let check = || quarantines.inner.forget_lost_clone(&lost.quarantine_id);
+    let between = |run: Box<dyn FnOnce() + Send>| {
+        *quarantines.inner.between_checks.lock().expect("hook") = Some(run);
+    };
+    let kept_because = |reason: Result<(), String>, why: &str| {
+        let reason = reason.expect_err("the record stays");
+        assert!(reason.contains(why), "{reason}");
+    };
+
+    // The live file vanishes after the engine found it.
+    let aside = live.with_extension("aside");
+    let (from, to) = (live.clone(), aside.clone());
+    between(Box::new(move || {
+        std::fs::rename(&from, &to).expect("move the live file aside");
+    }));
+    kept_because(check().await, "cannot read the volume's live file");
+    assert_record_kept(&h, &lost, "the live file vanished").await;
+    std::fs::rename(&aside, &live).expect("put the live file back");
+
+    // The live file is a symlink by the time the directory is read.
+    let (from, to) = (live.clone(), aside.clone());
+    between(Box::new(move || {
+        std::fs::rename(&from, &to).expect("move the live file aside");
+        std::os::unix::fs::symlink(&to, &from).expect("link the live file");
+    }));
+    kept_because(
+        check().await,
+        "the volume's live file is not a regular file",
+    );
+    assert_record_kept(&h, &lost, "a symlink").await;
+    std::fs::remove_file(&live).expect("remove the link");
+    std::fs::rename(&aside, &live).expect("put the live file back");
+
+    // The clone's file appears after the engine's lookups.
+    let appears = lost.path.clone();
+    between(Box::new(move || {
+        std::fs::write(&appears, b"clone").expect("write the clone");
+    }));
+    kept_because(check().await, "the clone's file is in the volume directory");
+    assert_record_kept(&h, &lost, "the clone is back").await;
+    std::fs::remove_file(&lost.path).expect("remove the clone");
+
+    // The volume directory unmounts after the engine found the live file:
+    // an empty directory takes its path, and it shows no live file.
+    let dir = live.parent().expect("a directory").to_path_buf();
+    let moved = dir.with_extension("moved");
+    let (from, to) = (dir.clone(), moved.clone());
+    between(Box::new(move || {
+        std::fs::rename(&from, &to).expect("move the directory aside");
+        std::fs::create_dir(&from).expect("an empty directory");
+    }));
+    kept_because(check().await, "cannot read the volume's live file");
+    std::fs::remove_dir(&dir).expect("remove the empty directory");
+    std::fs::rename(&moved, &dir).expect("put the directory back");
+    assert_record_kept(&h, &lost, "an unmounted directory").await;
+
+    // Right after the volume directory is opened, it is moved aside and a
+    // new one holding the clone and no live file takes its path. The reads
+    // go through the open directory, where the clone is missing and the live
+    // file is a regular file: the record is forgotten, and no file is
+    // touched. Reads by path would see the clone and keep it.
+    let (from, to, clone_path) = (dir.clone(), moved.clone(), lost.path.clone());
+    *quarantines.inner.after_open.lock().expect("hook") = Some(Box::new(move || {
+        std::fs::rename(&from, &to).expect("move the directory aside");
+        std::fs::create_dir(&from).expect("a new directory");
+        std::fs::write(&clone_path, b"clone").expect("write the clone");
+    }));
+    assert_eq!(check().await, Ok(()));
+    std::fs::remove_dir_all(&dir).expect("remove the new directory");
+    std::fs::rename(&moved, &dir).expect("put the directory back");
+    assert_record_forgotten(&h, &lost).await;
+    assert_live_kept(&h);
+}
+
+/// The forget path asks the engine about the volume only under the volume's
+/// lock, and only tries it: while a stream, a hand-over or the reconciler
+/// holds it, the record stays without the engine being asked, and the hash
+/// waits as any failed hash does instead of waiting for the lock. Once the
+/// lock is free, the next try forgets the record.
+#[tokio::test]
+async fn a_lost_clone_s_record_stays_while_another_holds_the_volume_s_lock() {
+    let h = Harness::new("handover-clone-gone-locked").await;
+    // The receiver's own hash of the copy never runs here.
+    let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
+    let lost = lost_clone_beside_the_live_file(&h).await;
+    // The copies on the same engine, store and locks, with a failed hash
+    // waiting an hour before it is tried again.
+    let (quarantines, _statuses) = Quarantines::new(
+        Arc::clone(&h.engine),
+        h.store.clone(),
+        h.locks.clone(),
+        Duration::from_secs(3600),
+    );
+    // Answered by the first engine lookup the forget path makes.
+    h.engine.fail_next(
+        FakeOp::VolumeChangedRanges,
+        EngineError::Io("the first lookup".to_owned()),
+    );
+
+    let held = h.locks.try_lock(VOL).expect("the volume's lock");
+    quarantines.hash(&lost);
+    wait_for("the hash to fail", || async {
+        quarantines.hash_failed(&lost.quarantine_id) && !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert_record_kept(&h, &lost, "the volume's lock is held").await;
+    let reason = quarantines
+        .inner
+        .forget_lost_clone(&lost.quarantine_id)
+        .await
+        .expect_err("the record stays");
+    assert!(reason.contains("holds its lock"), "{reason}");
+    assert_live_kept(&h);
+
+    // No loop: a pass before the wait ends starts no hash of the copy.
+    {
+        let _held_gate = quarantines.inner.hash_gate.lock().await;
+        quarantines.refresh().await.expect("refresh");
+        assert!(!quarantines.hashing(&lost.quarantine_id), "the hash waits");
+    }
+    assert!(quarantines.hash_failed(&lost.quarantine_id));
+    assert_record_kept(&h, &lost, "before the wait ends").await;
+
+    // The lock is free: the engine is asked from here on. Its first answer
+    // is the failure queued before the lock was taken, so no lookup ran
+    // while the lock was held.
+    drop(held);
+    let reason = quarantines
+        .inner
+        .forget_lost_clone(&lost.quarantine_id)
+        .await
+        .expect_err("the queued failure");
+    assert!(reason.contains("the first lookup"), "{reason}");
+    assert_record_kept(&h, &lost, "the queued failure").await;
+
+    // The next try forgets the record, and leaves the lock free.
+    quarantines.hash(&lost);
+    wait_for("the record to go", || async {
+        quarantined(&h).await.is_empty() && !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert_record_forgotten(&h, &lost).await;
+    assert!(!quarantines.hash_failed(&lost.quarantine_id));
+    assert!(h.locks.try_lock(VOL).is_some(), "the lock is released");
+    assert_live_kept(&h);
+}
+
+/// The directory the forget path reads is the one the engine looked the
+/// clone up in: a record whose path is not its kept snapshot's location
+/// stays, here although the path's own directory holds a file named by the
+/// volume id and no clone.
+#[tokio::test]
+async fn a_lost_clone_whose_record_and_kept_snapshot_name_different_files_keeps_its_record() {
+    let h = Harness::new("handover-clone-gone-elsewhere").await;
+    let quarantines = h.receiver.inner.quarantines.clone();
+    // The hash waits; each check below runs on its own.
+    let _gate = quarantines.inner.hash_gate.lock().await;
+    let lost = lost_clone_beside_the_live_file(&h).await;
+    let kept = h
+        .store
+        .kept_snapshot(&lost.snapshot_id)
+        .await
+        .expect("store")
+        .expect("kept");
+
+    // A second copy: its kept snapshot is in the volume directory, missing,
+    // and unknown to the engine, so the engine answers `NotFound` for it
+    // there; its record's path is in another directory, which holds a file
+    // named by the volume id and no clone.
+    let elsewhere = h._scratch.0.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("another directory");
+    let stray = elsewhere.join(VOL);
+    std::fs::write(&stray, b"not the live file").expect("a stray file");
+    let snapshot_id = format!("{}-other", kept.snapshot.snapshot_id);
+    let location = kept
+        .snapshot
+        .location
+        .with_file_name(format!("{VOL}.{snapshot_id}"));
+    assert!(!location.exists());
+    let twisted_kept = crate::store::KeptSnapshotRecord {
+        snapshot: VolumeSnapshot {
+            snapshot_id: snapshot_id.clone(),
+            location,
+            ..kept.snapshot.clone()
+        },
+        ..kept.clone()
+    };
+    let twisted = VolumeQuarantineRecord {
+        quarantine_id: crate::util::quarantine_id(),
+        path: elsewhere.join(lost.path.file_name().expect("a file name")),
+        snapshot_id,
+        ..lost.clone()
+    };
+    h.store
+        .record_volume_quarantine(&twisted_kept, &twisted)
+        .await
+        .expect("record");
+
+    let reason = quarantines
+        .inner
+        .forget_lost_clone(&twisted.quarantine_id)
+        .await
+        .expect_err("the record stays");
+    assert!(
+        reason.contains("not its kept snapshot's location"),
+        "{reason}"
+    );
+    assert_eq!(quarantined(&h).await, vec![lost.clone(), twisted.clone()]);
+    assert_eq!(
+        h.store
+            .kept_snapshot(&twisted.snapshot_id)
+            .await
+            .expect("store"),
+        Some(twisted_kept)
+    );
+
+    // The copy whose record and kept snapshot name one file is forgotten
+    // as before, and no file is touched.
+    assert_eq!(
+        quarantines
+            .inner
+            .forget_lost_clone(&lost.quarantine_id)
+            .await,
+        Ok(())
+    );
+    assert_record_forgotten_beside(&h, &lost, &twisted).await;
+    assert!(stray.exists());
+    assert_live_kept(&h);
+}
+
+/// The copy's record and its kept snapshot are gone, and `other` is the only
+/// record left.
+async fn assert_record_forgotten_beside(
+    h: &Harness,
+    lost: &VolumeQuarantineRecord,
+    other: &VolumeQuarantineRecord,
+) {
+    assert_eq!(quarantined(h).await, vec![other.clone()]);
+    assert_eq!(
+        h.store
+            .kept_snapshot(&lost.snapshot_id)
+            .await
+            .expect("store"),
+        None
+    );
 }

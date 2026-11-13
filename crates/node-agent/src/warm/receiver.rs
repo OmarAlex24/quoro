@@ -273,8 +273,12 @@ impl<E: Engine + 'static> WarmReceiver<E> {
         board: StatusBoard,
         options: ReceiverOptions,
     ) -> Self {
-        let (quarantines, _) =
-            Quarantines::new(Arc::clone(&engine), store.clone(), options.hash_retry);
+        let (quarantines, _) = Quarantines::new(
+            Arc::clone(&engine),
+            store.clone(),
+            locks.clone(),
+            options.hash_retry,
+        );
         Self {
             inner: Arc::new(Inner {
                 engine,
