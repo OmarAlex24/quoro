@@ -189,7 +189,7 @@ Run them on a Linux host, from the commit the demo build was made from. The lab 
 
 - A `409 conflict` means the previous voter-set change has not reached a majority yet ([protocol section 8.10](../contracts/node-agent-protocol.md#810-voter-set-changes-m5b)). Wait and repeat the call.
 - If `ha_ready` stays `false`, check that lab-3's agent is connected and has stored the new desired state.
-- To undo the step: `{"remove":["witness"]}`. That is allowed only while no `expiring` lease exists, because otherwise fewer than three voters would remain. Never pass `force` in the demo.
+- To undo the step: `{"remove":["witness"]}`. It leaves fewer than three voters, so it is allowed only while no `expiring` lease row is unrevoked or still behind its gate. A revoked row whose gate has passed does not block it ([protocol section 8.10](../contracts/node-agent-protocol.md#810-voter-set-changes-m5b), [ADR 0321](../adr/0321-four-lease-and-voter-readings-every-waiting-grant-is-marked.md)). Never pass `force` in the demo.
 
 ## Step 2: a warm app on lab-1
 
@@ -551,7 +551,7 @@ In this order:
 1. **Check the cut.** On lab-1, `nft list table inet quoro_lab_cut` fails, and `systemctl list-timers quoro-lab-cut-deadman.timer` lists nothing.
 2. **The demo app.** Set it back to `ha_policy: none` before anything in the voter set changes. `deleteApp` and `deleteVolume` are refused with `has_quarantines` while a quarantined copy exists, so delete the app, if at all, only after the next item. Its `expiring` lease blocks removing a vote.
 3. **The quarantined copy.** First save its record: id, node, size and SHA-256. Then decide whether to keep it. Deleting it is human-only and cannot be undone: `q -X DELETE "$QUORO/api/v1/volumes/$VOL/quarantines/<qrn id>"` ([#732](https://github.com/OmarAlex24/quoro/issues/732)).
-4. **The witness role.** Keep it: M6 needs three votes. Remove it only if the maintainer asks for that: `{"remove":["witness"]}` once no `expiring` lease exists. Never use `force`.
+4. **The witness role.** Keep it: M6 needs three votes. Remove it only if the maintainer asks for that: `{"remove":["witness"]}` once no `expiring` lease row is unrevoked or still behind its gate, and no lease has `local_pending` true: after an app leaves `warm`, its holder keeps renewing until it takes the `local` grant, and the guard does not count that lease. Never use `force`.
 5. **Quarantined control-plane directories** from step 6. They stay on the hosts until the maintainer decides. Record where they are.
 6. **Final state.** `GET /api/v1/nodes`, `GET /api/v1/cluster` and `GET /api/v1/apps`, compared with the pre-flight readings. Request every demo domain once.
 

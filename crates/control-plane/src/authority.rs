@@ -470,6 +470,19 @@ impl Authority {
             .is_none_or(|gate| gate.gate() <= now)
     }
 
+    /// Whether this authority holds a gate for `lease_id` and that gate has
+    /// passed. Unlike [`Authority::passed`], a lease with no gate answers
+    /// `false`: a caller that must know a gate passed cannot read a missing
+    /// one as passed. After a restart every `expiring` row has the start gate
+    /// of the restart rule ([`Authority::seed`]).
+    #[must_use]
+    pub fn gate_has_passed(&self, lease_id: &str) -> bool {
+        let now = self.now();
+        self.gates()
+            .get(lease_id)
+            .is_some_and(|gate| gate.gate() <= now)
+    }
+
     /// How long until `lease_id`'s gate passes, `None` once it has passed or
     /// for a lease with none. Records nothing: the write of a grant that
     /// waits checks the previous holder's gate with it, and the grant is
@@ -722,6 +735,31 @@ mod tests {
         assert!(!authority.passed("lse_d"));
         clock.advance(Duration::from_secs(1));
         assert!(authority.passed("lse_d"));
+    }
+
+    /// `gate_has_passed` answers `true` only for a gate it holds that has
+    /// passed: a lease with no gate is not one, although `passed` lets it be
+    /// granted. A seeded gate and a grant's gate pass at their time.
+    #[test]
+    fn only_a_held_gate_has_passed() {
+        let (authority, clock) = authority();
+        assert!(authority.passed("lse_a"));
+        assert!(!authority.gate_has_passed("lse_a"), "no gate");
+
+        authority.seed("lse_a", "nod_a", Some(15_000));
+        clock.advance(Duration::from_millis(18_000 - 1));
+        assert!(!authority.gate_has_passed("lse_a"));
+        clock.advance(Duration::from_millis(1));
+        assert!(authority.gate_has_passed("lse_a"));
+
+        authority.record_grant(&grant("nod_b", D, NEW, 0)).unwrap();
+        assert!(!authority.gate_has_passed("lse_a"), "the new holder's gate");
+        clock.advance(Duration::from_secs(18));
+        assert!(authority.gate_has_passed("lse_a"));
+
+        // A `local` grant drops the gate: none is held any more.
+        authority.record_local_grant("lse_a").unwrap();
+        assert!(!authority.gate_has_passed("lse_a"));
     }
 
     /// ADR 0203: the stored duration is lowered only once every longer
