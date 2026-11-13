@@ -42,7 +42,7 @@
 //! fakes; the unit directory, systemd's unit directories, the journal
 //! socket, `/proc` and the clock are fields of [`Options`].
 
-use crate::host::{DATABASE, NODE_UNIT, Out, UNIT, systemctl, systemctl_check};
+use crate::host::{AGENT_STORE, DATABASE, NODE_UNIT, Out, UNIT, systemctl, systemctl_check};
 use sqlx::Connection as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
 use std::fs;
@@ -58,8 +58,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const DROP_IN: &str = "quoro.service.d";
 /// The directory inside the copy that holds the unit file and its drop-ins.
 const SYSTEMD_DIR: &str = "systemd";
-/// The node agent's store inside the node data directory.
-const AGENT_STORE: &str = "node.db";
 /// Written first in the copy, before anything else changes.
 const STARTED: &str = "rejoin-started";
 /// A forced run's statement, next to `rejoin-started`.
