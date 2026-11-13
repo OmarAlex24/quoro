@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ShieldAlert, ShieldCheck, ShieldEllipsis } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { useGetCluster } from '../api/generated/cluster/cluster';
 import type { Node, NodeJoinTokenCreated } from '../api/generated/model';
-import { updateNodeRoles } from '../api/generated/nodes/nodes';
 import { expiryWords } from '../lib/agency-format';
 import { canChangeVoters } from '../lib/capabilities';
-import { createJoinToken } from '../lib/join-token';
+import { joinTokenMutation } from '../lib/join-token';
 import { problemView, type ProblemView } from '../lib/problem';
 import { cn } from '../lib/utils';
 import {
+  addWitnessMutation,
   candidateNote,
+  disconnectedVoters,
+  dropTokenUnlessShort,
   haReadout,
   haVotesState,
-  refreshVoters,
-  shortOfVotes,
   witnessCandidates,
   witnessJoinCommand,
   witnessProblem,
@@ -50,26 +50,16 @@ export function HaVotes({ nodes }: { nodes: readonly Node[] }) {
   });
   const [addingId, setAddingId] = useState<string | null>(null);
 
-  const addWitness = useMutation({
-    mutationFn: (node: Node) => updateNodeRoles(node.id, { add: ['witness'] }),
-    onMutate: (node) => setAddingId(node.id),
-    onSettled: () => {
-      setAddingId(null);
-      void refreshVoters(queryClient);
-    },
-  });
+  const addWitness = useMutation(addWitnessMutation(queryClient, setAddingId));
   // The secret lives in this mutation's result only; `reset()` drops it.
-  const joinToken = useMutation({ mutationFn: () => createJoinToken() });
+  const joinToken = useMutation(joinTokenMutation());
 
   const votes = cluster.data?.votes;
-  const short = shortOfVotes(votes);
   const dropToken = joinToken.reset;
   // The secret goes with the offer: once HA has its votes, nothing shows it again.
-  useEffect(() => {
-    if (!short) dropToken();
-  }, [short, dropToken]);
+  useEffect(() => dropTokenUnlessShort(votes, dropToken), [votes, dropToken]);
 
-  const state = haVotesState({ votes, error: cluster.error, loading: cluster.isLoading });
+  const state = haVotesState(cluster);
   if (state.kind === 'loading') return <HaVotesSkeleton />;
   if (state.kind === 'failed') return <ProblemBanner view={state.problem} className="mb-4" />;
   if (state.kind === 'hidden') return null;
@@ -78,6 +68,7 @@ export function HaVotes({ nodes }: { nodes: readonly Node[] }) {
     <HaVotesView
       readout={haReadout(state.votes, nodes)}
       candidates={witnessCandidates(nodes, state.votes)}
+      version={cluster.data?.version}
       canChange={canChangeVoters(me)}
       addingId={addingId}
       busy={addWitness.isPending || joinToken.isPending}
@@ -114,6 +105,8 @@ function HaVotesSkeleton() {
 export interface HaVotesViewProps {
   readout: HaReadout;
   candidates: readonly Node[];
+  /** The cluster's version, which a new witness's `quoro` binary should match. */
+  version?: string;
   canChange: boolean;
   /** The machine whose roles call is in flight. */
   addingId: string | null;
@@ -182,6 +175,11 @@ function Seat({ seat }: { seat: VoterSeat }) {
         ))}
         <span className={cn('ha-seat-w', !seat.connected && 'text-fault')}>{seat.words}</span>
       </span>
+      {seat.connected ? null : (
+        <p className="next-step">
+          Make sure its node agent, <code className="type-code">quoro node</code>, is running on that machine.
+        </p>
+      )}
     </li>
   );
 }
@@ -189,6 +187,7 @@ function Seat({ seat }: { seat: VoterSeat }) {
 /** The two ways to a third vote: an enrolled machine gains the role, or a new one joins as a witness. */
 function WitnessOffer({
   candidates,
+  version,
   canChange,
   addingId,
   busy,
@@ -230,18 +229,21 @@ function WitnessOffer({
 
       <div className="ha-way">
         <h3 className="ha-way-t">Enroll a new machine as the witness</h3>
-        <p className="ha-way-p">A small machine is enough. The join token is for one machine and lasts an hour.</p>
+        <p className="ha-way-p">
+          A small machine is enough. It needs the <code className="type-code">quoro</code> binary at the cluster’s
+          version{version ? `, ${version}` : ''}. The join token is for one machine and lasts an hour.
+        </p>
         {joinToken ? (
           <div className="grid gap-2">
             <SecretOnce
-              label="Run this on the new machine"
+              label="Run this as root on the new machine"
               secret={witnessJoinCommand(joinToken.join_command)}
               copyLabel="Copy command"
               note={`The token is shown only this once and expires ${expiryWords(joinToken.expires_at)}.`}
             />
             <p className="next-step">
-              Then start the node agent on that machine with <code className="type-code">quoro node</code>, and keep
-              it running. Until it connects, the witness cannot vote.
+              Then start the node agent there with <code className="type-code">quoro node</code>, as root too, and
+              keep it running, for example as a systemd service. Until it connects, the witness cannot vote.
             </p>
             <Button size="sm" className="justify-self-start" onClick={onDropToken}>
               Done
@@ -265,8 +267,8 @@ function WitnessOffer({
 
 /**
  * A machine that can gain the vote. One that is not connected can too (the
- * server takes the role either way), with a note that it votes only once its
- * agent connects.
+ * server takes the role either way); beside the button, a note says that it
+ * votes only once its agent connects. Without the button there is no note.
  */
 function Candidate({
   node,
@@ -282,7 +284,7 @@ function Candidate({
   onAdd: () => void;
 }) {
   const connected = node.status === 'connected';
-  const note = candidateNote(node);
+  const note = canChange ? candidateNote(node) : null;
   const noteId = `ha-cand-note-${node.id}`;
   return (
     <li className="ha-cand">
@@ -323,13 +325,17 @@ function StaleNote({ problem }: { problem: ProblemView }) {
   );
 }
 
-/** Enough voters: one quiet line, and the voters by name. */
+/**
+ * Enough voters: one quiet line, and the voters by name. A voter that is not
+ * connected still counts, so under them a line says what it needs.
+ */
 function HaSettled({ readout, stale }: { readout: HaReadout; stale: ProblemView | null }) {
   const ready = readout.state === 'ready';
   const Icon = ready ? ShieldCheck : ShieldEllipsis;
+  const away = disconnectedVoters(readout.seats);
   return (
     <section
-      className={cn('n1 ha-quiet', !ready && 'n1-shift', stale && 'ha-quiet-stale')}
+      className={cn('n1 ha-quiet', !ready && 'n1-shift', (stale || away.length > 0) && 'ha-quiet-rows')}
       aria-labelledby="ha-title"
     >
       <span className="n1-gl" aria-hidden="true">
@@ -348,6 +354,18 @@ function HaSettled({ readout, stale }: { readout: HaReadout; stale: ProblemView 
           </li>
         ))}
       </ul>
+      {away.length > 0 ? (
+        <p className="next-step">
+          Make sure the node agent, <code className="type-code">quoro node</code>, is running on{' '}
+          {away.map((name, index) => (
+            <Fragment key={index}>
+              {index === 0 ? null : index === away.length - 1 ? ' and ' : ', '}
+              <b>{name}</b>
+            </Fragment>
+          ))}
+          .
+        </p>
+      ) : null}
       {stale ? <StaleNote problem={stale} /> : null}
     </section>
   );

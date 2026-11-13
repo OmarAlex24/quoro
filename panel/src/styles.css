@@ -4705,11 +4705,11 @@
   }
 
   /*
-   * What is still to do on the new machine, under its join command (the HA
-   * view's witness offer, Add a node). The plate's solid shift rule goes on
-   * below it dashed, as the panel draws what is still missing: the command
-   * is in hand, this step is not done yet. 1 px in, so the 2 px rule sits on
-   * the centre of the plate's 4 px one.
+   * What is still to do on a machine: under its join command (the HA view's
+   * witness offer, Add a node), and under a voter that is not connected. The
+   * plate's solid shift rule goes on below it dashed, as the panel draws what
+   * is still missing: the command is in hand, this step is not done yet. 1 px
+   * in, so the 2 px rule sits on the centre of the plate's 4 px one.
    */
   .next-step {
     margin-left: 1px;
@@ -4962,8 +4962,12 @@
     transform: translateY(1px);
   }
 
-  /* Only a strip with the line wraps; the line takes a row of its own. */
-  .ha-quiet-stale {
+  /*
+   * Only a strip with a line under it wraps: what a disconnected voter needs,
+   * or that the votes may be out of date. Each line takes a row of its own,
+   * under the sentence.
+   */
+  .ha-quiet-rows {
     flex-wrap: wrap;
   }
 
@@ -4971,6 +4975,17 @@
     flex-basis: 100%;
     margin-top: 0;
     padding-left: 40px;
+  }
+
+  .ha-quiet .next-step {
+    flex-basis: calc(100% - 40px);
+    margin-left: 40px;
+  }
+
+  /* In a voter's seat, the step is as small as the seat's other words. */
+  .ha-seat .next-step {
+    font-size: 12px;
+    line-height: 1.45;
   }
 
   /* While the first votes load: the strip HA settles into, as dither. */

@@ -2,13 +2,14 @@
 import { useMutation } from '@tanstack/react-query';
 import { Plus } from 'lucide-react';
 import { useState, type ReactElement } from 'react';
+import { useGetCluster } from '../api/generated/cluster/cluster';
 import type { NodeJoinTokenCreated } from '../api/generated/model';
 import { expiryWords } from '../lib/agency-format';
 import { canEnrollNodes } from '../lib/capabilities';
-import { createJoinToken } from '../lib/join-token';
+import { joinTokenMutation, nodeInstallerCommand } from '../lib/join-token';
 import { problemView } from '../lib/problem';
 import { useSession } from '../session';
-import { SecretOnce } from './secret-once';
+import { CopyWell, SecretOnce } from './secret-once';
 import { Button } from './ui/button';
 import { Dialog, DialogContent, DialogTrigger } from './ui/dialog';
 import { ProblemBanner } from './ui/problem-banner';
@@ -18,17 +19,17 @@ const INVITE = 'Create a join token and run the installer on the new machine.';
 /**
  * Adding a node: a join token (`createNodeJoinToken`) and the one-line
  * command that enrolls the new machine, shown once in `SecretOnce`, as the HA
- * view's witness offer shows it, with how the installer takes it. The secret
- * lives in the mutation's result only; closing the dialog drops it. Only an
- * owner or an operator can create a token; for anyone else the invitation is
- * not shown. `trigger` is the control that opens it; focus goes back to it
- * when the dialog closes.
+ * view's witness offer shows it, with the installer command that takes it.
+ * The secret lives in the mutation's result only; closing the dialog drops
+ * it. Only an owner or an operator can create a token; for anyone else the
+ * invitation is not shown. `trigger` is the control that opens it; focus goes
+ * back to it when the dialog closes.
  */
 export function AddNodeDialog({ trigger }: { trigger: ReactElement }) {
   const [open, setOpen] = useState(false);
-  const joinToken = useMutation({
-    mutationFn: () => createJoinToken(),
-  });
+  const joinToken = useMutation(joinTokenMutation());
+  // The cluster's version, for the installer command: the Nodes page reads it already.
+  const cluster = useGetCluster({ query: { enabled: open, retry: false } });
   const close = (next: boolean) => {
     if (!next) joinToken.reset();
     setOpen(next);
@@ -41,7 +42,7 @@ export function AddNodeDialog({ trigger }: { trigger: ReactElement }) {
       <DialogContent title="Add a node" description={INVITE}>
         <div className="grid gap-3">
           {joinToken.data ? (
-            <JoinCommand token={joinToken.data} onDone={() => close(false)} />
+            <JoinCommand token={joinToken.data} version={cluster.data?.version} onDone={() => close(false)} />
           ) : (
             <>
               <p className="text-[13px] leading-snug text-ink-2">
@@ -66,12 +67,22 @@ export function AddNodeDialog({ trigger }: { trigger: ReactElement }) {
 }
 
 /**
- * The token, once: the join command the server built, and how to use it. The
- * command only enrolls; the installer runs it with `QUORO_ROLE=node` and then
- * starts the node agent, so the words point there instead of to the command
- * alone.
+ * The token, once: the join command the server built, and the installer
+ * command that uses it. The join command only enrolls; the installer installs
+ * the node, runs the join with `QUORO_ROLE=node` and starts the node agent,
+ * so the words point there. The installer command is not secret: its URL,
+ * token and fingerprint are placeholders, filled from the join command.
  */
-export function JoinCommand({ token, onDone }: { token: NodeJoinTokenCreated; onDone: () => void }) {
+export function JoinCommand({
+  token,
+  version,
+  onDone,
+}: {
+  token: NodeJoinTokenCreated;
+  /** The cluster's version, for `QUORO_VERSION`; a placeholder while unknown. */
+  version?: string;
+  onDone: () => void;
+}) {
   return (
     <>
       <SecretOnce
@@ -80,12 +91,25 @@ export function JoinCommand({ token, onDone }: { token: NodeJoinTokenCreated; on
         copyLabel="Copy command"
         note={`The token is shown only this once and expires ${expiryWords(token.expires_at)}.`}
       />
-      <p className="next-step">
-        Run the installer on the new machine with <code className="type-code">QUORO_ROLE=node</code>, and this
-        command’s URL, token and fingerprint in <code className="type-code">QUORO_JOIN_URL</code>,{' '}
-        <code className="type-code">QUORO_JOIN_TOKEN</code> and <code className="type-code">QUORO_JOIN_FINGERPRINT</code>.
-        It runs the command for you and starts the node agent, <code className="type-code">quoro-node.service</code>.
-      </p>
+      <div className="next-step grid gap-2">
+        <p>
+          On the new machine, run the installer as root, with the URL, token and fingerprint from this command:
+        </p>
+        <CopyWell value={nodeInstallerCommand(version)} copyLabel="Copy installer command" />
+        <p>
+          It joins the machine and starts its node agent, <code className="type-code">quoro-node.service</code>.{' '}
+          {version ? (
+            <>
+              <code className="type-code">QUORO_VERSION</code> keeps the node at the cluster’s version, {version}.
+            </>
+          ) : (
+            <>
+              Set <code className="type-code">QUORO_VERSION</code> to the cluster’s version.
+            </>
+          )}{' '}
+          Without it, the installer installs the latest release.
+        </p>
+      </div>
       <Button className="justify-self-end" onClick={onDone}>
         Done
       </Button>

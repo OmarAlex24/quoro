@@ -7,6 +7,8 @@ import { getListNodesQueryKey } from '../api/generated/nodes/nodes';
 import { getListVmsQueryKey } from '../api/generated/vms/vms';
 import {
   candidateNote,
+  disconnectedVoters,
+  dropTokenUnlessShort,
   haReadout,
   haVotesState,
   missingVoteWords,
@@ -204,12 +206,36 @@ describe('shortOfVotes', () => {
   });
 });
 
+describe('dropTokenUnlessShort', () => {
+  const calls = (current: ClusterVotes | undefined): number => {
+    let dropped = 0;
+    dropTokenUnlessShort(current, () => {
+      dropped += 1;
+    });
+    return dropped;
+  };
+
+  it('keeps the token while HA is short of a vote', () => {
+    expect(calls(votes([voter(lab3), voter(lab4)]))).toBe(0);
+    expect(calls(votes([]))).toBe(0);
+  });
+
+  it('drops it once the count reaches required, a disconnected voter included, before ha_ready', () => {
+    expect(calls(votes([voter(lab3), voter(lab4), voter(edge, false)], false))).toBe(1);
+    expect(calls(votes([voter(lab3), voter(lab4), voter(edge)], true))).toBe(1);
+  });
+
+  it('drops it with no votes, so no token outlives the offer', () => {
+    expect(calls(undefined)).toBe(1);
+  });
+});
+
 describe('haVotesState', () => {
   const current = votes([voter(lab3), voter(lab4)]);
   const offline = new TypeError('Failed to fetch');
 
   it('shows the votes when they arrived', () => {
-    expect(haVotesState({ votes: current, error: null, loading: false })).toEqual({
+    expect(haVotesState({ data: { votes: current }, error: null, isLoading: false })).toEqual({
       kind: 'votes',
       votes: current,
       stale: null,
@@ -217,7 +243,7 @@ describe('haVotesState', () => {
   });
 
   it('keeps the last votes when a refetch fails, and says why beside them', () => {
-    const state = haVotesState({ votes: current, error: offline, loading: false });
+    const state = haVotesState({ data: { votes: current }, error: offline, isLoading: false });
     expect(state.kind).toBe('votes');
     if (state.kind !== 'votes') return;
     expect(state.votes).toBe(current);
@@ -226,15 +252,15 @@ describe('haVotesState', () => {
 
   it('says why when the call fails before any votes arrived', () => {
     const forbidden = new ApiProblem({ status: 403, code: 'forbidden', reason: 'scope_missing' });
-    expect(haVotesState({ votes: undefined, error: forbidden, loading: false })).toEqual({
+    expect(haVotesState({ data: undefined, error: forbidden, isLoading: false })).toEqual({
       kind: 'failed',
       problem: { message: "Your role can't see the voters (scope_missing)", code: 'forbidden', reason: 'scope_missing' },
     });
   });
 
   it('is loading until the first answer, and hidden while the query is off', () => {
-    expect(haVotesState({ votes: undefined, error: null, loading: true })).toEqual({ kind: 'loading' });
-    expect(haVotesState({ votes: undefined, error: undefined, loading: false })).toEqual({ kind: 'hidden' });
+    expect(haVotesState({ data: undefined, error: null, isLoading: true })).toEqual({ kind: 'loading' });
+    expect(haVotesState({ data: undefined, error: null, isLoading: false })).toEqual({ kind: 'hidden' });
   });
 });
 
@@ -243,11 +269,22 @@ describe('candidateNote', () => {
     expect(candidateNote(edge)).toBeNull();
   });
 
-  it('says what adding the role does to a machine that is not connected', () => {
-    const note = 'Not connected. It gets the role now and can vote once its node agent connects.';
+  it('says what adding the role does to a machine that is not connected, without repeating its lamp', () => {
+    const note = 'It gets the role now and can vote once its node agent connects.';
     expect(candidateNote(node('lab-edge', ['edge'], { status: 'disconnected' }))).toBe(note);
     expect(candidateNote(node('lab-edge', ['edge'], { status: 'pending' }))).toBe(note);
     expect(candidateNote(node('lab-edge', ['edge'], { status: 'fenced' }))).toBe(note);
+  });
+});
+
+describe('disconnectedVoters', () => {
+  it('names the voters that are not connected, in their order', () => {
+    const current = votes([voter(lab3), voter(lab4, false), voter(edge, false)]);
+    expect(disconnectedVoters(haReadout(current, [lab3, lab4, edge]).seats)).toEqual(['lab-4', 'lab-edge']);
+  });
+
+  it('is empty when every voter is connected', () => {
+    expect(disconnectedVoters(haReadout(votes([voter(lab3), voter(lab4)]), [lab3, lab4]).seats)).toEqual([]);
   });
 });
 
