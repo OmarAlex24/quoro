@@ -6942,8 +6942,8 @@ paths:
         and clears `lost_at` once they are answered. The scope is human-only:
         an agent is refused with `forbidden` and
         `reason: human_only`. A connected or removed node is refused with
-        `conflict`. When a lease the node holds is already at 2^53 - 1, the
-        token cap, nothing is written and the call answers `conflict` with
+        `conflict`. When an unrevoked lease row that names the node is
+        already at 2^53 - 1, the token cap, nothing is written and the call answers `conflict` with
         `reason: token_exhausted` (node-agent-protocol.md section 8.6,
         ADR 0325). Declaring a node already declared lost changes nothing and
         answers `200`. The call is audited (D-0031).
