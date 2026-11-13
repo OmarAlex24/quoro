@@ -27,15 +27,17 @@
 //!   a row that stores none (ADR 0289).
 //! - **The send.** Under the writer gate, the row found again unrevoked,
 //!   naming the entry and reading `local`, the policy `warm`, no failed
-//!   fence, the session ready, no conversion in flight on it, and majority
-//!   support for the duration sent (for `D` before the barrier or the
-//!   raise, which precede a grant of `D`). The grant
-//!   carries the row's token, `mode` `expiring`, the duration and no `re`
-//!   (ADR 0256). It is queued and recorded on the session in one hold of the
-//!   sessions lock ([`NodeHub::queue_conversion`]), which checks the barrier
-//!   again: its first renewal is then answered as the first one, writing the
-//!   row `expiring` ([`super::conversion`]). The send writes nothing but a
-//!   raise; the conversion grant counts toward no gate (ADR 0241).
+//!   fence, the session ready, its start's grants queued, no conversion in
+//!   flight on it, and majority support for the duration sent (for `D`
+//!   before the barrier or the raise, which precede a grant of `D`). The
+//!   grant carries the row's token, `mode` `expiring`, the duration and no
+//!   `re` (ADR 0256). It is queued and recorded on the session in one hold
+//!   of the sessions lock ([`NodeHub::queue_conversion`]), which checks the
+//!   start's grants queued and the barrier again, so the session start's
+//!   same-token `local` repeat never reaches the node after it: its first
+//!   renewal is then answered as the first one, writing the row `expiring`
+//!   ([`super::conversion`]). The send writes nothing but a raise; the
+//!   conversion grant counts toward no gate (ADR 0241).
 //! - **A refusal.** A refusal of the grant drops what its send recorded and
 //!   the held entry, writes nothing, and sends no other on that session
 //!   ([`NodeHub::conversion_refused`]): the holder's next `hello` decides.
@@ -403,8 +405,13 @@ impl NodeHub {
         if !conversion::app_is_warm(&mut w.tx, &row.resource_id).await? {
             return Ok(Attempt::Drop);
         }
+        // Neither the conversion nor the barrier `local` grant before it is
+        // queued until the session start's grants are, so the start's
+        // same-token `local` repeat cannot follow it on the wire
+        // ([`NodeHub::mark_start_grants_queued`]).
         if leases::fenced(&mut w.tx, &self.0.unrecorded_failures, &row).await?
             || !self.session_ready(&row.holder_node_id, generation)
+            || !self.start_grants_queued(&row.holder_node_id, generation)
         {
             return Ok(Attempt::Wait);
         }
@@ -600,15 +607,19 @@ impl NodeHub {
 
     /// Queues `frame`, the conversion grant `grant_id` of `lease_id`, on
     /// `generation`'s channel and records it on the session, in one hold of
-    /// the sessions lock that finds `generation` still the node's session
+    /// the sessions lock that finds `generation` still the node's session,
+    /// its start's grants queued ([`NodeHub::mark_start_grants_queued`]),
     /// and ADR 0257's barrier passed for the lease at `in_flight`'s token
-    /// under that same lock. Recorded only once the frame is queued: the
-    /// conversion in flight, so its first renewal is answered as the first
-    /// one ([`super::conversion`]); the end of the `local` grant's refusal of
-    /// renewals ("From R …", Renewals: "until a conversion grant follows");
-    /// and the grant's message id, for a refusal of it. Every reader of
-    /// these takes this lock, so none sees the frame queued without the
-    /// record. Returns whether it was queued and recorded.
+    /// under that same lock. The channel goes out after the outbox, so the
+    /// session start's same-token `local` repeat, queued on the outbox,
+    /// cannot follow the conversion and end it. Recorded only once the
+    /// frame is queued: the conversion in flight, so its first renewal is
+    /// answered as the first one ([`super::conversion`]); the end of the
+    /// `local` grant's refusal of renewals ("From R …", Renewals: "until a
+    /// conversion grant follows"); and the grant's message id, for a refusal
+    /// of it. Every reader of these takes this lock, so none sees the frame
+    /// queued without the record. Returns whether it was queued and
+    /// recorded.
     pub(super) fn queue_conversion(
         &self,
         node_id: &str,
@@ -625,6 +636,14 @@ impl NodeHub {
         else {
             return false;
         };
+        if !handle.start_grants_queued {
+            tracing::debug!(
+                lease_id,
+                node_id,
+                "no conversion grant before the session start's grants are queued"
+            );
+            return false;
+        }
         if !handle.local_end.barrier_passed(lease_id, in_flight.token) {
             tracing::warn!(
                 lease_id,
@@ -1404,6 +1423,66 @@ mod tests {
         ack(&after, &f, &next).await;
         after.hub.attempt_held().await;
         the_conversion(&queued(&mut next), 3, D);
+        f.done();
+    }
+
+    /// Test 13: no conversion, and no barrier `local` grant, is queued on a
+    /// session before its start's grants are: the start's same-token
+    /// `local` repeat goes on the outbox, which goes out before the
+    /// session's channel, so a conversion queued first would reach the node
+    /// before that repeat and be ended by it. Here every other condition
+    /// holds (the `hello` listed the lease `local` at 3, the row stores `D`,
+    /// its newest write is acknowledged, support); the conversion goes only
+    /// once the start's grants are marked queued. On a session whose
+    /// `hello` did not list the lease, the barrier grant waits the same way.
+    #[tokio::test]
+    async fn no_conversion_goes_before_the_session_starts_grants_are_queued() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        let generation = on.session.generation;
+        assert!(hub.start_grants_queued(&f.node_id, generation));
+        hub.unmark_start_grants_queued(&f.node_id, generation);
+        assert!(hub.barrier_passed(&f.node_id, generation, LEASE, 3));
+        ack(&f.state, &f, &on).await;
+        hub.hold_conversion(&f.row().await);
+        hub.attempt_held().await;
+        assert!(
+            queued(&mut on).is_empty(),
+            "no conversion before the start's grants are queued"
+        );
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+        assert!(grant_ids(&f.state, &f.node_id).is_empty());
+        let held = entry(&f.state).unwrap();
+        assert_eq!((held.kind, held.sent_on), (Kind::Convert, None));
+
+        hub.mark_start_grants_queued(&f.node_id, generation);
+        hub.attempt_held().await;
+        the_conversion(&queued(&mut on), 3, D);
+        f.done();
+
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, None).await;
+        let generation = on.session.generation;
+        hub.unmark_start_grants_queued(&f.node_id, generation);
+        hub.hold_conversion(&f.row().await);
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        assert!(
+            queued(&mut on).is_empty(),
+            "no barrier grant before the start's grants are queued"
+        );
+        assert_eq!(entry(&f.state).unwrap().barrier_on, None);
+
+        hub.mark_start_grants_queued(&f.node_id, generation);
+        hub.attempt_held().await;
+        grant_then_ping(&queued(&mut on), 3);
         f.done();
     }
 }

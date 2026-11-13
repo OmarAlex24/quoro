@@ -783,6 +783,55 @@ impl NodeHub {
         }
     }
 
+    /// `generation`'s start queued its grants on the outbox
+    /// ([`Session::send_grants`](super::Session::send_grants)), the
+    /// same-token `local` repeat and its `ping` among them: a conversion
+    /// grant may be queued on it from now on ([`super::convert`]).
+    pub(super) fn mark_start_grants_queued(&self, node_id: &str, generation: u64) {
+        let newly = {
+            let mut sessions = self.0.sessions.lock().expect("session lock");
+            sessions
+                .get_mut(node_id)
+                .filter(|handle| handle.generation == generation && !handle.start_grants_queued)
+                .is_some_and(|handle| {
+                    handle.start_grants_queued = true;
+                    true
+                })
+        };
+        if newly {
+            self.wake_held();
+        }
+    }
+
+    /// Whether `generation` is the node's live session and its start queued
+    /// its grants ([`NodeHub::mark_start_grants_queued`]). Takes the
+    /// sessions lock alone.
+    pub(super) fn start_grants_queued(&self, node_id: &str, generation: u64) -> bool {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(node_id)
+            .filter(|handle| handle.generation == generation)
+            .is_some_and(|handle| handle.start_grants_queued)
+    }
+
+    /// Test seam: `generation` reads as a session whose start has not
+    /// queued its grants yet.
+    #[cfg(test)]
+    pub(super) fn unmark_start_grants_queued(&self, node_id: &str, generation: u64) {
+        if let Some(handle) = self
+            .0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+        {
+            handle.start_grants_queued = false;
+        }
+    }
+
     /// Whether `generation` is the node's live session, has finished its
     /// start, and has no `lease_revoke` unanswered and none held back. A
     /// grant goes out only then: the node holds a grant back until it has

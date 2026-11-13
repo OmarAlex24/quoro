@@ -523,6 +523,13 @@ struct SessionHandle {
     /// and what it carried, so a refusal of one drops what it recorded
     /// ([`convert`]).
     conversion_grants: HashMap<String, (String, conversion::InFlight)>,
+    /// Whether the session start's grants are queued on the outbox
+    /// ([`Session::send_grants`], [`NodeHub::mark_start_grants_queued`]),
+    /// the same-token `local` repeat and its `ping` among them. No
+    /// conversion grant, and no barrier `local` grant before one, is queued
+    /// on this session before: the repeat would reach the node after it and
+    /// end the conversion ([`convert`]).
+    start_grants_queued: bool,
 }
 
 /// A follower's position in the change log, kept in memory for its live
@@ -2247,6 +2254,7 @@ impl NodeHub {
                 settles: conversion::Settles::default(),
                 local_end: local_end::SessionState::default(),
                 conversion_grants: HashMap::new(),
+                start_grants_queued: false,
             },
         );
         (generation, rx, closed_rx, changed)
@@ -5003,6 +5011,13 @@ impl Session {
             }
         }
         self.send_grants(outbox).await;
+        // A conversion grant is queued on the session's channel, which
+        // `run_session` sends after what this pass queued on the outbox: one
+        // recorded from here on reaches the node after the session start's
+        // same-token `local` repeat and its `ping`, which would otherwise
+        // end it ([`convert`]). Marked whatever `send_grants` sent.
+        self.hub
+            .mark_start_grants_queued(&self.node_id, self.generation);
         true
     }
 
