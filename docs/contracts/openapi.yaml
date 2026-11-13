@@ -1102,6 +1102,15 @@ components:
             were revoked with new tokens at that time. Cleared once the node
             returns and has answered the revokes of those leases
             (node-agent-protocol.md sections 8.3 and 9).
+        mesh_error:
+          type: [string, 'null']
+          description: |
+            From M5b: why the node's last apply of the mesh failed, from its
+            newest `status_report` (node-agent-protocol.md sections 5.3 and
+            6.9), or null. While it is set, the node answers no promotion vote
+            and `Cluster.votes.ha_ready` does not count it. The primary keeps
+            it in memory: after a primary restart it is null until the node's
+            next report, within 30 s.
         created_at:
           type: string
           format: date-time
@@ -3921,7 +3930,10 @@ components:
             promoted since the repository was created, because the key never
             enters the change log (node-agent-protocol.md sections 7.1 and
             7.3, ADR 0322). While it is false, the primary takes no backup of
-            the repository, restores none and runs no garbage collection, and
+            the repository, starts no restore (a restore the old primary started
+            and its target node lists still finishes, and one it never
+            received is recorded `failed`, node-agent-protocol.md section 7.3
+            step 4) and runs no garbage collection, and
             `rotateBackupRecoveryKey` answers `conflict`. The owner restores
             the key with `restoreBackupRepositoryKey`.
         control_plane_schedule:
