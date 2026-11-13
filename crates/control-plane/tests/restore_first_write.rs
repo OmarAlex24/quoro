@@ -1049,11 +1049,15 @@ async fn an_accept_loss_first_write_removes_every_other_node() {
         Some("primary")
     );
     assert_eq!(cp_status(&store, &old).await, None);
-    // Each lease the holder held moves to its token + 1, recorded revoked,
-    // as declaring the node lost does. The row revoked before the write
-    // follows the declare-lost rule for revoked rows, which this test does
-    // not pin.
-    for (id, token) in [(EXPIRING, 4), (LOCAL, 6), (MARKED, 7)] {
+    // Each lease row of the holder moves to its token + 1, recorded revoked,
+    // as declaring the node lost does (ADR 0202): the row revoked before the
+    // write too.
+    for (id, token) in [
+        (EXPIRING, 4),
+        (EXPIRING_REVOKED, 5),
+        (LOCAL, 6),
+        (MARKED, 7),
+    ] {
         assert_eq!(lease(&store, id).await, (token, true), "{id}");
     }
     assert_eq!(sealed(&store).await, vec![NEW_NODE.to_string()]);
@@ -1375,6 +1379,79 @@ async fn a_lease_granted_after_an_earlier_declaration_is_raised() {
     assert_eq!(lost_at(&store, HOLDER).await.as_deref(), Some(DECLARED));
     assert_eq!(lost_at(&store, &old).await, None);
     assert_eq!(status(&store, HOLDER).await, "removed");
+}
+
+/// The first write raises the rows declaring a node lost raises (ADR 0202):
+/// a removed machine's row revoked before the write is raised and keeps its
+/// `revoked_at`, also one below the cap, which reaches the cap without a
+/// refusal. A row already revoked at the cap is left as it is, with no
+/// entry, and refuses nothing. No `lost_at` is set.
+#[tokio::test]
+async fn a_removed_machines_revoked_rows_are_raised_below_the_cap() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    const EARLIER: &str = "2026-01-02T03:04:05.000Z";
+    for (id, token) in [(EXPIRING_REVOKED, MAX_TOKEN - 1), (LOCAL, MAX_TOKEN)] {
+        sqlx::query("UPDATE leases SET fencing_token = ?, revoked_at = ? WHERE id = ?")
+            .bind(token)
+            .bind(EARLIER)
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: lost(&old),
+            moved: true
+        }
+    );
+    async fn revoked_at(store: &Store, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT revoked_at FROM leases WHERE id = ?")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+    }
+    for (id, token) in [
+        (EXPIRING, 4),
+        (EXPIRING_REVOKED, MAX_TOKEN),
+        (LOCAL, MAX_TOKEN),
+        (MARKED, 7),
+    ] {
+        assert_eq!(lease(&store, id).await, (token, true), "{id}");
+    }
+    for id in [EXPIRING_REVOKED, LOCAL] {
+        assert_eq!(
+            revoked_at(&store, id).await.as_deref(),
+            Some(EARLIER),
+            "{id}"
+        );
+    }
+    let entries = entries_after(&store, head.seq).await;
+    assert!(
+        entries
+            .iter()
+            .any(|(_, kind, id, _, _, payload)| kind == "lease"
+                && id == EXPIRING_REVOKED
+                && payload["fencing_token"] == MAX_TOKEN),
+        "the raise of the row revoked below the cap: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(_, kind, id, _, _, _)| kind == "lease" && id == LOCAL),
+        "no entry for the row revoked at the cap: {entries:?}"
+    );
+    for id in lost(&old) {
+        assert_eq!(status(&store, &id).await, "removed", "{id}");
+        assert_eq!(lost_at(&store, &id).await, None, "{id}");
+    }
 }
 
 /// Only machines with the `node` role are removed: a witness-only and an

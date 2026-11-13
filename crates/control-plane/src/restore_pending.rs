@@ -53,12 +53,14 @@
 //! every such machine is removed ([`to_remove`]). For each one, in this order
 //! ([`remove_the_lost`]):
 //!
-//! - the token of each lease it holds goes up by one and the row is recorded
-//!   revoked, as declaring the node lost does (node-agent-protocol.md section
-//!   8.3): the rows `declareNodeLost` raises ([`crate::leases::held_by_node`],
-//!   [`crate::leases::bump_tokens`]), also when the machine was declared lost
-//!   before and holds a lease granted since. The write raises the tokens and
-//!   does not declare the machine lost: it sets no `lost_at`;
+//! - the token of each lease row that names it goes up by one and the row is
+//!   recorded revoked, as declaring the node lost does (node-agent-protocol.md
+//!   section 8.3): the rows `declareNodeLost` raises
+//!   ([`crate::api::nodes::raise_lost_leases`], ADR 0202), a revoked one
+//!   included, except a row already revoked at the token cap, also when the
+//!   machine was declared lost before and holds a lease granted since. The
+//!   write raises the tokens and does not declare the machine lost: it sets
+//!   no `lost_at`;
 //! - it turns `removed`, with its node entry, the whole row, as `removeNode`
 //!   writes a removal (section 10), so the voter set and the required set of
 //!   section 8.4 read it removed from that `seq` on. The same row write
@@ -587,18 +589,13 @@ async fn remove_the_lost(
 
     let mut last_removal = None;
     for node_id in &lost {
-        // The rows declaring the node lost raises (section 8.3), without its
-        // early return for a node already declared lost: a lease granted
-        // after that declaration is raised too. No `lost_at` is set.
+        // The rows declaring the node lost raises (section 8.3, ADR 0202),
+        // revoked ones below the cap included, without its early return for
+        // a node already declared lost: a lease granted after that
+        // declaration is raised too. No `lost_at` is set.
         let raise =
             format!("cannot raise the lease tokens of node {node_id}, which --accept-loss removes");
-        let held: Vec<String> = crate::leases::held_by_node(conn, node_id)
-            .await
-            .map_err(|error| api_reason(&raise, error))?
-            .into_iter()
-            .map(|lease| lease.id)
-            .collect();
-        crate::leases::bump_tokens(conn, &held, node_id, actor)
+        crate::api::nodes::raise_lost_leases(conn, node_id, actor)
             .await
             .map_err(|error| api_reason(&raise, error))?;
         sqlx::query("UPDATE nodes SET status = 'removed', cp_status = NULL WHERE id = ?")
@@ -699,9 +696,11 @@ pub async fn to_remove(
 /// that is already at the token cap (node-agent-protocol.md section 8.6,
 /// "The cap"; ADR 0325), read on `conn`, as `(lease id, token)` sorted by
 /// machine, then lease id. These are the rows declaring a node lost raises
-/// ([`crate::leases::held_by_node`]) whose token
-/// [`crate::leases::bump_tokens`] refuses to raise. Only columns of the
-/// first schema are read, so it reads an unmigrated database too.
+/// ([`crate::api::nodes::raise_lost_leases`]) whose token
+/// [`crate::leases::bump_tokens`] refuses to raise: the unrevoked rows at
+/// the cap. A revoked row is raised only below the cap, so it reaches at
+/// most the cap and never refuses. Only columns of the first schema are
+/// read, so it reads an unmigrated database too.
 ///
 /// # Errors
 ///
