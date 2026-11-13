@@ -966,11 +966,10 @@ async fn a_declaration_before_the_hello_is_revoked_first_and_frees_nothing_until
     );
     let revoke = frames[1].clone();
     assert_eq!(revoke["body"]["lease_id"], lease_id.as_str());
-    assert!(
-        revoke["body"]["fencing_token"]
-            .as_i64()
-            .is_some_and(|revoked| revoked >= token),
-        "at least the token the node holds: {revoke}"
+    assert_eq!(
+        revoke["body"]["fencing_token"].as_i64(),
+        Some(row_token),
+        "the token the declaration raised the row to: {revoke}"
     );
     assert_eq!(revoke["body"]["reason"], "declared_lost", "{revoke}");
     assert!(

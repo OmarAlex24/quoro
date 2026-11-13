@@ -2207,7 +2207,8 @@ async fn a_lease_of_a_node_declared_lost_through_the_api_waits_for_its_gate() {
     );
 
     tokio::time::sleep_until(passes).await;
-    ready_grants(&mut setup, &moving, moving.old_token).await;
+    // Above the token the declaration raised the row to (ADR 0202, #948).
+    ready_grants(&mut setup, &moving, moving.old_token + 1).await;
 }
 
 /// R, then the old holder's renewal answered from R (section 8.4, "From R

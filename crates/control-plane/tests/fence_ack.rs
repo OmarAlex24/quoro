@@ -2172,8 +2172,9 @@ async fn revoke_row(server: &Server, lease_id: &str, at: &str) {
         .unwrap();
 }
 
-/// A `revoked_at` older than any the tests write through the API.
-const EARLIER_REVOKE: &str = "2026-11-12T10:15:32Z";
+/// A `revoked_at` older than any the tests write through the API, in the
+/// fixed-width form the store writes, since timestamps compare as strings.
+const EARLIER_REVOKE: &str = "2026-11-12T10:15:32.000Z";
 
 /// Waits until the node row reads `disconnected`: the session's end writes
 /// it with its change-log entry, so no entry of the session's end follows.
