@@ -46,7 +46,7 @@
 
 use super::conversion::{self, InFlight};
 use super::held::{Attempt, HeldGrant, Kind};
-use super::local_end::Barrier;
+use super::local_end::{Barrier, local_end_entry};
 use super::{ControlMessage, NodeHub, lease_token, new_msg_id};
 use crate::authority::DEFAULT_DURATION_MS;
 use crate::changelog::{Actor, ActorType};
@@ -255,7 +255,9 @@ impl NodeHub {
     /// Whether the held conversion `held` of `lease_id`, not sent yet, is
     /// owed no more: there is no row, the row no longer names it (holder and
     /// token), is revoked or no longer reads `local`, or the app's policy is
-    /// no longer `warm`. A marked row still owes it: it waits.
+    /// no longer `warm`. A marked row still owes it: it waits. With the
+    /// policy off `warm`, R's `local` grant may take its place first
+    /// ([`NodeHub::conversion_off_warm`]).
     ///
     /// # Errors
     ///
@@ -272,7 +274,67 @@ impl NodeHub {
         if !owes(&row, held) {
             return Ok(true);
         }
-        Ok(!conversion::app_is_warm(&mut conn, &row.resource_id).await?)
+        if conversion::app_is_warm(&mut conn, &row.resource_id).await? {
+            return Ok(false);
+        }
+        self.conversion_off_warm(&mut conn, lease_id, held, &row)
+            .await?;
+        Ok(true)
+    }
+
+    /// The policy is off `warm` over `row`, which still owes the held
+    /// conversion `held` of `lease_id`: the conversion is owed no more, and
+    /// the caller drops it. When R's same-token `local` grant is owed for
+    /// `row` (marked, its newest write gave it no new token, as
+    /// [`leases::leave_warm`] reads it), that grant takes the conversion's
+    /// place, in one hold of the registry lock and only while the entry is
+    /// still `held`: a grant held since stays, the conversion of a later
+    /// change back to `warm` included. The caller's drop then finds nothing
+    /// left to drop.
+    ///
+    /// R's commit holds that grant itself ([`NodeHub::end_renewals_committed`]).
+    /// This covers two `updateApp` calls that race: a change to `warm`
+    /// commits, a change off `warm` commits R and holds its grant, and only
+    /// then does the first call hold its conversion, after its own commit,
+    /// replacing R's grant ([`NodeHub::hold_conversion`]). Without this, R's
+    /// grant would wait for the holder's next `hello`.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    async fn conversion_off_warm(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        lease_id: &str,
+        held: &HeldGrant,
+        row: &Lease,
+    ) -> Result<(), ApiError> {
+        if !row.unsettled || leases::newest_write_gave_new_token(conn, lease_id).await? {
+            return Ok(());
+        }
+        let eligible = self.local_end_evidenced(row);
+        let replaced = {
+            let mut registry = self.0.held.lock().expect("held grant lock");
+            if registry.entries.get(lease_id) == Some(held) {
+                registry.insert(lease_id.to_string(), local_end_entry(row, eligible))
+            } else {
+                None
+            }
+        };
+        let Some(replaced) = replaced else {
+            return Ok(());
+        };
+        self.release_held_revoke(&replaced);
+        tracing::info!(
+            lease_id,
+            holder = %row.holder_node_id,
+            token = row.fencing_token,
+            eligible_on = ?eligible,
+            "the policy is off warm: the local grant that ends the renewals takes the held \
+             conversion's place"
+        );
+        self.wake_held();
+        Ok(())
     }
 
     /// What [`convert_step`] reads of `row` on `generation`, on `conn`, with
@@ -345,6 +407,8 @@ impl NodeHub {
                 return Ok(Attempt::Drop);
             }
             if !conversion::app_is_warm(&mut conn, &row.resource_id).await? {
+                self.conversion_off_warm(&mut conn, lease_id, held, &row)
+                    .await?;
                 return Ok(Attempt::Drop);
             }
             let facts = self
@@ -372,6 +436,8 @@ impl NodeHub {
         // "Changing the mode": the conversion goes while the policy is
         // `warm`; a policy off `warm` ends it, and R holds the `local` grant.
         if !conversion::app_is_warm(&mut w.tx, &row.resource_id).await? {
+            self.conversion_off_warm(&mut w.tx, lease_id, held, &row)
+                .await?;
             return Ok(Attempt::Drop);
         }
         // Neither the conversion nor the barrier `local` grant before it is
@@ -1562,6 +1628,36 @@ mod tests {
         the_conversion(&queued(&mut on), 3, D);
         assert_eq!(f.writes().await, writes, "the send writes nothing");
         assert_eq!(f.row().await.duration_ms, Some(ABOVE));
+        f.done().await;
+    }
+
+    /// Test 16, two `updateApp` calls that race: a change to `warm`
+    /// commits, then a change off `warm` commits R and holds its same-token
+    /// `local` grant, and only then does the first call hold its conversion,
+    /// which replaces R's grant. The conversion goes no more, the policy
+    /// being off `warm`, and R's grant takes its place again: once R is
+    /// acknowledged, the grant and its `ping` go out on the holder's
+    /// session, with no conversion, rather than at its next `hello`.
+    #[tokio::test]
+    async fn a_conversion_held_after_r_gives_rs_local_grant_back() {
+        let f = fixture("warm", "local", Some(D as i64), false).await;
+        created(&f).await;
+        let hub = &f.state.hub;
+        let mut on = live(&f.state, &f, Some(("held", LeaseMode::Local, 3))).await;
+        // The change to `warm` read the row unmarked, `local` at 3.
+        let entering = f.row().await;
+        r(&f).await;
+        assert_eq!(entry(&f.state).map(|held| held.kind), Some(Kind::LocalEnd));
+        hub.hold_conversion(&entering);
+        assert_eq!(entry(&f.state).map(|held| held.kind), Some(Kind::Convert));
+
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        hub.attempt_held().await;
+        let sent = queued(&mut on);
+        grant_then_ping(&sent, 3);
+        assert!(conversions(&sent).is_empty());
+        assert_eq!(f.row().await.mode, "local");
         f.done().await;
     }
 

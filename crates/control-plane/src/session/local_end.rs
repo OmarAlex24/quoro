@@ -168,6 +168,15 @@ pub(super) struct Barrier {
     pub seq: Option<u64>,
 }
 
+/// The held entry of the same-token `local` grant that ends the renewals of
+/// `lease`, eligible on `eligible` ([`NodeHub::hold_local_end`]).
+pub(super) fn local_end_entry(lease: &Lease, eligible: Option<u64>) -> HeldGrant {
+    let mut held = HeldGrant::of(lease, eligible);
+    held.kind = Kind::LocalEnd;
+    held.support_ms = DEFAULT_DURATION_MS;
+    held
+}
+
 impl NodeHub {
     /// Records what `generation`'s `hello` listed `held` or `uncertain`:
     /// every such lease, and apart those it holds `local`.
@@ -377,17 +386,20 @@ impl NodeHub {
     /// holder holds the lease at the row's token; otherwise it waits for
     /// such evidence: a renewal, or the holder's next `hello`.
     fn hold_local_end(&self, lease: &Lease) {
+        self.register_local_end(lease, self.local_end_evidenced(lease));
+    }
+
+    /// The holder's current session, after its `hello`, when that session
+    /// has evidence that the holder holds `lease` at the row's token: the
+    /// session the `local` grant that ends the renewals may go out on
+    /// ([`NodeHub::hold_local_end`]). Takes the sessions lock alone.
+    pub(super) fn local_end_evidenced(&self, lease: &Lease) -> Option<u64> {
         let token = u64::try_from(lease.fencing_token).unwrap_or(0);
-        let evidenced = {
-            let sessions = self.0.sessions.lock().expect("session lock");
-            sessions
-                .get(&lease.holder_node_id)
-                .filter(|handle| {
-                    handle.hello_recorded && handle.local_end.evidence(&lease.id, token)
-                })
-                .map(|handle| handle.generation)
-        };
-        self.register_local_end(lease, evidenced);
+        let sessions = self.0.sessions.lock().expect("session lock");
+        sessions
+            .get(&lease.holder_node_id)
+            .filter(|handle| handle.hello_recorded && handle.local_end.evidence(&lease.id, token))
+            .map(|handle| handle.generation)
     }
 
     /// The resend from `hello`: the grant may go out on `generation`, whose
@@ -417,12 +429,10 @@ impl NodeHub {
                 {
                     (false, None)
                 }
-                _ => {
-                    let mut held = HeldGrant::of(lease, eligible);
-                    held.kind = Kind::LocalEnd;
-                    held.support_ms = DEFAULT_DURATION_MS;
-                    (true, registry.insert(lease.id.clone(), held))
-                }
+                _ => (
+                    true,
+                    registry.insert(lease.id.clone(), local_end_entry(lease, eligible)),
+                ),
             }
         };
         if let Some(replaced) = replaced {
