@@ -33,7 +33,9 @@ pub const TLS_FINGERPRINT: &str = concat!(
 /// Every [`Server`] holds a clone of its directory, and so does a server
 /// restarted on it, so the directory outlives a server that is dropped and
 /// reopened. A test that stops every server and opens the directory again
-/// keeps its own clone from [`TestDir::new`] until it ends.
+/// keeps its own clone from [`TestDir::new`] until it ends. Dropping a
+/// `Server` does not stop its tasks: they run on until the test's runtime
+/// ends, and find the directory gone once its last clone dropped.
 #[derive(Clone)]
 pub struct TestDir(Arc<DirGuard>);
 
@@ -41,11 +43,18 @@ struct DirGuard(PathBuf);
 
 impl Drop for DirGuard {
     fn drop(&mut self) {
-        // A file written into the directory while it is being removed fails
-        // the removal; the next try removes that file too.
-        for _ in 0..3 {
+        // A file written into the directory while it is being removed, as by
+        // a database connection of a task still running, fails the removal;
+        // a later try, after a short wait, removes that file too.
+        for attempt in 0..3_u32 {
             match std::fs::remove_dir_all(&self.0) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    if attempt == 2 {
+                        eprintln!("cannot remove the test directory {}: {e}", self.0.display());
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+                }
                 _ => return,
             }
         }
