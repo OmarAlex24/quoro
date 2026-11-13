@@ -359,9 +359,6 @@ async fn wait_fenced(
 async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result<bool, ApiError> {
     let hub = &state.hub;
     let mut conn = state.store.pool().acquire().await?;
-    // Read before the rows: a revoke still pending on a session that ends
-    // after this read is not taken for a refusal.
-    let connected = hub.is_connected(node_id);
     let mut waiting = false;
     for lease_id in lease_ids {
         let Some(lease) = leases::by_id(&mut conn, lease_id).await? else {
@@ -370,11 +367,18 @@ async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result
         if lease.holder_node_id != node_id {
             continue;
         }
+        if let Some(hold) = hub.take_removal_hold(node_id, RemovalStep::LeaseCheck) {
+            hold.hold().await;
+        }
         // The in-memory failures before the rows, as
         // `fences::failed_leases` reads them: one recorded in between is in
         // one of the two.
         let unrecorded = hub.unrecorded_failures().of_node(node_id, lease_id);
         let unanswered = hub.revoke_unanswered(node_id, lease_id);
+        // Read after the pending revoke: a session that ends in between takes
+        // its pending revoke with it, and reads here as ended, so the refusal
+        // below names the session's end and not a refused revoke (#941).
+        let connected = hub.is_connected(node_id);
         let listing = crate::fences::nodes_listing(&mut conn, lease_id).await?;
         if listing.iter().any(|id| id == node_id) {
             return Err(ApiError::conflict(format!(
@@ -414,7 +418,7 @@ async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result
         }
         if !connected {
             return Err(ApiError::conflict(format!(
-                "the node's session ended before it answered the lease_revoke of {lease_id}"
+                "the node's session ended before it released {lease_id}"
             )));
         }
         if !unanswered {

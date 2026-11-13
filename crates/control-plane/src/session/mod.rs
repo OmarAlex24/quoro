@@ -732,6 +732,11 @@ pub enum Fault {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RemovalStep {
+    /// In the fence's check of a lease the node holds, after the lease row
+    /// is read and before every other read of that check: the node's
+    /// unrecorded failed fences, the `fence_failure` listings, whether the
+    /// lease's revoke waits for an answer and whether the node is connected.
+    LeaseCheck,
     /// After the call read whether the node is connected, before the
     /// removal's transaction begins.
     Checked,
