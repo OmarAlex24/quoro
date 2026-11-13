@@ -42,8 +42,8 @@
 //! Writing the folded rows into the new database is [`database`]: the
 //! insert with foreign keys deferred, the cascades, the copy of each entry
 //! into `change_log`, `meta` and the checks of both chains. [`Schema`]
-//! keeps each column's declared type, `NOT NULL` and default for that
-//! insert ([`Column`]).
+//! keeps each column's declared type, `NOT NULL`, default and whether it
+//! holds JSON text for that insert ([`Column`]).
 
 pub mod database;
 
@@ -102,7 +102,8 @@ pub fn table_of(entity_type: &str) -> Option<&'static str> {
 /// wrapped repository key, which stays out of the log (section 7.1).
 const REPO_KEY: (&str, &str) = ("backup_repositories", "repo_key_enc");
 
-/// One column of a table, as `PRAGMA table_info` reports it.
+/// One column of a table, as `PRAGMA table_info` reports it, and whether
+/// the table's SQL checks it with `json_valid`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Column {
     pub name: String,
@@ -114,6 +115,9 @@ pub struct Column {
     /// The SQL text of the column's default as the schema writes it (`0`,
     /// `'none'`, ...), or `None` when it has no `DEFAULT`.
     pub default: Option<String>,
+    /// Whether the column holds JSON text: the table's SQL checks it with
+    /// `json_valid(<name>)`.
+    pub json: bool,
 }
 
 /// The columns of one table.
@@ -154,6 +158,14 @@ impl Schema {
             if rows.is_empty() {
                 continue;
             }
+            // The table's SQL as the schema and the migrations wrote it; an
+            // added column's definition is in it with its CHECK.
+            let create: String = sqlx::query_scalar(
+                "SELECT IFNULL((SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?), '')",
+            )
+            .bind(table)
+            .fetch_one(&mut *conn)
+            .await?;
             let mut key: Vec<(i64, String)> = rows
                 .iter()
                 .filter(|(.., pk)| *pk > 0)
@@ -166,6 +178,7 @@ impl Schema {
                     columns: rows
                         .into_iter()
                         .map(|(name, declared_type, not_null, default, _)| Column {
+                            json: create.contains(&format!("json_valid({name})")),
                             name,
                             declared_type,
                             not_null,

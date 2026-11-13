@@ -65,7 +65,11 @@
 //!   tunnel run token, standard base64 for a custody seal (migration 0012).
 //!   The one ciphertext no payload carries, `backup_repositories.repo_key_enc`,
 //!   is always an empty BLOB;
-//! - JSON `null` is SQL `NULL`.
+//! - JSON `null` is SQL `NULL`, except in a `NOT NULL` column that holds JSON
+//!   text (its table checks it with `json_valid`), which the primary can only
+//!   have written as the text `null`: an approval decided with no body
+//!   keeps `params` `null` in its audit record. A nullable JSON text column
+//!   keeps `NULL`, as each of its writers stores an absent value.
 //!
 //! A value that does not fit its column stops the build with an error that
 //! names the entity, the `seq` of the entry that wrote the value and the
@@ -1038,10 +1042,14 @@ enum Bound {
 /// Why the value does not fit the column.
 fn decode(table: &str, column: &super::Column, value: &Value) -> Result<Bound, String> {
     if value.is_null() {
-        return if column.not_null {
-            Err("null in a NOT NULL column".to_owned())
-        } else {
+        return if !column.not_null {
             Ok(Bound::Null)
+        } else if column.json {
+            // The primary stored the JSON text `null`, the one value such a
+            // column can hold that the payload carries as JSON `null`.
+            Ok(Bound::Text("null".to_owned()))
+        } else {
+            Err("null in a NOT NULL column".to_owned())
         };
     }
     match (column.declared_type.to_ascii_uppercase().as_str(), value) {

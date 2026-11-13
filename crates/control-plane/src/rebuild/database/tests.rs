@@ -33,6 +33,11 @@ async fn log(store: &Store, entity_type: &str, entity_id: &str, op: Op, payload:
 /// Appends an audit record and its `audit` entry (`audit-log-format.md`
 /// section 3.2).
 async fn audit_record(store: &Store, operation: &str) {
+    audit_record_with(store, operation, json!({"name": "x", "n": 1})).await;
+}
+
+/// [`audit_record`] with `params`.
+async fn audit_record_with(store: &Store, operation: &str, params: Value) {
     let mut w = store.begin_write().await.unwrap();
     audit::append(
         &mut w.tx,
@@ -49,7 +54,7 @@ async fn audit_record(store: &Store, operation: &str) {
             target_type: None,
             target_id: None,
             project_id: None,
-            params: json!({"name": "x", "n": 1}),
+            params,
             justification: None,
             trigger_event_id: None,
             incident_id: None,
@@ -637,6 +642,103 @@ async fn a_value_that_does_not_fit_names_the_entity_the_seq_and_the_column() {
         "{error}"
     );
     assert!(dir.files().is_empty(), "{:?}", dir.files());
+}
+
+/// A column holds JSON text when its table checks it with `json_valid`, a
+/// column added by a migration included. A JSON `null` is the text `null`
+/// in such a column that is `NOT NULL`, SQL `NULL` in a nullable one, and
+/// refused in a `NOT NULL` column of plain text.
+#[tokio::test]
+async fn a_json_null_fills_a_column_as_the_column_holds_it() {
+    let store = primary().await;
+    let mut conn = store.pool().acquire().await.unwrap();
+    let schema = Schema::read(&mut conn).await.unwrap();
+    let find = |table: &str, name: &str| {
+        schema
+            .columns(table)
+            .unwrap()
+            .iter()
+            .find(|column| column.name == name)
+            .unwrap_or_else(|| panic!("{table}.{name}"))
+            .clone()
+    };
+    for (table, name, json, not_null) in [
+        ("audit_log", "params", true, true),
+        ("approvals", "params", true, true),
+        ("events", "data", true, true),
+        ("apps", "backup_schedule", true, true),
+        ("events", "actor", true, false),
+        ("apps", "source", true, false),
+        ("audit_log", "operation", false, true),
+        ("approvals", "params_hash", false, true),
+        ("audit_log", "params_sha256", false, false),
+    ] {
+        let column = find(table, name);
+        assert_eq!(
+            (column.json, column.not_null),
+            (json, not_null),
+            "{table}.{name}"
+        );
+        let decoded = decode(table, &column, &Value::Null);
+        match (json, not_null) {
+            (true, true) => assert_eq!(decoded, Ok(Bound::Text("null".to_owned()))),
+            (_, false) => assert_eq!(decoded, Ok(Bound::Null), "{table}.{name}"),
+            (false, true) => assert!(decoded.is_err(), "{table}.{name}: {decoded:?}"),
+        }
+    }
+}
+
+/// An approval decided with no body writes its audit record with `params`
+/// `null` (`service::approvals::decide`): the primary stores the text
+/// `null`, the record's entry carries JSON `null`, and the built database
+/// stores the text `null`, whose record the build's audit chain check
+/// verifies. The app's nullable `source` stays NULL.
+#[tokio::test]
+async fn an_audit_record_with_null_params_is_built_as_the_primary_stores_it() {
+    let primary = primary().await;
+    log(
+        &primary,
+        "project",
+        "prj_1",
+        Op::Create,
+        project("prj_1", "demo"),
+    )
+    .await;
+    log(&primary, "app", "app_1", Op::Create, app("app_1", "prj_1")).await;
+    audit_record_with(
+        &primary,
+        "POST /api/v1/approvals/{approval_id}/approve",
+        Value::Null,
+    )
+    .await;
+    let text = ("text".to_owned(), Some("null".to_owned()));
+    assert_eq!(
+        stored(&primary, "audit_log", "params", "seq = 1").await,
+        text
+    );
+    let payload: String =
+        sqlx::query_scalar("SELECT payload FROM change_log WHERE entity_type = 'audit'")
+            .fetch_one(primary.pool())
+            .await
+            .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload.get("params"), Some(&Value::Null), "{payload}");
+
+    let dir = Dir::new();
+    let built = build(&followed(&primary).await, CLUSTER, 2, &dir.target())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(built.rows["audit_log"], 1);
+    let rebuilt = open(&dir.target()).await;
+    assert_eq!(
+        stored(&rebuilt, "audit_log", "params", "seq = 1").await,
+        text
+    );
+    assert_eq!(
+        stored(&rebuilt, "apps", "source", "id = 'app_1'").await,
+        ("null".to_owned(), None)
+    );
+    rebuilt.pool().close().await;
 }
 
 /// The cascades the schema declares between tables the log carries, read
