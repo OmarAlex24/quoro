@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use quoro_backup::layout;
 use quoro_backup::{
     ChunkId, FORMAT, Manifest, RecoveryKey, RepoConfig, RepoKey, Restorer, Seal, SourceKind,
-    open_manifest, unwrap_repo_key, verify_seal,
+    open_manifest, open_newest_config, verify_seal,
 };
 use quoro_control_plane::primary_status::MARKER_FILE;
 use quoro_providers::object_store::ObjectStore;
@@ -484,7 +484,8 @@ fn is_private(_: &std::fs::Permissions) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Unwraps `repo_key` from the newest config the recovery key opens
-/// (section 8.2 step 1).
+/// (section 8.2 step 1), with the reader a primary also uses to restore the
+/// key ([`open_newest_config`]).
 async fn choose_config<S: ObjectStore>(
     store: &S,
     root: &str,
@@ -495,45 +496,16 @@ async fn choose_config<S: ObjectStore>(
         .list(&format!("{root}config-"))
         .await
         .map_err(|error| failed(format!("cannot list the config objects: {error}")))?;
-    let mut counters: Vec<(u64, String)> = listed
-        .into_iter()
-        .filter_map(|object| {
-            let name = object.key.strip_prefix(root).unwrap_or(&object.key);
-            layout::parse_config_n(name).map(|counter| (counter, object.key))
-        })
-        .collect();
-    counters.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
-
-    for (_, key) in counters {
-        let bytes = match store.get(&key).await {
-            Ok(bytes) => bytes,
-            // A config object that cannot be read is not one this key opens.
-            Err(_) => continue,
-        };
-        let config: RepoConfig = match serde_json::from_slice(&bytes) {
-            Ok(config) => config,
-            Err(_) => continue,
-        };
-        if config.cluster_id != cluster_id {
-            continue;
-        }
-        match unwrap_repo_key(&config.wrapped_repo_key, recovery, &config.repository_id) {
-            Ok(repo_key) => {
-                if config.format != FORMAT {
-                    return Err(failed(format!(
-                        "the config object names unknown format {}",
-                        config.format
-                    )));
-                }
-                return Ok((config, repo_key));
-            }
-            // The recovery key does not open this one: try the next config.
-            Err(_) => continue,
-        }
-    }
-    Err(failed(
-        "the recovery key opens no config object of this repository",
-    ))
+    open_newest_config(
+        root,
+        listed.into_iter().map(|object| object.key),
+        cluster_id,
+        None,
+        recovery,
+        |key| async move { store.get(&key).await },
+    )
+    .await
+    .map_err(|error| failed(error.to_string()))
 }
 
 /// The config's `cluster_public_key` must be the public half of the given
