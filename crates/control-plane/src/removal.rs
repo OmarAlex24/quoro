@@ -418,7 +418,7 @@ async fn fenced(state: &AppState, node_id: &str, lease_ids: &[String]) -> Result
         }
         if !connected {
             return Err(ApiError::conflict(format!(
-                "the node's session ended before it answered the lease_revoke of {lease_id}"
+                "the node's session ended before it released {lease_id}"
             )));
         }
         if !unanswered {

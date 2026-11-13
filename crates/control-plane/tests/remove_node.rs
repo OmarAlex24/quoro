@@ -657,7 +657,8 @@ async fn removing_a_disconnected_node_raises_its_tokens_and_drops_its_records() 
     // Once the node is gone, its instance reads `unknown`, not `running`.
     drop(socket);
     wait_disconnected(&server, &node_id).await;
-    assert_eq!(node_status(&server, &node_id).await, "disconnected");
+    // The session's end writes the row after it detaches the session.
+    wait_status(&server, &node_id, "disconnected").await;
 
     // Section 8.10 rule 2, which the fake node does not acknowledge itself.
     common::settle_voters(&server).await;
@@ -1680,7 +1681,7 @@ async fn a_repair_carries_an_unrecorded_failed_fence_in_its_removal_entry() {
     let before = log_head(&server).await;
     let res = remove(&owner, &server, &x.node_id).await;
     assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
-    let entries = entries_after(&server, before).await;
+    let entries = removal_writes_after(&server, before, &x.node_id).await;
     let kinds: Vec<(&str, &str)> = entries
         .iter()
         .map(|(_, kind, id, _, _)| (kind.as_str(), id.as_str()))
