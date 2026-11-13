@@ -685,15 +685,20 @@ async fn removing_a_vote_below_three_with_expiring_leases_needs_force() {
 
     // Rule 2 waits again, and `force` does not bypass it: nobody holds the
     // version of the removal yet... until A and B acknowledge it.
-    assert_eq!(
-        roles_refused(
+    let (status, code, detail) = problem_detail(
+        roles(
             &owner,
             &server,
             &edge.node_id,
-            json!({ "add": ["witness"], "force": true })
+            json!({ "add": ["witness"], "force": true }),
         )
         .await,
-        (409, "conflict".to_string())
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(
+        detail.contains("has not reached a majority of voters"),
+        "{detail}"
     );
     holds_version(&mut machine_a, removed_at).await;
     holds_version(&mut machine_b, removed_at).await;
