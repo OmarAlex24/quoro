@@ -801,9 +801,10 @@ fn stored_token(token: i64) -> u64 {
 /// Every listed lease is still acknowledged to the node, each with a token
 /// (ADR 0245): a lease the node holds, its token after the increment; one
 /// another node holds, that lease's token plus one, so the node clears a
-/// failed fence it recorded at that token (ADR 0247); and one with no row,
-/// [`crate::fences::UNKNOWN_LEASE_TOKEN`] (P-0273). The node clears only the
-/// failed fences below its lease's token.
+/// failed fence it recorded at that token (ADR 0247), at most the cap,
+/// [`crate::leases::MAX_TOKEN`], which the change log carries; and one with
+/// no row, [`crate::fences::UNKNOWN_LEASE_TOKEN`] (P-0273). The node clears
+/// only the failed fences below its lease's token.
 ///
 /// A listed lease the node still holds that is already at the token cap
 /// refuses the whole acknowledgement with `token_exhausted` before anything
@@ -872,8 +873,15 @@ async fn fence_ack_tx(
         let token = match bumped.iter().find(|lease| &lease.id == lease_id) {
             Some(lease) => stored_token(lease.fencing_token),
             None => match crate::leases::by_id(&mut w.tx, lease_id).await? {
-                // Another node holds it (ADR 0247).
-                Some(lease) => stored_token(lease.fencing_token).saturating_add(1),
+                // Another node holds it (ADR 0247). At the cap, the cap
+                // itself, as for a lease with no row: the change log
+                // refuses a higher token.
+                Some(lease) => stored_token(
+                    lease
+                        .fencing_token
+                        .saturating_add(1)
+                        .min(crate::leases::MAX_TOKEN),
+                ),
                 None => crate::fences::UNKNOWN_LEASE_TOKEN,
             },
         };
