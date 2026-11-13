@@ -99,7 +99,8 @@ before the host is touched. A join token is single use and expires, so create a
 fresh one for every attempt. The exception is a node refused with a `409` about
 the voters, which the primary answers while the previous voter-set change has
 not settled: that refusal leaves the token unused, and the installer says to
-run it again with the same token once the voters have caught up. A host that is
+run it again with the same token, while it has not expired, once the primary
+accepts voter changes again. A host that is
 already enrolled needs no token: re-running the installer with its role finds
 its identity and skips the enrollment.
 
