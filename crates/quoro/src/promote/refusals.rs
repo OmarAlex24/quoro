@@ -18,8 +18,11 @@
 //! is also empty once it was moved aside, and a refollowing agent's log is
 //! below its mark until it reaches the head it refollows to.
 //!
-//! Every check reads; none writes. The agent's store is opened only when
-//! `node.db` exists, so a host without one gets none.
+//! Every check reads; none writes. The agent's store is opened read-only
+//! and only when `node.db` exists, so a host without one gets none, and no
+//! table, migration or node-local key is created. systemd's answer about
+//! the unit must be read: when it cannot be, the command cannot tell and
+//! refuses.
 
 use std::fmt;
 use std::fs;
@@ -210,7 +213,12 @@ pub(crate) async fn check(
     if exists(&database) {
         return Err(Refusal::ControlPlaneDatabase(database));
     }
-    if host.control_plane_unit_known() {
+    let unit = host.control_plane_unit_known().map_err(|e| {
+        Refusal::Unreadable(format!(
+            "cannot tell whether this host has a control-plane unit: {e}"
+        ))
+    })?;
+    if unit {
         return Err(Refusal::ControlPlaneUnit);
     }
 
@@ -219,7 +227,7 @@ pub(crate) async fn check(
     if !exists(&node_dir.join(crate::host::AGENT_STORE)) {
         return Err(Refusal::LogEmpty);
     }
-    let store = NodeStore::open(node_dir)
+    let store = NodeStore::open_read_only(node_dir)
         .await
         .map_err(|e| Refusal::Unreadable(format!("cannot open the agent's store: {e}")))?;
     let reads = freeze::promotion_reads(&store)
@@ -262,9 +270,10 @@ pub(crate) async fn check(
         return Err(Refusal::SchemaTooNew { stored, newest });
     }
 
-    // 7. A seal of every key in use, opened to its key.
+    // 7. A seal of every key in use, opened to its key. Only the entries of
+    // the two tables that say which keys are in use are read.
     let entries = store
-        .log_entries()
+        .log_entries_of(&keys::ENTITY_TYPES)
         .await
         .map_err(|e| Refusal::Unreadable(format!("cannot read the agent's followed log: {e}")))?;
     let keys = keys::check(&identity, &entries, node_dir)

@@ -22,8 +22,9 @@ use quoro_proto::custody::{self, CustodyKey, CustodyPublicKey, KeyKind, SealCont
 use quoro_proto::sign;
 use serde_json::{Value, json};
 
-use super::command::{Flags, Host, Out, Outcome, Paths, Request, parse_args, run};
+use super::command::{Flags, Host, Outcome, Paths, Request, parse_args, read_load_state, run};
 use super::refusals::{RESTORE_PENDING, Refusal};
+use crate::host::Out;
 use crate::node::{Role, write_role};
 
 const NODE_ID: &str = "nod_01JC9Z0000000000000000000A";
@@ -62,6 +63,8 @@ struct Fixture {
     paths: Paths,
     euid: Cell<Option<u32>>,
     unit: Cell<bool>,
+    /// systemd's answer about the unit cannot be read.
+    unit_unreadable: Cell<bool>,
     now: SystemTime,
     /// Every [`Host`] call, in order.
     reads: RefCell<Vec<&'static str>>,
@@ -80,9 +83,12 @@ impl Host for Fixture {
         Ok(self.paths.clone())
     }
 
-    fn control_plane_unit_known(&self) -> bool {
+    fn control_plane_unit_known(&self) -> Result<bool, String> {
         self.reads.borrow_mut().push("unit");
-        self.unit.get()
+        if self.unit_unreadable.get() {
+            return Err("System has not been booted with systemd".to_string());
+        }
+        Ok(self.unit.get())
     }
 
     fn now(&self) -> SystemTime {
@@ -118,6 +124,7 @@ impl Fixture {
             paths,
             euid: Cell::new(Some(0)),
             unit: Cell::new(false),
+            unit_unreadable: Cell::new(false),
             now: at(NOW),
             reads: RefCell::new(Vec::new()),
             custody_key: CustodyKey::generate(&mut custody::os_rng()),
@@ -505,6 +512,14 @@ fn the_command_line_is_checked() {
         (&["--accept-loss", "--statement", "  "][..], "non-empty"),
         (&["--accept-loss", "--statement"][..], "needs a value"),
         (
+            &["--accept-loss", "--statement", "--dry-run"][..],
+            "not the option '--dry-run'",
+        ),
+        (
+            &["--ack-fence", "--statement", "--", "why"][..],
+            "not the option '--'",
+        ),
+        (
             &["--accept-loss", "--statement", "a", "--statement", "b"][..],
             "given twice",
         ),
@@ -557,9 +572,11 @@ async fn a_run_that_is_not_root_stops_before_it_reads_anything() {
 }
 
 /// Issue #19: the command opens its vote connections as root, so no step of
-/// it may run as the data directory's owner. No file of this module names
-/// the function that re-executes the command as that owner, nor the module
-/// that holds it.
+/// it may run as the data directory's owner. No Rust file under `promote/`,
+/// at any depth, nor `promote.rs`, names the function that re-executes the
+/// command as that owner, nor the module that holds it; and `main` hands
+/// `cluster promote` to `promote::command` directly, with no privilege drop
+/// before or around it.
 #[test]
 fn the_command_never_runs_as_the_data_directory_s_owner() {
     let needles = [
@@ -568,8 +585,16 @@ fn the_command_never_runs_as_the_data_directory_s_owner() {
     ];
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = vec![src.join("promote.rs")];
-    for entry in fs::read_dir(src.join("promote")).unwrap() {
-        files.push(entry.unwrap().path());
+    let mut dirs = vec![src.join("promote")];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
     }
     for file in &files {
         let text = fs::read_to_string(file).unwrap();
@@ -577,12 +602,31 @@ fn the_command_never_runs_as_the_data_directory_s_owner() {
             assert!(!text.contains(needle), "{} names {needle}", file.display());
         }
     }
-    for name in ["command.rs", "refusals.rs", "keys.rs"] {
+    for name in [
+        "command.rs",
+        "refusals.rs",
+        "keys.rs",
+        "prepare.rs",
+        "prepare/tests.rs",
+    ] {
         assert!(
             files.contains(&src.join("promote").join(name)),
             "{name} is read: {files:?}"
         );
     }
+
+    // `main` drops no privilege before it dispatches, and the arm calls
+    // the command and nothing else.
+    let main = fs::read_to_string(src.join("main.rs")).unwrap();
+    let start = main.find("async fn main() -> ExitCode {").unwrap();
+    let body = &main[start..start + main[start..].find("\n}\n").unwrap()];
+    for needle in needles {
+        assert!(!body.contains(needle), "main names {needle}");
+    }
+    let arm = r#""cluster" if rest.first().is_some_and(|word| word == "promote") => {"#;
+    let at = body.find(arm).expect("main has the cluster promote arm") + arm.len();
+    let call = &body[at..at + body[at..].find('}').unwrap()];
+    assert_eq!(call.trim(), "promote::command(&rest[1..]).await");
 }
 
 /// Refusal 1: a machine enrolled as an edge or a witness.
@@ -637,6 +681,76 @@ async fn a_control_plane_database_or_unit_on_this_host_is_refused() {
     assert!(matches!(&refusal, Refusal::ControlPlaneUnit), "{refusal}");
     fixture.unit.set(false);
     fixture.passes().await;
+}
+
+/// Refusal 2: when systemd's answer about the unit cannot be read, the
+/// command cannot tell whether this host has a control-plane unit, and
+/// refuses.
+#[tokio::test]
+async fn an_unreadable_systemd_answer_refuses() {
+    let fixture = Fixture::new().await;
+    fixture.unit_unreadable.set(true);
+    let refusal = fixture.refusal().await;
+    assert!(
+        matches!(&refusal, Refusal::Unreadable(message)
+            if message.contains("cannot tell whether this host has a control-plane unit")
+                && message.contains("not been booted with systemd")),
+        "{refusal}"
+    );
+    assert!(refusal.to_string().ends_with("Nothing was changed"));
+    fixture.unit_unreadable.set(false);
+    fixture.passes().await;
+}
+
+/// What `systemctl show --property=LoadState --value quoro.service` says:
+/// `not-found` is no unit, any other state is one, and a failed or empty
+/// answer is no answer.
+#[test]
+fn systemd_s_load_state_is_read() {
+    assert_eq!(read_load_state(true, "not-found\n", ""), Ok(false));
+    for state in ["loaded\n", "masked\n", "bad-setting\n", "error\n"] {
+        assert_eq!(read_load_state(true, state, ""), Ok(true), "{state}");
+    }
+    let error = read_load_state(true, "\n", "").unwrap_err();
+    assert!(error.contains("printed no state"), "{error}");
+    let error = read_load_state(false, "", "Failed to connect to bus\n").unwrap_err();
+    assert!(
+        error.contains("failed: Failed to connect to bus"),
+        "{error}"
+    );
+}
+
+/// The refusals and `--abort` open the agent's store read-only: the
+/// node-local key, which only the agent's own open creates, stays missing,
+/// and the store's tables are the ones it had.
+#[tokio::test]
+async fn the_agent_s_store_is_opened_read_only() {
+    let fixture = Fixture::new().await;
+    let key = fixture.node_dir().join("local.key");
+    fs::remove_file(&key).unwrap();
+    let tables = || async {
+        let store = NodeStore::open_read_only(fixture.node_dir()).await.unwrap();
+        let names: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        names
+    };
+    let before = tables().await;
+    sqlx::query("DROP TABLE builds")
+        .execute(fixture.store().await.pool())
+        .await
+        .unwrap();
+    fs::remove_file(&key).unwrap();
+    let dropped = tables().await;
+    assert_eq!(dropped.len() + 1, before.len());
+
+    fixture.passes().await;
+    let (result, _) = fixture.run_abort().await;
+    assert_eq!(result.unwrap(), Outcome::Aborted);
+    assert!(!key.exists(), "no node-local key is created");
+    assert_eq!(tables().await, dropped, "no table is created");
 }
 
 /// Refusal 3: an empty log, and a host whose agent has no store, where none
@@ -1215,6 +1329,40 @@ async fn a_seal_that_opens_to_another_key_refuses() {
     let refusal = fixture.refusal().await;
     assert!(
         keys_say(&refusal, &[DEK_ID, "not a 32-byte key"]),
+        "{refusal}"
+    );
+}
+
+/// The keys refusal lists every problem at once: a second data key, a
+/// missing custody key and a key in use without a seal, each in its own
+/// message.
+#[tokio::test]
+async fn every_key_problem_is_listed_at_once() {
+    let fixture = Fixture::new().await;
+    let mine = fixture.custody_key.public_key().clone();
+    let second = "0123456789abcdef0123456789abcdef";
+    let tls = tls_id(CERT_PEM);
+    fixture
+        .append(
+            vec![
+                seal(NODE_ID, &mine, KeyKind::Dek, second, &[4; 32]),
+                unseal(NODE_ID, KeyKind::Tls, &tls),
+            ],
+            None,
+        )
+        .await;
+    let custody = fixture.node_dir().join(CUSTODY_KEY_FILE);
+    fs::remove_file(&custody).unwrap();
+
+    let refusal = fixture.refusal().await;
+    let Refusal::Keys(problems) = &refusal else {
+        panic!("{refusal}");
+    };
+    assert_eq!(problems.len(), 3, "{problems:#?}");
+    assert!(keys_say(&refusal, &["2 data-encryption keys"]), "{refusal}");
+    assert!(keys_say(&refusal, &["custody key"]), "{refusal}");
+    assert!(
+        keys_say(&refusal, &["TLS key", &tls, "holds no seal"]),
         "{refusal}"
     );
 }

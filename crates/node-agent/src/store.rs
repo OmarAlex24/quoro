@@ -768,6 +768,27 @@ pub(crate) fn connect_options(data_dir: &Path) -> SqliteConnectOptions {
         .busy_timeout(Duration::from_secs(5))
 }
 
+/// The columns of a `change_log` row, in [`LogEntry`]'s order.
+const LOG_ENTRY_COLUMNS: &str =
+    "seq, term, time, actor_type, actor_id, entity_type, entity_id, op, payload, prev_hash, hash";
+
+/// A `change_log` row read with [`LOG_ENTRY_COLUMNS`].
+fn log_entry_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<LogEntry, AgentError> {
+    Ok(LogEntry {
+        seq: stored_seq(row.try_get("seq").map_err(store_error)?)?,
+        term: stored_seq(row.try_get("term").map_err(store_error)?)?,
+        time: row.try_get("time").map_err(store_error)?,
+        actor_type: row.try_get("actor_type").map_err(store_error)?,
+        actor_id: row.try_get("actor_id").map_err(store_error)?,
+        entity_type: row.try_get("entity_type").map_err(store_error)?,
+        entity_id: row.try_get("entity_id").map_err(store_error)?,
+        op: row.try_get("op").map_err(store_error)?,
+        payload: row.try_get("payload").map_err(store_error)?,
+        prev_hash: row.try_get("prev_hash").map_err(store_error)?,
+        hash: row.try_get("hash").map_err(store_error)?,
+    })
+}
+
 impl NodeStore {
     /// Opens (creating when missing) `<data_dir>/node.db` in WAL mode with
     /// foreign keys on, and creates the tables.
@@ -798,6 +819,41 @@ impl NodeStore {
             data_dir: data_dir.to_path_buf(),
             key,
             clock: Arc::new(LogClock::new(last_log)),
+            logs_tx,
+            log_gate: Arc::new(tokio::sync::Mutex::new(())),
+            applied: Arc::new(watch::channel(0).0),
+        })
+    }
+
+    /// Opens the existing `<data_dir>/node.db` only to read it, from a
+    /// process other than the agent's: `quoro cluster promote` reads its
+    /// refusals and `--abort` reads the freeze so (section 7.3). It never
+    /// creates the file, a table, a migration or the node-local key. The
+    /// connection is read-only, so every write through the store fails, and
+    /// the store's node-local key is a random one held in memory, so a
+    /// desired-state body does not open through it.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] when the file does not exist or SQLite cannot
+    /// open it.
+    pub async fn open_read_only(data_dir: &Path) -> Result<Self, AgentError> {
+        let options = SqliteConnectOptions::new()
+            .filename(data_dir.join("node.db"))
+            .read_only(true)
+            .create_if_missing(false)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .map_err(store_error)?;
+        let (logs_tx, _) = broadcast::channel(LOG_BROADCAST_CAPACITY);
+        Ok(Self {
+            pool,
+            data_dir: data_dir.to_path_buf(),
+            key: Arc::new(LocalKey::in_memory()),
+            clock: Arc::new(LogClock::new(0)),
             logs_tx,
             log_gate: Arc::new(tokio::sync::Mutex::new(())),
             applied: Arc::new(watch::channel(0).0),
@@ -3270,30 +3326,38 @@ impl NodeStore {
     ///
     /// [`AgentError::Store`] on a SQLite failure.
     pub async fn log_entries(&self) -> Result<Vec<LogEntry>, AgentError> {
-        let rows = sqlx::query(
-            "SELECT seq, term, time, actor_type, actor_id, entity_type, entity_id, op, \
-             payload, prev_hash, hash FROM change_log ORDER BY seq",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {LOG_ENTRY_COLUMNS} FROM change_log ORDER BY seq"
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(store_error)?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(LogEntry {
-                    seq: stored_seq(row.try_get("seq").map_err(store_error)?)?,
-                    term: stored_seq(row.try_get("term").map_err(store_error)?)?,
-                    time: row.try_get("time").map_err(store_error)?,
-                    actor_type: row.try_get("actor_type").map_err(store_error)?,
-                    actor_id: row.try_get("actor_id").map_err(store_error)?,
-                    entity_type: row.try_get("entity_type").map_err(store_error)?,
-                    entity_id: row.try_get("entity_id").map_err(store_error)?,
-                    op: row.try_get("op").map_err(store_error)?,
-                    payload: row.try_get("payload").map_err(store_error)?,
-                    prev_hash: row.try_get("prev_hash").map_err(store_error)?,
-                    hash: row.try_get("hash").map_err(store_error)?,
-                })
-            })
-            .collect()
+        rows.iter().map(log_entry_from_row).collect()
+    }
+
+    /// The entries of the node's copy of the change log whose `entity_type`
+    /// is one of `entity_types`, in `seq` order. Only those rows are read, so
+    /// a reader that needs a few tables of a long log does not hold the
+    /// whole log in memory: `quoro cluster promote` reads the keys in use
+    /// this way (section 7.3).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn log_entries_of(&self, entity_types: &[&str]) -> Result<Vec<LogEntry>, AgentError> {
+        if entity_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; entity_types.len()].join(", ");
+        let sql = format!(
+            "SELECT {LOG_ENTRY_COLUMNS} FROM change_log WHERE entity_type IN ({marks}) ORDER BY seq"
+        );
+        let mut query = sqlx::query(&sql);
+        for entity_type in entity_types {
+            query = query.bind(*entity_type);
+        }
+        let rows = query.fetch_all(&self.pool).await.map_err(store_error)?;
+        rows.iter().map(log_entry_from_row).collect()
     }
 
     /// Moves the node's copy of the change log aside after `log_diverged`
@@ -4960,6 +5024,72 @@ mod tests {
             store.backup("bkp_new").await.unwrap().unwrap().guest_flush,
             Some(false)
         );
+    }
+
+    /// Section 7.3: a reader of a few tables reads only their entries, in
+    /// `seq` order, through a store opened read-only, which creates nothing
+    /// and writes nothing.
+    #[tokio::test]
+    async fn some_types_of_the_log_are_read_alone_through_a_read_only_store() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let mut prev = ZERO_HASH.to_owned();
+        let types = [
+            "app",
+            "signing_key",
+            "project",
+            "node_key_custody",
+            "signing_key",
+        ];
+        let entries: Vec<LogEntry> = types
+            .iter()
+            .zip(1u64..)
+            .map(|(entity_type, seq)| {
+                let hash = format!("{seq:064x}");
+                let entry = LogEntry {
+                    seq,
+                    term: 1,
+                    time: "2026-11-02T10:15:31Z".to_owned(),
+                    actor_type: "system".to_owned(),
+                    actor_id: "test".to_owned(),
+                    entity_type: (*entity_type).to_owned(),
+                    entity_id: format!("ent_{seq}"),
+                    op: "create".to_owned(),
+                    payload: "{}".to_owned(),
+                    prev_hash: prev.clone(),
+                    hash: hash.clone(),
+                };
+                prev = hash;
+                entry
+            })
+            .collect();
+        store.store_log_batch(&entries, Some(5)).await.unwrap();
+        assert_eq!(
+            store
+                .log_entries_of(&["node_key_custody", "signing_key"])
+                .await
+                .unwrap(),
+            [entries[1].clone(), entries[3].clone(), entries[4].clone()]
+        );
+        store.pool().close().await;
+
+        let key = dir.0.join("local.key");
+        std::fs::remove_file(&key).unwrap();
+        let reader = NodeStore::open_read_only(&dir.0).await.unwrap();
+        assert_eq!(
+            reader.log_entries_of(&["signing_key"]).await.unwrap(),
+            [entries[1].clone(), entries[4].clone()]
+        );
+        assert!(reader.log_entries_of(&[]).await.unwrap().is_empty());
+        assert_eq!(reader.log_entries().await.unwrap(), entries);
+        assert!(reader.set_meta("written", "no").await.is_err());
+        assert_eq!(reader.meta("written").await.unwrap(), None);
+        assert!(!key.exists(), "no node-local key is created");
+
+        // A directory without a store gets none.
+        let empty = TempDir::new();
+        assert!(NodeStore::open_read_only(&empty.0).await.is_err());
+        assert!(!empty.0.join("node.db").exists());
     }
 
     /// Verified entries `from_seq..from_seq + count`, chained on `prev_hash`.

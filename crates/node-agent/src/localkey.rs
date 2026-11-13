@@ -64,6 +64,15 @@ impl LocalKey {
         }
     }
 
+    /// A random key held only in memory, which no file holds: the key of a
+    /// store opened read-only ([`crate::store::NodeStore::open_read_only`]),
+    /// which neither reads nor creates `local.key`. A body sealed with the
+    /// node's key does not open with it.
+    pub(crate) fn in_memory() -> Self {
+        let key: [u8; KEY_LEN] = util::random_bytes();
+        Self::from_key(&key)
+    }
+
     fn from_bytes(bytes: &[u8]) -> Result<Self, AgentError> {
         let key: [u8; KEY_LEN] = bytes.try_into().map_err(|_| {
             AgentError::LocalKey(format!(

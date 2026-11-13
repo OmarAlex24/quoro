@@ -8,18 +8,17 @@
 //! temporary directory and run without root.
 
 use std::fs;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
 
 use quoro_node_agent::AgentError;
-use quoro_node_agent::freeze::{self, PromotionReads};
+use quoro_node_agent::freeze::{self, PromotionLock, PromotionReads};
 use quoro_node_agent::store::{NodeStore, PROMOTION_FREEZE};
 use quoro_proto::custody::KeyKind;
 
 use super::refusals::{self, Passed, Refusal};
-use crate::rejoin::Systemd as _;
+use crate::host::{AGENT_STORE, Out, UNIT};
 
 /// The command line, read by [`parse_args`].
 #[derive(Debug, PartialEq, Eq)]
@@ -51,9 +50,9 @@ pub(crate) struct Flags {
 /// # Errors
 ///
 /// A usage message: an unknown option or a positional argument,
-/// `--statement` without a value, given twice or blank, `--ack-fence` or
-/// `--accept-loss` without `--statement`, `--statement` without either, and
-/// `--abort` with any other option.
+/// `--statement` without a value, with an option as its value, given twice
+/// or blank, `--ack-fence` or `--accept-loss` without `--statement`,
+/// `--statement` without either, and `--abort` with any other option.
 pub(crate) fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut abort = false;
     let mut others = 0usize;
@@ -75,6 +74,14 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Request, String> {
                 let Some(value) = args.next() else {
                     return Err(format!("cluster promote: '{argument}' needs a value"));
                 };
+                // `--statement --dry-run` would record the flag as the
+                // operator's statement and drop the flag.
+                if value.starts_with("--") {
+                    return Err(format!(
+                        "cluster promote: --statement needs the statement's text, not the option \
+                         '{value}'"
+                    ));
+                }
                 if flags.statement.is_some() {
                     return Err("cluster promote: --statement is given twice".to_string());
                 }
@@ -132,7 +139,12 @@ pub(crate) trait Host {
     /// A message when the configuration cannot be read.
     fn paths(&self) -> Result<Paths, String>;
     /// Whether systemd knows the control-plane unit, `quoro.service`.
-    fn control_plane_unit_known(&self) -> bool;
+    ///
+    /// # Errors
+    ///
+    /// A message when systemd's answer could not be read, so the command
+    /// cannot tell.
+    fn control_plane_unit_known(&self) -> Result<bool, String>;
     /// The clock, for the age of the head step 1 shows.
     fn now(&self) -> SystemTime;
 }
@@ -142,11 +154,7 @@ struct RealHost;
 
 impl Host for RealHost {
     fn euid(&self) -> Option<u32> {
-        // `/proc/self` belongs to the effective user of this process (as in
-        // `rejoin.rs`).
-        fs::metadata("/proc/self")
-            .ok()
-            .map(|metadata| metadata.uid())
+        Some(rustix::process::geteuid().as_raw())
     }
 
     fn paths(&self) -> Result<Paths, String> {
@@ -159,13 +167,42 @@ impl Host for RealHost {
         })
     }
 
-    fn control_plane_unit_known(&self) -> bool {
-        crate::rejoin::RealSystemd.known()
+    fn control_plane_unit_known(&self) -> Result<bool, String> {
+        let output = crate::host::systemctl(&["show", "--property=LoadState", "--value", UNIT])?;
+        read_load_state(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
     }
 
     fn now(&self) -> SystemTime {
         SystemTime::now()
     }
+}
+
+/// Reads `systemctl show --property=LoadState --value quoro.service`: a
+/// unit systemd does not know reads `not-found`, and any other load state
+/// (`loaded`, `masked`, `bad-setting` and so on) is a unit on this host.
+///
+/// # Errors
+///
+/// A message when `systemctl` failed or printed no state: the command cannot
+/// tell, so it refuses rather than read that as no unit.
+pub(crate) fn read_load_state(succeeded: bool, stdout: &str, stderr: &str) -> Result<bool, String> {
+    let state = stdout.trim();
+    if !succeeded || state.is_empty() {
+        return Err(format!(
+            "systemctl show --property=LoadState {UNIT} {}: {}",
+            if succeeded {
+                "printed no state"
+            } else {
+                "failed"
+            },
+            stderr.trim()
+        ));
+    }
+    Ok(state != "not-found")
 }
 
 /// What a run that did not refuse did. None of them changed anything but
@@ -179,40 +216,6 @@ pub(crate) enum Outcome {
     /// Every refusal passed and step 1 ran; the rest of the promotion is
     /// not built yet, so the command stopped.
     NotBuilt,
-}
-
-/// The lines the command prints on stdout, kept for the tests.
-pub(crate) struct Out {
-    /// Every line, in order.
-    pub lines: Vec<String>,
-    echo: bool,
-}
-
-impl Out {
-    /// Prints each line as it comes.
-    fn printing() -> Self {
-        Self {
-            lines: Vec::new(),
-            echo: true,
-        }
-    }
-
-    /// Keeps the lines without printing them.
-    #[cfg(test)]
-    pub(crate) fn quiet() -> Self {
-        Self {
-            lines: Vec::new(),
-            echo: false,
-        }
-    }
-
-    fn say(&mut self, line: impl Into<String>) {
-        let line = line.into();
-        if self.echo {
-            println!("{line}");
-        }
-        self.lines.push(line);
-    }
 }
 
 /// `quoro cluster promote [--dry-run] [--ack-fence] [--accept-loss]
@@ -375,16 +378,28 @@ fn not_built(flags: &Flags) -> String {
 }
 
 /// `--abort` (section 7.3, ADR 0280): ends a freeze a stopped promotion
-/// left. `freeze::abort` takes the promotion lock without waiting, so it is
-/// refused while a promotion runs on this host.
+/// left. It takes the promotion lock without waiting, as
+/// `freeze::abort` does, so it is refused while a promotion runs on this
+/// host, and holds it while it reads the freeze and ends it, so no
+/// promotion starts or freezes in between. The store is read through a
+/// read-only open.
 async fn abort(paths: &Paths, out: &mut Out) -> Result<Outcome, Refusal> {
     let dir = &paths.node_data_dir;
-    let store_path = dir.join(crate::host::AGENT_STORE);
+    let store_path = dir.join(AGENT_STORE);
     if fs::symlink_metadata(&store_path).is_err() {
         return Err(Refusal::NoAgentStore(store_path));
     }
+    let _lock = match PromotionLock::acquire(dir) {
+        Ok(lock) => lock,
+        Err(AgentError::PromotionRunning) => return Err(Refusal::PromotionRunning),
+        Err(e) => {
+            return Err(Refusal::Unreadable(format!(
+                "cannot take the promotion lock: {e}"
+            )));
+        }
+    };
     let frozen_at = {
-        let store = NodeStore::open(dir).await.map_err(|e| {
+        let store = NodeStore::open_read_only(dir).await.map_err(|e| {
             Refusal::Unreadable(format!(
                 "cannot open the agent's store {}: {e}",
                 store_path.display()
@@ -395,13 +410,9 @@ async fn abort(paths: &Paths, out: &mut Out) -> Result<Outcome, Refusal> {
             .await
             .map_err(|e| Refusal::Unreadable(format!("cannot read the freeze: {e}")))?
     };
-    match freeze::abort(dir).await {
-        Ok(()) => {}
-        Err(AgentError::PromotionRunning) => return Err(Refusal::PromotionRunning),
-        Err(e) => {
-            return Err(Refusal::Unreadable(format!("cannot end the freeze: {e}")));
-        }
-    }
+    freeze::unfreeze(dir)
+        .await
+        .map_err(|e| Refusal::Unreadable(format!("cannot end the freeze: {e}")))?;
     match &frozen_at {
         Some(at) => out.say(format!(
             "ended the promotion freeze set at {at}; the agent dials its primary again within \

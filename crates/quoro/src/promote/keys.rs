@@ -24,6 +24,12 @@
 //! `quoro_control_plane::rebuild::fold`, the rule step 4 builds the database
 //! with, against this binary's schema in memory. The custody key is loaded,
 //! never created.
+//!
+//! Every problem is listed, not only the first: a data-key count other than
+//! one, a custody key that cannot be loaded, and each key in use whose seal
+//! is missing, does not open or opens to another key. Without the custody
+//! key, a key's seal is still checked for what needs no key: that it is in
+//! the log and is base64.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -43,6 +49,8 @@ use super::command::kind_name;
 const SEAL_ENTITY: &str = "node_key_custody";
 /// The `entity_type` of a signing key's change-log entries (migration 0012).
 const SIGNING_ENTITY: &str = "signing_key";
+/// The entries [`check`] reads: the agent's store selects only these.
+pub(crate) const ENTITY_TYPES: [&str; 2] = [SEAL_ENTITY, SIGNING_ENTITY];
 /// The table of the seals.
 const SEAL_TABLE: &str = "node_key_custody";
 /// The table of the signing keys.
@@ -71,12 +79,16 @@ struct TlsPair {
 /// the key its id names (module documentation). Returns the keys, signing
 /// keys first in key-id order, then the data key, then the TLS key.
 ///
+/// `entries` are the followed log's entries of [`ENTITY_TYPES`], in `seq`
+/// order; an entry of another type is skipped.
+///
 /// # Errors
 ///
-/// Every problem found, one message each: the log's key tables cannot be
-/// read, more than one data key or none, a key without a seal for this
-/// machine, a seal that does not open, a seal that opens to another key, or
-/// a custody key that cannot be loaded.
+/// Every problem found, one message each: more than one data key or none, a
+/// custody key that cannot be loaded, a key without a seal for this
+/// machine, a seal that does not open, or a seal that opens to another key.
+/// Only a log whose key tables cannot be read stops the check at once, with
+/// that one message.
 pub(crate) async fn check(
     identity: &Identity,
     entries: &[LogEntry],
@@ -85,17 +97,20 @@ pub(crate) async fn check(
     let ledger = read_ledger(&identity.node_id, entries)
         .await
         .map_err(|message| vec![message])?;
-    let in_use = in_use(identity, &ledger)?;
-    let custody_key = identity::load_custody_key(node_data_dir)
-        .map_err(|e| vec![format!("cannot load this machine's custody key: {e}")])?;
-    let problems: Vec<String> = in_use
-        .iter()
-        .filter_map(|(kind, key_id)| {
-            open_seal(identity, &ledger, &custody_key, *kind, key_id)
-                .err()
-                .map(|problem| format!("the {} {key_id}: {problem}", kind_name(*kind)))
-        })
-        .collect();
+    let mut problems = Vec::new();
+    let in_use = in_use(identity, &ledger, &mut problems);
+    let custody_key = match identity::load_custody_key(node_data_dir) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            problems.push(format!("cannot load this machine's custody key: {e}"));
+            None
+        }
+    };
+    for (kind, key_id) in &in_use {
+        if let Err(problem) = open_seal(identity, &ledger, custody_key.as_ref(), *kind, key_id) {
+            problems.push(format!("the {} {key_id}: {problem}", kind_name(*kind)));
+        }
+    }
     if problems.is_empty() {
         Ok(in_use)
     } else {
@@ -103,13 +118,13 @@ pub(crate) async fn check(
     }
 }
 
-/// The keys in use (module documentation).
-///
-/// # Errors
-///
-/// A message when the log holds more than one `dek` seal for this machine,
-/// or none.
-fn in_use(identity: &Identity, ledger: &Ledger) -> Result<Vec<(KeyKind, String)>, Vec<String>> {
+/// The keys in use (module documentation). A data-key count other than one
+/// is pushed to `problems`, and the data key is then left out.
+fn in_use(
+    identity: &Identity,
+    ledger: &Ledger,
+    problems: &mut Vec<String>,
+) -> Vec<(KeyKind, String)> {
     let mut signing: BTreeSet<String> = ledger.signing_keys.clone();
     signing.insert(identity.cluster_key_id.clone());
     let deks: Vec<&String> = ledger
@@ -119,20 +134,22 @@ fn in_use(identity: &Identity, ledger: &Ledger) -> Result<Vec<(KeyKind, String)>
         .map(|(_, key_id)| key_id)
         .collect();
     let dek = match deks.as_slice() {
-        [one] => (*one).clone(),
+        [one] => Some((*one).clone()),
         [] => {
-            return Err(vec![
+            problems.push(
                 "the followed log holds no data-encryption key sealed to this machine".to_string(),
-            ]);
+            );
+            None
         }
         many => {
             let ids: Vec<&str> = many.iter().map(|id| id.as_str()).collect();
-            return Err(vec![format!(
+            problems.push(format!(
                 "the followed log holds {} data-encryption keys sealed to this machine ({}), and \
                  a primary keeps exactly one",
                 many.len(),
                 ids.join(", ")
-            )]);
+            ));
+            None
         }
     };
     let fingerprint = identity
@@ -144,13 +161,14 @@ fn in_use(identity: &Identity, ledger: &Ledger) -> Result<Vec<(KeyKind, String)>
         .into_iter()
         .map(|key_id| (KeyKind::Signing, key_id))
         .collect();
-    keys.push((KeyKind::Dek, dek));
+    keys.extend(dek.map(|dek| (KeyKind::Dek, dek)));
     keys.push((KeyKind::Tls, fingerprint));
-    Ok(keys)
+    keys
 }
 
 /// Opens this machine's seal of the `kind` key `key_id` and checks that it
-/// holds that key.
+/// holds that key. Without `custody_key`, whose absence is its own problem,
+/// it checks only that the seal is in the log and is base64.
 ///
 /// # Errors
 ///
@@ -159,7 +177,7 @@ fn in_use(identity: &Identity, ledger: &Ledger) -> Result<Vec<(KeyKind, String)>
 fn open_seal(
     identity: &Identity,
     ledger: &Ledger,
-    custody_key: &CustodyKey,
+    custody_key: Option<&CustodyKey>,
     kind: KeyKind,
     key_id: &str,
 ) -> Result<(), String> {
@@ -171,6 +189,9 @@ fn open_seal(
     };
     let sealed = crate::tls::base64_decode(text)
         .map_err(|_| "its seal in the followed log is not base64".to_string())?;
+    let Some(custody_key) = custody_key else {
+        return Ok(());
+    };
     let context = SealContext {
         cluster_id: &identity.cluster_id,
         node_id: &identity.node_id,
