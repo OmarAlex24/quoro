@@ -16,21 +16,34 @@
 //! - Once every entry is folded, an entity that never received a `create`
 //!   stops the rebuild with [`FoldError::NoCreate`], which names the entity
 //!   and the `seq` of its first entry. No row made only of updates is ever
-//!   returned.
+//!   returned as a row: one built after a `delete` is listed in
+//!   [`Folded::dropped`] instead.
 //!
 //! Each `entity_type` names one table ([`table_of`]). An entity's row is the
 //! one its `entity_id` names, which for a table with a composite key joins
-//! the key's columns with `/`. An app's `warm_node_id`, `warm_node_pinned`
-//! and `warm_interval_s` travel under their column names in a whole-App
-//! payload and are absent from a partial one, so the merge writes or keeps
-//! them like any other column (ADR 0286).
+//! the key's columns with `/`. A `create` whose key columns, joined with
+//! `/`, are not its `entity_id` does not stop the fold: its row is kept
+//! under its `entity_id`, and the `create` is listed in
+//! [`Folded::mismatches`] for the caller to log. An app's `warm_node_id`,
+//! `warm_node_pinned` and `warm_interval_s` travel under their column names
+//! in a whole-App payload and are absent from a partial one, so the merge
+//! writes or keeps them like any other column (ADR 0286).
 //! `backup_repositories.repo_key_enc` is in no payload (section 7.1), so the
 //! rebuilt row holds an empty BLOB there ([`Cell::EmptyBlob`]).
 //!
+//! The schema's `ON DELETE CASCADE` deletes need the deletions and their
+//! order: a row the primary removed by a cascade has no entry of its own.
+//! So the fold returns every `delete` with its `seq` ([`Folded::deletions`])
+//! and each row with the `seq` of the `create` it starts from
+//! ([`FoldedRow::created_seq`]). With them the next step can tell that a
+//! child created before its parent's `delete` went with it, even when the
+//! parent was created again later under the same id.
+//!
 //! Writing the folded rows into the new database is not done here: the
-//! insert with foreign keys deferred, the schema's `ON DELETE CASCADE`
-//! deletes, the copy of each entry into `change_log`, `meta` and the checks
-//! of both chains.
+//! insert with foreign keys deferred, the cascades, the copy of each entry
+//! into `change_log`, `meta` and the checks of both chains. [`Schema`]
+//! keeps each column's declared type, `NOT NULL` and default for that
+//! insert ([`Column`]).
 
 use serde_json::{Map, Value};
 use sqlx::SqliteConnection;
@@ -87,11 +100,25 @@ pub fn table_of(entity_type: &str) -> Option<&'static str> {
 /// wrapped repository key, which stays out of the log (section 7.1).
 const REPO_KEY: (&str, &str) = ("backup_repositories", "repo_key_enc");
 
+/// One column of a table, as `PRAGMA table_info` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Column {
+    pub name: String,
+    /// The declared type as the schema writes it (`TEXT`, `INTEGER`,
+    /// `BLOB`, ...), empty when the column declares none.
+    pub declared_type: String,
+    /// Whether the column is `NOT NULL`.
+    pub not_null: bool,
+    /// The SQL text of the column's default as the schema writes it (`0`,
+    /// `'none'`, ...), or `None` when it has no `DEFAULT`.
+    pub default: Option<String>,
+}
+
 /// The columns of one table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Table {
     /// Every column, in table order.
-    columns: Vec<String>,
+    columns: Vec<Column>,
     /// The key's columns, in key order.
     key: Vec<String>,
 }
@@ -115,24 +142,34 @@ impl Schema {
     pub async fn read(conn: &mut SqliteConnection) -> Result<Self, sqlx::Error> {
         let mut tables = BTreeMap::new();
         for (_, table) in TABLES {
-            let rows: Vec<(String, i64)> =
-                sqlx::query_as("SELECT name, pk FROM pragma_table_info(?) ORDER BY cid")
-                    .bind(table)
-                    .fetch_all(&mut *conn)
-                    .await?;
+            let rows: Vec<(String, String, bool, Option<String>, i64)> = sqlx::query_as(
+                "SELECT name, \"type\", \"notnull\", dflt_value, pk \
+                 FROM pragma_table_info(?) ORDER BY cid",
+            )
+            .bind(table)
+            .fetch_all(&mut *conn)
+            .await?;
             if rows.is_empty() {
                 continue;
             }
             let mut key: Vec<(i64, String)> = rows
                 .iter()
-                .filter(|(_, pk)| *pk > 0)
-                .map(|(name, pk)| (*pk, name.clone()))
+                .filter(|(.., pk)| *pk > 0)
+                .map(|(name, .., pk)| (*pk, name.clone()))
                 .collect();
             key.sort();
             tables.insert(
                 table,
                 Table {
-                    columns: rows.into_iter().map(|(name, _)| name).collect(),
+                    columns: rows
+                        .into_iter()
+                        .map(|(name, declared_type, not_null, default, _)| Column {
+                            name,
+                            declared_type,
+                            not_null,
+                            default,
+                        })
+                        .collect(),
                     key: key.into_iter().map(|(_, name)| name).collect(),
                 },
             );
@@ -143,8 +180,15 @@ impl Schema {
     /// Every column of `table`, in table order, or `None` for a table this
     /// schema lacks.
     #[must_use]
-    pub fn columns(&self, table: &str) -> Option<&[String]> {
+    pub fn columns(&self, table: &str) -> Option<&[Column]> {
         self.tables.get(table).map(|t| t.columns.as_slice())
+    }
+
+    /// The key columns of `table`, in key order, or `None` for a table this
+    /// schema lacks.
+    #[must_use]
+    pub fn key(&self, table: &str) -> Option<&[String]> {
+        self.tables.get(table).map(|t| t.key.as_slice())
     }
 }
 
@@ -161,7 +205,7 @@ pub struct Entry<'a> {
 }
 
 /// One column of a folded row.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cell {
     /// What a payload wrote under the column's name, as the payload carries
     /// it.
@@ -174,8 +218,18 @@ pub enum Cell {
     EmptyBlob,
 }
 
-/// A folded row: every column of its table, by name.
+/// A folded row's columns, by name.
 pub type Row = BTreeMap<String, Cell>;
+
+/// A row the fold returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldedRow {
+    /// The `seq` of the `create` this row starts from: the entity's last
+    /// `create`. Every `update` since is merged over it.
+    pub created_seq: u64,
+    /// Every column of its table, by name.
+    pub cells: Row,
+}
 
 /// A row the fold does not return although its entity received a `create`:
 /// after a `delete`, `update`s alone built it again.
@@ -185,16 +239,45 @@ pub struct Dropped {
     pub entity_id: String,
     /// The `seq` of the `update` that began the row after the `delete`.
     pub seq: u64,
+    /// The columns those updates wrote, merged in `seq` order into an empty
+    /// row. The key's columns are not among them.
+    pub cells: Row,
+}
+
+/// A `delete` the fold met.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Deletion {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub seq: u64,
+}
+
+/// A `create` whose row its `entity_id` does not name. The fold keeps the
+/// row under `entity_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyMismatch {
+    pub seq: u64,
+    pub entity_type: String,
+    pub entity_id: String,
+    /// The payload's key columns joined with `/`, or `None` when one is
+    /// missing or is neither a string nor an integer.
+    pub payload_key: Option<String>,
 }
 
 /// The result of [`fold`].
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Folded {
     /// The final rows, per table, each under the `entity_id` that names it.
-    pub tables: BTreeMap<&'static str, BTreeMap<String, Row>>,
+    pub tables: BTreeMap<&'static str, BTreeMap<String, FoldedRow>>,
+    /// Every `delete`, in `seq` order, for the cascades its deleted row
+    /// would have run.
+    pub deletions: Vec<Deletion>,
     /// The rows made only of updates that the fold left out, in `seq`
     /// order. Section 7.3 step 4 inserts no such row.
     pub dropped: Vec<Dropped>,
+    /// The `create`s whose key columns are not their `entity_id`, in `seq`
+    /// order.
+    pub mismatches: Vec<KeyMismatch>,
 }
 
 /// Why the fold stops the rebuild.
@@ -211,14 +294,6 @@ pub enum FoldError {
     BadOp { seq: u64, op: String },
     /// The payload of the entry at `seq` is not a JSON object.
     BadPayload { seq: u64 },
-    /// The `create` at `seq` carries a row that its `entity_id` does not
-    /// name: the payload's key columns, joined with `/`, are missing or
-    /// differ from `entity_id`.
-    KeyMismatch {
-        seq: u64,
-        entity_type: String,
-        entity_id: String,
-    },
     /// The entity never received a `create`; `first_seq` is its first
     /// entry (ADR 0317).
     NoCreate {
@@ -251,14 +326,6 @@ impl std::fmt::Display for FoldError {
                     "the payload of the entry at seq {seq} is not a JSON object"
                 )
             }
-            Self::KeyMismatch {
-                seq,
-                entity_type,
-                entity_id,
-            } => write!(
-                f,
-                "the create at seq {seq} carries a {entity_type} row whose key is not {entity_id:?}"
-            ),
             Self::NoCreate {
                 entity_type,
                 entity_id,
@@ -280,11 +347,21 @@ struct Entity {
     first_seq: u64,
     /// Whether it ever received a `create`.
     created: bool,
-    /// Its row, absent before its first entry that writes one and after a
+    /// Its row.
+    current: Current,
+}
+
+/// An entity's row while the fold runs.
+enum Current {
+    /// No row: before its first entry that writes one, and after a
     /// `delete`.
-    row: Option<Row>,
-    /// When `row` holds only updates, the `seq` of the first of them.
-    updates_since: Option<u64>,
+    Absent,
+    /// The row the `create` at `seq` began, with every `update` since
+    /// merged over it.
+    Created { seq: u64, row: Row },
+    /// A row only `update`s built, the first of them at `seq`: before the
+    /// entity's first `create`, or after a `delete`.
+    Updates { seq: u64, row: Row },
 }
 
 /// Folds `entries`, in `seq` order, into one row per entity, under the rules
@@ -300,6 +377,7 @@ pub fn fold<'a>(
     entries: impl IntoIterator<Item = Entry<'a>>,
 ) -> Result<Folded, FoldError> {
     let mut entities: BTreeMap<(String, String), Entity> = BTreeMap::new();
+    let mut folded = Folded::default();
     let mut last: Option<u64> = None;
     for entry in entries {
         let seq = entry.seq;
@@ -324,34 +402,47 @@ pub fn fold<'a>(
                 table: table_name,
                 first_seq: seq,
                 created: false,
-                row: None,
-                updates_since: None,
+                current: Current::Absent,
             });
         match entry.op {
             "create" => {
                 let fields = payload(&entry)?;
-                if key_of(table, &fields).as_deref() != Some(entry.entity_id) {
-                    return Err(FoldError::KeyMismatch {
+                let payload_key = key_of(table, &fields);
+                if payload_key.as_deref() != Some(entry.entity_id) {
+                    folded.mismatches.push(KeyMismatch {
                         seq,
                         entity_type: entry.entity_type.to_owned(),
                         entity_id: entry.entity_id.to_owned(),
+                        payload_key,
                     });
                 }
-                entity.row = Some(created_row(table_name, table, &fields));
+                entity.current = Current::Created {
+                    seq,
+                    row: created_row(table_name, table, &fields),
+                };
                 entity.created = true;
-                entity.updates_since = None;
             }
             "update" => {
                 let fields = payload(&entry)?;
-                if entity.row.is_none() {
-                    entity.updates_since = Some(seq);
+                if matches!(entity.current, Current::Absent) {
+                    entity.current = Current::Updates {
+                        seq,
+                        row: Row::new(),
+                    };
                 }
-                let row = entity.row.get_or_insert_with(Row::new);
-                merge(table_name, table, row, &fields);
+                if let Current::Created { row, .. } | Current::Updates { row, .. } =
+                    &mut entity.current
+                {
+                    merge(table_name, table, row, &fields);
+                }
             }
             "delete" => {
-                entity.row = None;
-                entity.updates_since = None;
+                entity.current = Current::Absent;
+                folded.deletions.push(Deletion {
+                    entity_type: entry.entity_type.to_owned(),
+                    entity_id: entry.entity_id.to_owned(),
+                    seq,
+                });
             }
             other => {
                 return Err(FoldError::BadOp {
@@ -374,24 +465,25 @@ pub fn fold<'a>(
         });
     }
 
-    let mut folded = Folded::default();
     for ((entity_type, entity_id), entity) in entities {
-        let Some(row) = entity.row else {
-            continue;
-        };
-        if let Some(seq) = entity.updates_since {
-            folded.dropped.push(Dropped {
+        match entity.current {
+            Current::Absent => {}
+            Current::Created { seq, row } => {
+                folded.tables.entry(entity.table).or_default().insert(
+                    entity_id,
+                    FoldedRow {
+                        created_seq: seq,
+                        cells: row,
+                    },
+                );
+            }
+            Current::Updates { seq, row } => folded.dropped.push(Dropped {
                 entity_type,
                 entity_id,
                 seq,
-            });
-            continue;
+                cells: row,
+            }),
         }
-        folded
-            .tables
-            .entry(entity.table)
-            .or_default()
-            .insert(entity_id, row);
     }
     folded.dropped.sort_by_key(|dropped| dropped.seq);
     Ok(folded)
@@ -407,7 +499,7 @@ fn payload(entry: &Entry<'_>) -> Result<Map<String, Value>, FoldError> {
 
 /// The `entity_id` that names the row `fields` carries: its key columns in
 /// key order, joined with `/`. `None` when a key column is missing or is
-/// neither a string nor an integer.
+/// neither a string nor an integer, or the table has no key.
 fn key_of(table: &Table, fields: &Map<String, Value>) -> Option<String> {
     let parts = table
         .key
@@ -434,15 +526,15 @@ fn created_row(table_name: &str, table: &Table, fields: &Map<String, Value>) -> 
     table
         .columns
         .iter()
-        .map(|column| {
-            let cell = if !from_payload(table_name, column) {
+        .map(|Column { name, .. }| {
+            let cell = if !from_payload(table_name, name) {
                 Cell::EmptyBlob
-            } else if let Some(value) = fields.get(column) {
+            } else if let Some(value) = fields.get(name) {
                 Cell::Value(value.clone())
             } else {
                 Cell::Default
             };
-            (column.clone(), cell)
+            (name.clone(), cell)
         })
         .collect()
 }
@@ -452,12 +544,12 @@ fn created_row(table_name: &str, table: &Table, fields: &Map<String, Value>) -> 
 /// ignored, and so are the key's columns: the row stays the one `entity_id`
 /// names.
 fn merge(table_name: &str, table: &Table, row: &mut Row, fields: &Map<String, Value>) {
-    for column in &table.columns {
-        if table.key.contains(column) || !from_payload(table_name, column) {
+    for Column { name, .. } in &table.columns {
+        if table.key.contains(name) || !from_payload(table_name, name) {
             continue;
         }
-        if let Some(value) = fields.get(column) {
-            row.insert(column.clone(), Cell::Value(value.clone()));
+        if let Some(value) = fields.get(name) {
+            row.insert(name.clone(), Cell::Value(value.clone()));
         }
     }
 }
@@ -473,6 +565,16 @@ mod tests {
         let store = Store::open_in_memory().await.unwrap();
         let mut conn = store.pool().acquire().await.unwrap();
         Schema::read(&mut conn).await.unwrap()
+    }
+
+    /// The names of `table`'s columns, in table order.
+    fn names(schema: &Schema, table: &str) -> Vec<String> {
+        schema
+            .columns(table)
+            .unwrap()
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()
     }
 
     /// An owned entry; [`run`] borrows it as an [`Entry`].
@@ -531,7 +633,7 @@ mod tests {
     }
 
     fn row_of<'f>(folded: &'f Folded, table: &str, entity_id: &str) -> &'f Row {
-        &folded.tables[table][entity_id]
+        &folded.tables[table][entity_id].cells
     }
 
     fn value(v: Value) -> Cell {
@@ -613,14 +715,18 @@ mod tests {
         .unwrap();
         let apps = &folded.tables["apps"];
         assert_eq!(apps.keys().collect::<Vec<_>>(), ["app_2"]);
-        assert_eq!(apps["app_2"]["name"], value(json!("shop")));
+        assert_eq!(apps["app_2"].cells["name"], value(json!("shop")));
         assert!(folded.dropped.is_empty());
     }
 
     #[tokio::test]
     async fn an_update_without_a_row_merges_into_an_empty_row() {
         let schema = schema().await;
-        // An update before its create rebuilds: it does not stop the fold.
+        // An update before its create does not stop the fold, and the
+        // create replaces what it wrote: the row is the create's, with the
+        // later update merged over it. The update's `role` and
+        // `password_hash`, which neither the create nor the later update
+        // carries, are gone.
         let folded = run(
             &schema,
             &[
@@ -629,7 +735,7 @@ mod tests {
                     "user",
                     "usr_1",
                     "update",
-                    json!({"id": "usr_1", "name": "Ada"}),
+                    json!({"id": "usr_1", "name": "Ada", "role": "owner", "password_hash": "h1"}),
                 ),
                 entry(
                     2,
@@ -648,9 +754,89 @@ mod tests {
             ],
         )
         .unwrap();
-        let row = row_of(&folded, "users", "usr_1");
-        assert_eq!(row["email"], value(json!("ada@example.com")));
-        assert_eq!(row["name"], value(json!("Ada L")));
+        let mut expected: Row = names(&schema, "users")
+            .into_iter()
+            .map(|name| (name, Cell::Default))
+            .collect();
+        expected.insert("id".to_owned(), value(json!("usr_1")));
+        expected.insert("email".to_owned(), value(json!("ada@example.com")));
+        expected.insert("name".to_owned(), value(json!("Ada L")));
+        assert_eq!(
+            folded.tables["users"]["usr_1"],
+            FoldedRow {
+                created_seq: 2,
+                cells: expected,
+            }
+        );
+        assert!(folded.dropped.is_empty());
+
+        // An update with no create: the error names it, at its own seq.
+        assert_eq!(
+            run(
+                &schema,
+                &[
+                    entry(1, "user", "usr_1", "create", json!({"id": "usr_1"})),
+                    entry(
+                        2,
+                        "user",
+                        "usr_2",
+                        "update",
+                        json!({"id": "usr_2", "name": "Bo"}),
+                    ),
+                ],
+            ),
+            Err(FoldError::NoCreate {
+                entity_type: "user".to_owned(),
+                entity_id: "usr_2".to_owned(),
+                first_seq: 2,
+            })
+        );
+
+        // After a delete, the updates merge into an empty row, one over the
+        // other: the dropped row holds exactly the fields they wrote, the
+        // later value winning, and no key column.
+        let folded = run(
+            &schema,
+            &[
+                entry(
+                    1,
+                    "user",
+                    "usr_1",
+                    "create",
+                    json!({"id": "usr_1", "email": "ada@example.com", "name": "Ada"}),
+                ),
+                entry(2, "user", "usr_1", "delete", json!({})),
+                entry(
+                    3,
+                    "user",
+                    "usr_1",
+                    "update",
+                    json!({"id": "usr_1", "name": "A", "role": "member"}),
+                ),
+                entry(
+                    4,
+                    "user",
+                    "usr_1",
+                    "update",
+                    json!({"id": "usr_1", "name": "B", "disabled": 1}),
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(!folded.tables.contains_key("users"));
+        assert_eq!(
+            folded.dropped,
+            [Dropped {
+                entity_type: "user".to_owned(),
+                entity_id: "usr_1".to_owned(),
+                seq: 3,
+                cells: Row::from([
+                    ("disabled".to_owned(), value(json!(1))),
+                    ("name".to_owned(), value(json!("B"))),
+                    ("role".to_owned(), value(json!("member"))),
+                ]),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -753,22 +939,86 @@ mod tests {
                 entity_type: "vm".to_owned(),
                 entity_id: "vm_1".to_owned(),
                 seq: 3,
+                cells: Row::from([("desired_status".to_owned(), value(json!("running")))]),
             }]
         );
     }
 
+    /// The cascades need every delete and its seq, and the seq of each
+    /// row's create (section 7.3 step 4). An app deleted after its variable
+    /// was created, then created again under the same id, comes back as a
+    /// row whose create is after the delete, while the variable's create is
+    /// before it.
+    #[tokio::test]
+    async fn the_fold_returns_each_delete_and_the_seq_of_each_rows_last_create() {
+        let schema = schema().await;
+        let env = json!({"app_id": "app_1", "name": "FOO", "value_enc": "aa", "updated_at": "t1"});
+        let folded = run(
+            &schema,
+            &[
+                entry(1, "app", "app_1", "create", whole_app("app_1", "blog")),
+                entry(2, "app_env", "app_1/FOO", "create", env),
+                entry(3, "app", "app_2", "create", whole_app("app_2", "shop")),
+                // The primary's cascade removed app_1/FOO with no entry.
+                entry(4, "app", "app_1", "delete", json!({})),
+                entry(5, "app", "app_1", "create", whole_app("app_1", "blog2")),
+                entry(
+                    6,
+                    "app",
+                    "app_1",
+                    "update",
+                    json!({"id": "app_1", "status": "down"}),
+                ),
+                entry(7, "app", "app_2", "delete", json!({})),
+                entry(8, "app", "app_3", "create", whole_app("app_3", "wiki")),
+                entry(9, "app", "app_3", "delete", json!({})),
+                entry(10, "app", "app_3", "create", whole_app("app_3", "wiki")),
+                entry(11, "app", "app_3", "delete", json!({})),
+            ],
+        )
+        .unwrap();
+        let deletion = |entity_id: &str, seq| Deletion {
+            entity_type: "app".to_owned(),
+            entity_id: entity_id.to_owned(),
+            seq,
+        };
+        assert_eq!(
+            folded.deletions,
+            [
+                deletion("app_1", 4),
+                deletion("app_2", 7),
+                deletion("app_3", 9),
+                deletion("app_3", 11),
+            ]
+        );
+        assert_eq!(folded.tables["apps"].keys().collect::<Vec<_>>(), ["app_1"]);
+        let app = &folded.tables["apps"]["app_1"];
+        assert_eq!(app.created_seq, 5);
+        assert_eq!(app.cells["name"], value(json!("blog2")));
+        assert_eq!(app.cells["status"], value(json!("down")));
+        assert_eq!(folded.tables["app_env"]["app_1/FOO"].created_seq, 2);
+        assert!(folded.dropped.is_empty());
+    }
+
+    /// The tables marked LOCAL in `db-schema.sql` and its migrations: the
+    /// change log carries no entry for them, and a promoted primary starts
+    /// them empty (section 7.3 step 4).
+    const LOCAL: [&str; 5] = [
+        "sessions",
+        "access_tokens",
+        "webhook_deliveries",
+        "interactive_sessions",
+        "osv_mirror",
+    ];
+
+    /// The tables that are never replicated and are not marked LOCAL:
+    /// `meta` and the change log itself. The schema keeps no other
+    /// bookkeeping table: its version is `meta.schema_version`.
+    const NEVER_REPLICATED: [&str; 2] = ["meta", "change_log"];
+
     #[tokio::test]
     async fn each_entity_type_names_one_table_of_this_schema() {
         let schema = schema().await;
-        let local = [
-            "sessions",
-            "access_tokens",
-            "webhook_deliveries",
-            "interactive_sessions",
-            "osv_mirror",
-            "meta",
-            "change_log",
-        ];
         let mut tables: Vec<&str> = Vec::new();
         for (entity_type, table) in TABLES {
             assert_eq!(table_of(entity_type), Some(table));
@@ -776,7 +1026,11 @@ mod tests {
                 schema.columns(table).is_some(),
                 "{table} is not in the schema"
             );
-            assert!(!local.contains(&table), "{table} is not replicated");
+            assert!(!LOCAL.contains(&table), "{table} is LOCAL");
+            assert!(
+                !NEVER_REPLICATED.contains(&table),
+                "{table} is not replicated"
+            );
             assert!(!tables.contains(&table), "{table} is named twice");
             tables.push(table);
         }
@@ -831,6 +1085,109 @@ mod tests {
         );
     }
 
+    /// Every table of this schema is in the map, LOCAL or never replicated,
+    /// so a replicated table a migration adds and the map leaves out fails
+    /// here rather than in a promotion.
+    #[tokio::test]
+    async fn every_table_of_this_schema_is_mapped_local_or_never_replicated() {
+        let store = Store::open_in_memory().await.unwrap();
+        let in_schema: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert!(in_schema.len() > TABLES.len(), "{in_schema:?}");
+        for table in &in_schema {
+            let mapped = TABLES.iter().any(|(_, mapped)| mapped == table);
+            let local = LOCAL.contains(&table.as_str());
+            let never = NEVER_REPLICATED.contains(&table.as_str());
+            assert_eq!(
+                u8::from(mapped) + u8::from(local) + u8::from(never),
+                1,
+                "{table}: mapped {mapped}, LOCAL {local}, never replicated {never}"
+            );
+        }
+        // Each list names tables this schema has, so none goes stale.
+        for table in TABLES
+            .iter()
+            .map(|(_, table)| *table)
+            .chain(LOCAL)
+            .chain(NEVER_REPLICATED)
+        {
+            assert!(
+                in_schema.iter().any(|name| name == table),
+                "{table} is not in the schema"
+            );
+        }
+    }
+
+    /// `Schema::read` keeps each column's declared type, `NOT NULL` and
+    /// default, as `PRAGMA table_info` reports them, and the key in key
+    /// order.
+    #[tokio::test]
+    async fn the_schema_keeps_each_columns_type_not_null_and_default() {
+        let schema = schema().await;
+        let column = |table: &str, name: &str| {
+            schema
+                .columns(table)
+                .unwrap()
+                .iter()
+                .find(|column| column.name == name)
+                .unwrap()
+                .clone()
+        };
+        let fact = |declared_type: &str, not_null: bool, default: Option<&str>| {
+            (
+                declared_type.to_owned(),
+                not_null,
+                default.map(str::to_owned),
+            )
+        };
+        for (table, name, expected) in [
+            ("apps", "id", fact("TEXT", true, None)),
+            ("apps", "ha_policy", fact("TEXT", true, Some("'none'"))),
+            ("apps", "warm_interval_s", fact("INTEGER", true, Some("30"))),
+            ("apps", "warm_node_id", fact("TEXT", false, None)),
+            ("apps", "current_deployment_id", fact("TEXT", false, None)),
+            (
+                "apps",
+                "backup_schedule",
+                fact("TEXT", true, Some(r#"'{"interval_h":24,"keep":7}'"#)),
+            ),
+            (
+                "backup_repositories",
+                "repo_key_enc",
+                fact("BLOB", true, None),
+            ),
+            ("app_env", "value_enc", fact("BLOB", true, None)),
+            ("users", "disabled", fact("INTEGER", true, Some("0"))),
+        ] {
+            let Column {
+                declared_type,
+                not_null,
+                default,
+                ..
+            } = column(table, name);
+            assert_eq!(
+                (declared_type, not_null, default),
+                expected,
+                "{table}.{name}"
+            );
+        }
+        assert_eq!(
+            names(&schema, "app_env"),
+            ["app_id", "name", "value_enc", "updated_at"]
+        );
+        assert_eq!(schema.key("app_env").unwrap(), ["app_id", "name"]);
+        assert_eq!(
+            schema.key("node_key_custody").unwrap(),
+            ["node_id", "key_kind", "key_id"]
+        );
+        assert_eq!(schema.key("apps").unwrap(), ["id"]);
+    }
+
     #[tokio::test]
     async fn a_composite_entity_id_joins_the_key_columns_with_a_slash() {
         let schema = schema().await;
@@ -856,32 +1213,61 @@ mod tests {
         .unwrap();
         let env_rows = &folded.tables["app_env"];
         assert_eq!(env_rows.keys().collect::<Vec<_>>(), ["app_1/FOO"]);
-        assert_eq!(env_rows["app_1/FOO"]["value_enc"], value(json!("cc")));
+        assert_eq!(env_rows["app_1/FOO"].cells["value_enc"], value(json!("cc")));
         assert!(
             folded.tables["node_key_custody"]
                 .contains_key("nod_1/dek/0123456789abcdef0123456789abcdef")
         );
         assert!(folded.tables["audit_log"].contains_key("7"));
+        assert!(folded.mismatches.is_empty(), "{:?}", folded.mismatches);
 
-        // A create whose entity_id is not its key joined with `/` stops the
-        // fold, as does one that lacks a key column.
-        for (entity_id, payload) in [
-            ("app_1", env("FOO", "aa")),
-            ("FOO/app_1", env("FOO", "aa")),
-            ("app_1/FOO", json!({"app_id": "app_1", "value_enc": "aa"})),
+        // A create whose entity_id is not its key joined with `/`, or that
+        // lacks a key column, does not stop the fold: the row is kept under
+        // its entity_id, an update finds it there, and the create is
+        // reported with its seq and the key its payload gives.
+        for (entity_id, payload, payload_key) in [
+            ("app_1", env("FOO", "aa"), Some("app_1/FOO")),
+            ("FOO/app_1", env("FOO", "aa"), Some("app_1/FOO")),
+            (
+                "app_1/FOO",
+                json!({"app_id": "app_1", "value_enc": "aa"}),
+                None,
+            ),
+            (
+                "app_1/FOO",
+                json!({"app_id": "app_1", "name": ["FOO"], "value_enc": "aa"}),
+                None,
+            ),
         ] {
+            let folded = run(
+                &schema,
+                &[
+                    entry(1, "app_env", "app_1/BAR", "create", env("BAR", "bb")),
+                    entry(2, "app_env", entity_id, "create", payload),
+                    entry(
+                        3,
+                        "app_env",
+                        entity_id,
+                        "update",
+                        json!({"value_enc": "dd"}),
+                    ),
+                ],
+            )
+            .unwrap();
             assert_eq!(
-                run(
-                    &schema,
-                    &[entry(1, "app_env", entity_id, "create", payload)]
-                ),
-                Err(FoldError::KeyMismatch {
-                    seq: 1,
+                folded.mismatches,
+                [KeyMismatch {
+                    seq: 2,
                     entity_type: "app_env".to_owned(),
                     entity_id: entity_id.to_owned(),
-                }),
+                    payload_key: payload_key.map(str::to_owned),
+                }],
                 "{entity_id}"
             );
+            let kept = &folded.tables["app_env"][entity_id];
+            assert_eq!(kept.created_seq, 2, "{entity_id}");
+            assert_eq!(kept.cells["value_enc"], value(json!("dd")), "{entity_id}");
+            assert!(folded.tables["app_env"].contains_key("app_1/BAR"));
         }
     }
 
@@ -909,7 +1295,7 @@ mod tests {
             assert!(!row.contains_key(field), "{field}");
         }
         // Exactly the table's columns, each once.
-        let mut columns = schema.columns("apps").unwrap().to_vec();
+        let mut columns = names(&schema, "apps");
         columns.sort();
         assert_eq!(row.keys().cloned().collect::<Vec<_>>(), columns);
     }
