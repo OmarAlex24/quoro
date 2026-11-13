@@ -2373,7 +2373,7 @@ async fn restoring_the_repository_key_refuses_what_does_not_open_it() {
     let problem: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
         problem["detail"],
-        "cannot read the bucket: no config object could be read: denied: reads are refused",
+        "cannot read the bucket: a config object could not be read: denied: reads are refused",
         "{text}"
     );
     texts.push(text);

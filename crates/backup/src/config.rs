@@ -47,8 +47,9 @@ pub enum OpenConfigError {
     UnknownFormat(u32),
     /// The recovery key opens no config object of this repository.
     NoneOpens,
-    /// The listing named config objects, but `fetch` could read none of
-    /// them. It holds the text of the last read error, as `fetch` gave it.
+    /// The listing named config objects, `fetch` could not read at least one
+    /// of them, and the key opened none of those it read. It holds the text
+    /// of the last read error, as `fetch` gave it.
     Unreadable(String),
 }
 
@@ -62,7 +63,7 @@ impl fmt::Display for OpenConfigError {
                 f.write_str("the recovery key opens no config object of this repository")
             }
             Self::Unreadable(error) => {
-                write!(f, "no config object could be read: {error}")
+                write!(f, "a config object could not be read: {error}")
             }
         }
     }
@@ -107,10 +108,11 @@ pub fn config_keys_newest_first(
 /// # Errors
 ///
 /// [`OpenConfigError::UnknownFormat`] when the newest config the key opens
-/// names an unknown format, [`OpenConfigError::Unreadable`] when the listing
-/// names config objects but `fetch` reads none of them, and
-/// [`OpenConfigError::NoneOpens`] when the key opens none of those read,
-/// or there is no config object at all.
+/// names an unknown format, [`OpenConfigError::Unreadable`] when `fetch`
+/// could not read at least one listed config object and the key opens none
+/// of those read, and [`OpenConfigError::NoneOpens`] when every listed
+/// config object was read and the key opens none, or there is no config
+/// object at all.
 pub async fn open_newest_config<F, Fut, E>(
     root: &str,
     listed: impl IntoIterator<Item = String>,
@@ -124,7 +126,6 @@ where
     Fut: Future<Output = Result<Vec<u8>, E>>,
     E: fmt::Display,
 {
-    let mut read_any = false;
     let mut last_error = None;
     for key in config_keys_newest_first(root, listed) {
         // A config object that cannot be read is not one this key opens.
@@ -135,7 +136,6 @@ where
                 continue;
             }
         };
-        read_any = true;
         let Ok(config) = serde_json::from_slice::<RepoConfig>(&bytes) else {
             continue;
         };
@@ -156,8 +156,10 @@ where
         }
         return Ok((config, repo_key));
     }
+    // A config that could not be read may be the one the key opens, so a
+    // failed read is reported rather than a key that opens nothing.
     match last_error {
-        Some(error) if !read_any => Err(OpenConfigError::Unreadable(error)),
-        _ => Err(OpenConfigError::NoneOpens),
+        Some(error) => Err(OpenConfigError::Unreadable(error)),
+        None => Err(OpenConfigError::NoneOpens),
     }
 }

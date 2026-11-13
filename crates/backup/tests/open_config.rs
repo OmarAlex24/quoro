@@ -250,9 +250,10 @@ async fn an_unknown_format_ends_the_search() {
     );
 }
 
-/// When the listing names config objects but none of them can be read, the
-/// error says so, with the last read error, rather than that the key opens
-/// none. A config read and not opened, or no config object at all, is still
+/// When a listed config object cannot be read and the key opens none of
+/// those read, the error says so, with the last read error, rather than that
+/// the key opens none: the unread one may be the config the key opens. Every
+/// config read and none opened, or no config object at all, is still
 /// `NoneOpens`.
 #[tokio::test]
 async fn config_objects_that_cannot_be_read_are_unreadable() {
@@ -284,11 +285,12 @@ async fn config_objects_that_cannot_be_read_are_unreadable() {
     );
     assert_eq!(
         error.to_string(),
-        "no config object could be read: denied: reads are refused"
+        "a config object could not be read: denied: reads are refused"
     );
     assert!(!format!("{error:?}").contains(&recovery.to_text()));
 
-    // config-2 cannot be read, config-1 is read and does not open.
+    // config-2 cannot be read, config-1 is read and does not open: config-2
+    // may be the one the key opens, so the failed read is reported.
     let other = RecoveryKey::generate();
     let error = open_newest_config(ROOT, objects.keys(), CLUSTER, None, &other, |key| {
         let object = objects
@@ -300,7 +302,7 @@ async fn config_objects_that_cannot_be_read_are_unreadable() {
     })
     .await
     .unwrap_err();
-    assert_eq!(error, OpenConfigError::NoneOpens);
+    assert_eq!(error, OpenConfigError::Unreadable("denied".to_string()));
 
     // Nothing listed that is a config object.
     let error = open_newest_config(

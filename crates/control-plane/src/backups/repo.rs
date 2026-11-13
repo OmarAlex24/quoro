@@ -697,7 +697,7 @@ pub(crate) async fn restore_key(
     .await
     .map_err(|error| {
         if matches!(error, quoro_backup::OpenConfigError::Unreadable(_)) {
-            // The listing named config objects, but none could be read.
+            // A listed config object could not be read, and none read opened.
             let reason: String = error.to_string().chars().take(200).collect();
             ApiError::validation(format!("cannot read the bucket: {reason}"))
         } else {
