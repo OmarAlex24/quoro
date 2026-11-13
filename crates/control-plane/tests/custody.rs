@@ -1776,10 +1776,13 @@ async fn a_promotion_build_keeps_the_custody_rows_the_log_leaves_and_no_private_
     // its own.
     let created_at = "2026-10-01T10:00:00.000Z";
     let revoked_at = "2026-10-03T10:00:00.000Z";
-    let hash = sha256_hex(b"secret");
+    // Each node's credential has a hash of its own, as enrollment draws 32
+    // random bytes for each: `credential_hash` is UNIQUE, so two rows the
+    // build keeps cannot share one.
+    let hash = |node_id: &str| sha256_hex(format!("secret of {node_id}").as_bytes());
     let credential = |node_id: &str| {
         json!({
-            "node_id": node_id, "credential_hash": hash, "created_at": created_at,
+            "node_id": node_id, "credential_hash": hash(node_id), "created_at": created_at,
             "revoked_at": null,
         })
     };
@@ -1835,13 +1838,13 @@ async fn a_promotion_build_keeps_the_custody_rows_the_log_leaves_and_no_private_
         [
             (
                 recreated.to_owned(),
-                hash.clone(),
+                hash(recreated),
                 created_at.to_owned(),
                 Some(revoked_at.to_owned())
             ),
             (
                 update_first.to_owned(),
-                hash.clone(),
+                hash(update_first),
                 created_at.to_owned(),
                 None
             ),
