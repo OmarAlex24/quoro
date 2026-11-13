@@ -1317,7 +1317,11 @@ components:
           description: Expiry of the token.
         join_command:
           type: string
-          description: One-line command that enrolls the node and starts the node agent.
+          description: |
+            One-line command that enrolls the machine, run as root on it. It
+            enrolls only and starts nothing. Starting the node agent is a
+            separate step, as root too: `quoro node`, or the
+            `quoro-node.service` unit, which runs it.
     EnrollNodeRequest:
       type: object
       title: EnrollNodeRequest
@@ -5837,7 +5841,9 @@ components:
             - error
         result_detail:
           type: [string, 'null']
-          description: Refusal reason or error code.
+          description: |
+            Refusal reason or error code. On an `ok` record, only where
+            audit-log-format.md section 3 names one (`cluster.maintenance`).
         change_seq:
           type: [integer, 'null']
           description: Change-log seq the action produced, if any.
@@ -6763,9 +6769,15 @@ paths:
       description: |
         Removes a node. Removing a node is destructive and human-only (D-0030):
         an agent is refused with `forbidden` and `reason: human_only`, or with
-        `approval_required` when it asks for approval first. A node that still
-        hosts running instances is refused with `conflict`. The node moves to
-        `removed` and reconciliation stops targeting it. `Quoro-Justification` is
+        `approval_required` when it asks for approval first. Refused with
+        `conflict` for a node already `removed` (except the repair of
+        node-agent-protocol.md section 8.10), for the node that holds the
+        primary status, and for a node that still hosts running instances.
+        For a connected node the primary first revokes its leases over the
+        session, and the call stays open until the node answers, at most
+        180 s; a fence that is not confirmed in that time answers `conflict`
+        and removes nothing (node-agent-protocol.md section 10). The node
+        moves to `removed` and reconciliation stops targeting it. `Quoro-Justification` is
         required when the caller is an agent (D-0031). From M5b removing a voter
         changes the voter set, so it is also refused with `conflict` while the
         previous voter-set change has not reached a majority of voters
