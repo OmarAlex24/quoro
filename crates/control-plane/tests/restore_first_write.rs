@@ -1010,9 +1010,10 @@ fn lost(old: &str) -> Vec<String> {
 /// `cluster.restored` with exact `params` (the removed ids and the term the
 /// database holds), the statement as its justification and its removal
 /// entry as `change_seq`, before `cluster.primary_moved` and with no other
-/// record. Each removal clears the machine's `cp_status` in its own entry,
-/// so the move that follows finds no node holding the status: it writes the
-/// new host's entry only and records `from_node_id` null. It is the one
+/// record. Each removal clears the machine's `cp_status` in its own entry.
+/// The move that follows writes the new host's entry only, after the
+/// removals, and records the old primary, which held the status before the
+/// write, as `from_node_id`. It is the one
 /// write with the mark and the move. The new host's node keeps its row, its
 /// status and its seal.
 #[tokio::test]
@@ -1082,7 +1083,7 @@ async fn an_accept_loss_first_write_removes_every_other_node() {
     assert_eq!(record.justification.as_deref(), Some(STATEMENT));
     assert_eq!(
         records[1].params,
-        json!({ "from_node_id": null, "to_node_id": NEW_NODE })
+        json!({ "from_node_id": old, "to_node_id": NEW_NODE })
     );
 
     // Every entry after the restored head is this write's: the marks, the
@@ -1119,6 +1120,11 @@ async fn an_accept_loss_first_write_removes_every_other_node() {
     assert!(
         move_entry > *removals.last().unwrap(),
         "the move comes after the removals: {entries:?}"
+    );
+    assert_eq!(
+        moved_records(&store).await,
+        vec![Some(move_entry)],
+        "cluster.primary_moved carries the move's entry: {entries:?}"
     );
     for id in &removed {
         assert!(

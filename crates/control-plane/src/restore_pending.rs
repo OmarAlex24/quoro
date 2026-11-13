@@ -64,7 +64,10 @@
 //!   section 8.4 read it removed from that `seq` on. The same row write
 //!   clears its `cp_status`, so no removed machine keeps the primary status
 //!   and the next local enrollment on the new host takes it. With
-//!   `primary-node`, the move then finds no node holding the status;
+//!   `primary-node`, the write reads which node held the status before the
+//!   removals, and the move that follows names it as `from_node_id` in
+//!   `cluster.primary_moved`. The move writes no second entry for the old
+//!   primary, whose removal entry already reads no `cp_status`;
 //! - its custody seals are deleted (section 7.2,
 //!   [`crate::custody::delete_seals`]) and the records of the quarantined
 //!   copies it keeps are dropped ([`crate::quarantines::drop_node_copies`]),
@@ -475,6 +478,17 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
                     .unwrap_or_else(|| error.code.as_str().to_string())
             )
         })?;
+    // The node that holds the primary status before the removals, which clear
+    // it: the move's `cluster.primary_moved` names it as `from_node_id`.
+    let held_before: Option<String> = match &node_id {
+        Some(_) => sqlx::query_scalar(
+            "SELECT id FROM nodes WHERE cp_status = 'primary' ORDER BY id LIMIT 1",
+        )
+        .fetch_optional(&mut *w.tx)
+        .await
+        .map_err(|error| format!("cannot read the primary node: {error}"))?,
+        None => None,
+    };
     let removed = match (marker.accept_loss, marker.statement.as_deref()) {
         (true, Some(statement)) => {
             remove_the_lost(
@@ -490,7 +504,9 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
     };
     // After `cluster.restored`, so that record is the write's first.
     let moved = match &node_id {
-        Some(node_id) => Some(primary_status::move_in(&mut w.tx, node_id).await?),
+        Some(node_id) => {
+            Some(primary_status::move_in(&mut w.tx, node_id, held_before.as_deref()).await?)
+        }
         None => None,
     };
     sqlx::query(

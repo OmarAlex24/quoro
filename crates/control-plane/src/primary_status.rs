@@ -110,7 +110,7 @@ async fn move_primary(store: &Store, node_id: &str) -> Result<Moved, String> {
         .begin_write()
         .await
         .map_err(|error| format!("cannot move the primary status: {error}"))?;
-    let moved = move_in(&mut w.tx, node_id).await?;
+    let moved = move_in(&mut w.tx, node_id, None).await?;
     if let Moved::Yes { .. } = moved {
         w.commit()
             .await
@@ -123,10 +123,21 @@ async fn move_primary(store: &Store, node_id: &str) -> Result<Moved, String> {
 /// commit: the two node updates, their change-log entries and the audit
 /// record. It reads before it writes, so [`Moved::No`] has written nothing.
 ///
+/// `held_before` is the node that held the primary status when the caller's
+/// write began, for a caller whose write cleared it before the move (the
+/// `--accept-loss` removals of the restored primary's first write,
+/// [`crate::restore_pending`]); `cluster.primary_moved` names it as
+/// `from_node_id`. With `None`, the move names the node that holds the status
+/// when it runs.
+///
 /// # Errors
 ///
 /// A database error, after which the caller drops the transaction.
-pub(crate) async fn move_in(conn: &mut SqliteConnection, node_id: &str) -> Result<Moved, String> {
+pub(crate) async fn move_in(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    held_before: Option<&str>,
+) -> Result<Moved, String> {
     if !quoro_types::is_id(quoro_types::Prefix::Node, node_id) {
         return Ok(Moved::No("the file does not hold a nod_ id"));
     }
@@ -181,7 +192,10 @@ pub(crate) async fn move_in(conn: &mut SqliteConnection, node_id: &str) -> Resul
 
     // The cluster has one primary (D-0016); `from_node_id` is null when no node
     // held the status.
-    let from = holders.into_iter().next().map(|(id,)| id);
+    let from = match held_before {
+        Some(holder) => Some(holder.to_string()),
+        None => holders.into_iter().next().map(|(id,)| id),
+    };
     let record = Record {
         actor,
         agent_model: None,
