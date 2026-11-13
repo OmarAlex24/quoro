@@ -55,8 +55,10 @@
 //!
 //! - the token of each lease it holds goes up by one and the row is recorded
 //!   revoked, as declaring the node lost does (node-agent-protocol.md section
-//!   8.3, [`crate::api::nodes::declare_lost_write`], which also sets
-//!   `lost_at`);
+//!   8.3): the rows `declareNodeLost` raises ([`crate::leases::held_by_node`],
+//!   [`crate::leases::bump_tokens`]), also when the machine was declared lost
+//!   before and holds a lease granted since. The write raises the tokens and
+//!   does not declare the machine lost: it sets no `lost_at`;
 //! - it turns `removed`, with its node entry, the whole row, as `removeNode`
 //!   writes a removal (section 10), so the voter set and the required set of
 //!   section 8.4 read it removed from that `seq` on;
@@ -566,17 +568,20 @@ async fn remove_the_lost(
 
     let mut last_removal = None;
     for node_id in &lost {
-        crate::api::nodes::declare_lost_write(conn, node_id, actor)
+        // The rows declaring the node lost raises (section 8.3), without its
+        // early return for a node already declared lost: a lease granted
+        // after that declaration is raised too. No `lost_at` is set.
+        let raise =
+            format!("cannot raise the lease tokens of node {node_id}, which --accept-loss removes");
+        let held: Vec<String> = crate::leases::held_by_node(conn, node_id)
             .await
-            .map_err(|error| {
-                api_reason(
-                    &format!(
-                        "cannot raise the lease tokens of node {node_id}, which --accept-loss \
-                         removes"
-                    ),
-                    error,
-                )
-            })?;
+            .map_err(|error| api_reason(&raise, error))?
+            .into_iter()
+            .map(|lease| lease.id)
+            .collect();
+        crate::leases::bump_tokens(conn, &held, node_id, actor)
+            .await
+            .map_err(|error| api_reason(&raise, error))?;
         sqlx::query("UPDATE nodes SET status = 'removed' WHERE id = ?")
             .bind(node_id)
             .execute(&mut *conn)

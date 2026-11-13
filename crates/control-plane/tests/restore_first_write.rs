@@ -925,6 +925,14 @@ async fn status(store: &Store, id: &str) -> String {
         .unwrap()
 }
 
+async fn lost_at(store: &Store, id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT lost_at FROM nodes WHERE id = ?")
+        .bind(id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+}
+
 /// `(fencing_token, revoked)` of lease `id`.
 async fn lease(store: &Store, id: &str) -> (i64, bool) {
     let (token, revoked_at): (i64, Option<String>) =
@@ -1028,6 +1036,8 @@ async fn an_accept_loss_first_write_removes_every_other_node() {
 
     for id in &removed {
         assert_eq!(status(&store, id).await, "removed", "{id}");
+        // The write raises the tokens and declares nothing lost.
+        assert_eq!(lost_at(&store, id).await, None, "{id}");
     }
     assert_eq!(status(&store, NEW_NODE).await, "disconnected");
     assert_eq!(
@@ -1301,4 +1311,50 @@ async fn the_raise_refuses_at_the_cap_after_the_check_and_writes_nothing() {
     assert_eq!(cp_status(&store, &old).await.as_deref(), Some("primary"));
     assert!(exists(&dir, restore_pending::MARKER_FILE));
     assert!(exists(&dir, primary_status::MARKER_FILE));
+}
+
+/// A machine declared lost before the backup, which holds a lease granted
+/// after that declaration, has that lease's token raised too: the write
+/// raises every lease those machines hold, as declaring a node lost does
+/// (`backup-format.md` section 8.2), and does not stop at a `lost_at`
+/// already set. It declares nothing itself: the earlier `lost_at` stays as it
+/// was, and the other removed machine gets none.
+#[tokio::test]
+async fn a_lease_granted_after_an_earlier_declaration_is_raised() {
+    let (dir, store, old, head) = restored().await;
+    const DECLARED: &str = "2026-01-02T03:04:05.000Z";
+    sqlx::query("UPDATE nodes SET lost_at = ? WHERE id = ?")
+        .bind(DECLARED)
+        .bind(HOLDER)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: lost(&old),
+            moved: true
+        }
+    );
+    // The holder's unrevoked leases, granted after its declaration, move to
+    // their token + 1, recorded revoked.
+    for (id, token) in [(EXPIRING, 4), (LOCAL, 6), (MARKED, 7)] {
+        assert_eq!(lease(&store, id).await, (token, true), "{id}");
+    }
+    let raised: Vec<String> = entries_after(&store, head.seq)
+        .await
+        .into_iter()
+        .filter(|(_, kind, _, _, _, payload)| kind == "lease" && payload["revoked_at"].is_string())
+        .map(|(_, _, id, _, _, _)| id)
+        .collect();
+    for id in [EXPIRING, LOCAL, MARKED] {
+        assert!(raised.iter().any(|raised| raised == id), "{id}: {raised:?}");
+    }
+    assert_eq!(lost_at(&store, HOLDER).await.as_deref(), Some(DECLARED));
+    assert_eq!(lost_at(&store, &old).await, None);
+    assert_eq!(status(&store, HOLDER).await, "removed");
 }
