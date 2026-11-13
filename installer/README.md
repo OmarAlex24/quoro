@@ -96,9 +96,12 @@ curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/ins
 
 The three values are checked before anything is written, so a missing one fails
 before the host is touched. A join token is single use and expires, so create a
-fresh one for every attempt. A host that is already enrolled needs no token:
-re-running the installer with its role finds its identity and skips the
-enrollment.
+fresh one for every attempt. The exception is a node refused with a `409` about
+the voters, which the primary answers while the previous voter-set change has
+not settled: that refusal leaves the token unused, and the installer says to
+run it again with the same token once the voters have caught up. A host that is
+already enrolled needs no token: re-running the installer with its role finds
+its identity and skips the enrollment.
 
 A node or an edge install refuses a host that already runs a control plane (it
 finds `/etc/systemd/system/quoro.service` or `/var/lib/quoro/quoro.db`): turning

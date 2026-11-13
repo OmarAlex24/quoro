@@ -1253,6 +1253,12 @@ enroll_node() {
     fi
     if [ "$_status" -ne 0 ]; then
         cat "$WORK_DIR/join.err" >&2 || true
+        # A voter's enrollment while the voter set changes is refused with a
+        # 409 whose detail names the voters, and the refusal leaves the token
+        # unused (node-agent-protocol.md sections 2.3 and 8.10 rule 2).
+        if grep -q 'HTTP 409: .*voter' "$WORK_DIR/join.err" 2>/dev/null; then
+            die 'enrollment refused until the voter set settles; the join token was not used, so run the installer again with the same QUORO_JOIN_TOKEN once the voters have caught up'
+        fi
         die 'enrollment failed; a join token is single use and expires, so create a new one on the primary and pass it in QUORO_JOIN_TOKEN'
     fi
     log "enrolled: $_out"
