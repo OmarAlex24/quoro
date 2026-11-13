@@ -241,7 +241,7 @@ Such a cluster recovers by promoting a surviving node (node-agent-protocol.md se
 
 **The first write.** The restored primary's first change-log write, at its first start and before it serves, marks every `expiring` lease row unsettled (`leases.unsettled`, node-agent-protocol.md section 8.4, "The mark"), after any restore. When `primary-node` asks for it, the same write also moves the primary status and records `cluster.primary_moved` (above, ADR 0280). After a restore with `--accept-loss`, the same write also:
 
-- removes every machine with the `node` role that the statement declares gone, that is, every one in the restored database that is not `removed`, other than the new host's node;
+- removes every machine with the `node` role that the statement declares gone, that is, every one in the restored database that is not `removed`, other than the new host's node, and clears `cp_status` on each, so no removed machine names the primary; when the write moves the primary status (above), the new host's node holds it, and otherwise the next local enrollment of the new host's agent takes it;
 - raises the token of each lease those machines held, as declaring a node lost does (node-agent-protocol.md section 8.3);
 - deletes their custody seals (node-agent-protocol.md section 7.2);
 - records `cluster.restored` (`audit-log-format.md` section 3.9).
