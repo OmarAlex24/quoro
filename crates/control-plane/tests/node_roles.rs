@@ -463,15 +463,20 @@ async fn the_roles_refusals_come_in_order_and_a_no_op_changes_nothing() {
     );
 
     // Rule 2: adding the edge's vote waits for a majority at the version.
-    assert_eq!(
-        roles_refused(
+    let (status, code, detail) = problem_detail(
+        roles(
             &owner,
             &server,
             &edge.node_id,
-            json!({ "add": ["witness"] })
+            json!({ "add": ["witness"] }),
         )
         .await,
-        (409, "conflict".to_string())
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(
+        detail.contains("has not reached a majority of voters"),
+        "{detail}"
     );
     assert_eq!(roles_of(&server, &edge.node_id).await, json!(["edge"]));
     assert_eq!(state_head(&server).await, head, "nothing written");
@@ -489,16 +494,19 @@ async fn the_roles_refusals_come_in_order_and_a_no_op_changes_nothing() {
         json!({ "remove": ["witness"] }),
     )
     .await;
-    assert_eq!(
-        roles_refused(
+    // The removed node's own refusal, not rule 2's, which still waits here.
+    let (status, code, detail) = problem_detail(
+        roles(
             &owner,
             &server,
             &edge.node_id,
-            json!({ "add": ["witness"] })
+            json!({ "add": ["witness"] }),
         )
         .await,
-        (409, "conflict".to_string())
-    );
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert_eq!(detail, "the node is removed");
 }
 
 /// Section 8.10 rule 2 for the roles operation: a vote is added only once a
@@ -685,15 +693,20 @@ async fn removing_a_vote_below_three_with_expiring_leases_needs_force() {
 
     // Rule 2 waits again, and `force` does not bypass it: nobody holds the
     // version of the removal yet... until A and B acknowledge it.
-    assert_eq!(
-        roles_refused(
+    let (status, code, detail) = problem_detail(
+        roles(
             &owner,
             &server,
             &edge.node_id,
-            json!({ "add": ["witness"], "force": true })
+            json!({ "add": ["witness"], "force": true }),
         )
         .await,
-        (409, "conflict".to_string())
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(
+        detail.contains("has not reached a majority of voters"),
+        "{detail}"
     );
     holds_version(&mut machine_a, removed_at).await;
     holds_version(&mut machine_b, removed_at).await;
@@ -801,7 +814,8 @@ async fn after_a_restart_the_voters_acknowledge_again_on_their_next_session() {
 }
 
 /// `force` bypasses only D-0170's guard: removing a vote with `force` while
-/// rule 2 waits still answers `409 conflict` and changes nothing.
+/// rule 2 waits still answers `409 conflict` with rule 2's detail and changes
+/// nothing.
 #[tokio::test]
 async fn force_does_not_bypass_rule_2_when_removing_a_vote() {
     let server = start_with_patient_node_session().await;
@@ -832,15 +846,21 @@ async fn force_does_not_bypass_rule_2_when_removing_a_vote() {
         machine_edge.until("desired_state").await;
     }
     let head = state_head(&server).await;
-    assert_eq!(
-        roles_refused(
+    let (status, code, detail) = problem_detail(
+        roles(
             &owner,
             &server,
             &edge.node_id,
-            json!({ "remove": ["witness"], "force": true })
+            json!({ "remove": ["witness"], "force": true }),
         )
         .await,
-        (409, "conflict".to_string())
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    // Rule 2's own detail, not the guard's or the rows-and-log disagreement's.
+    assert!(
+        detail.contains("has not reached a majority of voters"),
+        "{detail}"
     );
     assert_eq!(
         roles_of(&server, &edge.node_id).await,
