@@ -752,6 +752,7 @@ async fn both_flags_take_one_statement_in_one_write() {
             ("node", NEW),
             ("lease", OLD_LOCAL),
             ("lease", OLD_EXPIRING),
+            ("lease", OLD_REVOKED),
             ("node", OLD),
             ("lease", OLD_EXPIRING),
             ("lease", OLD_REVOKED),
