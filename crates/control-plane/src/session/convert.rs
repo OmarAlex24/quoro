@@ -1032,7 +1032,7 @@ mod tests {
         assert_eq!(entry(&f.state).unwrap().sent_on, Some(generation));
         assert_eq!(f.row().await.mode, "local", "the send writes nothing");
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
 
         let f = fixture("warm", "local", Some(D as i64), false).await;
         created(&f).await;
@@ -1058,7 +1058,7 @@ mod tests {
             None
         );
         assert!(grant_ids(&f.state, &f.node_id).is_empty());
-        f.done();
+        f.done().await;
     }
 
     /// Test 3, the barrier on a live session: the session's `hello` did not
@@ -1094,7 +1094,7 @@ mod tests {
         the_conversion(&sent, 3, D);
         assert!(local_grants(&sent).is_empty(), "no second barrier grant");
         assert_eq!(f.row().await.mode, "local");
-        f.done();
+        f.done().await;
 
         let f = fixture("warm", "local", Some(D as i64), false).await;
         created(&f).await;
@@ -1117,7 +1117,7 @@ mod tests {
             hub.conversion_in_flight(&f.node_id, generation, LEASE),
             None
         );
-        f.done();
+        f.done().await;
     }
 
     /// Test 4, R after the conversion: a conversion in flight, then R, then
@@ -1151,7 +1151,7 @@ mod tests {
         assert!(of_type(&answer, "lease_grant").is_empty(), "{answer:?}");
         assert_eq!(f.row().await.mode, "local");
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// Test 5: a conversion whose frame is not queued, on a moved
@@ -1202,7 +1202,7 @@ mod tests {
         assert!(grant_ids(&f.state, &f.node_id).is_empty());
         assert_eq!(entry(&f.state).unwrap().sent_on, None);
         drop(session);
-        f.done();
+        f.done().await;
     }
 
     /// Test 6, the raise, from a session start: a row that reads `local`
@@ -1235,7 +1235,7 @@ mod tests {
         hub.attempt_held().await;
         the_conversion(&queued(&mut on), 3, D);
         first_answer_counts_d(&f, &mut on, 3).await;
-        f.done();
+        f.done().await;
     }
 
     /// Test 6, the raise, after a `local` grant with a new token (as a
@@ -1274,7 +1274,7 @@ mod tests {
         hub.attempt_held().await;
         the_conversion(&queued(&mut on), 4, D);
         first_answer_counts_d(&f, &mut on, 4).await;
-        f.done();
+        f.done().await;
     }
 
     /// Test 7: a refused conversion. What its send recorded goes, the held
@@ -1305,7 +1305,7 @@ mod tests {
         ack(&f.state, &f, &next).await;
         hub.attempt_held().await;
         the_conversion(&queued(&mut next), 3, D);
-        f.done();
+        f.done().await;
     }
 
     /// Test 8: a conversion that waits (here on its raise) is no wait: no
@@ -1322,7 +1322,7 @@ mod tests {
         assert_eq!(view(&f.state, &f).await, (false, Vec::new(), false));
         assert!(!hub.row_grant_pending(&f.row().await));
         assert!(!hub.grant_pending(LEASE));
-        f.done();
+        f.done().await;
     }
 
     /// Test 9: a `local` row under `warm` that carries the mark (R's, the
@@ -1360,7 +1360,7 @@ mod tests {
         ack(&f.state, &f, &next).await;
         hub.attempt_held().await;
         the_conversion(&queued(&mut next), 3, D);
-        f.done();
+        f.done().await;
     }
 
     /// Test 10: the policy leaves `warm` before the conversion went out:
@@ -1378,7 +1378,7 @@ mod tests {
         ack(&f.state, &f, &on).await;
         hub.attempt_held().await;
         grant_then_ping(&queued(&mut on), 3);
-        f.done();
+        f.done().await;
     }
 
     /// Test 11: a holder with no session holds nothing; its next session
@@ -1401,7 +1401,7 @@ mod tests {
         ack(&f.state, &f, &on).await;
         hub.attempt_held().await;
         the_conversion(&queued(&mut on), 3, D);
-        f.done();
+        f.done().await;
     }
 
     /// Test 12, a session cut between the conversion and its first answer.
@@ -1423,7 +1423,7 @@ mod tests {
         assert_eq!(f.row().await.mode, "expiring");
         f.state.hub.attempt_held().await;
         assert!(conversions(&queued(&mut next)).is_empty());
-        f.done();
+        f.done().await;
 
         let f = fixture("warm", "local", Some(D as i64), false).await;
         drop(converted(&f).await);
@@ -1431,7 +1431,7 @@ mod tests {
         ack(&f.state, &f, &next).await;
         f.state.hub.attempt_held().await;
         the_conversion(&queued(&mut next), 3, D);
-        f.done();
+        f.done().await;
 
         let f = fixture("warm", "local", Some(D as i64), false).await;
         drop(converted(&f).await);
@@ -1444,7 +1444,7 @@ mod tests {
                 .all(|grant| grant["body"]["fencing_token"] != 3),
             "no conversion at the old token"
         );
-        f.done();
+        f.done().await;
     }
 
     /// Test 12, a primary restart between the raise and the send: the
@@ -1473,7 +1473,7 @@ mod tests {
         ack(&after, &f, &next).await;
         after.hub.attempt_held().await;
         the_conversion(&queued(&mut next), 3, D);
-        f.done();
+        f.done().await;
     }
 
     /// Test 13: no conversion, and no barrier `local` grant, is queued on a
@@ -1532,7 +1532,7 @@ mod tests {
         hub.mark_start_grants_queued(&f.node_id, generation);
         hub.attempt_held().await;
         the_conversion(&queued(&mut on), 3, D);
-        f.done();
+        f.done().await;
 
         let f = fixture("warm", "local", Some(D as i64), false).await;
         created(&f).await;
@@ -1552,6 +1552,6 @@ mod tests {
         hub.mark_start_grants_queued(&f.node_id, generation);
         hub.attempt_held().await;
         grant_then_ping(&queued(&mut on), 3);
-        f.done();
+        f.done().await;
     }
 }
