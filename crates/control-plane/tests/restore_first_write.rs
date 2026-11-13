@@ -1358,3 +1358,120 @@ async fn a_lease_granted_after_an_earlier_declaration_is_raised() {
     assert_eq!(lost_at(&store, &old).await, None);
     assert_eq!(status(&store, HOLDER).await, "removed");
 }
+
+/// Only machines with the `node` role are removed: a witness-only and an
+/// edge-only machine stay as they were, and `cluster.restored` does not name
+/// them.
+#[tokio::test]
+async fn a_witness_only_or_edge_only_machine_is_not_removed() {
+    let (dir, store, old, head) = restored().await;
+    const WITNESS: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0F";
+    const EDGE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0G";
+    for (id, roles) in [(WITNESS, r#"["witness"]"#), (EDGE, r#"["edge"]"#)] {
+        insert_node(&store, id).await;
+        sqlx::query("UPDATE nodes SET roles = ? WHERE id = ?")
+            .bind(roles)
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    let head_after = log_head_of(&store).await;
+    assert_eq!(head_after, head, "the rows are written directly, no entry");
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: lost(&old),
+            moved: true
+        }
+    );
+    for id in [WITNESS, EDGE] {
+        assert_eq!(status(&store, id).await, "disconnected", "{id}");
+        assert_eq!(lost_at(&store, id).await, None, "{id}");
+    }
+    let records = records_after(&store, 0).await;
+    let restored = records
+        .iter()
+        .find(|record| record.operation == restore_pending::RESTORED_OPERATION)
+        .expect("cluster.restored");
+    assert_eq!(restored.params["removed_node_ids"], json!(lost(&old)));
+}
+
+/// The record of a quarantined copy a removed machine keeps is dropped in
+/// the same write, with its change-log `delete`, as a removal drops it
+/// (node-agent-protocol.md section 10).
+#[tokio::test]
+async fn a_removed_machines_quarantined_copy_is_dropped() {
+    let (dir, store, old, head) = restored().await;
+    const VOLUME: &str = "vol_01JC9Z1A2B3C4D5E6F7G8H9J0A";
+    const QUARANTINE: &str = "qrn_01JC9Z1A2B3C4D5E6F7G8H9J0A";
+    let now = now_rfc3339();
+    // The volume's app and project are not part of this test: the rows are
+    // written without the foreign-key checks, on one connection.
+    let mut conn = store.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO volumes (id, app_id, node_id, size_gb, mount_path, state, \
+         allocated_bytes, restored_from_backup_id, error, created_at, updated_at) \
+         VALUES (?, 'app_01JC9Z1A2B3C4D5E6F7G8H9J0A', ?, 2, '/data', 'ready', NULL, NULL, \
+         NULL, ?, ?)",
+    )
+    .bind(VOLUME)
+    .bind(NEW_NODE)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO volume_quarantines (id, volume_id, app_id, node_id, size_bytes, sha256, \
+         created_at) VALUES (?, ?, 'app_01JC9Z1A2B3C4D5E6F7G8H9J0A', ?, 4096, ?, ?)",
+    )
+    .bind(QUARANTINE)
+    .bind(VOLUME)
+    .bind(HOLDER)
+    .bind("a".repeat(64))
+    .bind(&now)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: lost(&old),
+            moved: true
+        }
+    );
+    let left: Vec<String> = sqlx::query_scalar("SELECT id FROM volume_quarantines")
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+    assert!(left.is_empty(), "{left:?}");
+    let entries = entries_after(&store, head.seq).await;
+    assert!(
+        entries
+            .iter()
+            .any(|(_, kind, id, actor_type, actor_id, _)| {
+                kind == "volume_quarantine"
+                    && id == QUARANTINE
+                    && (actor_type.as_str(), actor_id.as_str()) == ("system", "cluster")
+            }),
+        "{entries:?}"
+    );
+}

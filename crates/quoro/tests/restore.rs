@@ -1606,3 +1606,91 @@ async fn accept_loss_refuses_a_lease_at_the_token_cap_before_installing() {
         vec![OLD_NODE.to_string(), OTHER_NODE.to_string()]
     );
 }
+
+/// The host's node agent store is not read when its identity file names
+/// another cluster: that agent's voters are machines of the other cluster.
+/// Here the store cannot even be read, and the restore, which `--node-id`
+/// points at this cluster's node, goes on without the flag.
+#[tokio::test]
+async fn the_agent_store_of_another_cluster_is_not_read() {
+    let fixture =
+        machines_fixture(&[(NEW_NODE, r#"["node"]"#, "connected", Some("primary"))]).await;
+    let agent = fixture.base.join("other-cluster-agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(agent.join("node.db"), b"not a sqlite file at all").unwrap();
+
+    let dir = fixture.data_dir("other-cluster-agent-restore");
+    let mut options = fixture.options(&dir, None);
+    options.node_id = Some(NEW_NODE.to_string());
+    options.identity_file = fixture.identity_file("identity.json", OTHER_CLUSTER, NEW_NODE);
+    options.node_data_dir = agent.clone();
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    assert!(report.survivors.is_empty(), "{:?}", report.survivors);
+
+    // The same store under an identity file of this cluster is read, and
+    // refuses.
+    let dir = fixture.data_dir("this-cluster-agent-restore");
+    let mut options = fixture.options(&dir, None);
+    options.node_id = Some(NEW_NODE.to_string());
+    options.identity_file = fixture.identity_file("identity-this.json", CLUSTER, NEW_NODE);
+    options.node_data_dir = agent;
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot read the newest desired state"),
+        "{error}"
+    );
+    assert_nothing_installed(&dir);
+}
+
+/// The node of an identity file of this cluster is the new host's node even
+/// when the restored database does not hold it: it is no survivor among the
+/// agent's voters, and no `primary-node` is written. A removed node among
+/// those voters does not count either, and another node there still refuses.
+#[tokio::test]
+async fn an_identity_node_the_database_does_not_hold_is_not_a_surviving_voter() {
+    let fixture = machines_fixture(&[
+        (REMOVED_NODE, r#"["node"]"#, "removed", None),
+        (WITNESS_NODE, r#"["witness"]"#, "connected", None),
+    ])
+    .await;
+    let identity = fixture.identity_file("identity.json", CLUSTER, UNKNOWN_NODE);
+    let host: (&str, &[&str]) = (UNKNOWN_NODE, &["node"]);
+    let removed: (&str, &[&str]) = (REMOVED_NODE, &["node"]);
+    let late: (&str, &[&str]) = (LATE_NODE, &["node"]);
+
+    let dir = fixture.data_dir("unknown-host-node");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = identity.clone();
+    options.node_data_dir =
+        agent_store(&fixture, "agent-unknown-host", &[(2, &[host, removed])]).await;
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    assert!(report.survivors.is_empty(), "{:?}", report.survivors);
+    assert_eq!(report.primary.node_id(), None);
+    assert!(!dir.join("primary-node").exists());
+
+    let dir = fixture.data_dir("unknown-host-node-late");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = identity;
+    options.node_data_dir =
+        agent_store(&fixture, "agent-unknown-host-late", &[(2, &[host, late])]).await;
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("node agent last stored {LATE_NODE}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("other than this host's node {UNKNOWN_NODE}")),
+        "{text}"
+    );
+    assert!(!text.contains(&format!("stored {UNKNOWN_NODE}")), "{text}");
+    assert_nothing_installed(&dir);
+}
