@@ -12,7 +12,7 @@
 
 use crate::changelog::{self, Actor, Op};
 use crate::deploy;
-use crate::error::ApiError;
+use crate::error::{ApiError, Reason};
 use crate::fences::UnrecordedFailures;
 use crate::store::now_rfc3339;
 use futures_util::TryStreamExt as _;
@@ -610,24 +610,43 @@ pub(crate) async fn held_by_node(
 /// 8.3 and 8.5 step 3). Writes one change-log entry per lease and returns the
 /// rows; an id with no row, or held by another node, is skipped.
 ///
+/// The token cap (section 8.6, "The cap"; ADR 0321, ADR 0325): every lease
+/// to raise is read and checked before anything is written. When one is
+/// already at [`MAX_TOKEN`], or above it in a corrupted row, the call writes
+/// nothing and answers [`token_exhausted`]. Its callers (acknowledging a
+/// failed fence, declaring a node lost) call it before any write of their
+/// own and drop their transaction on its error, so the refusal changes
+/// nothing else either.
+///
 /// # Errors
 ///
-/// A database error.
+/// `conflict` with `reason: token_exhausted` when a lease to raise is at the
+/// cap, or a database error.
 pub(crate) async fn bump_tokens(
     conn: &mut SqliteConnection,
     lease_ids: &[String],
     holder: &str,
     actor: &Actor,
 ) -> Result<Vec<Lease>, ApiError> {
-    let now = now_rfc3339();
-    let mut bumped = Vec::new();
+    let mut held: Vec<Lease> = Vec::new();
     for lease_id in lease_ids {
-        let Some(mut lease) = by_id(conn, lease_id).await? else {
+        let Some(lease) = by_id(conn, lease_id).await? else {
             continue;
         };
-        if lease.holder_node_id != holder {
+        if lease.holder_node_id != holder || held.iter().any(|seen| seen.id == lease.id) {
             continue;
         }
+        held.push(lease);
+    }
+    let exhausted: Vec<&Lease> = held
+        .iter()
+        .filter(|lease| lease.fencing_token >= MAX_TOKEN)
+        .collect();
+    if !exhausted.is_empty() {
+        return Err(token_exhausted(&exhausted));
+    }
+    let now = now_rfc3339();
+    for lease in &mut held {
         lease.fencing_token = lease.fencing_token.max(0).saturating_add(1);
         if lease.revoked_at.is_none() {
             lease.revoked_at = Some(now.clone());
@@ -639,9 +658,32 @@ pub(crate) async fn bump_tokens(
             .execute(&mut *conn)
             .await?;
         changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
-        bumped.push(lease);
     }
-    Ok(bumped)
+    Ok(held)
+}
+
+/// `409 conflict` with `reason: token_exhausted` (section 8.6, "The cap";
+/// ADR 0321, ADR 0325), naming each lease whose token is already at
+/// [`MAX_TOKEN`] and that token, so the operator sees which row cannot move.
+#[must_use]
+pub(crate) fn token_exhausted(exhausted: &[&Lease]) -> ApiError {
+    let named: Vec<String> = exhausted
+        .iter()
+        .map(|lease| {
+            format!(
+                "lease {} is at fencing token {}",
+                lease.id, lease.fencing_token
+            )
+        })
+        .collect();
+    ApiError {
+        reason: Some(Reason::TokenExhausted),
+        ..ApiError::conflict(format!(
+            "{}, and {MAX_TOKEN} is the highest token the change log carries: the token cannot \
+             be raised, so nothing was written; recovery is a human action",
+            named.join("; ")
+        ))
+    }
 }
 
 /// The highest token any primary issues (section 8.5): 2^53 − 1, the highest
@@ -1568,6 +1610,109 @@ mod tests {
                 .unwrap();
             assert_eq!(stored, token);
         }
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// `(fencing_token, revoked_at)` of `lease_id`, read in `conn`.
+    async fn token_and_revoked(
+        conn: &mut sqlx::SqliteConnection,
+        lease_id: &str,
+    ) -> (i64, Option<String>) {
+        sqlx::query_as("SELECT fencing_token, revoked_at FROM leases WHERE id = ?")
+            .bind(lease_id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    async fn change_log_rows(conn: &mut sqlx::SqliteConnection) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM change_log")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    /// Section 8.6, "The cap" (ADR 0321, ADR 0325): `bump_tokens` checks
+    /// every lease it would raise before it writes. A list with one lease at
+    /// the cap and one below it is refused with `409 conflict` and
+    /// `reason: token_exhausted`, naming the exhausted lease and its token,
+    /// and neither lease is written, nor any change-log entry. A lease one
+    /// below the cap is raised to it, and its entry is one the change log
+    /// takes.
+    #[tokio::test]
+    async fn a_raise_past_the_cap_writes_nothing_and_answers_token_exhausted() {
+        let (store, lease, actor, data_dir) = store_with_lease().await;
+        let below = "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0F";
+        sqlx::query(
+            "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+             fencing_token, granted_at) VALUES (?, 'app', 'app_y', ?, 'local', ?, ?)",
+        )
+        .bind(below)
+        .bind(&lease.holder_node_id)
+        .bind(super::MAX_TOKEN - 1)
+        .bind("2026-11-07T10:00:00Z")
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE leases SET fencing_token = ? WHERE id = ?")
+            .bind(super::MAX_TOKEN)
+            .bind(&lease.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        // The exhausted lease listed after the one below the cap: the check
+        // runs before the first write, whatever the order.
+        let mut w = store.begin_write().await.unwrap();
+        let entries = change_log_rows(&mut w.tx).await;
+        let refused = super::bump_tokens(
+            &mut w.tx,
+            &[below.to_string(), lease.id.clone()],
+            &lease.holder_node_id,
+            &actor,
+        )
+        .await
+        .expect_err("one lease is at the cap");
+        assert_eq!(refused.code, crate::error::Code::Conflict);
+        assert_eq!(refused.reason, Some(crate::error::Reason::TokenExhausted));
+        let detail = refused.detail.unwrap_or_default();
+        assert!(
+            detail.contains(&format!(
+                "lease {} is at fencing token {}",
+                lease.id,
+                super::MAX_TOKEN
+            )),
+            "{detail}"
+        );
+        assert!(!detail.contains(below), "{detail}");
+        assert_eq!(
+            token_and_revoked(&mut w.tx, &lease.id).await,
+            (super::MAX_TOKEN, None)
+        );
+        assert_eq!(
+            token_and_revoked(&mut w.tx, below).await,
+            (super::MAX_TOKEN - 1, None)
+        );
+        assert_eq!(change_log_rows(&mut w.tx).await, entries);
+        drop(w);
+
+        // One below the cap: raised to it and recorded revoked.
+        let mut w = store.begin_write().await.unwrap();
+        let bumped = super::bump_tokens(
+            &mut w.tx,
+            &[below.to_string()],
+            &lease.holder_node_id,
+            &actor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bumped.len(), 1);
+        assert_eq!(bumped[0].fencing_token, super::MAX_TOKEN);
+        let (token, revoked_at) = token_and_revoked(&mut w.tx, below).await;
+        assert_eq!(token, super::MAX_TOKEN);
+        assert!(revoked_at.is_some());
+        assert_eq!(change_log_rows(&mut w.tx).await, entries + 1);
+        w.commit().await.unwrap();
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
