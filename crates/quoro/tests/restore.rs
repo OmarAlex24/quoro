@@ -24,6 +24,9 @@ const REPOSITORY: &str = "brp_01JCA0A2B3C4D5E6F7G8H9J0KM";
 const PREFIX: &str = "backups";
 const SIGNING_SEED: [u8; 32] = [7; 32];
 const DATA_KEY: [u8; 48] = [0x11; 48];
+/// The statement of `--accept-loss`.
+const STATEMENT: &str =
+    "no other machine with the node role survives, and no control plane of this cluster runs";
 const OLD: &str = "2026-11-05T03:00:42Z";
 const NEW: &str = "2026-11-05T09:00:00Z";
 
@@ -160,8 +163,17 @@ impl Fixture {
             node_id: None,
             // No node agent on this host unless a test writes one.
             identity_file: self.base.join("no-node-agent").join("identity.json"),
+            node_data_dir: self.base.join("no-node-agent"),
+            accept_loss: None,
             dry_run: false,
         }
+    }
+
+    /// [`Fixture::options`] with `--accept-loss` and [`STATEMENT`].
+    fn forced_options(&self, data_dir: &Path) -> restore::Options {
+        let mut options = self.options(data_dir, None);
+        options.accept_loss = Some(STATEMENT.into());
+        options
     }
 
     /// Writes a node agent identity file of `cluster_id` naming `node_id` and
@@ -205,6 +217,7 @@ async fn make_database(path: &Path, value: &str) -> Vec<u8> {
         .execute(&pool)
         .await
         .unwrap();
+    create_nodes(&pool, &[]).await;
     create_change_log(&pool, &[]).await;
     sqlx::query("INSERT INTO restored (value) VALUES (?)")
         .bind(value)
@@ -218,8 +231,9 @@ async fn make_database(path: &Path, value: &str) -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
-/// A database with a `nodes` table holding `(id, status, cp_status)` rows,
-/// the columns `quoro restore` reads, and an empty change log.
+/// A database with a `nodes` table holding `(id, status, cp_status)` rows of
+/// machines with the `node` role, the columns `quoro restore` reads, and an
+/// empty change log.
 async fn make_database_with_nodes(path: &Path, nodes: &[(&str, &str, Option<&str>)]) -> Vec<u8> {
     make_database_with(path, nodes, &[]).await
 }
@@ -231,6 +245,20 @@ async fn make_database_with(
     nodes: &[(&str, &str, Option<&str>)],
     log: &[(i64, &str)],
 ) -> Vec<u8> {
+    let machines: Vec<(&str, &str, &str, Option<&str>)> = nodes
+        .iter()
+        .map(|(id, status, cp_status)| (*id, r#"["node"]"#, *status, *cp_status))
+        .collect();
+    make_database_of(path, &machines, log).await
+}
+
+/// A database whose `nodes` table holds `(id, roles, status, cp_status)`
+/// rows, `roles` as JSON, with the change-log entries `log`.
+async fn make_database_of(
+    path: &Path,
+    machines: &[(&str, &str, &str, Option<&str>)],
+    log: &[(i64, &str)],
+) -> Vec<u8> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true);
@@ -239,25 +267,35 @@ async fn make_database_with(
         .connect_with(options)
         .await
         .unwrap();
-    sqlx::query("CREATE TABLE nodes (id TEXT PRIMARY KEY, status TEXT NOT NULL, cp_status TEXT)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    for (id, status, cp_status) in nodes {
-        sqlx::query("INSERT INTO nodes (id, status, cp_status) VALUES (?, ?, ?)")
-            .bind(id)
-            .bind(status)
-            .bind(cp_status)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
+    create_nodes(&pool, machines).await;
     create_change_log(&pool, log).await;
     let _ = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
         .execute(&pool)
         .await;
     pool.close().await;
     std::fs::read(path).unwrap()
+}
+
+/// The `nodes` columns `quoro restore` reads, with the rows `machines` as
+/// `(id, roles, status, cp_status)`.
+async fn create_nodes(pool: &sqlx::SqlitePool, machines: &[(&str, &str, &str, Option<&str>)]) {
+    sqlx::query(
+        "CREATE TABLE nodes (id TEXT PRIMARY KEY, roles TEXT NOT NULL, status TEXT NOT NULL, \
+         cp_status TEXT)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    for (id, roles, status, cp_status) in machines {
+        sqlx::query("INSERT INTO nodes (id, roles, status, cp_status) VALUES (?, ?, ?, ?)")
+            .bind(id)
+            .bind(roles)
+            .bind(status)
+            .bind(cp_status)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 /// The `change_log` columns `quoro restore` reads, with the entries `log`
@@ -686,7 +724,9 @@ const UNKNOWN_NODE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0E";
 const OTHER_CLUSTER: &str = "cls_01JC9Z1A2B3C4D5E6F7G8H9J0Z";
 
 /// A fixture whose one backup holds a `nodes` table: the old host's primary,
-/// the new host's node, another node and a removed one.
+/// the new host's node, another node and a removed one. The two other live
+/// nodes refuse a restore without `--accept-loss` (ADR 0261), so the tests of
+/// the pick that restore give the flag.
 async fn node_fixture() -> Fixture {
     let fixture = Fixture::new().await;
     let database = make_database_with_nodes(
@@ -709,7 +749,7 @@ async fn node_fixture() -> Fixture {
 async fn the_identity_file_of_this_cluster_names_the_new_primary_node() {
     let fixture = node_fixture().await;
     let dir = fixture.data_dir("identity");
-    let mut options = fixture.options(&dir, None);
+    let mut options = fixture.forced_options(&dir);
     options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
 
     let report = restore::execute(&fixture.store, &options).await.unwrap();
@@ -728,7 +768,7 @@ async fn the_identity_file_of_this_cluster_names_the_new_primary_node() {
 async fn an_identity_file_of_another_cluster_writes_no_marker() {
     let fixture = node_fixture().await;
     let dir = fixture.data_dir("other-cluster");
-    let mut options = fixture.options(&dir, None);
+    let mut options = fixture.forced_options(&dir);
     options.identity_file = fixture.identity_file("identity.json", OTHER_CLUSTER, NEW_NODE);
 
     let report = restore::execute(&fixture.store, &options).await.unwrap();
@@ -749,7 +789,7 @@ async fn an_identity_file_naming_an_unknown_or_removed_node_writes_no_marker() {
         ("removed", REMOVED_NODE, "is removed"),
     ] {
         let dir = fixture.data_dir(&format!("identity-{name}"));
-        let mut options = fixture.options(&dir, None);
+        let mut options = fixture.forced_options(&dir);
         options.identity_file =
             fixture.identity_file(&format!("identity-{name}.json"), CLUSTER, node_id);
 
@@ -768,7 +808,7 @@ async fn no_identity_file_writes_no_marker() {
     let fixture = node_fixture().await;
     let dir = fixture.data_dir("no-identity");
 
-    let report = restore::execute(&fixture.store, &fixture.options(&dir, None))
+    let report = restore::execute(&fixture.store, &fixture.forced_options(&dir))
         .await
         .unwrap();
     assert!(report.installed);
@@ -805,7 +845,7 @@ async fn a_node_id_the_database_does_not_hold_or_holds_removed_is_refused() {
 async fn node_id_overrides_the_identity_file() {
     let fixture = node_fixture().await;
     let dir = fixture.data_dir("node-id");
-    let mut options = fixture.options(&dir, None);
+    let mut options = fixture.forced_options(&dir);
     options.node_id = Some(OTHER_NODE.into());
     options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
 
@@ -826,7 +866,7 @@ async fn node_id_overrides_the_identity_file() {
 async fn a_dry_run_reports_the_node_and_writes_no_marker() {
     let fixture = node_fixture().await;
     let dir = fixture.data_dir("dry-run-node");
-    let mut options = fixture.options(&dir, None);
+    let mut options = fixture.forced_options(&dir);
     options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
     options.dry_run = true;
 
@@ -900,10 +940,9 @@ async fn the_marker_names_the_restored_logs_head() {
     let (h1, h2, h3) = (hash(1), hash(2), hash(3));
     let database = make_database_with(
         &fixture.base.join("logged.db"),
-        &[
-            (OLD_NODE, "connected", Some("primary")),
-            (NEW_NODE, "pending", None),
-        ],
+        // A cluster whose only node is the new host's own restores without
+        // --accept-loss.
+        &[(NEW_NODE, "connected", Some("primary"))],
         &[(1, h1.as_str()), (2, h2.as_str()), (3, h3.as_str())],
     )
     .await;
@@ -1073,4 +1112,373 @@ async fn a_restore_that_stops_before_installing_deletes_the_marker() {
         .unwrap_err();
     assert!(error.to_string().contains("signing key"), "{error}");
     assert_nothing_installed(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The refusal and --accept-loss (section 8.2, "When a restore is refused" and
+// "Override"; ADR 0261)
+// ---------------------------------------------------------------------------
+
+/// A node enrolled after the backup: only this host's node agent knows it.
+const LATE_NODE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0F";
+/// A machine with the `edge` role only.
+const EDGE_NODE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0G";
+/// A machine with the `witness` role only.
+const WITNESS_NODE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0H";
+
+/// A machine of the restored `nodes` table: `(id, roles, status, cp_status)`.
+type Machine<'a> = (&'a str, &'a str, &'a str, Option<&'a str>);
+
+/// The new host's node as the only live machine with the `node` role, next
+/// to a removed node, an edge-only and a witness-only machine.
+const ONLY_THE_HOSTS_NODE: [Machine<'static>; 4] = [
+    (NEW_NODE, r#"["node"]"#, "connected", Some("primary")),
+    (REMOVED_NODE, r#"["node"]"#, "removed", None),
+    (EDGE_NODE, r#"["edge"]"#, "connected", None),
+    (WITNESS_NODE, r#"["witness"]"#, "connected", None),
+];
+
+/// A fixture whose one backup holds `machines` and an empty change log.
+async fn machines_fixture(machines: &[Machine<'_>]) -> Fixture {
+    let fixture = Fixture::new().await;
+    let database = make_database_of(&fixture.base.join("machines.db"), machines, &[]).await;
+    fixture
+        .add_backup("bkp_01JC9Z1A2B3C4D5E6F7G8H9J0K", &database, NEW)
+        .await;
+    fixture
+}
+
+/// One stored desired state: its `rev` and the `(node_id, roles)` of its
+/// `spec.votes.voters`.
+type Revision<'a> = (u64, &'a [(&'a str, &'a [&'a str])]);
+
+/// Writes a node agent store into the new directory `name`, as the agent
+/// stores desired state (`quoro_node_agent::store::NodeStore`, bodies sealed
+/// with its node-local key), one per revision, and returns the directory.
+async fn agent_store(fixture: &Fixture, name: &str, revisions: &[Revision<'_>]) -> PathBuf {
+    let dir = fixture.base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = quoro_node_agent::store::NodeStore::open(&dir)
+        .await
+        .unwrap();
+    for (rev, voters) in revisions {
+        let voters: Vec<serde_json::Value> = voters
+            .iter()
+            .map(|(node_id, roles)| {
+                serde_json::json!({ "node_id": node_id, "roles": roles, "mesh_address": null })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "rev": rev,
+            "issued_at": NEW,
+            "term": 1,
+            "spec": { "votes": { "version": rev, "port": 51821, "voters": voters } },
+            "signature": "",
+        });
+        store.store_desired(*rev, &body).await.unwrap();
+    }
+    store.pool().close().await;
+    dir
+}
+
+fn forced_marker(head: Head) -> Marker {
+    Marker {
+        head,
+        accept_loss: true,
+        statement: Some(STATEMENT.to_string()),
+    }
+}
+
+fn genesis() -> Head {
+    Head {
+        seq: 0,
+        hash: GENESIS_HASH.to_string(),
+    }
+}
+
+/// Another live machine with the `node` role in the restored database
+/// refuses the restore before anything is installed. The new host's node, a
+/// removed node and machines without the `node` role do not count.
+#[tokio::test]
+async fn a_restored_database_with_another_live_node_is_refused() {
+    let mut machines = ONLY_THE_HOSTS_NODE.to_vec();
+    machines.push((OTHER_NODE, r#"["node","edge"]"#, "disconnected", None));
+    let fixture = machines_fixture(&machines).await;
+    let dir = fixture.data_dir("another-node");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, restore::Error::Failed(_)), "{error:?}");
+    let text = error.to_string();
+    assert!(text.contains("refusing to restore"), "{text}");
+    assert!(
+        text.contains(&format!("restored database holds {OTHER_NODE}")),
+        "{text}"
+    );
+    for id in [REMOVED_NODE, EDGE_NODE, WITNESS_NODE] {
+        assert!(!text.contains(id), "{id} does not count: {text}");
+    }
+    assert!(text.contains("--accept-loss --statement"), "{text}");
+    assert_nothing_installed(&dir);
+}
+
+/// A cluster whose only node is the new host's own restores as before, also
+/// when the host's node agent stored voters: a removed node and a
+/// witness-only machine among them do not count either. The marker is a
+/// plain one.
+#[tokio::test]
+async fn only_the_new_hosts_node_restores_as_before() {
+    let fixture = machines_fixture(&ONLY_THE_HOSTS_NODE).await;
+    let dir = fixture.data_dir("only-the-host");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+    options.node_data_dir = agent_store(
+        &fixture,
+        "agent",
+        &[(
+            3,
+            &[
+                (NEW_NODE, &["node"]),
+                (REMOVED_NODE, &["node"]),
+                (WITNESS_NODE, &["witness"]),
+            ],
+        )],
+    )
+    .await;
+
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    assert!(report.survivors.is_empty(), "{:?}", report.survivors);
+    assert!(!report.accept_loss);
+    let marker =
+        Marker::parse(&std::fs::read(dir.join(restore_pending::MARKER_FILE)).unwrap()).unwrap();
+    assert_eq!(marker, Marker::plain(genesis()));
+}
+
+/// A node enrolled after the backup is not in the restored database, but the
+/// newest `spec.votes.voters` this host's node agent stored names it: the
+/// restore is refused. Only the newest stored desired state counts.
+#[tokio::test]
+async fn the_agents_newest_voters_refuse_a_node_enrolled_after_the_backup() {
+    let fixture =
+        machines_fixture(&[(NEW_NODE, r#"["node"]"#, "connected", Some("primary"))]).await;
+    let identity = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+    let host: (&str, &[&str]) = (NEW_NODE, &["node"]);
+    let late: (&str, &[&str]) = (LATE_NODE, &["node"]);
+
+    let dir = fixture.data_dir("late-newest");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = identity.clone();
+    options.node_data_dir = agent_store(
+        &fixture,
+        "agent-late-newest",
+        &[(4, &[host]), (5, &[host, late])],
+    )
+    .await;
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("node agent last stored {LATE_NODE}")),
+        "{text}"
+    );
+    assert_nothing_installed(&dir);
+
+    // The same node in an older revision only: the newest one counts.
+    let dir = fixture.data_dir("late-older");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = identity;
+    options.node_data_dir = agent_store(
+        &fixture,
+        "agent-late-older",
+        &[(4, &[host, late]), (5, &[host])],
+    )
+    .await;
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    assert!(report.survivors.is_empty(), "{:?}", report.survivors);
+}
+
+/// A node agent store that exists but cannot be read leaves the restore
+/// unable to tell which nodes enrolled after the backup, so it refuses;
+/// `--accept-loss` does not read it, and restores.
+#[tokio::test]
+async fn an_agent_store_that_cannot_be_read_refuses_without_the_flag() {
+    let fixture =
+        machines_fixture(&[(NEW_NODE, r#"["node"]"#, "connected", Some("primary"))]).await;
+    let agent = fixture.base.join("broken-agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(agent.join("node.db"), b"not a sqlite file at all").unwrap();
+    let identity = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+
+    let dir = fixture.data_dir("broken-agent-plain");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = identity.clone();
+    options.node_data_dir = agent.clone();
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot read the newest desired state"),
+        "{error}"
+    );
+    assert_nothing_installed(&dir);
+
+    let dir = fixture.data_dir("broken-agent-forced");
+    let mut options = fixture.forced_options(&dir);
+    options.identity_file = identity;
+    options.node_data_dir = agent;
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    assert!(report.accept_loss);
+}
+
+/// A single-node cluster restored onto a fresh host needs the flag: the dead
+/// node is not the new host's node, which has none.
+#[tokio::test]
+async fn a_single_node_cluster_restored_onto_a_fresh_host_needs_the_flag() {
+    let fixture =
+        machines_fixture(&[(OLD_NODE, r#"["node"]"#, "connected", Some("primary"))]).await;
+
+    let dir = fixture.data_dir("fresh-host-plain");
+    let error = restore::execute(&fixture.store, &fixture.options(&dir, None))
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains(OLD_NODE), "{text}");
+    assert!(
+        text.contains("this host has no node of the cluster"),
+        "{text}"
+    );
+    assert_nothing_installed(&dir);
+
+    let dir = fixture.data_dir("fresh-host-forced");
+    let report = restore::execute(&fixture.store, &fixture.forced_options(&dir))
+        .await
+        .unwrap();
+    assert!(report.installed);
+    assert_eq!(report.survivors.in_database, vec![OLD_NODE.to_string()]);
+    assert!(!dir.join("primary-node").exists());
+}
+
+/// `--accept-loss --statement` restores a backup whose other nodes would
+/// refuse it. The marker carries both, and the report lists the machines the
+/// primary's first write removes: every live one with the `node` role other
+/// than the new host's node.
+#[tokio::test]
+async fn accept_loss_restores_and_the_marker_carries_the_statement() {
+    let fixture = node_fixture().await;
+    let identity = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+
+    let dir = fixture.data_dir("plain");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = identity.clone();
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("holds {OLD_NODE}, {OTHER_NODE}")),
+        "{text}"
+    );
+    assert_nothing_installed(&dir);
+
+    let dir = fixture.data_dir("forced");
+    let mut options = fixture.forced_options(&dir);
+    options.identity_file = identity;
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    assert!(report.accept_loss);
+    assert_eq!(
+        report.survivors.in_database,
+        vec![OLD_NODE.to_string(), OTHER_NODE.to_string()]
+    );
+    let bytes = std::fs::read(dir.join(restore_pending::MARKER_FILE)).unwrap();
+    let marker = Marker::parse(&bytes).unwrap();
+    assert_eq!(marker, forced_marker(genesis()));
+    assert_eq!(bytes, marker.to_bytes());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("primary-node"))
+            .unwrap()
+            .trim(),
+        NEW_NODE
+    );
+}
+
+/// A blank statement is refused as a usage error before anything is
+/// touched, also when `execute` is called without the command line.
+#[tokio::test]
+async fn a_blank_statement_is_refused() {
+    let fixture = Fixture::new().await;
+    let dir = fixture.data_dir("blank-statement");
+    let mut options = fixture.options(&dir, None);
+    options.accept_loss = Some(" \n".into());
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, restore::Error::Usage(_)), "{error:?}");
+    assert!(!dir.exists());
+}
+
+/// `--accept-loss` needs a non-empty `--statement`, `--statement` needs
+/// `--accept-loss`, and a statement that starts with `--` is a flag the shell
+/// passed in its place: each is a usage error, exit `2`, before any file is
+/// read.
+#[cfg(unix)]
+#[test]
+fn the_command_checks_accept_loss_and_its_statement() {
+    let base = [
+        "restore",
+        "--endpoint",
+        "https://example.invalid",
+        "--region",
+        "auto",
+        "--bucket",
+        "backups",
+        "--prefix",
+        "quoro",
+        "--cluster-id",
+        CLUSTER,
+        "--credentials-file",
+        "/nonexistent/credentials",
+        "--recovery-key-file",
+        "/nonexistent/recovery.key",
+        "--signing-key-file",
+        "/nonexistent/signing.key",
+        "--data-key-file",
+        "/nonexistent/data.key",
+        "--data-dir",
+        "/nonexistent/data",
+    ];
+    let cases: [(&[&str], &str); 4] = [
+        (&["--accept-loss"], "--accept-loss needs --statement"),
+        (
+            &["--statement", "nothing survives"],
+            "--statement needs --accept-loss",
+        ),
+        (
+            &["--accept-loss", "--statement", "   "],
+            "non-empty statement",
+        ),
+        (
+            &["--accept-loss", "--statement", "--dry-run"],
+            "starts with --",
+        ),
+    ];
+    for (extra, expected) in cases {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_quoro"))
+            .args(base)
+            .args(extra)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{extra:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{extra:?}: {stderr}");
+    }
 }

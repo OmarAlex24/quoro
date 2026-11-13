@@ -29,8 +29,9 @@
 //! - **It matches the database's log head:** this is the first start after
 //!   the restore, and the first write is made from it. In one transaction it
 //!   marks every `expiring` lease row unsettled (node-agent-protocol.md
-//!   section 8.4, "The mark", [`crate::leases::mark_expiring_rows`]), moves
-//!   the primary status when `primary-node` asks for it
+//!   section 8.4, "The mark", [`crate::leases::mark_expiring_rows`]), makes
+//!   the removals of `--accept-loss` when the marker asks for them (below),
+//!   moves the primary status when `primary-node` asks for it
 //!   ([`crate::primary_status::move_in`], `cluster.primary_moved`), and
 //!   records the marker's head in `meta.restore_marker`. `meta` is not in the
 //!   log, so that record is local. Once the transaction commits,
@@ -43,21 +44,51 @@
 //! Without a marker, and after a marker that names another database,
 //! `primary-node` is applied as before ([`crate::primary_status::apply_marker`]).
 //!
-//! `--accept-loss` is not built yet: its part of the first write (the
-//! removals, the token raises, the seal deletions and `cluster.restored`)
-//! comes later in issue #838. A marker that asks for it and names this
-//! database stops the start in [`check`], before the migrations and with
-//! nothing written, and stays, so the restore is not taken as done without
-//! that part.
+//! **`--accept-loss` (ADR 0261, ADR 0280).** The operator's statement says
+//! that no other machine with the `node` role survives. So the same first
+//! write also removes every machine with the `node` role that the restored
+//! database holds, not `removed`, other than the new host's node: the node
+//! `primary-node` names, the one `quoro restore` picked. With no
+//! `primary-node`, the new host has no node of the restored database, and
+//! every such machine is removed ([`to_remove`]). For each one, in this order
+//! ([`remove_the_lost`]):
+//!
+//! - the token of each lease it holds goes up by one and the row is recorded
+//!   revoked, as declaring the node lost does (node-agent-protocol.md section
+//!   8.3, [`crate::api::nodes::declare_lost_write`], which also sets
+//!   `lost_at`);
+//! - it turns `removed`, with its node entry, the whole row, as `removeNode`
+//!   writes a removal (section 10), so the voter set and the required set of
+//!   section 8.4 read it removed from that `seq` on;
+//! - its custody seals are deleted (section 7.2,
+//!   [`crate::custody::delete_seals`]) and the records of the quarantined
+//!   copies it keeps are dropped ([`crate::quarantines::drop_node_copies`]),
+//!   as a removal does (section 10).
+//!
+//! Then the write records `cluster.restored` (`audit-log-format.md` section
+//! 3.9), before the move's `cluster.primary_moved`, so it is the first record
+//! of the write. That write may remove more than one voter at once and runs
+//! no gate: it is exempt from node-agent-protocol.md section 8.10 rules 1 and
+//! 2.
+//!
+//! The token cap (node-agent-protocol.md section 8.6, ADR 0325): [`check`]
+//! reads every lease that write would raise and stops the start, before the
+//! migrations and with nothing written, when one is already at the cap
+//! ([`leases_at_cap`]), naming each with its token. `quoro restore
+//! --accept-loss` makes the same check on the restored database before it
+//! installs anything. The raise itself refuses at the cap too, as a backstop,
+//! and then the first write is not committed.
 
 use std::path::Path;
 
 use serde_json::{Map, Value, json};
 use sqlx::SqliteConnection;
 
-use crate::changelog::Actor;
+use crate::audit::{Channel, Outcome, Record};
+use crate::changelog::{self, Actor, Op};
+use crate::error::ApiError;
 use crate::primary_status::{self, File, Moved};
-use crate::store::{GENESIS_HASH, Store};
+use crate::store::{GENESIS_HASH, Store, read_term};
 
 /// The marker `quoro restore` writes into the data directory, next to the
 /// database and to `primary-node`.
@@ -68,8 +99,13 @@ pub const MARKER_FILE: &str = "restore-pending";
 pub const META_KEY: &str = "restore_marker";
 
 /// The system actor of the first write's entries, as of the primary status
-/// move it may carry (`audit-log-format.md` section 3.5).
+/// move it may carry (`audit-log-format.md` section 3.5), and of
+/// `cluster.restored` (section 3.9).
 const ACTOR: &str = "cluster";
+
+/// The system record of a first write made after `--accept-loss`
+/// (`audit-log-format.md` section 3.9).
+pub const RESTORED_OPERATION: &str = "cluster.restored";
 
 /// The largest `seq` a marker may name: entries are numbered within the
 /// IEEE-754 safe range, as every integer of the change log is.
@@ -253,9 +289,15 @@ pub enum Applied {
     NoMarker,
     /// The marker matched `meta.restore_marker`: deleted, nothing written.
     AlreadyWritten,
-    /// The first write committed; it marked `marked` lease rows and moved
-    /// the primary status when `moved`.
-    FirstWrite { marked: usize, moved: bool },
+    /// The first write committed; it marked `marked` lease rows, removed the
+    /// machines `removed` lists (only after `--accept-loss`, which also
+    /// recorded `cluster.restored`), and moved the primary status when
+    /// `moved`.
+    FirstWrite {
+        marked: usize,
+        removed: Vec<String>,
+        moved: bool,
+    },
     /// The marker named another log head, or could not be read or parsed:
     /// deleted (a failure to delete it is logged), nothing written from it.
     OtherDatabase,
@@ -274,10 +316,12 @@ pub enum Applied {
 /// # Errors
 ///
 /// A one-line reason that stops the start, with nothing written, nothing
-/// migrated and the marker and `primary-node` left in place: a marker of this
-/// database that asks for `--accept-loss`, which is not built yet; a
-/// `primary-node` file that cannot be read when the first write is due; or a
-/// database error.
+/// migrated and the marker and `primary-node` left in place: a
+/// `primary-node` file that cannot be read when the first write is due;
+/// after `--accept-loss`, a lease of a machine to remove whose token is
+/// already at the cap (`token_exhausted`, node-agent-protocol.md section
+/// 8.6), which stops every later start the same way until an operator
+/// resolves it; or a database error.
 pub async fn check(store: &Store, data_dir: &Path) -> Result<Pending, String> {
     let path = data_dir.join(MARKER_FILE);
     let marker = match std::fs::read(&path) {
@@ -318,15 +362,6 @@ pub async fn check(store: &Store, data_dir: &Path) -> Result<Pending, String> {
         });
     }
 
-    if marker.accept_loss {
-        return Err(format!(
-            "{} asks for a restore with --accept-loss, whose first write (removing the other \
-             nodes, raising their lease tokens, deleting their custody seals and recording \
-             cluster.restored) this version does not make yet; the start stops before its \
-             migrations, and nothing was written",
-            path.display()
-        ));
-    }
     let node_id = match primary_status::read_file(data_dir) {
         File::Missing => None,
         File::Text(text) => Some(text.trim().to_string()),
@@ -339,6 +374,9 @@ pub async fn check(store: &Store, data_dir: &Path) -> Result<Pending, String> {
             ));
         }
     };
+    if marker.accept_loss {
+        check_accept_loss(store, &path, node_id.as_deref()).await?;
+    }
     Ok(Pending::FirstWrite { marker, node_id })
 }
 
@@ -378,9 +416,11 @@ async fn read_database(store: &Store) -> Result<(Option<String>, Head), sqlx::Er
 ///
 /// # Errors
 ///
-/// A one-line reason for a database error, which stops the start. The first
-/// write is then not committed, so none of it is written, and the marker and
-/// `primary-node` stay for the next start.
+/// A one-line reason for a database error, which stops the start, or, after
+/// `--accept-loss`, for a lease to raise at the token cap, the backstop of
+/// what [`check`] already refuses. The first write is then not committed, so
+/// none of it is written, and the marker and `primary-node` stay for the next
+/// start.
 pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<Applied, String> {
     let path = data_dir.join(MARKER_FILE);
     let (marker, node_id) = match pending {
@@ -430,6 +470,20 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
                     .unwrap_or_else(|| error.code.as_str().to_string())
             )
         })?;
+    let removed = match (marker.accept_loss, marker.statement.as_deref()) {
+        (true, Some(statement)) => {
+            remove_the_lost(
+                &mut w.tx,
+                &actor,
+                &marker.head,
+                node_id.as_deref(),
+                statement,
+            )
+            .await?
+        }
+        _ => Vec::new(),
+    };
+    // After `cluster.restored`, so that record is the write's first.
     let moved = match &node_id {
         Some(node_id) => Some(primary_status::move_in(&mut w.tx, node_id).await?),
         None => None,
@@ -456,11 +510,252 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
         marked = marked.len(),
         "made the restored primary's first write: every expiring lease row is marked unsettled"
     );
+    if marker.accept_loss {
+        tracing::warn!(
+            removed_node_ids = ?removed,
+            "the restore was made with --accept-loss: its first write removed every other machine with the node role and recorded cluster.restored"
+        );
+    }
     remove(&path);
     Ok(Applied::FirstWrite {
         marked: marked.len(),
+        removed,
         moved: matches!(moved, Some(Moved::Yes { .. })),
     })
+}
+
+/// The `--accept-loss` part of the first write ([module docs](self)), in the
+/// first write's transaction `conn`, after the mark: removes every machine
+/// with the `node` role that the database holds, not `removed`, other than
+/// `host_node`, the node `primary-node` names; then records
+/// `cluster.restored` with the operator's `statement`. Returns the removed
+/// ids, by id.
+///
+/// `cluster.restored`'s `params.term` is the term the database holds when
+/// the write runs (`meta.term`), and its `change_seq` is the removal entry of
+/// the last machine removed, or, with none removed, the newest entry the
+/// write appended before it, if any.
+///
+/// # Errors
+///
+/// A one-line reason after which the caller drops the transaction, so
+/// nothing is written: a lease at the token cap (`token_exhausted`), a
+/// `meta.term` or `meta.cluster_id` that cannot be read, or a database
+/// error.
+async fn remove_the_lost(
+    conn: &mut SqliteConnection,
+    actor: &Actor,
+    head: &Head,
+    host_node: Option<&str>,
+    statement: &str,
+) -> Result<Vec<String>, String> {
+    let term = read_term(&mut *conn)
+        .await
+        .map_err(|error| format!("cannot read the term for {RESTORED_OPERATION}: {error}"))?;
+    let cluster_id: Option<String> =
+        sqlx::query_scalar("SELECT value FROM meta WHERE key = 'cluster_id'")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|error| format!("cannot read meta.cluster_id: {error}"))?;
+    let Some(cluster_id) = cluster_id else {
+        return Err(format!(
+            "the database names no cluster (meta.cluster_id) for {RESTORED_OPERATION}"
+        ));
+    };
+    let lost = to_remove(&mut *conn, host_node).await?;
+
+    let mut last_removal = None;
+    for node_id in &lost {
+        crate::api::nodes::declare_lost_write(conn, node_id, actor)
+            .await
+            .map_err(|error| {
+                api_reason(
+                    &format!(
+                        "cannot raise the lease tokens of node {node_id}, which --accept-loss \
+                         removes"
+                    ),
+                    error,
+                )
+            })?;
+        sqlx::query("UPDATE nodes SET status = 'removed' WHERE id = ?")
+            .bind(node_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| format!("cannot remove node {node_id}: {error}"))?;
+        let payload = crate::driver::node_payload(conn, node_id)
+            .await
+            .map_err(|error| api_reason(&format!("cannot read node {node_id}"), error))?;
+        last_removal = Some(
+            changelog::append(conn, actor, "node", node_id, Op::Update, payload)
+                .await
+                .map_err(|error| format!("cannot log the removal of node {node_id}: {error}"))?,
+        );
+        crate::custody::delete_seals(conn, node_id).await?;
+        crate::quarantines::drop_node_copies(conn, actor, node_id)
+            .await
+            .map_err(|error| {
+                api_reason(
+                    &format!("cannot drop the quarantined copies of node {node_id}"),
+                    error,
+                )
+            })?;
+    }
+
+    let change_seq = match last_removal {
+        Some(seq) => Some(seq),
+        None => {
+            let newest: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|error| format!("cannot read the change log's head: {error}"))?;
+            newest.filter(|seq| *seq > head.seq)
+        }
+    };
+    let record = Record {
+        actor: actor.clone(),
+        agent_model: None,
+        on_behalf_of: None,
+        channel: Channel::System,
+        operation: RESTORED_OPERATION.to_string(),
+        scope: None,
+        target_type: Some("cluster".to_string()),
+        target_id: Some(cluster_id),
+        project_id: None,
+        params: json!({
+            "removed_node_ids": lost,
+            "term": term,
+        }),
+        justification: Some(statement.to_string()),
+        trigger_event_id: None,
+        incident_id: None,
+        grant_id: None,
+        approval_id: None,
+        request_id: quoro_types::new_id(quoro_types::Prefix::Request),
+        result: Outcome::Ok,
+        result_detail: None,
+        change_seq,
+    };
+    crate::audit::append(&mut *conn, &record)
+        .await
+        .map_err(|error| format!("cannot record {RESTORED_OPERATION}: {error}"))?;
+    Ok(lost)
+}
+
+/// The machines the `--accept-loss` part of the first write removes, read
+/// on `conn`: every machine with the `node` role that the database holds,
+/// not `removed`, other than `host_node`, the new host's node. Sorted by id.
+/// `quoro restore --accept-loss` reads the same list from the restored
+/// database before it installs it.
+///
+/// # Errors
+///
+/// A one-line reason when the nodes cannot be read or a node's roles are
+/// not a JSON list of strings.
+pub async fn to_remove(
+    conn: &mut SqliteConnection,
+    host_node: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, roles FROM nodes WHERE status <> 'removed' ORDER BY id")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|error| format!("cannot read the nodes to remove: {error}"))?;
+    let mut lost = Vec::new();
+    for (node_id, roles) in rows {
+        let roles: Vec<String> = serde_json::from_str(&roles)
+            .map_err(|error| format!("cannot read the roles of node {node_id}: {error}"))?;
+        if Some(node_id.as_str()) != host_node && roles.iter().any(|role| role == "node") {
+            lost.push(node_id);
+        }
+    }
+    Ok(lost)
+}
+
+/// Every lease the first write would raise for the machines `node_ids`
+/// that is already at the token cap (node-agent-protocol.md section 8.6,
+/// "The cap"; ADR 0325), read on `conn`, as `(lease id, token)` sorted by
+/// machine, then lease id. These are the rows declaring a node lost raises
+/// ([`crate::leases::held_by_node`]) whose token
+/// [`crate::leases::bump_tokens`] refuses to raise. Only columns of the
+/// first schema are read, so it reads an unmigrated database too.
+///
+/// # Errors
+///
+/// A database error.
+pub async fn leases_at_cap(
+    conn: &mut SqliteConnection,
+    node_ids: &[String],
+) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    let mut at_cap = Vec::new();
+    for node_id in node_ids {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT id, fencing_token FROM leases \
+             WHERE holder_node_id = ? AND revoked_at IS NULL AND fencing_token >= ? ORDER BY id",
+        )
+        .bind(node_id)
+        .bind(crate::leases::MAX_TOKEN)
+        .fetch_all(&mut *conn)
+        .await?;
+        at_cap.extend(rows);
+    }
+    Ok(at_cap)
+}
+
+/// The refusal of a raise past the token cap, naming each `(lease id,
+/// token)` of `at_cap`, worded as every other path that refuses at the cap
+/// ([`crate::leases::token_exhausted_detail`]).
+#[must_use]
+pub fn token_cap_refusal(at_cap: &[(String, i64)]) -> String {
+    let named: Vec<(&str, i64)> = at_cap
+        .iter()
+        .map(|(lease_id, token)| (lease_id.as_str(), *token))
+        .collect();
+    crate::leases::token_exhausted_detail(&named)
+}
+
+/// What [`check`] reads, read-only, for a marker of this database that asks
+/// for `--accept-loss`: that no lease the first write would raise is already
+/// at the token cap. `marker_path` names the marker in the reason;
+/// `host_node` is the node `primary-node` names.
+async fn check_accept_loss(
+    store: &Store,
+    marker_path: &Path,
+    host_node: Option<&str>,
+) -> Result<(), String> {
+    let stops = "the start stops before its migrations, and nothing was written";
+    let mut tx = store.pool().begin().await.map_err(|error| {
+        format!(
+            "cannot read the database before the restored primary's first write: {error}; {stops}"
+        )
+    })?;
+    let lost = to_remove(&mut tx, host_node)
+        .await
+        .map_err(|reason| format!("{reason}; {stops}"))?;
+    let at_cap = leases_at_cap(&mut tx, &lost)
+        .await
+        .map_err(|error| format!("cannot read the lease tokens to raise: {error}; {stops}"))?;
+    tx.rollback().await.map_err(|error| {
+        format!("cannot end the read before the restored primary's first write: {error}; {stops}")
+    })?;
+    if !at_cap.is_empty() {
+        return Err(format!(
+            "{} asks for a restore with --accept-loss, whose first write raises the lease tokens \
+             of the machines it removes: {}; {stops}, and every later start stops the same way \
+             until an operator resolves it",
+            marker_path.display(),
+            token_cap_refusal(&at_cap)
+        ));
+    }
+    Ok(())
+}
+
+/// `what`, an [`ApiError`]'s detail (or its code), and that the first write
+/// wrote nothing: the caller drops the transaction.
+fn api_reason(what: &str, error: ApiError) -> String {
+    let reason = error
+        .detail
+        .unwrap_or_else(|| error.code.as_str().to_string());
+    format!("{what}: {reason}; nothing was written")
 }
 
 /// Deletes the marker; a failure is logged. A marker left behind this way

@@ -85,7 +85,8 @@ commands:
   restore --endpoint URL --region REGION --bucket NAME --prefix PREFIX
           --cluster-id CLS --credentials-file PATH --recovery-key-file PATH
           --signing-key-file PATH --data-key-file PATH --data-dir DIR
-          [--backup BKP] [--node-id NOD] [--dry-run]
+          [--backup BKP] [--node-id NOD] [--accept-loss --statement TEXT]
+          [--dry-run]
                                         restore a control-plane database from
                                         its backup repository, offline (ADR 0148)
 
@@ -100,7 +101,12 @@ the audit log and migrates.
 `quoro restore` names the node on this host that takes the primary status at
 the primary's next start: the one --node-id gives, otherwise the one in
 /var/lib/quoro-node/identity.json when that file exists (backup-format.md
-section 8.2).
+section 8.2). It refuses while another machine with the node role that is not
+removed appears in the restored database or among the voters this host's node
+agent last stored: such a cluster recovers by promoting a surviving node. With
+--accept-loss --statement TEXT, a statement that no other such machine
+survives and no control plane of the cluster runs, it restores anyway, and the
+primary's first write removes those machines (ADR 0261).
 
 quoro mcp stdio speaks MCP on stdin/stdout as one agent. The agent key
 (akey_...) is read from --key-file, a file only its owner may read (chmod 600);
