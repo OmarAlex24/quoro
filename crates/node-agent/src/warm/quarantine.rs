@@ -28,13 +28,16 @@
 //!   without touching any file, only when all three hold: the engine
 //!   answers `NotFound` for the clone as a snapshot of the volume (a pool
 //!   that does not mount answers `Unsupported`), and its path is missing;
-//!   another kept snapshot of the volume answers the engine, so the
-//!   directory is the real one; and the record still has no SHA-256, so the
-//!   primary never recorded the copy. The path checks read one open handle
-//!   of the clone's directory: the clone is missing, the other kept snapshot
-//!   is a regular file there, and the clone is still missing. Otherwise the
-//!   record stays, the hash's warning says why, and the hash is tried again.
-//!   The next report no longer lists a forgotten copy.
+//!   another kept snapshot of the volume answers the engine, or, when none
+//!   does, the engine finds the volume's live file, so the directory is the
+//!   real one; and the record still has no SHA-256, so the primary never
+//!   recorded the copy. Only an `Ok` counts for the live file: `NotFound` is
+//!   a missing file, and `Conflict`, as while a VM attaches the file, is not
+//!   now. The path checks read one open handle of the clone's directory: the
+//!   clone is missing, the other kept snapshot or the live file is a regular
+//!   file there, and the clone is still missing. Otherwise the record stays,
+//!   the hash's warning says why, and the hash is tried again. The next
+//!   report no longer lists a forgotten copy.
 //! - **`spec.quarantine_deletes`.** Each id the node holds is deleted: the
 //!   clone first, through the engine, then its kept snapshot and its record
 //!   in one transaction. Only the record's id and `snapshot_id` are read for
@@ -46,14 +49,15 @@
 //!   [`crate::kept`]).
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::os::unix::fs::FileExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
-use quoro_engine::{Engine, EngineError, RangesOf};
+use quoro_engine::{Engine, EngineError, RangesOf, VolumeId};
 use quoro_proto::wire::QuarantineStatus;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
@@ -433,16 +437,17 @@ impl<E: Engine + 'static> Quarantines<E> {
 impl<E: Engine> Inner<E> {
     /// Forgets the record of copy `id`, with its kept snapshot, when its
     /// clone is gone before it was hashed (section 9 step 2): the engine
-    /// answers `NotFound` for the clone, another kept snapshot of the volume
-    /// answers it, and the record has no SHA-256. Touches no file. Returns
-    /// why the record stays when it does.
+    /// answers `NotFound` for the clone; another kept snapshot of the volume
+    /// answers it, or, when none does, it finds the volume's live file
+    /// ([`Self::live_file`]); and the record has no SHA-256. Touches no
+    /// file. Returns why the record stays when it does.
     ///
     /// The engine's answers are then checked against one open handle of the
     /// clone's directory: the clone is missing from it, the other kept
-    /// snapshot is a regular file in it, and the clone is still missing. A
-    /// volume directory that mounts or unmounts meanwhile cannot split those
-    /// three reads. A copy with no other kept snapshot in that directory is
-    /// never forgotten.
+    /// snapshot or the live file is a regular file in it, and the clone is
+    /// still missing. A volume directory that mounts or unmounts meanwhile
+    /// cannot split those three reads. A copy with neither another kept
+    /// snapshot nor the live file in that directory is never forgotten.
     pub(super) async fn forget_lost_clone(&self, id: &str) -> Result<(), String> {
         let record = match self.store.volume_quarantine(id).await {
             Ok(Some(record)) if record.sha256.is_none() => record,
@@ -467,19 +472,20 @@ impl<E: Engine> Inner<E> {
             // `Unsupported` from a pool that does not mount among them.
             Err(e) => return Err(format!("the engine cannot look the clone up: {e}")),
         }
-        let Some(other) = present_volume_file(
+        let evidence = match present_volume_file(
             self.engine.as_ref(),
             &self.store,
             &record.volume_id,
             Some(&record.snapshot_id),
         )
         .await?
-        else {
-            return Err("no other kept snapshot of the volume answers the engine".to_owned());
+        {
+            Some(other) => Evidence::KeptSnapshot(other),
+            None => self.live_file(&record.volume_id).await?,
         };
         #[cfg(test)]
         run_hook(&self.between_checks);
-        self.clone_missing_beside(&record.path, &other)?;
+        self.clone_missing_beside(&record.path, &evidence)?;
         match self
             .store
             .forget_unhashed_volume_quarantine(id, &record.snapshot_id)
@@ -491,23 +497,55 @@ impl<E: Engine> Inner<E> {
         }
     }
 
+    /// The volume's own live file as the evidence of a lost clone, when no
+    /// other kept snapshot of the volume shows the directory (section 9 step
+    /// 2). The engine compares the file alone, which it runs on the file in
+    /// its current volume directory (`engine-trait.md` section 3.22), and
+    /// only an `Ok` counts.
+    ///
+    /// # Errors
+    ///
+    /// Why the record stays. `NotFound` is a missing file, which shows
+    /// nothing. `Conflict`, as while a VM the engine holds attaches the
+    /// file, is not now: the record stays and the hash is tried again after
+    /// its wait. Any other answer shows nothing either.
+    async fn live_file(&self, volume_id: &str) -> Result<Evidence, String> {
+        match self
+            .engine
+            .volume_changed_ranges(&RangesOf::Volume(VolumeId(volume_id.to_owned())), None)
+            .await
+        {
+            Ok(_) => Ok(Evidence::LiveFile(volume_id.to_owned())),
+            Err(EngineError::NotFound) => Err(
+                "no other kept snapshot of the volume answers the engine, and the volume's live \
+                 file is missing"
+                    .to_owned(),
+            ),
+            Err(EngineError::Conflict(reason)) => Err(format!(
+                "no other kept snapshot of the volume answers the engine, and the engine would \
+                 not check the volume's live file now: {reason}"
+            )),
+            Err(e) => Err(format!(
+                "no other kept snapshot of the volume answers the engine, and the engine cannot \
+                 check the volume's live file: {e}"
+            )),
+        }
+    }
+
     /// Reads, through one handle of the clone's directory opened with
-    /// `O_DIRECTORY | O_NOFOLLOW`, that `clone` is missing from it, that
-    /// `other` is a regular file in it, and that `clone` is still missing.
-    /// The error says which read failed.
-    fn clone_missing_beside(&self, clone: &Path, other: &Path) -> Result<(), String> {
+    /// `O_DIRECTORY | O_NOFOLLOW`, that `clone` is missing from it, that the
+    /// file `evidence` names is a regular file in it, and that `clone` is
+    /// still missing. The error says which read failed.
+    fn clone_missing_beside(&self, clone: &Path, evidence: &Evidence) -> Result<(), String> {
         use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, statat};
         let Some(dir) = clone.parent() else {
             return Err("the clone's path names no directory".to_owned());
         };
-        if other.parent() != Some(dir) {
-            return Err(
-                "no other kept snapshot of the volume is in the clone's directory".to_owned(),
-            );
-        }
-        let (Some(clone_name), Some(other_name)) = (clone.file_name(), other.file_name()) else {
-            return Err("the clone's or the other kept snapshot's path names no file".to_owned());
+        let Some(clone_name) = clone.file_name() else {
+            return Err("the clone's path names no file".to_owned());
         };
+        let evidence_name = evidence.name_in(dir)?;
+        let what = evidence.what();
         let dir = open(
             dir,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -522,10 +560,10 @@ impl<E: Engine> Inner<E> {
             Err(e) => Err(format!("cannot read the clone's file: {e}")),
         };
         clone_missing()?;
-        match statat(&dir, other_name, AtFlags::SYMLINK_NOFOLLOW) {
+        match statat(&dir, evidence_name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {}
-            Ok(_) => return Err("the other kept snapshot is not a regular file".to_owned()),
-            Err(e) => return Err(format!("cannot read the other kept snapshot: {e}")),
+            Ok(_) => return Err(format!("{what} is not a regular file")),
+            Err(e) => return Err(format!("cannot read {what}: {e}")),
         }
         clone_missing()
     }
@@ -634,6 +672,60 @@ async fn present_volume_file<E: Engine>(
         }
     }
     Ok(None)
+}
+
+/// What the engine found that shows a lost clone's volume directory to be
+/// the real one (section 9 step 2): a file of the volume in the directory it
+/// looked the clone up in.
+enum Evidence {
+    /// Another kept snapshot of the volume, at this location.
+    KeptSnapshot(PathBuf),
+    /// The volume's own live file, by the volume's id. The engine keeps it
+    /// in its current volume directory, named by the volume id
+    /// (`engine-trait.md` section 3.20), and looks a snapshot up only in that
+    /// directory, so the clone's directory is the one where it found the
+    /// live file.
+    LiveFile(String),
+}
+
+impl Evidence {
+    /// The evidence's file name in the clone's directory `dir`.
+    ///
+    /// # Errors
+    ///
+    /// A kept snapshot outside `dir`, or a path that names no file there.
+    fn name_in<'a>(&'a self, dir: &Path) -> Result<&'a OsStr, String> {
+        match self {
+            Self::KeptSnapshot(location) => {
+                if location.parent() != Some(dir) {
+                    return Err(
+                        "no other kept snapshot of the volume is in the clone's directory"
+                            .to_owned(),
+                    );
+                }
+                location
+                    .file_name()
+                    .ok_or_else(|| "the other kept snapshot's path names no file".to_owned())
+            }
+            Self::LiveFile(volume_id) => {
+                // One plain name, never a path that leaves the directory.
+                let name = Path::new(volume_id);
+                if name.file_name() == Some(name.as_os_str()) {
+                    Ok(name.as_os_str())
+                } else {
+                    Err("the volume's id names no file in the clone's directory".to_owned())
+                }
+            }
+        }
+    }
+
+    /// What the evidence is, for the reason a record stays.
+    fn what(&self) -> &'static str {
+        match self {
+            Self::KeptSnapshot(_) => "the other kept snapshot",
+            Self::LiveFile(_) => "the volume's live file",
+        }
+    }
 }
 
 /// Runs and clears the hook a test set.
