@@ -1197,15 +1197,7 @@ async fn agent_voters(node_data_dir: &Path) -> Result<Vec<StoredVoter>, Error> {
     let body = match sealed {
         None => body,
         Some(blob) => {
-            let key_file = node_data_dir.join(NODE_LOCAL_KEY_FILE);
-            if !key_file.try_exists().unwrap_or(false) {
-                return Err(unreadable(format!(
-                    "it is sealed and {} is missing",
-                    key_file.display()
-                )));
-            }
-            let key = quoro_node_agent::localkey::LocalKey::load_or_create(node_data_dir)
-                .map_err(|error| unreadable(error.to_string()))?;
+            let key = load_local_key(node_data_dir).map_err(unreadable)?;
             let rev =
                 u64::try_from(rev).map_err(|_| unreadable(format!("its rev {rev} is negative")))?;
             let plaintext = key
@@ -1221,6 +1213,41 @@ async fn agent_voters(node_data_dir: &Path) -> Result<Vec<StoredVoter>, Error> {
         .votes
         .map(|votes| votes.voters)
         .unwrap_or_default())
+}
+
+/// The agent's node-local key in `node_data_dir`, which seals the stored
+/// desired states. A restore must not create it: an agent without one stored
+/// no sealed state this restore can read.
+///
+/// The key file is opened first, so a missing file is reported missing and
+/// one that cannot be opened, such as for a permission error, is reported
+/// with its error, never taken as missing. The agent's own loader then reads
+/// the file just opened. node-agent offers no loader that only loads, so a
+/// key deleted between the two calls would be created again.
+///
+/// # Errors
+///
+/// A one-line reason when the file is missing, cannot be read or is not a
+/// key.
+fn load_local_key(node_data_dir: &Path) -> Result<quoro_node_agent::localkey::LocalKey, String> {
+    let key_file = node_data_dir.join(NODE_LOCAL_KEY_FILE);
+    match std::fs::File::open(&key_file) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "it is sealed and {} is missing",
+                key_file.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "it is sealed and {} cannot be read: {error}",
+                key_file.display()
+            ));
+        }
+    }
+    quoro_node_agent::localkey::LocalKey::load_or_create(node_data_dir)
+        .map_err(|error| format!("{}: {error}", key_file.display()))
 }
 
 /// Every lease the first write of a restore with `--accept-loss` would raise

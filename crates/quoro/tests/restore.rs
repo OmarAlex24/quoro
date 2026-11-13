@@ -1694,3 +1694,53 @@ async fn an_identity_node_the_database_does_not_hold_is_not_a_surviving_voter() 
     assert!(!text.contains(&format!("stored {UNKNOWN_NODE}")), "{text}");
     assert_nothing_installed(&dir);
 }
+
+/// The node-local key that seals the agent's stored desired states is
+/// loaded, never created: a missing key refuses the restore without the flag
+/// and is not created, and a key that cannot be read refuses with its error
+/// instead of being taken as missing.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_agents_node_local_key_is_never_created_and_an_unreadable_one_is_an_error() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture =
+        machines_fixture(&[(NEW_NODE, r#"["node"]"#, "connected", Some("primary"))]).await;
+    let identity = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+    let host: (&str, &[&str]) = (NEW_NODE, &["node"]);
+
+    let agent = agent_store(&fixture, "agent-no-key", &[(2, &[host])]).await;
+    let key = agent.join("local.key");
+    std::fs::remove_file(&key).unwrap();
+    let dir = fixture.data_dir("agent-no-key-restore");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = identity.clone();
+    options.node_data_dir = agent;
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("local.key is missing"),
+        "{error}"
+    );
+    assert!(!key.exists(), "the key is not created");
+    assert_nothing_installed(&dir);
+
+    let agent = agent_store(&fixture, "agent-unreadable-key", &[(2, &[host])]).await;
+    let key = agent.join("local.key");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&key).is_ok() {
+        // Root opens any file: the unreadable case cannot be made here.
+        return;
+    }
+    let dir = fixture.data_dir("agent-unreadable-key-restore");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = identity;
+    options.node_data_dir = agent;
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("local.key cannot be read"), "{text}");
+    assert!(!text.contains("missing"), "{text}");
+    assert_nothing_installed(&dir);
+}
