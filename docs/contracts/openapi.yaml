@@ -1296,7 +1296,7 @@ components:
       title: NodeJoinTokenCreated
       description: |
         The new join token. `token` is shown once and cannot be retrieved again;
-        `join_command` is the single line the operator runs on the new machine.
+        `join_command` is the line that enrolls the new machine.
       required:
         - id
         - token
@@ -6773,12 +6773,12 @@ paths:
         `conflict` for a node already `removed` (except the repair of
         node-agent-protocol.md section 8.10), for the node that holds the
         primary status, and for a node that still hosts running instances.
-        A node that is not connected and holds a lease at 2^53 - 1, the token
-        cap, is refused with `conflict` and `reason: token_exhausted`, and
+        A node that is not connected and holds a lease that is not revoked at
+        2^53 - 1, the token cap, is refused with `conflict` and `reason: token_exhausted`, and
         nothing is written (node-agent-protocol.md section 8.6, ADR 0325).
         For a connected node the primary first revokes its leases over the
-        session, and the call stays open until the node answers, at most
-        180 s; a fence that is not confirmed in that time answers `conflict`
+        session, and the call stays open until the node answers, up to a
+        bound the primary sets, as for `failoverApp`; a fence that is not confirmed in that time answers `conflict`
         and removes nothing (node-agent-protocol.md section 10). The node
         moves to `removed` and reconciliation stops targeting it. `Quoro-Justification` is
         required when the caller is an agent (D-0031). From M5b removing a voter
