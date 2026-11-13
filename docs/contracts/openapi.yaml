@@ -576,7 +576,8 @@ components:
             why a `conflict` was returned by `failoverApp` or `switchoverApp`
             (`not_warm`, `no_copy`, `not_in_sync`, `node_disconnected`,
             `fence_failed`, `no_support`, `lease_held`, `in_progress`,
-            `lease_revoked`; each operation says when), by `deleteApp` and `deleteVolume`
+            `lease_revoked`; each operation says when), by `updateApp` leaving
+            `warm` (`in_progress`, `lease_revoked`), by `deleteApp` and `deleteVolume`
             (`has_quarantines`), by `rotateSigningKey` (`in_progress`), or by
             an operation that would raise a lease's token past 2^53 - 1
             (`token_exhausted`, ADR 0325): `ackNodeFence`, `declareNodeLost`,
@@ -7688,7 +7689,14 @@ paths:
         lease row's newest write (node-agent-protocol.md sections 6.13 and
         8.4, "Changing the mode" and "When R is replicated"); until then the
         lease stays `local`, and a failover needs the source connected or
-        declared lost. Leaving `warm` deletes
+        declared lost. Leaving `warm` is refused with `conflict` and
+        `reason: in_progress` while a failover or switchover of the app runs
+        or a failover's grant to the warm node waits
+        (`App.lease.grant_pending`), and with `reason: lease_revoked` while
+        the app's lease is revoked in the primary's own view
+        (`App.lease.revoked_at` is set), since `failoverApp` needs the policy
+        `warm` to complete the move (node-agent-protocol.md section 6.13).
+        Otherwise leaving `warm` deletes
         the warm copy and, in the same transaction, writes the lease `local`
         with the unsettled mark (`Lease.unsettled`); `Lease.local_pending`
         stays true until every machine with the `node` role holds that write,
