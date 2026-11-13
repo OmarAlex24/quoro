@@ -14,7 +14,10 @@
 //! due scheduled backup of either source is recorded `failed` at once with
 //! [`super::KEY_ABSENT`] and emits `backup.failed`; it counts as the last
 //! attempt, so the next interval tries again (`node-agent-protocol.md`
-//! section 7.3, step 4).
+//! section 7.3, step 4). A volume backup that was already `queued` or
+//! `running` when this primary took over is recorded `failed` with the same
+//! error at the next tick, and its node's desired state no longer carries the
+//! job (`session::desired`).
 
 use crate::AppState;
 use crate::api::apps::BackupSchedule;
@@ -73,6 +76,9 @@ pub struct Tick {
     pub queued: usize,
     /// Backups that timed out and were failed.
     pub timed_out: usize,
+    /// Volume backups failed because this primary does not hold the
+    /// repository key.
+    pub key_absent: usize,
 }
 
 /// One tick of the schedule and timeout loop at `now`. The tests call it with
@@ -86,6 +92,11 @@ pub async fn run(state: &AppState, now: time::OffsetDateTime) -> Result<Tick, Ap
     // A sweep dispatches no backup (`backup-format.md` section 9).
     if state.backups.is_sweeping() {
         return Ok(tick);
+    }
+    // Before the timeout, so such a backup fails with the reason it has.
+    for node_id in fail_without_key(&state.store).await? {
+        tick.key_absent += 1;
+        state.hub.node_changed(&node_id);
     }
     for node_id in seal::time_out(&state.store, now).await? {
         tick.timed_out += 1;
@@ -102,6 +113,39 @@ pub async fn run(state: &AppState, now: time::OffsetDateTime) -> Result<Tick, Ap
         state.hub.node_changed(&node_id);
     }
     Ok(tick)
+}
+
+/// Records `failed` with [`super::KEY_ABSENT`] every `queued` or `running`
+/// volume backup of the repository while this primary does not hold its key,
+/// through [`seal::fail`], and returns the node of each one failed. Such a row
+/// can only come from before a promotion: the schedule and `createBackup` no
+/// longer queue one (`node-agent-protocol.md` section 7.3, step 4). A
+/// control-plane row was already resolved at start. A later report of the
+/// backup from its node finds the row terminal and changes nothing.
+async fn fail_without_key(store: &Store) -> Result<Vec<String>, ApiError> {
+    let Some(repository) = repo::any(store).await? else {
+        return Ok(Vec::new());
+    };
+    if repository.holds_key() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, node_id FROM backups \
+         WHERE repository_id = ? AND source_kind = 'volume' \
+           AND status IN ('queued', 'running') \
+         ORDER BY id",
+    )
+    .bind(&repository.id)
+    .fetch_all(store.pool())
+    .await?;
+    let mut changed = Vec::new();
+    for (backup_id, node_id) in rows {
+        if seal::fail(store, &backup_id, &node_id, super::KEY_ABSENT).await? {
+            tracing::warn!(backup_id = %backup_id, node_id = %node_id, reason = super::KEY_ABSENT, "a backup in progress failed");
+            changed.push(node_id);
+        }
+    }
+    Ok(changed)
 }
 
 /// The nodes whose `cold` apps had a scheduled backup queued.

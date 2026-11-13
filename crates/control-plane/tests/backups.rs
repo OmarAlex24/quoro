@@ -1668,6 +1668,346 @@ async fn a_scheduled_backup_without_the_repository_key_fails_at_once() {
     );
 }
 
+/// The `backup_id` of every job in a desired-state frame.
+fn spec_jobs(snapshot: &Value) -> Vec<String> {
+    snapshot["body"]["spec"]["backups"]
+        .as_array()
+        .map(|jobs| {
+            jobs.iter()
+                .map(|job| job["backup_id"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The next desired-state frame that `wanted` accepts.
+async fn recv_spec(socket: &mut Socket, wanted: impl Fn(&Value) -> bool) -> Value {
+    loop {
+        let snapshot = recv_type(socket, "desired_state").await;
+        if wanted(&snapshot) {
+            return snapshot;
+        }
+    }
+}
+
+/// A `status_report.backups[]` entry with `status`, and the manifest's key,
+/// digest, logical size and chunk count when one is given.
+fn reported_backup(
+    backup_id: &str,
+    status: BackupState,
+    manifest: Option<(String, String, u64, u64)>,
+) -> wire::BackupStatus {
+    let (manifest_key, manifest_digest, logical_bytes, chunk_count) = match manifest {
+        Some((key, digest, logical, chunks)) => {
+            (Some(key), Some(digest), Some(logical), Some(chunks))
+        }
+        None => (None, None, None, None),
+    };
+    let done = matches!(status, BackupState::Succeeded | BackupState::Failed);
+    wire::BackupStatus {
+        backup_id: backup_id.to_string(),
+        status,
+        snapshot_method: Some(wire::SnapshotMethod::Reflink),
+        pause_ms: Some(0),
+        guest_flush: None,
+        manifest_key,
+        manifest_digest,
+        logical_bytes,
+        uploaded_bytes: logical_bytes.map(|_| 0),
+        chunk_count,
+        error: None,
+        started_at: Some(quoro_control_plane::store::now_rfc3339()),
+        finished_at: done.then(quoro_control_plane::store::now_rfc3339),
+    }
+}
+
+/// `node-agent-protocol.md` section 7.3, step 4: a volume backup still
+/// `queued` or `running` while this primary does not hold the repository key,
+/// as a promoted primary inherits one, leaves its node's desired state, which
+/// is still built and sent with everything else. The next dispatch tick
+/// records the backup `failed` with `repository key absent`, with the event and
+/// records of any failure, and a later report of it from the node changes
+/// nothing. Once the key is restored, a new backup's job carries its source
+/// keys again.
+#[tokio::test]
+async fn a_backup_in_progress_without_the_repository_key_leaves_the_desired_state_and_fails() {
+    let mut setup = setup().await;
+    let pool = setup.server.state.store.pool().clone();
+    let (node_id, vm_id): (String, String) = sqlx::query_as(
+        "SELECT v.node_id, m.id FROM volumes v JOIN vms m ON m.app_id = v.app_id WHERE v.id = ?",
+    )
+    .bind(&setup.volume_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let absent = "repository key absent";
+    let now = time::OffsetDateTime::now_utc();
+
+    // First a backup its node reported `running`, then one still `queued`,
+    // each accepted while this primary held the key.
+    for (round, running) in [(1u64, true), (2, false)] {
+        let res = setup
+            .owner
+            .post(
+                setup
+                    .server
+                    .url(&format!("/api/v1/apps/{}/backups", setup.app_id)),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 202, "create: {}", res.text().await.unwrap());
+        let backup_id = res.json::<Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let snapshot = recv_spec(&mut setup.socket, |snapshot| {
+            spec_jobs(snapshot) == [backup_id.clone()]
+        })
+        .await;
+        let rev = snapshot["body"]["rev"].as_u64().unwrap();
+        if running {
+            send(
+                &mut setup.socket,
+                status_report(
+                    rev,
+                    Vec::new(),
+                    vec![reported_backup(&backup_id, BackupState::Running, None)],
+                ),
+            )
+            .await;
+            wait_for_backup(
+                &setup.owner,
+                &setup.server,
+                &mut setup.socket,
+                &backup_id,
+                "running",
+            )
+            .await;
+        }
+        let blob = drop_repository_key(&setup.server, &setup.repo_id).await;
+
+        // The node's next desired state has neither the job nor the
+        // repository, and still has the app's VM and volume.
+        setup.server.state.hub.node_changed(&node_id);
+        let snapshot =
+            recv_spec(&mut setup.socket, |snapshot| spec_jobs(snapshot).is_empty()).await;
+        let spec = &snapshot["body"]["spec"];
+        assert!(spec.get("backup_repository").is_none(), "{snapshot}");
+        assert!(
+            spec["vms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|vm| vm["vm_id"] == vm_id.as_str()),
+            "{snapshot}"
+        );
+        assert!(
+            spec["volumes"].as_array().unwrap().iter().any(|volume| {
+                volume["volume_id"] == setup.volume_id.as_str() && volume["state"] == "present"
+            }),
+            "{snapshot}"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM backups WHERE id = ?")
+            .bind(&backup_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, if running { "running" } else { "queued" });
+
+        // The tick records it failed, as any failure: the row, its
+        // change-log entry, the `backup.failed` event and the `backup.seal`
+        // record.
+        let tick = quoro_control_plane::backups::dispatch::run(&setup.server.state, now)
+            .await
+            .unwrap();
+        assert_eq!((tick.key_absent, tick.queued, tick.timed_out), (1, 0, 0));
+        let failed = wait_for_backup(
+            &setup.owner,
+            &setup.server,
+            &mut setup.socket,
+            &backup_id,
+            "failed",
+        )
+        .await;
+        assert_eq!(failed["error"], absent);
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM change_log WHERE entity_type = 'backup' AND entity_id = ? \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&backup_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], absent);
+        let data: String = sqlx::query_scalar(
+            "SELECT data FROM events WHERE type = 'backup.failed' \
+             AND json_extract(subject, '$.id') = ?",
+        )
+        .bind(&backup_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let data: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["backup_id"], backup_id.as_str());
+        assert_eq!(data["trigger"], "api");
+        assert_eq!(data["error"], absent);
+        let records: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE target_id = ? AND operation = 'backup.seal' \
+             AND result = 'error' AND result_detail = ?",
+        )
+        .bind(&backup_id)
+        .bind(absent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(records, 1);
+        let tick = quoro_control_plane::backups::dispatch::run(&setup.server.state, now)
+            .await
+            .unwrap();
+        assert_eq!(tick.key_absent, 0);
+
+        // A later report of the backup changes nothing, even a `succeeded`
+        // one with a real manifest. The volume report sent after it is
+        // applied only once the backup report was.
+        let manifest = write_manifest(&setup, &backup_id, &vec![9u8; 64 * 1024]).await;
+        send(
+            &mut setup.socket,
+            status_report(
+                rev,
+                Vec::new(),
+                vec![reported_backup(
+                    &backup_id,
+                    BackupState::Succeeded,
+                    Some(manifest),
+                )],
+            ),
+        )
+        .await;
+        let allocated = 4096 * (round + 1);
+        send(
+            &mut setup.socket,
+            status_report(
+                rev,
+                vec![VolumeStatus {
+                    volume_id: setup.volume_id.clone(),
+                    state: WireVolumeState::Ready,
+                    allocated_bytes: Some(allocated),
+                    error: None,
+                }],
+                Vec::new(),
+            ),
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let applied: Option<i64> =
+                sqlx::query_scalar("SELECT allocated_bytes FROM volumes WHERE id = ?")
+                    .bind(&setup.volume_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if applied == Some(i64::try_from(allocated).unwrap()) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the volume report was not applied"
+            );
+            heartbeat(&mut setup.socket).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM backups WHERE id = ?")
+                .bind(&backup_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("failed".to_string(), Some(absent.to_string())));
+        assert_eq!(
+            setup
+                .memory
+                .get(&format!(
+                    "{}{}",
+                    root(&setup.server),
+                    layout::seal(&setup.app_id, &backup_id)
+                ))
+                .await,
+            Err(ObjectStoreError::NotFound)
+        );
+        let succeeded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE type = 'backup.succeeded' \
+             AND json_extract(subject, '$.id') = ?",
+        )
+        .bind(&backup_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(succeeded, 0);
+
+        // The key comes back by SQL for the second round.
+        if round == 1 {
+            sqlx::query("UPDATE backup_repositories SET repo_key_enc = ? WHERE id = ?")
+                .bind(&blob)
+                .bind(&setup.repo_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    // Restored from the recovery key, the key gives a new backup's job its
+    // source keys and the repository entry again.
+    let res =
+        restore_repository_key(&setup.owner, &setup.server, &setup.repo_id, &setup.recovery).await;
+    assert_eq!(res.status(), 200, "restore: {}", res.text().await.unwrap());
+    let res = setup
+        .owner
+        .post(
+            setup
+                .server
+                .url(&format!("/api/v1/apps/{}/backups", setup.app_id)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "create: {}", res.text().await.unwrap());
+    let backup_id = res.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snapshot = recv_spec(&mut setup.socket, |snapshot| {
+        spec_jobs(snapshot) == [backup_id.clone()]
+    })
+    .await;
+    let spec = &snapshot["body"]["spec"];
+    let keys = setup.repo_key.source_keys(&setup.app_id);
+    assert_eq!(
+        spec["backups"][0]["id_key"],
+        base64_of(keys.id_key.as_bytes())
+    );
+    assert_eq!(
+        spec["backups"][0]["data_key"],
+        base64_of(keys.data_key.as_bytes())
+    );
+    assert_eq!(
+        spec["backup_repository"]["repository_id"],
+        setup.repo_id.as_str()
+    );
+    let tick = quoro_control_plane::backups::dispatch::run(&setup.server.state, now)
+        .await
+        .unwrap();
+    assert_eq!(tick.key_absent, 0);
+    let status: String = sqlx::query_scalar("SELECT status FROM backups WHERE id = ?")
+        .bind(&backup_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "queued");
+}
+
 // ---------------------------------------------------------------------------
 // Restoring the repository key (ADR 0322)
 // ---------------------------------------------------------------------------
