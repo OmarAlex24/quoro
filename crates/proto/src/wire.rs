@@ -1638,6 +1638,12 @@ pub struct SupportGrant {
     pub voters_version: u64,
 }
 
+/// The term ceiling (section 8.8): 2^53 - 1, the highest integer the change
+/// log's canonical JSON carries. No machine sends, stores or adopts a higher
+/// term, whether it arrives in a `welcome`, a `desired_state`, a
+/// `support_request`, a `support_grant`, the `term` of an `error` or a vote.
+pub const MAX_TERM: u64 = (1 << 53) - 1;
+
 /// The floor of `support_request.support_ms` (sections 5.27 and 8.8).
 pub const MIN_SUPPORT_MS: u64 = 3_000;
 

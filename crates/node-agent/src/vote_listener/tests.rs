@@ -10,7 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quoro_proto::wire::{DesiredState, Spec, SpecMesh, SpecVoter, SpecVotes, VoteRequest};
+use quoro_proto::wire::{
+    DesiredState, MAX_TERM, Spec, SpecMesh, SpecVoter, SpecVotes, VoteRequest,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpSocket, TcpStream};
@@ -18,8 +20,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::{
-    BODY_LIMIT, Caller, LOCAL_WARN_EVERY, MAX_CONNECTIONS, MAX_TERM, VoteListener,
-    VoteListenerOptions, WarnLimit, connection_caller, listen_address, local_caller_uid,
+    BODY_LIMIT, Caller, LOCAL_WARN_EVERY, MAX_CONNECTIONS, VoteListener, VoteListenerOptions,
+    WarnLimit, connection_caller, listen_address, local_caller_uid,
 };
 use crate::lease::{HostClock, ManualHostClock};
 use crate::mesh::ListenerLink;

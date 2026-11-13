@@ -910,20 +910,37 @@ impl Session {
                 ) => first,
             };
             match first {
-                Ok(Some(Ok(Message::Text(text)))) => match parse_raw_control(&text) {
-                    Ok((raw, ControlMessage::Welcome(welcome))) => (raw.id, welcome),
-                    Ok((_, other)) => {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    // Section 8.8 "The term ceiling": a `welcome` whose term
+                    // is above 2^53 - 1 is answered `bad_message` before
+                    // anything acts on it, so the node adopts nothing (no
+                    // term, schema version, address or primary), and the
+                    // session ends; the node dials again (section 4.4). It
+                    // reads the raw body, so a term that does not fit a
+                    // `u64` is answered too.
+                    if let Some(id) = welcome_above_ceiling(&text) {
                         warn!(
-                            kind = other.kind(),
-                            "the primary did not start with welcome; reconnecting"
+                            max_term = wire::MAX_TERM,
+                            "the welcome's term is above the term ceiling; adopting nothing and ending the session"
                         );
+                        let _ = write_message(&mut sink, above_ceiling("welcome"), Some(&id)).await;
                         return Ok(SessionEnd::Reconnect);
                     }
-                    Err(_) => {
-                        warn!("the primary's first frame is not a welcome; reconnecting");
-                        return Ok(SessionEnd::Reconnect);
+                    match parse_raw_control(&text) {
+                        Ok((raw, ControlMessage::Welcome(welcome))) => (raw.id, welcome),
+                        Ok((_, other)) => {
+                            warn!(
+                                kind = other.kind(),
+                                "the primary did not start with welcome; reconnecting"
+                            );
+                            return Ok(SessionEnd::Reconnect);
+                        }
+                        Err(_) => {
+                            warn!("the primary's first frame is not a welcome; reconnecting");
+                            return Ok(SessionEnd::Reconnect);
+                        }
                     }
-                },
+                }
                 Ok(Some(Ok(_))) => {
                     warn!("the primary's first frame is not a text frame; reconnecting");
                     return Ok(SessionEnd::Reconnect);
@@ -1717,6 +1734,12 @@ impl Session {
     /// stored (section 8.8 "Terms"): a lower one is answered `stale_term` and
     /// ends the session, keeping the stored snapshot; a higher one is stored
     /// first, and a snapshot whose term cannot be kept is not stored.
+    ///
+    /// A term above 2^53 - 1 is answered `bad_message` and changes nothing
+    /// (section 8.8 "The term ceiling"). That check comes before the
+    /// signature's: such a body has no RFC 8785 form, so no signature over it
+    /// can verify, and checking the signature first would answer
+    /// `bad_signature` instead.
     async fn on_desired_state<S>(
         &mut self,
         raw: &RawFrame,
@@ -1726,6 +1749,14 @@ impl Session {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        if vote::above_ceiling(body) {
+            warn!(
+                max_term = wire::MAX_TERM,
+                "a desired_state's term is above the term ceiling; it changes nothing"
+            );
+            write_message(sink, above_ceiling("desired_state"), Some(&raw.id)).await?;
+            return Ok(None);
+        }
         let key = self.identity.verifying_key()?;
         if let Err(e) = quoro_proto::sign::verify_body(&key, body) {
             let error = ProtocolError {
@@ -3388,6 +3419,31 @@ fn stale_term(kind: &str, highest: u64) -> NodeMessage {
         fatal: true,
         term: Some(highest),
     })
+}
+
+/// The `bad_message` a machine answers a `welcome`, `desired_state` or
+/// `support_request` whose term is above 2^53 - 1 with: non-fatal, without a
+/// term (sections 5.18 and 8.8 "The term ceiling").
+fn above_ceiling(kind: &str) -> NodeMessage {
+    NodeMessage::Error(ProtocolError {
+        code: ErrorCode::BadMessage,
+        message: format!(
+            "the {kind}'s term is above the term ceiling {}",
+            wire::MAX_TERM
+        ),
+        fatal: false,
+        term: None,
+    })
+}
+
+/// The `id` of `text` when it is a `welcome` whose term is above 2^53 - 1
+/// (section 8.8 "The term ceiling"), read from the raw body so a term too
+/// large for a `u64` counts as well.
+fn welcome_above_ceiling(text: &str) -> Option<String> {
+    RawFrame::parse(text)
+        .ok()
+        .filter(|raw| raw.kind == "welcome" && vote::above_ceiling(&raw.body))
+        .map(|raw| raw.id)
 }
 
 /// The connect timeout of the advertised addresses after `failed_attempts`

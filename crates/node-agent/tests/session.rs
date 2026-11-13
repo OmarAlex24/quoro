@@ -31,8 +31,8 @@ use quoro_proto::custody::CustodyKey;
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
     Command, ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck,
-    LogEntries, QuarantineStatus, Spec, SpecEdge, SpecNetwork, SpecVoter, SpecVotes, SpecWitness,
-    SupportRequest, Welcome,
+    LogEntries, MAX_TERM, QuarantineStatus, Spec, SpecEdge, SpecNetwork, SpecVoter, SpecVotes,
+    SpecWitness, SupportRequest, Welcome,
 };
 use quoro_proto::{
     ErrorCode, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ProtocolError, ResourceType,
@@ -2990,6 +2990,164 @@ async fn a_support_request_with_a_lower_term_ends_the_session() {
     assert!(frames.iter().all(|frame| frame["type"] != "support_grant"));
     ended(serving).await;
     assert_eq!(store.support().await.unwrap(), None);
+}
+
+/// Asserts that `frame` is the non-fatal `bad_message` answering `re`,
+/// without a term: the answer to a term above the ceiling (section 8.8 "The
+/// term ceiling").
+fn assert_above_ceiling(frame: &Value, re: &str) {
+    assert_eq!(frame["type"], "error", "{frame}");
+    assert_eq!(frame["re"], re, "{frame}");
+    assert_eq!(frame["body"]["code"], "bad_message", "{frame}");
+    assert_eq!(frame["body"]["fatal"], false, "{frame}");
+    assert!(frame["body"].get("term").is_none(), "{frame}");
+}
+
+/// A `welcome` answering `re` whose `term` is the JSON number `term`, with a
+/// schema version and an advertised address the node would keep.
+fn raw_welcome(term: &str, re: &str) -> String {
+    format!(
+        r#"{{"v":1,"type":"welcome","id":"msg_welcome","re":"{re}","body":{{"cluster_id":"cls_test","term":{term},"server_time":"2026-11-02T10:15:30Z","heartbeat_interval_ms":100,"session_timeout_ms":15000,"primary_node_id":"nod_primary","primary_urls":["https://other.example:8443"],"schema_version":14}}}}"#
+    )
+}
+
+/// Section 8.8 "The term ceiling": after a `welcome` whose term is above
+/// 2^53 - 1 the node adopts nothing (no term, no schema version), answers
+/// `bad_message` and ends the session; it dials again. A term too large for
+/// a `u64` is answered the same way. A `welcome` at the ceiling is adopted.
+#[tokio::test]
+async fn a_welcome_above_the_term_ceiling_adopts_nothing_and_the_node_redials() {
+    let dir = TempDir::new();
+    let TermNode {
+        mut session,
+        store,
+        _observed,
+        ..
+    } = term_node(&dir, None).await;
+    store.raise_term(3).await.unwrap();
+    for term in [
+        "9007199254740992",
+        "18446744073709551615",
+        "18446744073709551616",
+    ] {
+        let (mut ws, hello, serving) = open_session(session).await;
+        send(&mut ws, raw_welcome(term, hello["id"].as_str().unwrap())).await;
+        let frames = frames_until_closed(&mut ws).await;
+        assert_eq!(frames.len(), 1, "{term}: only the error: {frames:?}");
+        assert_above_ceiling(&frames[0], "msg_welcome");
+        session = ended(serving).await;
+        assert_eq!(store.highest_term().await.unwrap(), Some(3), "{term}");
+        assert_eq!(
+            store.welcome_schema_version().await.unwrap(),
+            None,
+            "{term}"
+        );
+    }
+
+    let (mut ws, hello, serving) = open_session(session).await;
+    send(
+        &mut ws,
+        raw_welcome("9007199254740991", hello["id"].as_str().unwrap()),
+    )
+    .await;
+    read_until(&mut ws, "status_report").await;
+    assert_eq!(store.highest_term().await.unwrap(), Some(MAX_TERM));
+    assert_eq!(store.welcome_schema_version().await.unwrap(), Some(14));
+    end_session(ws, serving).await;
+}
+
+/// Sections 5.11 and 8.8 "The term ceiling": a `desired_state` whose term is
+/// above 2^53 - 1 is answered `bad_message`, not `bad_signature`, and changes
+/// nothing: no term raised, no snapshot stored. No signature can cover such
+/// a body, which has no RFC 8785 form; here it was signed at the ceiling and
+/// its term raised after. The session goes on, and a snapshot at the ceiling
+/// is stored.
+#[tokio::test]
+async fn a_desired_state_above_the_term_ceiling_is_bad_message_and_changes_nothing() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        key,
+        _observed,
+    } = term_node(&dir, None).await;
+    let (mut ws, serving) = welcomed(session, 2).await;
+    for (id, term) in [
+        ("msg_above", json!(MAX_TERM + 1)),
+        ("msg_max", json!(u64::MAX)),
+        ("msg_float", json!(1e20)),
+    ] {
+        let mut state = snapshot(4, Vec::new()).state;
+        state.term = MAX_TERM;
+        let mut body = state.to_unsigned_value();
+        sign::sign_body(&key, &mut body).unwrap();
+        body["term"] = term;
+        send(
+            &mut ws,
+            ControlMessage::DesiredState(body)
+                .to_frame(id, None)
+                .to_text(),
+        )
+        .await;
+        assert_above_ceiling(&reply_to(&mut ws, id).await, id);
+        assert_eq!(store.highest_term().await.unwrap(), Some(2), "{id}");
+        assert_eq!(store.latest_desired().await.unwrap(), None, "{id}");
+    }
+
+    send(
+        &mut ws,
+        desired_frame_at(5, MAX_TERM, None, &key, "msg_ceiling"),
+    )
+    .await;
+    let stored = reply_to(&mut ws, "msg_ceiling").await;
+    assert_eq!(stored["body"]["status"], "ok", "{stored}");
+    assert_eq!(store.highest_term().await.unwrap(), Some(MAX_TERM));
+    assert_eq!(store.latest_desired().await.unwrap().unwrap().0, 5);
+    end_session(ws, serving).await;
+}
+
+/// Sections 5.27 and 8.8 "The term ceiling": a `support_request` whose term
+/// is above 2^53 - 1 is answered `bad_message`, non-fatal and without a
+/// term, on a voter and on a machine that is not one, as the term check
+/// runs on every machine. Nothing changes: no term raised, no promise
+/// stored, and the session goes on.
+#[tokio::test]
+async fn a_support_request_above_the_term_ceiling_is_bad_message_and_changes_nothing() {
+    for current in [Some(voter_snapshot(1, 3120)), None] {
+        let voter = current.is_some();
+        let dir = TempDir::new();
+        let TermNode {
+            session,
+            store,
+            _observed,
+            ..
+        } = term_node(&dir, current).await;
+        let (mut ws, serving) = welcomed(session, 2).await;
+        send(
+            &mut ws,
+            support_frame(MAX_TERM + 1, "nod_primary", 15_000, 15_000, "msg_above"),
+        )
+        .await;
+        assert_above_ceiling(&reply_to(&mut ws, "msg_above").await, "msg_above");
+        assert_eq!(
+            store.highest_term().await.unwrap(),
+            Some(2),
+            "voter {voter}"
+        );
+        assert_eq!(store.support().await.unwrap(), None, "voter {voter}");
+
+        if voter {
+            send(
+                &mut ws,
+                support_frame(2, "nod_primary", 15_000, 15_000, "msg_support"),
+            )
+            .await;
+            let grant = reply_to(&mut ws, "msg_support").await;
+            assert_eq!(grant["type"], "support_grant", "{grant}");
+            assert_eq!(grant["body"]["term"], 2, "{grant}");
+        }
+        end_session(ws, serving).await;
+    }
 }
 
 /// Sections 5.28 and 8.8: a voter answers `support_grant` echoing the

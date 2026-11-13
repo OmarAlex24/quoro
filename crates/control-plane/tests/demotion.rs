@@ -13,7 +13,7 @@ use common::{Server, start_with_patient_node_session};
 use futures_util::StreamExt;
 use quoro_control_plane::events::{self, NewEvent, Source};
 use quoro_control_plane::store::DEMOTED_REFUSAL;
-use quoro_proto::wire::{ControlMessage, NodeMessage};
+use quoro_proto::wire::{ControlMessage, MAX_TERM, NodeMessage};
 use quoro_proto::{ErrorCode, ProtocolError};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -512,6 +512,72 @@ async fn a_stale_term_without_a_usable_term_records_one_above_the_current_term()
             meta(&server, "demoted_by_term").await.as_deref(),
             Some(recorded),
             "meta.term {meta_term:?}, stale_term {node_term:?}"
+        );
+        assert!(server.state.store.is_demoted());
+    }
+}
+
+/// Section 8.8 "The term ceiling": an `error` whose `term` is above
+/// 2^53 - 1 is malformed. A `stale_term` that carries one does not demote
+/// the primary and records nothing; the session and the API go on. A
+/// `stale_term` at the ceiling still demotes it, and records the ceiling.
+#[tokio::test]
+async fn a_stale_term_above_the_term_ceiling_is_malformed_and_demotes_nothing() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let mut on_a = Machine::connect(&server, &a).await;
+    let welcome = on_a
+        .start
+        .iter()
+        .find(|frame| frame["type"] == "welcome")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for term in [MAX_TERM + 1, u64::MAX] {
+        on_a.send(stale_term(Some(term)), Some(&welcome)).await;
+        let frames = on_a.settle().await;
+        assert!(
+            frames.iter().all(|frame| frame["type"] != "error"),
+            "{term}: {frames:?}"
+        );
+        assert!(!server.state.store.is_demoted(), "{term}");
+        assert_eq!(meta(&server, "demoted_by_term").await, None, "{term}");
+    }
+    let res = owner.get(server.url("/api/v1/nodes")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+
+    on_a.send(stale_term(Some(MAX_TERM)), Some(&welcome)).await;
+    ended_with_not_primary(&mut on_a).await;
+    assert_eq!(recorded_term(&server).await, MAX_TERM.to_string());
+}
+
+/// Section 8.8 "The term ceiling": a demotion records no term above
+/// 2^53 - 1 as `meta.demoted_by_term`. One above `meta.term` stops at the
+/// ceiling, and a node term above it is not usable: the session never
+/// passes one (the test above), and the store does not record one either.
+#[tokio::test]
+async fn a_demotion_never_records_a_term_above_the_ceiling() {
+    let ceiling = MAX_TERM.to_string();
+    for (meta_term, node_term, recorded) in [
+        (ceiling.as_str(), None, Some(ceiling.as_str())),
+        (ceiling.as_str(), Some(MAX_TERM), Some(ceiling.as_str())),
+        ("18446744073709551615", Some(5), Some(ceiling.as_str())),
+        ("3", Some(MAX_TERM + 1), Some("4")),
+        ("bad", Some(MAX_TERM + 1), None),
+    ] {
+        let server = start_with_patient_node_session().await;
+        sqlx::query("UPDATE meta SET value = ? WHERE key = 'term'")
+            .bind(meta_term)
+            .execute(server.state.store.pool())
+            .await
+            .unwrap();
+        server.state.hub.stale_term(node_term).await;
+        assert_eq!(
+            meta(&server, "demoted_by_term").await.as_deref(),
+            recorded,
+            "meta.term {meta_term}, stale_term {node_term:?}"
         );
         assert!(server.state.store.is_demoted());
     }
