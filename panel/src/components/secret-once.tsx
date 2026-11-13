@@ -30,20 +30,22 @@ export function SecretOnce({
         {/*
          * The 28 px button gives up 3 px above and below, so it takes exactly
          * one 22 px line: centred on the first, clear of the second, 4 px
-         * from the edges of the well.
+         * from the edges of the well. Its focus ring sits on its edge, so it
+         * does not reach into the second line.
          */}
         <CopyButton
           value={secret}
           label={copyLabel}
           variant="default"
-          className="float-right -my-[3px] -mr-[6px] ml-3"
+          className="float-right -my-[3px] -mr-[6px] ml-3 focus-visible:outline-offset-0"
         />
         <code className="block whitespace-pre-wrap wrap-anywhere type-code text-[12.5px] leading-[22px] text-ink select-all">
           {secretParts(secret).map((part, index) =>
             part.space ? (
               part.text
             ) : (
-              <span key={index} className="inline-block max-w-full">
+              // `role="none"`: a screen reader reads the value as one text, not word by word.
+              <span key={index} role="none" className="inline-block max-w-full">
                 {part.text}
               </span>
             ),
