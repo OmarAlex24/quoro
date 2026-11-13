@@ -82,8 +82,7 @@ impl std::fmt::Display for TokenExhausted {
 
 impl std::error::Error for TokenExhausted {}
 
-/// One lease row as the cap check reads it, from the fold or from the
-/// database.
+/// One lease row as the cap check reads it from the fold.
 struct CapRow<'a> {
     id: &'a str,
     holder_node_id: Option<&'a str>,
@@ -319,7 +318,9 @@ impl From<ApiError> for PromotionError {
 ///    [`crate::api::nodes::declare_lost_write`]), after the cap check of
 ///    [`check_token_cap`] on the same rows. That call's own refusals, of a
 ///    connected or `removed` node, are not the promotion's: the contract
-///    gives this write none;
+///    gives this write none. Nor does it write a `declareNodeLost` record:
+///    `cluster.promoted` with `ack_fence: true` and `from_node_id` is its
+///    record (`audit-log-format.md` sections 3.7 and 3.9, ADR 0182);
 /// 4. with `--accept-loss`, marks every `expiring` lease row unsettled
 ///    ([`crate::leases::mark_expiring_rows`]);
 /// 5. records `cluster.promoted` (`audit-log-format.md` section 3.9): actor
@@ -458,33 +459,35 @@ pub async fn write(store: &Store, promotion: &Promotion) -> Result<Written, Prom
 }
 
 /// [`check_token_cap`]'s rule on the rows of the database, inside the
-/// write: every lease row that names `node_id`, and the node's `lost_at`.
+/// write: nothing when the node already carries `lost_at`, otherwise the
+/// leases the declaration raises, read through the one query that selects
+/// them ([`crate::leases::held_by_node`]), at the cap or above.
 async fn check_cap_in(
     conn: &mut SqliteConnection,
     node_id: &str,
-) -> Result<Result<(), TokenExhausted>, sqlx::Error> {
+) -> Result<Result<(), TokenExhausted>, PromotionError> {
     let lost_at: Option<Option<String>> =
         sqlx::query_scalar("SELECT lost_at FROM nodes WHERE id = ?")
             .bind(node_id)
             .fetch_optional(&mut *conn)
             .await?;
-    let rows: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT id, holder_node_id, fencing_token, revoked_at FROM leases \
-         WHERE holder_node_id = ? ORDER BY id",
-    )
-    .bind(node_id)
-    .fetch_all(&mut *conn)
-    .await?;
-    Ok(exhausted(
-        node_id,
-        lost_at.flatten().is_some(),
-        rows.iter().map(|(id, holder, token, revoked_at)| CapRow {
-            id,
-            holder_node_id: Some(holder.as_str()),
-            fencing_token: Some(*token),
-            revoked: revoked_at.is_some(),
-        }),
-    ))
+    if lost_at.flatten().is_some() {
+        return Ok(Ok(()));
+    }
+    // `held_by_node` gives the rows in id order.
+    let leases: Vec<ExhaustedLease> = crate::leases::held_by_node(conn, node_id)
+        .await?
+        .into_iter()
+        .filter(|lease| lease.fencing_token >= MAX_TOKEN)
+        .map(|lease| ExhaustedLease {
+            lease_id: lease.id,
+            fencing_token: lease.fencing_token,
+        })
+        .collect();
+    if leases.is_empty() {
+        return Ok(Ok(()));
+    }
+    Ok(Err(TokenExhausted { leases }))
 }
 
 /// Writes `cp_status` of `node_id` and its node entry, the whole row, as

@@ -18,6 +18,7 @@ use quoro_control_plane::promotion::{
 use quoro_control_plane::rebuild;
 use quoro_control_plane::store::{Store, now_rfc3339};
 use serde_json::{Value, json};
+use sqlx::SqliteConnection;
 
 /// The token cap (section 8.6, "The cap"): 2^53 − 1.
 const MAX_TOKEN: i64 = (1 << 53) - 1;
@@ -34,6 +35,9 @@ const OLD: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0A";
 const NEW: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0B";
 /// Another node.
 const OTHER: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0C";
+/// A node whose id sorts before every other node's, for a test that inserts
+/// it after them.
+const EARLY: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J09";
 
 /// The old primary's leases: `local`, `expiring`, and `expiring` revoked.
 const OLD_LOCAL: &str = "lse_01JC9Z1A2B3C4D5E6F7G8H9J01";
@@ -46,6 +50,7 @@ const OTHER_LOCAL: &str = "lse_01JC9Z1A2B3C4D5E6F7G8H9J05";
 const OTHER_MARKED: &str = "lse_01JC9Z1A2B3C4D5E6F7G8H9J06";
 
 const REVOKED_AT: &str = "2026-11-12T09:00:00.000Z";
+const LOST_AT: &str = "2026-11-12T10:00:00.000Z";
 
 /// `(id, holder, mode, token, revoked_at, unsettled)` of a fixture lease.
 type FixtureLease = (
@@ -81,6 +86,35 @@ async fn set_term(store: &Store, term: &str) {
     .unwrap();
 }
 
+/// Inserts a disconnected node `id` with `cp_status`, and its `create` entry.
+async fn insert_node(conn: &mut SqliteConnection, id: &str, cp_status: Option<&str>, now: &str) {
+    sqlx::query(
+        "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, \
+         behind_nat, labels, capacity, allocated, kvm, engine_version, agent_version, \
+         desired_rev, applied_rev, log_seq, last_seen_at, created_at) \
+         VALUES (?, ?, '[\"node\"]', ?, 'disconnected', '', NULL, 1, '{}', '{}', '{}', \
+         '{}', NULL, NULL, 0, 0, 0, ?, ?)",
+    )
+    .bind(id)
+    .bind(id)
+    .bind(cp_status)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let payload = json!({
+        "id": id, "name": id, "roles": ["node"], "cp_status": cp_status,
+        "status": "disconnected", "public_key": "", "address": null, "behind_nat": 1,
+        "labels": {}, "capacity": {}, "allocated": {}, "kvm": {}, "engine_version": null,
+        "agent_version": null, "desired_rev": 0, "applied_rev": 0, "log_seq": 0,
+        "last_seen_at": now, "created_at": now, "lost_at": null,
+    });
+    changelog::append(conn, &fixture_actor(), "node", id, Op::Create, payload)
+        .await
+        .unwrap();
+}
+
 /// Inserts the fixture's nodes and leases into `store`, each with its
 /// `create` entry. `old_holds_primary` gives the old primary's node
 /// `cp_status = 'primary'`; a running control plane keeps that status on its
@@ -93,31 +127,7 @@ async fn fixture(store: &Store, old_holds_primary: bool) {
         (NEW, None),
         (OTHER, None),
     ] {
-        sqlx::query(
-            "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, \
-             behind_nat, labels, capacity, allocated, kvm, engine_version, agent_version, \
-             desired_rev, applied_rev, log_seq, last_seen_at, created_at) \
-             VALUES (?, ?, '[\"node\"]', ?, 'disconnected', '', NULL, 1, '{}', '{}', '{}', \
-             '{}', NULL, NULL, 0, 0, 0, ?, ?)",
-        )
-        .bind(id)
-        .bind(id)
-        .bind(cp_status)
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *w.tx)
-        .await
-        .unwrap();
-        let payload = json!({
-            "id": id, "name": id, "roles": ["node"], "cp_status": cp_status,
-            "status": "disconnected", "public_key": "", "address": null, "behind_nat": 1,
-            "labels": {}, "capacity": {}, "allocated": {}, "kvm": {}, "engine_version": null,
-            "agent_version": null, "desired_rev": 0, "applied_rev": 0, "log_seq": 0,
-            "last_seen_at": now, "created_at": now, "lost_at": null,
-        });
-        changelog::append(&mut w.tx, &fixture_actor(), "node", id, Op::Create, payload)
-            .await
-            .unwrap();
+        insert_node(&mut w.tx, id, cp_status, &now).await;
     }
     for (index, (id, holder, mode, token, revoked_at, unsettled)) in LEASES.iter().enumerate() {
         let app = format!("app_01JC9Z1A2B3C4D5E6F7G8H9J{index:02}");
@@ -186,6 +196,30 @@ async fn set_token(store: &Store, lease_id: &str, token: i64) {
         lease_id,
         Op::Update,
         json!({ "id": lease_id, "fencing_token": token }),
+    )
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+}
+
+/// Sets `cp_status` and `lost_at` of node `id`, with its `update` entry, as a
+/// followed log would hold them.
+async fn set_node(store: &Store, id: &str, cp_status: Option<&str>, lost_at: Option<&str>) {
+    let mut w = store.begin_write().await.unwrap();
+    sqlx::query("UPDATE nodes SET cp_status = ?, lost_at = ? WHERE id = ?")
+        .bind(cp_status)
+        .bind(lost_at)
+        .bind(id)
+        .execute(&mut *w.tx)
+        .await
+        .unwrap();
+    changelog::append(
+        &mut w.tx,
+        &fixture_actor(),
+        "node",
+        id,
+        Op::Update,
+        json!({ "id": id, "cp_status": cp_status, "lost_at": lost_at }),
     )
     .await
     .unwrap();
@@ -362,13 +396,21 @@ async fn promoted_records(store: &Store) -> Vec<(i64, Value)> {
         .collect()
 }
 
-/// The record `audit-log-format.md` section 3.9 asks for.
-fn expected_record(ack_fence: bool, accept_loss: bool, change_seq: i64) -> Value {
+/// The record `audit-log-format.md` section 3.9 asks for, with `from` as
+/// `params.from_node_id`. It is compared as a `Value`, so each param's type
+/// counts too: `term` and `log_seq` are integers, the flags booleans, and a
+/// `from_node_id` of `null` is neither absent nor a string.
+fn expected_record(
+    from: Option<&str>,
+    ack_fence: bool,
+    accept_loss: bool,
+    change_seq: i64,
+) -> Value {
     json!({
         "actor_type": "system", "actor_id": "cluster", "channel": "cli",
         "agent_model": null, "scope": null, "target_type": "node", "target_id": NEW,
         "params": {
-            "from_node_id": OLD, "to_node_id": NEW, "term": TERM, "log_seq": LOG_SEQ,
+            "from_node_id": from, "to_node_id": NEW, "term": TERM, "log_seq": LOG_SEQ,
             "ack_fence": ack_fence, "accept_loss": accept_loss,
         },
         "justification": (ack_fence || accept_loss).then_some(STATEMENT),
@@ -446,7 +488,7 @@ async fn a_promotion_moves_the_primary_status_in_one_write_at_its_term() {
         promoted_records(&store).await,
         [(
             written.audit_seq,
-            expected_record(false, false, entries[1].0)
+            expected_record(Some(OLD), false, false, entries[1].0)
         )]
     );
     assert_eq!(audit_count(&store).await, 1, "the first record of the term");
@@ -562,7 +604,7 @@ async fn ack_fence_declares_the_old_primary_lost_as_declare_node_lost_does() {
         promoted_records(&store).await,
         [(
             written.audit_seq,
-            expected_record(true, false, entries[1].0)
+            expected_record(Some(OLD), true, false, entries[1].0)
         )]
     );
 }
@@ -667,7 +709,7 @@ async fn accept_loss_marks_every_expiring_row_and_only_those() {
         promoted_records(&store).await,
         [(
             written.audit_seq,
-            expected_record(false, true, entries[1].0)
+            expected_record(Some(OLD), false, true, entries[1].0)
         )]
     );
 }
@@ -705,7 +747,10 @@ async fn both_flags_take_one_statement_in_one_write() {
     assert!(lease(&store, OTHER_EXPIRING).await.5);
     assert_eq!(
         promoted_records(&store).await,
-        [(written.audit_seq, expected_record(true, true, entries[1].0))]
+        [(
+            written.audit_seq,
+            expected_record(Some(OLD), true, true, entries[1].0)
+        )]
     );
 }
 
@@ -775,4 +820,213 @@ async fn a_database_not_at_the_term_or_a_flag_without_statement_writes_nothing()
         Err(PromotionError::Node { .. })
     ));
     assert_nothing(&store).await;
+}
+
+/// Section 7.3 step 5 when no node but the promoted one holds the primary
+/// status: the write clears nothing, `params.from_node_id` is `null`, as for
+/// `cluster.primary_moved`, and `--ack-fence` declares no node lost. Only
+/// the promoted node's entry and the record are written; no lease and no
+/// `lost_at` changes.
+#[tokio::test]
+async fn with_no_old_primary_from_node_id_is_null_and_ack_fence_declares_nobody() {
+    let store = rebuilt().await;
+    set_term(&store, &OLD_TERM.to_string()).await;
+    set_node(&store, OLD, None, None).await;
+    set_term(&store, &TERM.to_string()).await;
+    assert_eq!(promotion::old_primary(&fold(&store).await, NEW), None);
+    let leases_before = leases(&store).await;
+    let before = log_head(&store).await;
+
+    let written = promotion::write(&store, &request(true, false, Some(STATEMENT)))
+        .await
+        .unwrap();
+    assert_eq!(written.from_node_id, None);
+    let entries = assert_one_write_at_term(&store, before, &written).await;
+    assert_eq!(kinds(&entries), [("node", NEW), ("audit", "1")]);
+    assert_eq!(entries[0].6["cp_status"], "primary");
+    assert_eq!(entries[0].6["lost_at"], Value::Null);
+    assert_eq!(node(&store, NEW).await, (Some("primary".to_string()), None));
+    for id in [OLD, OTHER] {
+        assert_eq!(node(&store, id).await, (None, None), "{id}");
+    }
+    assert_eq!(leases(&store).await, leases_before);
+
+    let records = promoted_records(&store).await;
+    assert_eq!(
+        records,
+        [(
+            written.audit_seq,
+            expected_record(None, true, false, entries[0].0)
+        )]
+    );
+    assert_eq!(
+        records[0].1["params"],
+        json!({
+            "from_node_id": null, "to_node_id": NEW, "term": 7, "log_seq": 42,
+            "ack_fence": true, "accept_loss": false,
+        })
+    );
+}
+
+/// Section 7.3 step 5 when more than one node other than the promoted one
+/// holds the primary status: the write clears each, and the first by id is
+/// the one `params.from_node_id` names and `--ack-fence` declares lost, as
+/// `promotion::old_primary` gives it from the fold. `EARLY`, inserted last
+/// but first by id, is that node: it gets `lost_at`, and the other holders,
+/// the old primary's node among them, keep their leases and get no
+/// `lost_at`.
+#[tokio::test]
+async fn with_several_holders_each_is_cleared_and_the_first_by_id_is_declared_lost() {
+    let store = rebuilt().await;
+    set_term(&store, &OLD_TERM.to_string()).await;
+    let mut w = store.begin_write().await.unwrap();
+    insert_node(&mut w.tx, EARLY, Some("primary"), &now_rfc3339()).await;
+    w.commit().await.unwrap();
+    set_node(&store, OTHER, Some("primary"), None).await;
+    set_term(&store, &TERM.to_string()).await;
+    assert_eq!(
+        promotion::old_primary(&fold(&store).await, NEW),
+        Some(EARLY)
+    );
+    let leases_before = leases(&store).await;
+    let before = log_head(&store).await;
+
+    let written = promotion::write(&store, &request(true, false, Some(STATEMENT)))
+        .await
+        .unwrap();
+    assert_eq!(written.from_node_id.as_deref(), Some(EARLY));
+    let entries = assert_one_write_at_term(&store, before, &written).await;
+    assert_eq!(
+        kinds(&entries),
+        [
+            ("node", EARLY),
+            ("node", OLD),
+            ("node", OTHER),
+            ("node", NEW),
+            ("node", EARLY),
+            ("audit", "1"),
+        ]
+    );
+    for entry in &entries[..3] {
+        assert_eq!(entry.6["cp_status"], Value::Null, "{}", entry.5);
+        assert_eq!(entry.6["lost_at"], Value::Null, "{}", entry.5);
+    }
+    assert_eq!(entries[3].6["cp_status"], "primary");
+    let (cp_status, lost_at) = node(&store, EARLY).await;
+    assert_eq!(cp_status, None);
+    let lost_at = lost_at.expect("declared lost");
+    assert_eq!(entries[4].6["lost_at"], json!(lost_at));
+    assert_eq!(node(&store, OLD).await, (None, None));
+    assert_eq!(node(&store, OTHER).await, (None, None));
+    assert_eq!(node(&store, NEW).await, (Some("primary".to_string()), None));
+    assert_eq!(leases(&store).await, leases_before, "no token raised");
+
+    let records = promoted_records(&store).await;
+    assert_eq!(
+        records,
+        [(
+            written.audit_seq,
+            expected_record(Some(EARLY), true, false, entries[3].0)
+        )]
+    );
+    assert_eq!(
+        records[0].1["params"],
+        json!({
+            "from_node_id": EARLY, "to_node_id": NEW, "term": 7, "log_seq": 42,
+            "ack_fence": true, "accept_loss": false,
+        })
+    );
+}
+
+/// Section 7.3 step 5 and ADR 0202: `--ack-fence` for an old primary already
+/// declared lost declares nothing again. Its `lost_at` stays, no token is
+/// raised, and a lease it holds at the cap refuses nothing, since nothing is
+/// raised: the in-write check agrees with `check_token_cap` on the fold. The
+/// write only moves the status and records the promotion with
+/// `ack_fence: true`.
+#[tokio::test]
+async fn ack_fence_on_an_old_primary_already_lost_declares_nothing_again() {
+    let store = rebuilt().await;
+    set_term(&store, &OLD_TERM.to_string()).await;
+    set_node(&store, OLD, Some("primary"), Some(LOST_AT)).await;
+    set_token(&store, OLD_EXPIRING, MAX_TOKEN).await;
+    set_term(&store, &TERM.to_string()).await;
+    assert_eq!(promotion::check_token_cap(&fold(&store).await, OLD), Ok(()));
+    let leases_before = leases(&store).await;
+    let before = log_head(&store).await;
+
+    let written = promotion::write(&store, &request(true, false, Some(STATEMENT)))
+        .await
+        .unwrap();
+    assert_eq!(written.from_node_id.as_deref(), Some(OLD));
+    let entries = assert_one_write_at_term(&store, before, &written).await;
+    assert_eq!(
+        kinds(&entries),
+        [("node", OLD), ("node", NEW), ("audit", "1")]
+    );
+    assert_eq!(entries[0].6["cp_status"], Value::Null);
+    assert_eq!(entries[0].6["lost_at"], LOST_AT);
+    assert_eq!(node(&store, OLD).await, (None, Some(LOST_AT.to_string())));
+    assert_eq!(node(&store, OTHER).await, (None, None));
+    assert_eq!(leases(&store).await, leases_before, "no token raised");
+    assert_eq!(lease(&store, OLD_EXPIRING).await.2, MAX_TOKEN);
+    assert_eq!(lease(&store, OLD_LOCAL).await.2, 3);
+
+    let records = promoted_records(&store).await;
+    assert_eq!(
+        records,
+        [(
+            written.audit_seq,
+            expected_record(Some(OLD), true, false, entries[1].0)
+        )]
+    );
+    assert_eq!(
+        records[0].1["params"],
+        json!({
+            "from_node_id": OLD, "to_node_id": NEW, "term": 7, "log_seq": 42,
+            "ack_fence": true, "accept_loss": false,
+        })
+    );
+}
+
+/// A failure after the write has started, here the insert of the record
+/// itself, the last insert of the write, drops the whole transaction: no
+/// entry, no record, `cp_status` where it was, no `lost_at`, no lease
+/// change. Once the failure is gone the same write goes through.
+#[tokio::test]
+async fn a_failure_after_the_write_started_leaves_nothing_written() {
+    let store = rebuilt().await;
+    sqlx::query(
+        "CREATE TRIGGER refuse_record BEFORE INSERT ON audit_log \
+         BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let leases_before = leases(&store).await;
+    let before = log_head(&store).await;
+
+    let error = promotion::write(&store, &request(true, true, Some(STATEMENT)))
+        .await
+        .unwrap_err();
+    let PromotionError::Failed(why) = &error else {
+        panic!("{error}");
+    };
+    assert!(why.starts_with("cannot record cluster.promoted"), "{why}");
+    assert!(why.contains("refused by the test"), "{why}");
+    assert_eq!(log_head(&store).await, before, "no entry");
+    assert_eq!(audit_count(&store).await, 0, "no record");
+    assert_eq!(node(&store, OLD).await, (Some("primary".to_string()), None));
+    assert_eq!(node(&store, NEW).await, (None, None));
+    assert_eq!(node(&store, OTHER).await, (None, None));
+    assert_eq!(leases(&store).await, leases_before);
+
+    sqlx::query("DROP TRIGGER refuse_record")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let written = promotion::write(&store, &request(true, true, Some(STATEMENT)))
+        .await
+        .unwrap();
+    assert_one_write_at_term(&store, before, &written).await;
 }
