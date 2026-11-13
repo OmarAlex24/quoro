@@ -91,12 +91,16 @@ async fn the_command_reaches_the_primary_over_its_control_socket() {
         "{}",
         text(&out_of_range.stderr)
     );
+    // No socket file, as on the first upgrade from a release before the
+    // maintenance window: the command says no window can open, and why.
     let absent = maintenance(&socket, &["--end"]).await;
     assert_eq!(absent.status.code(), Some(1));
+    let reason = text(&absent.stderr);
     assert!(
-        text(&absent.stderr).contains("no running primary answers"),
-        "{}",
-        text(&absent.stderr)
+        reason.contains("no maintenance window can open")
+            && reason.contains("the running primary has no control socket")
+            && reason.contains("a release from before the maintenance window"),
+        "{reason}"
     );
 
     let mut server = Command::new(env!("CARGO_BIN_EXE_quoro"))
@@ -186,6 +190,15 @@ async fn the_command_reaches_the_primary_over_its_control_socket() {
 
     server.kill().await.expect("stop the server");
     let _ = server.wait().await;
+    // A killed primary leaves its socket file behind, and nothing answers on
+    // it.
+    let stale = maintenance(&socket, &["--end"]).await;
+    assert_eq!(stale.status.code(), Some(1));
+    assert!(
+        text(&stale.stderr).contains("no running primary answers"),
+        "{}",
+        text(&stale.stderr)
+    );
     let pool = sqlx::SqlitePool::connect(&format!(
         "sqlite://{}?mode=ro",
         dir.0.join("cp").join("quoro.db").display()

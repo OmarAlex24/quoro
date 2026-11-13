@@ -1318,12 +1318,18 @@ start_unit() {
 # running, over its local control socket. The command fails both when no
 # window opened and when a window opened but does not cover every lease; it
 # prints which, and the leases it did cover keep their longer validity. A
-# failure does not stop the upgrade: a warm app the window does not cover
-# fences if the restart takes longer than about D, which is the safe outcome.
+# primary of a release from before the maintenance window has no control
+# socket, so on the first upgrade from one no window opens at all. A failure
+# does not stop the upgrade: a warm app the window does not cover fences if the
+# restart takes longer than about D, which is the safe outcome.
 open_maintenance_window() {
     systemctl is-active --quiet quoro.service 2>/dev/null || return 0
     log 'asking the running primary for a maintenance window before restarting quoro.service'
     if /usr/local/bin/quoro cluster maintenance; then
+        return 0
+    fi
+    if [ ! -S /run/quoro/control.sock ]; then
+        log 'warning: the running primary has no control socket, so no maintenance window covers the warm apps (see the message above): a warm app fences if quoro.service takes longer than about D (15 s) to restart; going on with the upgrade'
         return 0
     fi
     log 'warning: the maintenance window does not cover every warm app (see the message above): a warm app it does not cover fences if quoro.service takes longer than about D (15 s) to restart; going on with the upgrade'

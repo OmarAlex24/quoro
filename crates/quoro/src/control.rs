@@ -23,7 +23,15 @@
 //! ([`VERSION`]). A primary refuses a request whose `v` it does not know, or
 //! that has none, with an error that says so, rather than guess at its
 //! meaning; a change to the meaning of either line takes a new version. Every
-//! answer keeps `ok` and `message`, so any client can print it.
+//! answer keeps `v`, `ok` and `message`, so any client can print it.
+//!
+//! An answer's `v` is the version the primary serves, whatever version the
+//! request carried, refusals included. That is the rule every later version
+//! keeps: a client that gets a refusal whose `v` is not the version it sent
+//! must send the request again in the version the refusal carries. So a
+//! client of a later version keeps speaking the versions of the releases it
+//! may upgrade from. Version 1 is the first, so this client has nothing to
+//! fall back to: it prints every refusal and fails.
 //!
 //! `QUORO_CONTROL_SOCKET` names another path, for tests.
 
@@ -346,6 +354,16 @@ async fn call(path: &Path, body: &Value) -> Result<Value, String> {
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             return Err(format!(
                 "permission denied on {shown}: run it as root on the primary's host"
+            ));
+        }
+        // No socket file at all: the first upgrade from a release before the
+        // maintenance window meets this, while quoro.service does run.
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "no maintenance window can open: {shown} does not exist, so the running primary \
+                 has no control socket. Either it runs a release from before the maintenance \
+                 window, or it could not open the socket (its log says why), or this host does \
+                 not run the primary or quoro.service is not running"
             ));
         }
         Ok(Err(e)) => {
