@@ -1098,3 +1098,257 @@ async fn an_existing_target_refuses_the_build() {
     ));
     assert_eq!(dir.files(), ["quoro.db"]);
 }
+
+/// A `-wal` or `-shm` file at the target's path refuses the build before it
+/// starts, and one that appears while it runs refuses the link: SQLite would
+/// read it as part of the new database. Nothing is left but that file.
+#[tokio::test]
+async fn a_wal_or_shm_file_at_the_target_refuses_the_build() {
+    let primary = primary().await;
+    log(
+        &primary,
+        "user",
+        "usr_1",
+        Op::Create,
+        user("usr_1", "a@example.com"),
+    )
+    .await;
+    let entries = followed(&primary).await;
+    let dir = Dir::new();
+    let [wal, shm] = sidecars(&dir.target());
+    for side in [&wal, &shm] {
+        std::fs::write(side, b"someone's pages").unwrap();
+        let error = build(&entries, CLUSTER, 2, &dir.target())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, BuildError::Exists(path) if path == side),
+            "{error}"
+        );
+        let name = side.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(dir.files(), [name]);
+        assert_eq!(std::fs::read(side).unwrap(), b"someone's pages");
+        std::fs::remove_file(side).unwrap();
+    }
+
+    // Just before the link: the database is written under its temporary
+    // name, then a side file appears at the target.
+    for side in [&wal, &shm] {
+        let temporary = temporary_path(&dir.target()).unwrap();
+        create_new(&temporary).unwrap();
+        write(&entries, CLUSTER, 2, &temporary).await.unwrap();
+        std::fs::write(side, b"someone's pages").unwrap();
+        let error = settle(&temporary, &dir.target()).unwrap_err();
+        assert!(
+            matches!(&error, BuildError::Exists(path) if path == side),
+            "{error}"
+        );
+        assert!(!dir.target().exists());
+        assert!(temporary.exists(), "the build removes its own file");
+        remove_database(&temporary);
+        std::fs::remove_file(side).unwrap();
+        assert!(dir.files().is_empty(), "{:?}", dir.files());
+    }
+    build(&entries, CLUSTER, 2, &dir.target()).await.unwrap();
+    assert_eq!(dir.files(), ["quoro.db"]);
+}
+
+/// The `audit_log` rows go in the order of their own `seq`, whatever the
+/// order of their entries in the change log: here the second record's entry
+/// comes before the first's, which the table's triggers would refuse in
+/// change-log order.
+#[tokio::test]
+async fn audit_records_are_inserted_in_their_own_seq_order() {
+    let source = primary().await;
+    audit_record(&source, "test.one").await;
+    audit_record(&source, "test.two").await;
+    audit_record(&source, "test.three").await;
+    let records: Vec<String> = sqlx::query_scalar(
+        "SELECT payload FROM change_log WHERE entity_type = 'audit' ORDER BY seq",
+    )
+    .fetch_all(source.pool())
+    .await
+    .unwrap();
+    assert_eq!(records.len(), 3);
+    let primary = primary().await;
+    for index in [1, 2, 0] {
+        let record: Value = serde_json::from_str(&records[index]).unwrap();
+        let seq = record["seq"].to_string();
+        log(&primary, "audit", &seq, Op::Create, record).await;
+    }
+    let entries = followed(&primary).await;
+    let order: Vec<&str> = entries.iter().map(|e| e.entity_id.as_str()).collect();
+    assert_eq!(order, ["2", "3", "1"], "the log holds them out of order");
+
+    let dir = Dir::new();
+    let built = build(&entries, CLUSTER, 2, &dir.target())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(built.rows["audit_log"], 3);
+    let rebuilt = open(&dir.target()).await;
+    let stored: Vec<(i64, String)> =
+        sqlx::query_as("SELECT seq, operation FROM audit_log ORDER BY seq")
+            .fetch_all(rebuilt.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        [
+            (1, "test.one".to_owned()),
+            (2, "test.two".to_owned()),
+            (3, "test.three".to_owned()),
+        ]
+    );
+}
+
+/// Each build first removes what a build of the same target left when it
+/// did not finish: the regular files named `.<name>.rebuild-<16 hex
+/// digits>`, alone or with `-wal`, `-shm` or `-journal`, owned by the user
+/// it runs as. Every other name, a directory and a symbolic link stay.
+#[tokio::test]
+async fn a_build_removes_what_a_stopped_build_left() {
+    let primary = primary().await;
+    log(
+        &primary,
+        "user",
+        "usr_1",
+        Op::Create,
+        user("usr_1", "a@example.com"),
+    )
+    .await;
+    let dir = Dir::new();
+    let left = ".quoro.db.rebuild-0123456789abcdef";
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        std::fs::write(dir.0.join(format!("{left}{suffix}")), b"stale").unwrap();
+    }
+    let mut kept = vec![
+        ".quoro.db.rebuild-0123456789ABCDEF".to_owned(),
+        ".quoro.db.rebuild-0123456789abcde".to_owned(),
+        ".quoro.db.rebuild-0123456789abcdef-old".to_owned(),
+        ".other.db.rebuild-0123456789abcdef".to_owned(),
+        "quoro.db.rebuild-0123456789abcdef".to_owned(),
+        "notes.txt".to_owned(),
+    ];
+    for name in &kept {
+        std::fs::write(dir.0.join(name), b"not a build's").unwrap();
+    }
+    let directory = ".quoro.db.rebuild-fedcba9876543210";
+    std::fs::create_dir(dir.0.join(directory)).unwrap();
+    kept.push(directory.to_owned());
+    #[cfg(unix)]
+    {
+        let link = ".quoro.db.rebuild-aaaaaaaaaaaaaaaa";
+        std::os::unix::fs::symlink(dir.0.join("notes.txt"), dir.0.join(link)).unwrap();
+        kept.push(link.to_owned());
+    }
+
+    build(&followed(&primary).await, CLUSTER, 2, &dir.target())
+        .await
+        .unwrap();
+    kept.push("quoro.db".to_owned());
+    kept.sort();
+    assert_eq!(dir.files(), kept);
+    assert_eq!(
+        std::fs::read(dir.0.join("notes.txt")).unwrap(),
+        b"not a build's"
+    );
+}
+
+/// The followed entries' chain is checked before the fold reads them: an
+/// entry edited into a payload the fold refuses, or into a value its column
+/// cannot hold, stops the build with the change-log break at its `seq`,
+/// not with a fold or column error.
+#[tokio::test]
+async fn a_tampered_entry_stops_at_the_chain_before_the_fold() {
+    let primary = primary().await;
+    log(
+        &primary,
+        "user",
+        "usr_1",
+        Op::Create,
+        user("usr_1", "a@example.com"),
+    )
+    .await;
+    log(
+        &primary,
+        "user",
+        "usr_1",
+        Op::Update,
+        json!({"id": "usr_1", "disabled": 0}),
+    )
+    .await;
+    let entries = followed(&primary).await;
+    let dir = Dir::new();
+    for payload in ["[]", r#"{"disabled":"no","id":"usr_1"}"#] {
+        let mut edited = entries.clone();
+        edited[1].payload = payload.to_owned();
+        let error = build(&edited, CLUSTER, 2, &dir.target()).await.unwrap_err();
+        assert!(
+            matches!(&error, BuildError::ChangeLog { seq: 2, .. }),
+            "{payload}: {error}"
+        );
+        assert!(dir.files().is_empty(), "{:?}", dir.files());
+    }
+}
+
+/// The chain checks of a build read the new file a page at a time and find
+/// the same break whatever the page size: none on the file as built, the
+/// first edited record or entry once one is edited.
+#[tokio::test]
+async fn the_chain_checks_find_the_same_break_page_by_page() {
+    let source = primary().await;
+    for operation in ["test.one", "test.two", "test.three", "test.four"] {
+        audit_record(&source, operation).await;
+    }
+    let dir = Dir::new();
+    build(&followed(&source).await, CLUSTER, 2, &dir.target())
+        .await
+        .unwrap();
+    let rebuilt = open(&dir.target()).await;
+    let mut conn = rebuilt.pool().acquire().await.unwrap();
+    for page in [1, 2, 3, PAGE] {
+        verify_chains(&mut conn, page)
+            .await
+            .unwrap_or_else(|e| panic!("page {page}: {e}"));
+    }
+
+    sqlx::query("DROP TRIGGER audit_log_append_only_update")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE audit_log SET operation = 'test.edited' WHERE seq = 3")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    for page in [1, 2, 3, PAGE] {
+        let error = verify_chains(&mut conn, page).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                BuildError::AuditChain {
+                    seq: 3,
+                    reason: audit::HASH_MISMATCH
+                }
+            ),
+            "page {page}: {error}"
+        );
+    }
+
+    sqlx::query("DROP TRIGGER change_log_append_only_update")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE change_log SET actor_id = 'edited' WHERE seq = 2")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    for page in [1, 2, 3, PAGE] {
+        let error = verify_chains(&mut conn, page).await.unwrap_err();
+        assert!(
+            matches!(error, BuildError::ChangeLog { seq: 2, .. }),
+            "page {page}: {error}"
+        );
+    }
+    drop(conn);
+    rebuilt.pool().close().await;
+}

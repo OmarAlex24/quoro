@@ -5,32 +5,47 @@
 //!
 //! [`build`] writes it into a new file:
 //!
-//! 1. It creates the schema of this binary, `db-schema.sql` and every
+//! 1. It checks the chain of the followed entries before anything reads
+//!    them: each `seq` follows the one before it from 1, each `prev_hash` is
+//!    the `hash` of the entry before it (the genesis hash for the first), and
+//!    each entry hashes to its own `hash`. A tampered log stops here, at the
+//!    `seq` it breaks at, rather than with a fold or column error further on.
+//! 2. It creates the schema of this binary, `db-schema.sql` and every
 //!    migration, through the same migration path [`Store`] uses.
-//! 2. It folds the entries per entity ([`super::fold`]) and stops on the
+//! 3. It folds the entries per entity ([`super::fold`]) and stops on the
 //!    fold's errors.
-//! 3. It applies the schema's `ON DELETE CASCADE` deletes itself
+//! 4. It applies the schema's `ON DELETE CASCADE` deletes itself
 //!    ([`Cascaded`]): a row the primary removed with its parent has no entry
 //!    of its own. A row goes with a parent deleted after its own last
 //!    `create`, when it pointed at that parent at the time of the delete; a
 //!    parent created again later under the same id does not bring back the
 //!    rows deleted before it.
-//! 4. It inserts the final rows in one transaction with foreign keys
+//! 5. It inserts the final rows in one transaction with foreign keys
 //!    deferred, decoding each column as its writer encodes it in the payload
-//!    ([`insert_rows`]).
-//! 5. It copies every entry into `change_log` in `seq` order, unchanged.
-//! 6. It writes `meta`: `cluster_id` from the agent's identity, `term` the
+//!    ([`insert_rows`]). The rows go in the order of the `create`s they start
+//!    from, except those of `audit_log`, which go in the order of their own
+//!    `seq`: its triggers take a record only right after the one before it.
+//! 6. It copies every entry into `change_log` in `seq` order, unchanged.
+//! 7. It writes `meta`: `cluster_id` from the agent's identity, `term` the
 //!    promotion's term, `schema_version` this binary's, and `webhook_cursor`
 //!    the `seq` of the newest event in the rebuilt event log (0 when it holds
 //!    none). No other key: `meta` is not in the log.
-//! 7. Tables marked LOCAL start empty, and `backup_repositories.repo_key_enc`
+//! 8. Tables marked LOCAL start empty, and `backup_repositories.repo_key_enc`
 //!    is an empty BLOB (section 7.1).
-//! 8. It verifies the change-log chain and the audit chain on the new file
-//!    (`audit-log-format.md` section 6) and stops on a break.
+//! 9. It verifies the change-log chain and the audit chain on the new file
+//!    (`audit-log-format.md` section 6), reading each a page at a time, and
+//!    stops on a break.
 //!
-//! The file is built under a temporary name next to the target and linked
-//! into place only once everything above holds, so a build that stops leaves
-//! nothing at the target path, and one that finds the path taken refuses.
+//! The file is built under a temporary name next to the target,
+//! `.<file name>.rebuild-<16 hex digits>`, and linked into place only once
+//! everything above holds, so a build that stops leaves nothing at the
+//! target path. The target path, or a `-wal` or `-shm` file next to it,
+//! refuses the build when it exists, both before the build starts and just
+//! before the link: SQLite would read such a file as part of the new
+//! database. A build that crashed leaves its temporary file behind, so each
+//! build first removes the regular files next to the target that bear such
+//! a name, or that name with `-wal`, `-shm` or `-journal` after it, and that
+//! belong to the user it runs as.
 //!
 //! # How a payload's values become columns
 //!
@@ -41,17 +56,24 @@
 //! - a `REAL` column takes a JSON number;
 //! - a `TEXT` column takes a JSON string as it stands, an object or an array
 //!   as its JSON text (RFC 8785, the form the audit log stores `params` in),
-//!   or an integer as its decimal text;
+//!   or an integer as its decimal text. Such a column holds the same JSON
+//!   value as the primary's, though its keys may be in another order: the
+//!   primary stores the text its writer made, the payload carries the value
+//!   in RFC 8785 form;
 //! - a `BLOB` column takes a string in its writer's encoding
 //!   ([`BLOB_ENCODINGS`]): lowercase hex for the `*_enc` ciphertexts and the
-//!   tunnel run token, standard base64 for a custody seal (migration 0012);
+//!   tunnel run token, standard base64 for a custody seal (migration 0012).
+//!   The one ciphertext no payload carries, `backup_repositories.repo_key_enc`,
+//!   is always an empty BLOB;
 //! - JSON `null` is SQL `NULL`.
 //!
 //! A value that does not fit its column stops the build with an error that
 //! names the entity, the `seq` of the entry that wrote the value and the
 //! column ([`BuildError::Column`]).
 
-use super::{Cell, Deletion, Dropped, Entry, FoldError, Folded, KeyMismatch, Schema, TABLES};
+use super::{
+    Cell, Deletion, Dropped, Entry, FoldError, Folded, FoldedRow, KeyMismatch, Schema, TABLES,
+};
 use crate::audit;
 use crate::changelog;
 use crate::store::{GENESIS_HASH, MAX_TERM, Store, random_secret};
@@ -165,7 +187,8 @@ pub struct Built {
 /// Why [`build`] stopped. Nothing is left at the target path.
 #[derive(Debug)]
 pub enum BuildError {
-    /// Something already exists at the target path.
+    /// Something already exists at the target path, or at its `-wal` or
+    /// `-shm` path; the path is the one found.
     Exists(PathBuf),
     /// The followed log is empty.
     EmptyLog,
@@ -212,7 +235,8 @@ pub enum BuildError {
         child: &'static str,
         parent: &'static str,
     },
-    /// The change-log chain breaks at `seq`.
+    /// The change-log chain breaks at `seq`: the followed entries' before
+    /// the fold, or the copied log's on the new file.
     ChangeLog {
         seq: u64,
         reason: String,
@@ -343,11 +367,13 @@ pub async fn build(
     if cluster_id.is_empty() {
         return Err(BuildError::NoClusterId);
     }
-    if std::fs::symlink_metadata(path).is_ok() {
-        return Err(BuildError::Exists(path.to_path_buf()));
+    check_chain(entries)?;
+    if let Some(taken) = taken(path) {
+        return Err(BuildError::Exists(taken));
     }
     let temporary = temporary_path(path)?;
     create_new(&temporary)?;
+    sweep(path, &temporary);
     let built = match write(entries, cluster_id, term, &temporary).await {
         Ok(built) => built,
         Err(error) => {
@@ -399,6 +425,95 @@ fn sidecars(path: &Path) -> [PathBuf; 2] {
     })
 }
 
+/// The first of `path` and its `-wal` and `-shm` files that exists, or
+/// `None`. SQLite opening a database reads a `-wal` or `-shm` file next to
+/// it as its own, so a build must find none there.
+fn taken(path: &Path) -> Option<PathBuf> {
+    std::iter::once(path.to_path_buf())
+        .chain(sidecars(path))
+        .find(|file| std::fs::symlink_metadata(file).is_ok())
+}
+
+/// Removes what earlier builds of `path` left next to it when they did not
+/// finish: each regular file whose name [`is_leftover`] takes, owned by the
+/// owner of `ours`, this build's own temporary file, which it leaves alone.
+/// A file it cannot read or remove is left, with a warning for the latter.
+fn sweep(path: &Path, ours: &Path) {
+    let (Some(name), Some(own)) = (path.file_name(), ours.file_name()) else {
+        return;
+    };
+    let Some(name) = name.to_str() else {
+        return;
+    };
+    let Some(owner) = std::fs::symlink_metadata(ours)
+        .ok()
+        .and_then(|meta| owner_of(&meta))
+    else {
+        return;
+    };
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!(".{name}.rebuild-");
+    for item in listing.flatten() {
+        let file_name = item.file_name();
+        if file_name.as_os_str() == own
+            || !file_name.to_str().is_some_and(|f| is_leftover(f, &prefix))
+        {
+            continue;
+        }
+        let file = item.path();
+        let Ok(meta) = std::fs::symlink_metadata(&file) else {
+            continue;
+        };
+        if !meta.file_type().is_file() || owner_of(&meta) != Some(owner) {
+            continue;
+        }
+        match std::fs::remove_file(&file) {
+            Ok(()) => tracing::info!(path = %file.display(), "removed what a stopped rebuild left"),
+            Err(error) => tracing::warn!(
+                %error,
+                path = %file.display(),
+                "cannot remove what a stopped rebuild left"
+            ),
+        }
+    }
+}
+
+/// Whether `file_name` is a name [`temporary_path`] gives after `prefix`,
+/// `.<file name>.rebuild-`, followed by 16 lowercase hex digits, alone or
+/// with SQLite's `-wal`, `-shm` or `-journal` after it.
+fn is_leftover(file_name: &str, prefix: &str) -> bool {
+    let Some(rest) = file_name.strip_prefix(prefix) else {
+        return false;
+    };
+    let random = ["-wal", "-shm", "-journal"]
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))
+        .unwrap_or(rest);
+    random.len() == 16
+        && random
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The user id that owns a file, where the platform has one.
+#[cfg(unix)]
+fn owner_of(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(meta.uid())
+}
+
+/// The user id that owns a file, where the platform has one.
+#[cfg(not(unix))]
+fn owner_of(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
 /// Removes the database at `path` and its sidecars, ignoring what is not
 /// there.
 fn remove_database(path: &Path) {
@@ -412,8 +527,9 @@ fn remove_database(path: &Path) {
 }
 
 /// Moves the closed database at `temporary` to `path`: it checks that no
-/// `-wal` page is left, removes the empty sidecars, syncs the file, links
-/// it at `path`, which fails when `path` exists, removes the temporary
+/// `-wal` page is left, removes the empty sidecars, syncs the file, checks
+/// that nothing appeared at `path` or its `-wal` or `-shm` path meanwhile,
+/// links it at `path`, which fails when `path` exists, removes the temporary
 /// name and syncs the directory. When a step after the link fails, it
 /// removes the link it made, so the build's error leaves no file at `path`.
 fn settle(temporary: &Path, path: &Path) -> Result<(), BuildError> {
@@ -430,6 +546,9 @@ fn settle(temporary: &Path, path: &Path) -> Result<(), BuildError> {
         }
     }
     std::fs::File::open(temporary)?.sync_all()?;
+    if let Some(taken) = taken(path) {
+        return Err(BuildError::Exists(taken));
+    }
     match std::fs::hard_link(temporary, path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -470,8 +589,9 @@ async fn write(
     built
 }
 
-/// Steps 2 to 8 of the module documentation, into `store`, a new database
-/// with this binary's schema.
+/// Steps 3 to 9 of the module documentation, into `store`, a new database
+/// with this binary's schema. The folded rows are dropped once inserted and
+/// checked, before the chain checks read the new file.
 async fn fill(
     store: &Store,
     followed: &[FollowedEntry],
@@ -526,30 +646,39 @@ async fn fill(
         rows.insert(table, count.unsigned_abs());
     }
     w.commit().await?;
+    // Only the lists [`Built`] returns outlive the insert: the rows and the
+    // entries that point into the followed log go before the chain checks.
+    let Folded {
+        tables,
+        deletions,
+        dropped,
+        mismatches,
+    } = folded;
+    drop(tables);
+    drop(deletions);
+    drop(entries);
 
     let mut conn = store.pool().acquire().await?;
-    verify_chains(&mut conn).await?;
+    verify_chains(&mut conn, PAGE).await?;
     Ok(Built {
         head_seq,
         rows,
         schema_version: schema_version.parse().unwrap_or_default(),
         webhook_cursor: webhook_cursor.unsigned_abs(),
         cascaded,
-        mismatches: folded.mismatches,
-        dropped: folded.dropped,
+        mismatches,
+        dropped,
     })
 }
 
-/// Copies `entries` into `change_log` unchanged, in `seq` order, and returns
-/// the newest `seq`. Each must follow the one before it, from `seq` 1 and
-/// the genesis hash; [`verify_chains`] re-hashes them once written.
-async fn copy_change_log(
-    conn: &mut SqliteConnection,
-    entries: &[FollowedEntry],
-) -> Result<u64, BuildError> {
-    let mut expected = 1;
+/// Checks the chain of `entries` before anything reads them (step 1 of the
+/// module documentation): each `seq` follows the one before it from 1, each
+/// `prev_hash` is the `hash` of the entry before it, the genesis hash for
+/// the first, and each entry hashes to its own `hash`
+/// ([`changelog::links`]).
+fn check_chain(entries: &[FollowedEntry]) -> Result<(), BuildError> {
     let mut prev_hash = GENESIS_HASH;
-    for entry in entries {
+    for (expected, entry) in (1_u64..).zip(entries) {
         let broken = |reason: &str| BuildError::ChangeLog {
             seq: entry.seq,
             reason: reason.to_owned(),
@@ -562,6 +691,42 @@ async fn copy_change_log(
                 "its prev_hash is not the hash of the entry before it",
             ));
         }
+        let stored = changelog::StoredEntry {
+            seq: i64::try_from(entry.seq).map_err(|_| broken("seq out of range"))?,
+            term: i64::try_from(entry.term).map_err(|_| broken("term out of range"))?,
+            time: entry.time.clone(),
+            actor_type: entry.actor_type.clone(),
+            actor_id: entry.actor_id.clone(),
+            entity_type: entry.entity_type.clone(),
+            entity_id: entry.entity_id.clone(),
+            op: entry.op.clone(),
+            payload: entry.payload.clone(),
+            prev_hash: entry.prev_hash.clone(),
+            hash: entry.hash.clone(),
+        };
+        match changelog::links(&stored, prev_hash) {
+            Ok(true) => {}
+            Ok(false) => return Err(broken("its hash does not cover it")),
+            Err(error) => return Err(broken(&error.to_string())),
+        }
+        prev_hash = &entry.hash;
+    }
+    Ok(())
+}
+
+/// Copies `entries`, whose chain [`check_chain`] checked, into `change_log`
+/// unchanged, in `seq` order, and returns the newest `seq`;
+/// [`verify_chains`] re-hashes them once written.
+async fn copy_change_log(
+    conn: &mut SqliteConnection,
+    entries: &[FollowedEntry],
+) -> Result<u64, BuildError> {
+    let mut head = 0;
+    for entry in entries {
+        let broken = |reason: &str| BuildError::ChangeLog {
+            seq: entry.seq,
+            reason: reason.to_owned(),
+        };
         sqlx::query(
             "INSERT INTO change_log (seq, term, time, actor_type, actor_id, entity_type, \
              entity_id, op, payload, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -580,16 +745,20 @@ async fn copy_change_log(
         .execute(&mut *conn)
         .await
         .map_err(|error| broken(&error.to_string()))?;
-        expected += 1;
-        prev_hash = &entry.hash;
+        head = entry.seq;
     }
-    Ok(expected - 1)
+    Ok(head)
 }
 
-/// Re-hashes the change log from `seq` 1 ([`changelog::verify`]) and walks
-/// the audit chain from record 1 ([`audit::verify_records`]).
-async fn verify_chains(conn: &mut SqliteConnection) -> Result<(), BuildError> {
-    match changelog::verify(conn).await {
+/// The rows each chain check of [`verify_chains`] reads at once in a build.
+const PAGE: u32 = 1024;
+
+/// Re-hashes the change log from `seq` 1 ([`changelog::verify_paged`]) and
+/// walks the audit chain from record 1 ([`audit::verify_records`], one page
+/// after another, each seeded with the hash the page before it ended on),
+/// holding `page` rows of either at a time.
+async fn verify_chains(conn: &mut SqliteConnection, page: u32) -> Result<(), BuildError> {
+    match changelog::verify_paged(conn, page).await {
         Ok(None) => {}
         Ok(Some(seq)) => {
             return Err(BuildError::ChangeLog {
@@ -604,24 +773,37 @@ async fn verify_chains(conn: &mut SqliteConnection) -> Result<(), BuildError> {
             });
         }
     }
-    let rows = sqlx::query(&format!(
-        "SELECT {} FROM audit_log ORDER BY seq",
-        audit::COLUMNS
-    ))
-    .fetch_all(&mut *conn)
-    .await?;
-    let records = rows
-        .iter()
-        .map(audit::record_value_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    let verification = audit::verify_records(records, 1, GENESIS_HASH);
-    if !verification.ok {
-        return Err(BuildError::AuditChain {
-            seq: verification.broken_at_seq.unwrap_or_default(),
-            reason: verification.reason.unwrap_or_default(),
-        });
+    let mut after = i64::MIN;
+    let mut first_seq = 1;
+    let mut seed = GENESIS_HASH.to_owned();
+    loop {
+        let rows = sqlx::query(&format!(
+            "SELECT {} FROM audit_log WHERE seq > ? ORDER BY seq LIMIT ?",
+            audit::COLUMNS
+        ))
+        .bind(after)
+        .bind(page.max(1))
+        .fetch_all(&mut *conn)
+        .await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let records = rows
+            .iter()
+            .map(audit::record_value_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(rows);
+        let verification = audit::verify_records(records, first_seq, &seed);
+        if !verification.ok {
+            return Err(BuildError::AuditChain {
+                seq: verification.broken_at_seq.unwrap_or_default(),
+                reason: verification.reason.unwrap_or_default(),
+            });
+        }
+        after = verification.last_seq;
+        first_seq = verification.last_seq + 1;
+        seed = verification.head_hash;
     }
-    Ok(())
 }
 
 /// One `ON DELETE CASCADE` of the schema between two tables the change log
@@ -935,11 +1117,54 @@ fn writer_seq(
         .unwrap_or(created_seq)
 }
 
+/// The table whose rows [`insert_order`] puts in their own `seq` order.
+const AUDIT_TABLE: &str = "audit_log";
+
+/// The rows of `folded` in the order [`insert_rows`] inserts them: the order
+/// of the `create`s they start from, except that the `audit_log` rows, in
+/// the places they take in that order, go in the order of their own `seq`.
+/// The table's triggers take a record only right after the record before
+/// it, and nothing in the log says its entries come in that order.
+fn insert_order(folded: &Folded) -> Vec<(u64, &'static str, &String, &FoldedRow)> {
+    let mut rows: Vec<(u64, &'static str, &String, &FoldedRow)> = folded
+        .tables
+        .iter()
+        .flat_map(|(table, rows)| {
+            rows.iter()
+                .map(|(entity_id, row)| (row.created_seq, *table, entity_id, row))
+        })
+        .collect();
+    rows.sort_by_key(|(created_seq, ..)| *created_seq);
+    let slots: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, table, ..))| *table == AUDIT_TABLE)
+        .map(|(slot, _)| slot)
+        .collect();
+    let mut records: Vec<_> = slots.iter().map(|slot| rows[*slot]).collect();
+    records.sort_by_key(|(_, _, entity_id, row)| audit_seq(entity_id, row));
+    for (slot, row) in slots.into_iter().zip(records) {
+        rows[slot] = row;
+    }
+    rows
+}
+
+/// The `seq` of an `audit_log` row: its `seq` column, or its `entity_id`
+/// when the column holds no integer. `None`, first in the order, for
+/// neither, which the insert then refuses.
+fn audit_seq(entity_id: &str, row: &FoldedRow) -> Option<i64> {
+    match row.cells.get("seq") {
+        Some(Cell::Value(value)) => value.as_i64(),
+        _ => None,
+    }
+    .or_else(|| entity_id.parse().ok())
+}
+
 /// Inserts every row of `folded` through `conn`, a database with the schema
-/// `schema` was read from, in the order of the `create`s the rows start
-/// from, decoding each column as its writer encodes it in the payload
-/// (module documentation). A column the `create` lacked is left to the
-/// column's default; the wrapped repository key is an empty BLOB.
+/// `schema` was read from, in [`insert_order`], decoding each column as its
+/// writer encodes it in the payload (module documentation). A column the
+/// `create` lacked is left to the column's default; the wrapped repository
+/// key is an empty BLOB.
 ///
 /// `entries` are the entries `folded` comes from, for the `seq` an error
 /// names. Foreign keys are the caller's: [`build`] defers them, a test may
@@ -956,16 +1181,7 @@ pub async fn insert_rows(
     folded: &Folded,
     entries: &[Entry<'_>],
 ) -> Result<(), BuildError> {
-    let mut rows: Vec<(u64, &'static str, &String, &super::FoldedRow)> = folded
-        .tables
-        .iter()
-        .flat_map(|(table, rows)| {
-            rows.iter()
-                .map(|(entity_id, row)| (row.created_seq, *table, entity_id, row))
-        })
-        .collect();
-    rows.sort_by_key(|(created_seq, ..)| *created_seq);
-    for (created_seq, table, entity_id, row) in rows {
+    for (created_seq, table, entity_id, row) in insert_order(folded) {
         let entity_type = entity_type_of(table);
         let column_error = |column: &str, seq: u64, reason: String| BuildError::Column {
             entity_type: entity_type.to_owned(),

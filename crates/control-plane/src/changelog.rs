@@ -541,13 +541,56 @@ pub async fn verify(conn: &mut SqliteConnection) -> Result<Option<i64>, AppendEr
         .await?;
     let mut expected_prev = GENESIS_HASH.to_string();
     for entry in rows.into_iter().map(StoredEntry::from) {
-        let canonical = jcs::canonicalize(&entry.unhashed()?).map_err(AppendError::NotCanonical)?;
-        if entry.prev_hash != expected_prev || sha256_hex(canonical.as_bytes()) != entry.hash {
+        if !links(&entry, &expected_prev)? {
             return Ok(Some(entry.seq));
         }
         expected_prev = entry.hash;
     }
     Ok(None)
+}
+
+/// [`verify`], reading the log `page` entries at a time, so no more than one
+/// page is held at once: the same walk from `seq` 1, the same result.
+///
+/// # Errors
+///
+/// A database error, or a stored payload that is not valid JSON.
+pub async fn verify_paged(
+    conn: &mut SqliteConnection,
+    page: u32,
+) -> Result<Option<i64>, AppendError> {
+    let mut expected_prev = GENESIS_HASH.to_string();
+    let mut after = 0;
+    loop {
+        let rows: Vec<Row> = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM change_log WHERE seq > ? ORDER BY seq LIMIT ?"
+        ))
+        .bind(after)
+        .bind(page.max(1))
+        .fetch_all(&mut *conn)
+        .await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        for entry in rows.into_iter().map(StoredEntry::from) {
+            if !links(&entry, &expected_prev)? {
+                return Ok(Some(entry.seq));
+            }
+            after = entry.seq;
+            expected_prev = entry.hash;
+        }
+    }
+}
+
+/// Whether `entry` follows the entry whose `hash` is `prev_hash` and hashes
+/// to its own stored `hash`: the check [`verify`] makes of each entry.
+///
+/// # Errors
+///
+/// A payload that is not valid JSON, or an entry with no RFC 8785 form.
+pub(crate) fn links(entry: &StoredEntry, prev_hash: &str) -> Result<bool, AppendError> {
+    let canonical = jcs::canonicalize(&entry.unhashed()?).map_err(AppendError::NotCanonical)?;
+    Ok(entry.prev_hash == prev_hash && sha256_hex(canonical.as_bytes()) == entry.hash)
 }
 
 #[cfg(test)]
@@ -590,6 +633,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(verify(&mut conn).await.unwrap(), Some(1));
+    }
+
+    /// `verify_paged` finds what `verify` finds, whatever the page size:
+    /// nothing on an intact log, the first edited entry on another.
+    #[tokio::test]
+    async fn verify_paged_finds_what_verify_finds() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut w = store.begin_write().await.unwrap();
+        let actor = Actor::system("test");
+        for i in 0..5 {
+            append(
+                &mut w.tx,
+                &actor,
+                "vm",
+                &format!("vm_{i}"),
+                Op::Create,
+                json!({"n": i}),
+            )
+            .await
+            .unwrap();
+        }
+        for page in [1, 2, 5, 100] {
+            assert_eq!(
+                verify_paged(&mut w.tx, page).await.unwrap(),
+                None,
+                "page {page}"
+            );
+        }
+        w.commit().await.unwrap();
+
+        let mut conn = store.pool().acquire().await.unwrap();
+        sqlx::query("DROP TRIGGER change_log_append_only_update")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE change_log SET actor_id = 'edited' WHERE seq = 4")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(verify(&mut conn).await.unwrap(), Some(4));
+        for page in [1, 2, 3, 5, 100] {
+            assert_eq!(
+                verify_paged(&mut conn, page).await.unwrap(),
+                Some(4),
+                "page {page}"
+            );
+        }
     }
 
     #[tokio::test]
