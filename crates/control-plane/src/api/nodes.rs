@@ -1114,7 +1114,10 @@ async fn declare_lost_tx(
 /// and no release is recorded ([`crate::leases::Releases`]): a lease moves on
 /// `lost_at` through [`crate::leases::is_released`], which keeps an
 /// `expiring` lease behind its gate, and only while the node has not
-/// reported since ([`crate::leases::declaration_releases`]).
+/// reported since ([`crate::leases::declaration_releases`]). A node that
+/// returns gets a `declared_lost` revoke at the raised token for every row
+/// raised, one it had already released included, and its `lost_at` is
+/// cleared only once it has answered them all.
 ///
 /// It checks nothing else. `declareNodeLost` ([`declare_lost_tx`]) refuses
 /// an unknown, `removed` or connected node before it calls this. The
