@@ -1150,7 +1150,7 @@ pub(super) async fn new_token_row(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::hub_with_node;
+    use super::super::tests::{close_and_remove, hub_with_node};
     use super::{HeldGrant, NodeHub};
     use crate::leases;
 
@@ -1229,7 +1229,7 @@ mod tests {
         assert!(hub.0.take_revoke(&node_id, generation, id).is_some());
         hub.latch_hello(&node_id, generation);
         assert_eq!(hub.countable_ack(&node_id), 7);
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     /// A second session-start registration of the same row and revoke
@@ -1260,7 +1260,7 @@ mod tests {
         assert_eq!(frame["type"], "lease_revoke");
         assert!(rx.try_recv().is_err());
         assert_eq!(held_revokes(hub, &node_id), 0);
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     /// Section 4.2 rule 3: a held grant goes out only once the revokes
@@ -1298,7 +1298,7 @@ mod tests {
             .unwrap()
             .held_revokes = 0;
         assert!(hub.session_ready(&node_id, generation));
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     /// A late registration of an older token never replaces a newer one: a
@@ -1318,7 +1318,7 @@ mod tests {
         let held = entry(hub, "lse_one");
         assert_eq!(held.token, 3, "the newer entry stays");
         assert_eq!(held.eligible_on, Some(generation));
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     /// ADR 0292: what a failover's `in_progress` reads is what
@@ -1347,7 +1347,7 @@ mod tests {
         other.holder_node_id = "nod_other".to_string();
         assert!(!hub.row_grant_pending(&other), "another holder");
         assert!(hub.grant_pending("lse_one"), "the entry stays");
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     /// A re-entry's `hold_grant` over a held `local` grant that ends the
@@ -1368,7 +1368,7 @@ mod tests {
             .insert("lse_one".to_string(), held);
         hub.hold_grant(&lease);
         assert_eq!(entry(hub, "lse_one").kind, super::Kind::NewToken);
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     /// An attempt reads an entry, decides to drop it, and a registration of
@@ -1411,7 +1411,7 @@ mod tests {
         let read = entry(hub, "lse_one");
         hub.drop_held("lse_one", &read);
         assert!(!hub.0.held.lock().unwrap().entries.contains_key("lse_one"));
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     /// ADR 0299 and review finding B1: a `log_ack` counts only on a session
@@ -1426,6 +1426,6 @@ mod tests {
         hub.stale_leases_revoked(&node_id, generation);
         hub.count_log_ack(&node_id, generation, 5);
         assert_eq!(hub.countable_ack(&node_id), 5);
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 }

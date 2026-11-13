@@ -686,7 +686,7 @@ pub(super) async fn app_is_warm(
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::super::tests::hub_with_node;
+    use super::super::tests::{close_and_remove, hub_with_node};
     use super::{InFlight, Plan, Seen, plan};
     use crate::AppState;
     use crate::authority::{ManualClock, MonotonicClock, VoterSupport};
@@ -841,23 +841,13 @@ pub(super) mod tests {
             self.state.hub.authority().passed(LEASE)
         }
 
-        /// Closes every state opened on `data_dir`, then removes it.
-        ///
-        /// The order matters (#902). Each state keeps two databases there,
-        /// `quoro.db` and `vulns-cache.db`, whose pools open connections
-        /// lazily, each on a thread of its own. The tasks [`AppState::open`]
-        /// spawned keep using them and hold the state until the runtime ends,
-        /// so dropping the state is not enough. A connection that opens during
-        /// the removal creates its files again, and the removal fails with
-        /// "Directory not empty". Closing a pool waits until its connections
-        /// are closed, and a closed pool opens no more.
+        /// Closes every state opened on `data_dir` (the fixture's own and the
+        /// ones [`restart`] opened), then removes it. [`close_and_remove`]
+        /// says why the order matters.
         pub(in crate::session) async fn done(self) {
-            let restarted = std::mem::take(&mut *self.restarted.lock().unwrap());
-            for state in std::iter::once(&self.state).chain(&restarted) {
-                state.store.pool().close().await;
-                state.vulns.cache().close().await;
-            }
-            std::fs::remove_dir_all(&self.data_dir).unwrap();
+            let restarted = self.restarted.into_inner().unwrap();
+            let states: Vec<&AppState> = std::iter::once(&self.state).chain(&restarted).collect();
+            close_and_remove(&states, &self.data_dir).await;
         }
     }
 
