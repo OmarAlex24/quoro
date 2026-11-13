@@ -9,15 +9,17 @@
 //! not. Each round asks every voter of `spec.votes.voters` once, all at the
 //! same time, the candidate's own agent included: `POST /v1/vote` to the
 //! voter's mesh address on `spec.votes.port`, from the candidate's own mesh
-//! address. The socket is bound to that address before it connects, so the
-//! voter sees the source that section 8.9 checks.
+//! address. That address is the one the candidate's own entry in
+//! `spec.votes.voters` gives ([`VoteClient::new`]), the source every voter
+//! checks the request against. The socket is bound to it before it connects,
+//! so the voter sees the source that section 8.9 checks.
 //!
 //! **Root.** A new connection leaves through the mesh interface only when one
 //! of the machine's own root processes opens it (section 6.9), and a voter
 //! answers a caller on its own host only when that caller's socket is root's
 //! (section 8.9). So both rounds refuse with [`VoteClientError::NotRoot`]
-//! before any socket is opened while the effective uid is not 0
-//! ([`VoteClientOptions::effective_uid`]). The client never changes its uid.
+//! before any socket is opened while the effective uid, from `geteuid(2)`,
+//! is not 0. The client never changes its uid.
 //!
 //! **The term** (section 7.3 step 2). `T` starts one above the highest term
 //! the machine has seen. When a `check` answer carries a term at or above
@@ -77,7 +79,7 @@ use tokio::net::TcpSocket;
 use tracing::debug;
 
 use crate::util;
-use crate::vote::mesh_ip;
+use crate::vote::{NODE_ROLE, mesh_ip};
 
 /// The longest answer body read, in bytes. A `voters_changed` answer lists
 /// the voter set, a few dozen bytes per voter.
@@ -85,12 +87,12 @@ pub const ANSWER_LIMIT: usize = 64 << 10;
 /// The longest error text kept from an answer that is not `200`.
 const ERROR_CHARS: usize = 300;
 
-/// Reads the effective uid of this process.
-pub type EffectiveUid = fn() -> u32;
+/// Reads the effective uid of this process. Only the crate's tests replace
+/// [`effective_uid`].
+type EffectiveUid = fn() -> u32;
 
 /// The effective uid of this process, from `geteuid(2)`.
-#[must_use]
-pub fn effective_uid() -> u32 {
+fn effective_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
@@ -111,7 +113,7 @@ impl Monotonic for SystemMonotonic {
     }
 }
 
-/// Timings and seams; tests replace the seams.
+/// Timings, and the clock seam that tests replace.
 #[derive(Clone, Debug)]
 pub struct VoteClientOptions {
     /// How long a voter may take to accept the connection.
@@ -121,8 +123,6 @@ pub struct VoteClientOptions {
     /// The most check rounds [`VoteClient::check`] runs before it gives up
     /// ([`CheckOutcome::Unsettled`]); at least one runs.
     pub max_checks: u32,
-    /// Reads the effective uid: [`effective_uid`] outside tests.
-    pub effective_uid: EffectiveUid,
     /// The clock receipt times are read on: [`SystemMonotonic`] outside
     /// tests.
     pub clock: Arc<dyn Monotonic>,
@@ -134,27 +134,33 @@ impl Default for VoteClientOptions {
             connect_timeout: Duration::from_secs(5),
             answer_timeout: Duration::from_secs(10),
             max_checks: 8,
-            effective_uid,
             clock: Arc::new(SystemMonotonic),
         }
     }
 }
 
-/// The machine that asks for the votes.
+/// The machine that asks for the votes. Its mesh address comes from its own
+/// entry in `spec.votes.voters` ([`VoteClient::new`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     /// The cluster, `cls_`.
     pub cluster_id: String,
     /// The candidate's node id, `nod_`: `candidate_node_id` of every request.
     pub node_id: String,
-    /// The candidate's own mesh address, without its prefix length: the
-    /// source of every request.
-    pub mesh_address: IpAddr,
 }
 
-/// Why a round was not run. Each is decided before any socket is opened.
+/// Why a client was not made or a round was not run. Each is decided before
+/// any socket is opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VoteClientError {
+    /// The candidate, by its node id, is not in `spec.votes.voters`.
+    NotAVoter(String),
+    /// The candidate's entry in `spec.votes.voters` lacks the `node` role:
+    /// only a node can be promoted (sections 7.3 and 8.9).
+    NotANode(String),
+    /// The candidate's entry in `spec.votes.voters` has no mesh address, or
+    /// one that is not an address.
+    NoMeshAddress(String),
     /// The effective uid is not 0 (sections 6.9 and 8.9).
     NotRoot {
         /// The effective uid read.
@@ -167,6 +173,21 @@ pub enum VoteClientError {
 impl fmt::Display for VoteClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotAVoter(node_id) => write!(
+                f,
+                "{node_id} is not in the voter set: only a voter with the node role can be \
+                 promoted"
+            ),
+            Self::NotANode(node_id) => write!(
+                f,
+                "{node_id} does not have the node role in the voter set: only a node can be \
+                 promoted"
+            ),
+            Self::NoMeshAddress(node_id) => write!(
+                f,
+                "{node_id} has no mesh address in the voter set: the voters answer only a \
+                 request from the candidate's own mesh address"
+            ),
             Self::NotRoot { euid } => write!(
                 f,
                 "vote requests are sent only as root (effective uid {euid}): the mesh carries \
@@ -332,6 +353,9 @@ pub struct VoteClient {
     votes: SpecVotes,
     candidate: Candidate,
     options: VoteClientOptions,
+    /// The candidate's own mesh address: the source of every request.
+    source: IpAddr,
+    effective_uid: EffectiveUid,
 }
 
 impl VoteClient {
@@ -339,13 +363,46 @@ impl VoteClient {
     /// agent's newest stored desired state: its `version`, `port` and
     /// `voters`. `votes.listen` is not read: a voter that does not listen
     /// gives no answer.
-    #[must_use]
-    pub fn new(votes: SpecVotes, candidate: Candidate, options: VoteClientOptions) -> Self {
-        Self {
+    ///
+    /// Every request leaves from the mesh address of the candidate's own
+    /// entry in `votes.voters`, the first with its node id, in its canonical
+    /// form: an IPv4-mapped IPv6 address is used as plain IPv4. A voter
+    /// grants only a request from that address (section 8.9).
+    ///
+    /// # Errors
+    ///
+    /// When every voter would refuse the candidate (sections 7.3 and 8.9):
+    /// [`VoteClientError::NotAVoter`] when it is not in `votes.voters`,
+    /// [`VoteClientError::NotANode`] when its entry lacks the `node` role,
+    /// and [`VoteClientError::NoMeshAddress`] when its entry has no mesh
+    /// address or one that is not an address.
+    pub fn new(
+        votes: SpecVotes,
+        candidate: Candidate,
+        options: VoteClientOptions,
+    ) -> Result<Self, VoteClientError> {
+        let source = own_address(&votes, &candidate.node_id)?;
+        Ok(Self {
             votes,
             candidate,
             options,
-        }
+            source,
+            effective_uid,
+        })
+    }
+
+    /// The candidate's own mesh address, the source of every request.
+    #[must_use]
+    pub fn mesh_address(&self) -> IpAddr {
+        self.source
+    }
+
+    /// The client with `read` in place of `geteuid(2)`, so a test runs as
+    /// root or not whatever its own uid. Production code cannot reach it.
+    #[cfg(test)]
+    fn with_effective_uid(mut self, read: EffectiveUid) -> Self {
+        self.effective_uid = read;
+        self
     }
 
     /// Takes the term with `check` requests, starting one above `seen`, the
@@ -378,7 +435,7 @@ impl VoteClient {
     }
 
     fn require_root(&self) -> Result<(), VoteClientError> {
-        match (self.options.effective_uid)() {
+        match (self.effective_uid)() {
             0 => Ok(()),
             euid => Err(VoteClientError::NotRoot { euid }),
         }
@@ -450,18 +507,14 @@ impl VoteClient {
         target: SocketAddr,
         body: Bytes,
     ) -> Result<(StatusCode, Bytes, Instant), NoAnswer> {
-        let source = SocketAddr::new(self.candidate.mesh_address, 0);
         let socket = if target.is_ipv4() {
             TcpSocket::new_v4()
         } else {
             TcpSocket::new_v6()
         }
         .map_err(|e| NoAnswer::Connect(format!("cannot open a socket: {e}")))?;
-        socket.bind(source).map_err(|e| {
-            NoAnswer::Connect(format!(
-                "cannot use the mesh address {}: {e}",
-                self.candidate.mesh_address
-            ))
+        socket.bind(SocketAddr::new(self.source, 0)).map_err(|e| {
+            NoAnswer::Connect(format!("cannot use the mesh address {}: {e}", self.source))
         })?;
         let stream = tokio::time::timeout(self.options.connect_timeout, socket.connect(target))
             .await
@@ -511,6 +564,25 @@ impl VoteClient {
             .await
             .map_err(|_| NoAnswer::Timeout(format!("{target} did not answer in time")))?
     }
+}
+
+/// The mesh address the candidate `node_id` asks from: that of its first
+/// entry in `votes.voters`, which must have the `node` role, in its
+/// canonical form ([`mesh_ip`]).
+fn own_address(votes: &SpecVotes, node_id: &str) -> Result<IpAddr, VoteClientError> {
+    let entry = votes
+        .voters
+        .iter()
+        .find(|voter| voter.node_id == node_id)
+        .ok_or_else(|| VoteClientError::NotAVoter(node_id.to_owned()))?;
+    if !entry.roles.iter().any(|role| role == NODE_ROLE) {
+        return Err(VoteClientError::NotANode(node_id.to_owned()));
+    }
+    entry
+        .mesh_address
+        .as_deref()
+        .and_then(mesh_ip)
+        .ok_or_else(|| VoteClientError::NoMeshAddress(node_id.to_owned()))
 }
 
 /// One above `highest`, while that is within [`MAX_TERM`].

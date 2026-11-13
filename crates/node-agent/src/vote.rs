@@ -478,7 +478,7 @@ pub enum VoteDecision {
 
 /// The role a voter must have for its mesh address to ask for votes
 /// (section 8.9): only such a machine holds custody seals (ADR 0180).
-const NODE_ROLE: &str = "node";
+pub(crate) const NODE_ROLE: &str = "node";
 
 /// An address that may carry a prefix length, as an IP address in its
 /// canonical form. `None` for an unspecified or multicast address, which

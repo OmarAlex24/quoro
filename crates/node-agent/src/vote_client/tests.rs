@@ -9,7 +9,10 @@ use hyper::StatusCode;
 use quoro_proto::wire::{MAX_TERM, SpecVoter, SpecVotes, VoteAnswer, VoteOutcome, VoteRefusal};
 use serde_json::json;
 
-use super::{CheckOutcome, NoAnswer, Reply, Round, VoterReply, classify, settle, tally};
+use super::{
+    Candidate, CheckOutcome, NoAnswer, Reply, Round, VoteClient, VoteClientError,
+    VoteClientOptions, VoterReply, classify, settle, tally,
+};
 
 const VERSION: u64 = 7;
 const ME: &str = "nod_c";
@@ -557,6 +560,98 @@ fn each_reply_that_is_no_answer() {
     assert!(matches!(read(200, &changed, false), Reply::Answer { .. }));
 }
 
+/// The mesh address the client for `ME` over `voters` asks from, or why it
+/// was not made.
+fn own_address(voters: Vec<SpecVoter>) -> Result<std::net::IpAddr, VoteClientError> {
+    VoteClient::new(
+        votes(voters),
+        Candidate {
+            cluster_id: "cls_1".to_owned(),
+            node_id: ME.to_owned(),
+        },
+        VoteClientOptions::default(),
+    )
+    .map(|client| client.mesh_address())
+}
+
+/// The source of every request is the mesh address of the candidate's own
+/// entry in `spec.votes.voters`, without its prefix length; the first entry
+/// with its node id decides.
+#[test]
+fn the_client_asks_from_its_own_entry_in_the_voter_set() {
+    assert_eq!(own_address(five().voters), Ok("10.43.0.2".parse().unwrap()));
+    assert_eq!(
+        own_address(vec![
+            voter(B, &["node"], Some("10.43.0.3")),
+            voter(ME, &["node"], Some("10.43.0.9/16")),
+            voter(ME, &["node"], Some("10.43.0.8")),
+        ]),
+        Ok("10.43.0.9".parse().unwrap())
+    );
+}
+
+/// An IPv4-mapped IPv6 address in the candidate's entry is used as plain
+/// IPv4: the address an IPv4 socket binds and the voters check.
+#[test]
+fn an_ipv4_mapped_own_address_is_used_as_ipv4() {
+    for address in ["::ffff:10.43.0.2", "::ffff:10.43.0.2/112"] {
+        assert_eq!(
+            own_address(vec![voter(ME, &["node"], Some(address))]),
+            Ok("10.43.0.2".parse().unwrap()),
+            "{address}"
+        );
+    }
+    assert_eq!(
+        own_address(vec![voter(ME, &["node"], Some("fd00::2/64"))]),
+        Ok("fd00::2".parse().unwrap())
+    );
+}
+
+/// Section 7.3: a machine that is not a voter cannot be promoted, and every
+/// voter would answer it `not_allowed` (section 8.9).
+#[test]
+fn a_candidate_outside_the_voter_set_is_refused() {
+    let not_a_voter = Err(VoteClientError::NotAVoter(ME.to_owned()));
+    assert_eq!(own_address(Vec::new()), not_a_voter);
+    assert_eq!(
+        own_address(vec![voter(B, &["node"], Some("10.43.0.2"))]),
+        not_a_voter
+    );
+}
+
+/// Section 7.3: only a machine with the `node` role is promoted, and a
+/// voter answers only a source with that role (section 8.9).
+#[test]
+fn a_candidate_without_the_node_role_is_refused() {
+    for roles in [&["witness"][..], &["edge", "witness"], &[]] {
+        assert_eq!(
+            own_address(vec![voter(ME, roles, Some("10.43.0.2"))]),
+            Err(VoteClientError::NotANode(ME.to_owned())),
+            "{roles:?}"
+        );
+    }
+}
+
+/// A candidate with no mesh address of its own, or one that names no one
+/// machine, has no source a voter would answer.
+#[test]
+fn a_candidate_without_a_mesh_address_is_refused() {
+    for address in [
+        None,
+        Some(""),
+        Some("not an address"),
+        Some("0.0.0.0/16"),
+        Some("::ffff:0.0.0.0"),
+        Some("224.0.0.1"),
+    ] {
+        assert_eq!(
+            own_address(vec![voter(ME, &["node"], address)]),
+            Err(VoteClientError::NoMeshAddress(ME.to_owned())),
+            "{address:?}"
+        );
+    }
+}
+
 /// The client against vote listeners on 127.0.0.x addresses, as in the
 /// listener's own tests: the candidate is 127.0.0.21, the other nodes
 /// 127.0.0.22, .23 and .25, and the witness 127.0.0.24. Linux routes all of
@@ -564,11 +659,11 @@ fn each_reply_that_is_no_answer() {
 /// as its source.
 #[cfg(target_os = "linux")]
 mod over_sockets {
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use quoro_proto::wire::{
         DesiredState, MAX_TERM, Spec, SpecMesh, SpecVoter, SpecVotes, VoteOutcome, VoteRefusal,
@@ -660,21 +755,37 @@ mod over_sockets {
         }
     }
 
+    /// The answer timeout of a test that waits out a voter that never
+    /// answers.
+    const SHORT: Duration = Duration::from_millis(1500);
+    /// The answer timeout of every other test: a real voter writes to its
+    /// store before it answers `granted`, which a loaded runner can slow.
+    const LONG: Duration = Duration::from_secs(10);
+
     fn client(votes: &SpecVotes, euid: fn() -> u32) -> VoteClient {
+        client_waiting(votes, euid, LONG)
+    }
+
+    /// The client of the candidate `ME`, whose effective uid is `euid()`,
+    /// waiting `answer_timeout` for each answer.
+    fn client_waiting(
+        votes: &SpecVotes,
+        euid: fn() -> u32,
+        answer_timeout: Duration,
+    ) -> VoteClient {
         VoteClient::new(
             votes.clone(),
             Candidate {
                 cluster_id: CLUSTER.to_owned(),
                 node_id: ME.to_owned(),
-                mesh_address: OWN.parse().unwrap(),
             },
             VoteClientOptions {
-                connect_timeout: Duration::from_secs(2),
-                answer_timeout: Duration::from_millis(1500),
-                effective_uid: euid,
+                answer_timeout,
                 ..VoteClientOptions::default()
             },
         )
+        .expect("the candidate is a node voter with a mesh address")
+        .with_effective_uid(euid)
     }
 
     fn as_root() -> u32 {
@@ -1039,7 +1150,7 @@ mod over_sockets {
         )
         .await;
         let w = Fake::on(W_AT, port, None).await;
-        let client = client(&votes, as_root);
+        let client = client_waiting(&votes, as_root, SHORT);
 
         let outcome = client.check(1).await.unwrap();
         let CheckOutcome::Settled(round) = outcome else {
@@ -1072,6 +1183,57 @@ mod over_sockets {
         assert_eq!(d.stored().await, (None, None));
         // One connection per round: the check and the vote, nothing again.
         assert_eq!((b.accepted(), w.accepted()), (2, 2));
+    }
+
+    /// A round asks every voter at the same time: two voters that never
+    /// answer cost one answer timeout, where asking one after the other
+    /// would cost two, and the voter that answers is counted in the same
+    /// round.
+    #[tokio::test]
+    async fn a_round_asks_every_voter_at_the_same_time() {
+        let (own, port) = own_port().await;
+        let votes = spec_votes(port, Vec::new());
+        let _me = Voter::serve(own, ME, &votes, Some("boot-a")).await;
+        let b = Fake::on(B_AT, port, None).await;
+        let d = Voter::on(D_AT, port, D, &votes).await;
+        let w = Fake::on(W_AT, port, None).await;
+        let wait = Duration::from_secs(3);
+        let client = client_waiting(&votes, as_root, wait);
+
+        let start = Instant::now();
+        let round = client.vote(2).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= wait && elapsed < wait.mul_f64(1.7),
+            "{elapsed:?} for answer timeouts of {wait:?}: {round:?}"
+        );
+        for silent in [B, W] {
+            assert!(
+                matches!(reply(&round, silent), Reply::NoAnswer(NoAnswer::Timeout(_))),
+                "{silent}: {round:?}"
+            );
+        }
+        assert_vote(reply(&round, D), VoteOutcome::Granted, 2);
+        assert_eq!(d.stored().await, (Some(2), stored(2)));
+        assert_eq!((b.accepted(), w.accepted()), (1, 1));
+    }
+
+    /// The candidate's own entry may give its mesh address as an
+    /// IPv4-mapped IPv6 address: the client binds the IPv4 address, the
+    /// source the voters check, and B grants.
+    #[tokio::test]
+    async fn an_ipv4_mapped_own_address_is_the_source() {
+        let (own, port) = own_port().await;
+        let mut votes = spec_votes(port, Vec::new());
+        votes.voters[0].mesh_address = Some(format!("::ffff:{OWN}"));
+        let _me = Voter::serve(own, ME, &votes, Some("boot-a")).await;
+        let b = Voter::on(B_AT, port, B, &votes).await;
+        let client = client(&votes, as_root);
+        assert_eq!(client.mesh_address(), OWN.parse::<IpAddr>().unwrap());
+
+        let round = client.vote(2).await.unwrap();
+        assert_vote(reply(&round, B), VoteOutcome::Granted, 2);
+        assert_eq!(b.stored().await, (Some(2), stored(2)));
     }
 
     /// Section 8.8: an answer whose `term` is above 2^53 - 1 is no answer. It
