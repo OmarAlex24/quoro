@@ -480,16 +480,18 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
                     .unwrap_or_else(|| error.code.as_str().to_string())
             )
         })?;
-    // The node that holds the primary status before the removals, which clear
-    // it: the move's `cluster.primary_moved` names it as `from_node_id`.
+    // With `--accept-loss`, the node that holds the primary status before the
+    // removals, which clear it: the move's `cluster.primary_moved` names it as
+    // `from_node_id`. Without it nothing clears the status before the move,
+    // which names the node that holds it, as `move_primary` does.
     let held_before: Option<String> = match &node_id {
-        Some(_) => sqlx::query_scalar(
+        Some(_) if marker.accept_loss => sqlx::query_scalar(
             "SELECT id FROM nodes WHERE cp_status = 'primary' ORDER BY id LIMIT 1",
         )
         .fetch_optional(&mut *w.tx)
         .await
         .map_err(|error| format!("cannot read the primary node: {error}"))?,
-        None => None,
+        _ => None,
     };
     let removed = match (marker.accept_loss, marker.statement.as_deref()) {
         (true, Some(statement)) => {

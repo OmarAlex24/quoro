@@ -381,6 +381,17 @@ async fn the_first_start_after_a_restore_makes_the_first_write_before_any_other(
     assert_eq!(cp_status(store, NEW_NODE).await.as_deref(), Some("primary"));
     assert_eq!(cp_status(store, &old).await, None);
     assert_eq!(moved_records(store).await, vec![Some(head.seq + 4)]);
+    // Without `--accept-loss` the move names the node that held the status.
+    let moved: Vec<Value> = records_after(store, 0)
+        .await
+        .into_iter()
+        .filter(|record| record.operation == "cluster.primary_moved")
+        .map(|record| record.params)
+        .collect();
+    assert_eq!(
+        moved,
+        vec![json!({ "from_node_id": old.as_str(), "to_node_id": NEW_NODE })]
+    );
     assert_eq!(restore_marker(store).await, Some(meta_value(&head)));
     assert!(!exists(&dir, restore_pending::MARKER_FILE));
     assert!(!exists(&dir, primary_status::MARKER_FILE));

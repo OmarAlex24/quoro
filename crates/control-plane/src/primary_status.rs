@@ -124,11 +124,12 @@ async fn move_primary(store: &Store, node_id: &str) -> Result<Moved, String> {
 /// record. It reads before it writes, so [`Moved::No`] has written nothing.
 ///
 /// `held_before` is the node that held the primary status when the caller's
-/// write began, for a caller whose write cleared it before the move (the
-/// `--accept-loss` removals of the restored primary's first write,
-/// [`crate::restore_pending`]); `cluster.primary_moved` names it as
-/// `from_node_id`. With `None`, the move names the node that holds the status
-/// when it runs.
+/// write began, given only by a caller whose write cleared it before the move:
+/// the restored primary's first write after a restore with `--accept-loss`,
+/// whose removals clear it ([`crate::restore_pending`]); `cluster.primary_moved`
+/// names it as `from_node_id`. With `None`, as from [`move_primary`] and from a
+/// first write without `--accept-loss`, the move names the node that holds the
+/// status when it runs.
 ///
 /// # Errors
 ///
