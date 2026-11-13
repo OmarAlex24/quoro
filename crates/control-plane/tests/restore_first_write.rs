@@ -1297,6 +1297,7 @@ async fn the_first_start_after_an_accept_loss_restore_removes_the_other_nodes() 
 #[tokio::test]
 async fn the_raise_refuses_at_the_cap_after_the_check_and_writes_nothing() {
     let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
     write_marker(&dir, &forced(&head));
     write_primary_node(&dir);
     let pending = restore_pending::check(&store, &dir).await.unwrap();
@@ -1338,6 +1339,7 @@ async fn the_raise_refuses_at_the_cap_after_the_check_and_writes_nothing() {
 #[tokio::test]
 async fn a_lease_granted_after_an_earlier_declaration_is_raised() {
     let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
     const DECLARED: &str = "2026-01-02T03:04:05.000Z";
     sqlx::query("UPDATE nodes SET lost_at = ? WHERE id = ?")
         .bind(DECLARED)
@@ -1381,6 +1383,7 @@ async fn a_lease_granted_after_an_earlier_declaration_is_raised() {
 #[tokio::test]
 async fn a_witness_only_or_edge_only_machine_is_not_removed() {
     let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
     const WITNESS: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0F";
     const EDGE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0G";
     for (id, roles) in [(WITNESS, r#"["witness"]"#), (EDGE, r#"["edge"]"#)] {
@@ -1423,6 +1426,7 @@ async fn a_witness_only_or_edge_only_machine_is_not_removed() {
 #[tokio::test]
 async fn a_removed_machines_quarantined_copy_is_dropped() {
     let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
     const VOLUME: &str = "vol_01JC9Z1A2B3C4D5E6F7G8H9J0A";
     const QUARANTINE: &str = "qrn_01JC9Z1A2B3C4D5E6F7G8H9J0A";
     let now = now_rfc3339();
