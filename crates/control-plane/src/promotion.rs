@@ -92,12 +92,14 @@ struct CapRow<'a> {
 }
 
 /// The cap check itself, over every lease row: when the node is not
-/// declared lost yet, the rows the declaration raises are those that name
-/// it as holder and are not revoked ([`crate::leases::held_by_node`], then
-/// [`crate::leases::bump_tokens`]). A row already revoked, at the cap or
-/// not, is not raised, as `removeNode` leaves a row revoked at the cap
-/// (`removal.rs`). A node already declared lost has nothing raised: the
-/// declaration changes nothing then (ADR 0202).
+/// declared lost yet, the declaration raises every row that names it as
+/// holder, a revoked one included, but a row already revoked at the cap,
+/// which it leaves as it is, as `removeNode` does (`removal.rs`)
+/// ([`crate::api::nodes::declare_lost_write`], then
+/// [`crate::leases::bump_tokens`]). Only an unrevoked row among them can
+/// refuse: a revoked row it raises is below the cap and reaches at most the
+/// cap. A node already declared lost has nothing raised: the declaration
+/// changes nothing then (ADR 0202).
 fn exhausted<'a>(
     node_id: &str,
     node_lost: bool,
@@ -182,11 +184,12 @@ pub fn old_primary<'a>(folded: &'a Folded, to_node_id: &str) -> Option<&'a str> 
 /// declaration of `old_primary_node_id` as lost would raise, and whose token
 /// is already at 2^53 − 1 or above, is named in a [`TokenExhausted`].
 ///
-/// Those leases are exactly the ones [`write`] would raise
-/// ([`crate::api::nodes::declare_lost_write`]): the rows of the `leases`
-/// table that name the node as holder and are not revoked, none when the
-/// `nodes` row of the node already carries `lost_at`. A row revoked at the
-/// cap is left as it is and refuses nothing.
+/// [`write`] raises every row of the `leases` table that names the node as
+/// holder, a revoked one included, and none when the `nodes` row of the node
+/// already carries `lost_at` ([`crate::api::nodes::declare_lost_write`]).
+/// Only an unrevoked one among them can be at the cap: a revoked row below
+/// the cap reaches at most the cap, and a row revoked at the cap is left as
+/// it is and refuses nothing.
 ///
 /// The command calls it before any real vote request, and so before the
 /// freeze: a refusal then takes no term, freezes nothing and writes nothing.
@@ -460,8 +463,11 @@ pub async fn write(store: &Store, promotion: &Promotion) -> Result<Written, Prom
 
 /// [`check_token_cap`]'s rule on the rows of the database, inside the
 /// write: nothing when the node already carries `lost_at`, otherwise the
-/// leases the declaration raises, read through the one query that selects
-/// them ([`crate::leases::held_by_node`]), at the cap or above.
+/// unrevoked leases the node holds ([`crate::leases::held_by_node`]) at the
+/// cap or above. The declaration raises the node's revoked rows too
+/// ([`crate::api::nodes::declare_lost_write`]), but none of them refuses:
+/// one below the cap reaches at most the cap, and one at the cap is left as
+/// it is.
 async fn check_cap_in(
     conn: &mut SqliteConnection,
     node_id: &str,

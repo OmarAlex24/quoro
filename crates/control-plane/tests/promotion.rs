@@ -506,9 +506,10 @@ async fn a_promotion_moves_the_primary_status_in_one_write_at_its_term() {
 /// Section 7.3 step 5 and section 8.3: with `--ack-fence` the write declares
 /// the old primary's node lost as `declareNodeLost` does. On the same
 /// fixture, the API call and the promotion leave the same lease rows, raise
-/// the same tokens, write the same lease entries in the same order, and set
-/// `lost_at` with a node entry that carries it. Only the API's refusal of a
-/// connected node is not the promotion's.
+/// the same tokens, a revoked row's included (ADR 0202), write the same
+/// lease entries in the same order, and set `lost_at` with a node entry that
+/// carries it. Only the API's refusal of a connected node is not the
+/// promotion's.
 #[tokio::test]
 async fn ack_fence_declares_the_old_primary_lost_as_declare_node_lost_does() {
     // The API on a running control plane, whose own node holds the status.
@@ -544,14 +545,16 @@ async fn ack_fence_declares_the_old_primary_lost_as_declare_node_lost_does() {
             ("node", NEW),
             ("lease", OLD_LOCAL),
             ("lease", OLD_EXPIRING),
+            ("lease", OLD_REVOKED),
             ("node", OLD),
             ("audit", "1"),
         ]
     );
 
-    // The same rows: each lease the node held is raised by one and recorded
-    // revoked with the node still its holder; the revoked one and the other
-    // node's are left as they are.
+    // The same rows: each lease row that names the node, the revoked one
+    // included, is raised by one and recorded revoked with the node still its
+    // holder, the revoked one keeping its `revoked_at`; the other node's are
+    // left as they are.
     let (_, api_lost) = node(&server.state.store, OLD).await;
     let (cp_status, lost_at) = node(&store, OLD).await;
     assert_eq!(cp_status, None);
@@ -576,16 +579,25 @@ async fn ack_fence_declares_the_old_primary_lost_as_declare_node_lost_does() {
             assert_eq!(row.4.as_deref(), fixture_row.4, "{id}");
         }
     }
-    assert_eq!(raised, 2, "the two leases the old primary held unrevoked");
+    assert_eq!(raised, 3, "the three lease rows that name the old primary");
     assert_eq!(lease(&store, OLD_LOCAL).await.2, 4);
     assert_eq!(lease(&store, OLD_EXPIRING).await.2, 6);
+    for store in [&store, &server.state.store] {
+        let (_, _, token, _, revoked_at, _) = lease(store, OLD_REVOKED).await;
+        assert_eq!((token, revoked_at.as_deref()), (5, Some(REVOKED_AT)));
+    }
 
     // The same entries, in the same order: the lease entries, then the
     // node's with `lost_at`.
-    let declared: Vec<&Entry> = entries[2..5].iter().collect();
+    let declared: Vec<&Entry> = entries[2..6].iter().collect();
     assert_eq!(
         kinds(&api_entries),
-        [("lease", OLD_LOCAL), ("lease", OLD_EXPIRING), ("node", OLD)]
+        [
+            ("lease", OLD_LOCAL),
+            ("lease", OLD_EXPIRING),
+            ("lease", OLD_REVOKED),
+            ("node", OLD)
+        ]
     );
     for (ours, api) in declared.iter().zip(&api_entries) {
         let strip = |payload: &Value| {
@@ -605,8 +617,8 @@ async fn ack_fence_declares_the_old_primary_lost_as_declare_node_lost_does() {
         };
         assert_eq!(strip(&ours.6), strip(&api.6), "{}", ours.5);
     }
-    assert_eq!(declared[2].6["lost_at"], json!(lost_at));
-    assert!(api_entries[2].6["lost_at"].is_string());
+    assert_eq!(declared[3].6["lost_at"], json!(lost_at));
+    assert!(api_entries[3].6["lost_at"].is_string());
 
     assert_eq!(
         promoted_records(&store).await,
