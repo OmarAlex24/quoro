@@ -578,7 +578,8 @@ components:
             `fence_failed`, `no_support`, `lease_held`, `in_progress`,
             `lease_revoked`; each operation says when), by `deleteApp` and `deleteVolume`
             (`has_quarantines`), by `rotateSigningKey` (`in_progress`), or by
-            `ackNodeFence` (`token_exhausted`).
+            `ackNodeFence`, `switchoverApp` and `startApp`
+            (`token_exhausted`).
             Absent for other codes and other conflicts.
           enum:
             - scope_missing
@@ -4213,7 +4214,8 @@ components:
             holder took the row's `local` grant: from the `pong` that follows
             a same-token `local` grant, or from the holder's report of the
             lease as `local` (node-agent-protocol.md section 8.4, ADR 0261,
-            ADR 0280). It usually turns true when the app leaves `warm`, with
+            ADR 0280). Neither counts while a node the row does not name lists
+            the lease `held` or `uncertain` at or above the row's token. It usually turns true when the app leaves `warm`, with
             the write that ends an `expiring` lease's renewals; while the row
             is marked, a `local` write with a new token leaves it true. On an
             unmarked row, such a write turns it true when it marks the row:
@@ -7870,7 +7872,9 @@ paths:
         new token, and is not refused as already running
         (node-agent-protocol.md section 8.4, "A holder that holds no
         lease"). It moves nothing: the lease stays with the node the row
-        names. The call stays open while the lease's gate has not passed, at
+        names. A lease whose token is 2^53 - 1, the token cap, is refused
+        with `conflict` and `reason: token_exhausted`, and nothing is
+        written (section 8.6). The call stays open while the lease's gate has not passed, at
         most `duration_ms + 2M`, as `failoverApp` does after a revoke, and
         answers `202` once the row's write commits. A grant that must wait
         for replication and majority support follows, and
@@ -7966,7 +7970,10 @@ paths:
           of voters, so it cannot grant an `expiring` lease (section 8.8);
         - `lease_held`: the source is not connected and may still hold the
           lease: the lease's gate (`App.lease.gate_at`, section 8.4) has not
-          passed and no fence of it was confirmed. A lease that is still
+          passed and no fence of it was confirmed; or the source is
+          connected and refused the revoke, or has not answered it when the
+          primary stops waiting, after a bound the primary sets. The call
+          stays open meanwhile, and a retry sends no second revoke. A lease that is still
           `local` (section 8.4, "Changing the mode") is held until the node is
           declared lost (`declareNodeLost`). That includes a warm app's
           lease until the primary answers its holder's first renewal after
@@ -8090,7 +8097,10 @@ paths:
         the freeze until the new instance runs, typically a few seconds.
         Refused with `conflict` and `reason`: `not_warm`; `in_progress`, also
         while a failover's grant to the warm node waits
-        (`App.lease.grant_pending`, ADR 0292); `lease_revoked` while the
+        (`App.lease.grant_pending`, ADR 0292); `token_exhausted` while the
+        lease's token is 2^53 - 1, the token cap, which the grant to the
+        warm node would pass (node-agent-protocol.md section 8.6), checked
+        before the next reasons; `lease_revoked` while the
         app's lease is revoked in the primary's own view
         (`App.lease.revoked_at` is set), as after a switchover that stopped
         after its revoke: `failoverApp` to the warm node moves that lease
@@ -8101,7 +8111,8 @@ paths:
         when the switchover started. It ends with `app.switched_over`, the old
         node becoming the warm copy with no quarantine, or, when a step before
         the revoke failed, with `app.switchover_failed`: the primary sent
-        the source `switchover_thaw` and nothing moved. When a step after the
+        the source `switchover_thaw`, unless a failed fence covers the lease
+        (node-agent-protocol.md section 5.17), and nothing moved. When a step after the
         revoke fails, it ends with `app.switchover_failed` at `step` `move`,
         which opens an incident: the lease stays revoked, the app stays
         stopped on its node or, when the node did not confirm the stop, may

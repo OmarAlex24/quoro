@@ -297,7 +297,7 @@ System records, with `actor_type` `system`, `channel` `system` and no `scope`:
 | `backup.prune` | `backups` | `backup` / the backup | Retention removed its seal and manifest |
 | `backup.upgrade_skipped` | `backups` | `backup_repository` / the repository | The primary migrated without the pre-upgrade backup because the operator passed `--skip-upgrade-backup` (backup-format.md section 7.2); `params` is `{from_schema_version, to_schema_version}` |
 | `backup.gc` | `backups` | `backup_repository` / the repository | A garbage-collection sweep ran; `params` holds the counts of objects it deleted |
-| `lease.grant` | `leases` | `app` / the app | A `local` lease was granted at placement or after a restore; `params` is `{node_id, fencing_token}` |
+| `lease.grant` | `leases` | `app` / the app | A `local` lease was granted at placement, after a restore, or from M5b by `startApp` to a node that held no lease for the app (node-agent-protocol.md section 8.4, "A holder that holds no lease"); `params` is `{node_id, fencing_token}` |
 | `lease.revoke` | `leases` | `app` / the app | A lease was revoked with reason `moved` or `deleted`; `params` is `{node_id, fencing_token, reason}` |
 | `audit_export.probe` | `audit_export` | `audit_export` / the export | The daily probe ran; `ok` with the strength in the change log, or `error` |
 | `cluster.primary_moved` | `cluster` | `node` / the node that now holds the primary status | At its first start after `quoro restore`, the primary moved the primary status to the node on its new host (backup-format.md section 8.2); `params` is `{from_node_id, to_node_id}`, `from_node_id` null when no node held it. From M5b it is written in the restored primary's first change-log write, with `cluster.restored` when the restore had `--accept-loss` (section 3.9, ADR 0280) |
@@ -331,7 +331,7 @@ System records, with `actor_type` `system` and no `scope`:
 
 | `operation` | `actor_id` | `channel` | `target_type` / `target_id` | When |
 | --- | --- | --- | --- | --- |
-| `lease.grant` | `leases` | `system` | `app` / the app | Also an `expiring` lease granted with a new token, to a new holder or again after expiry or revoke; `params` is `{node_id, fencing_token, mode, duration_ms}`. Renewals write no record |
+| `lease.grant` | `leases` | `system` | `app` / the app | Also an `expiring` lease granted with a new token, to a new holder or again after expiry or revoke, `startApp`'s grant to a node that held no lease included; `params` is `{node_id, fencing_token, mode, duration_ms}`. Renewals write no record |
 | `lease.revoke` | `leases` | `system` | `app` / the app | Also the revokes of a returning node declared lost, with reason `declared_lost` |
 | `cluster.maintenance` | `cluster` | `cli` | `cluster` / the cluster id | The operator or the installer ran `quoro cluster maintenance` on the primary's host and the primary opened the window (node-agent-protocol.md section 8.11); `params` is `{duration_s}`, `ok` once a majority supported it and its raise of `leases.duration_ms` was replicated (ADR 0268), `error` with the reason otherwise. `--end` writes another record with `params` `{end: true}` |
 
