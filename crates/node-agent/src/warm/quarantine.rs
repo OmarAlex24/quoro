@@ -35,9 +35,14 @@
 //!   a missing file, and `Conflict`, as while a VM attaches the file, is not
 //!   now. The path checks read one open handle of the clone's directory: the
 //!   clone is missing, the other kept snapshot or the live file is a regular
-//!   file there, and the clone is still missing. Otherwise the record stays,
-//!   the hash's warning says why, and the hash is tried again. The next
-//!   report no longer lists a forgotten copy.
+//!   file there, and the clone is still missing. The engine's lookups and these reads run
+//!   under the volume's lock ([`VolumeLocks`]), which the node agent's warm
+//!   calls on a volume share (`engine-trait.md` section 4), so a check of
+//!   the live file never makes the commit of a received copy fail with
+//!   `Conflict`. The lock is only tried, never waited for: while another
+//!   holds it, the record stays for now. Whenever the record stays, the
+//!   hash's warning says why, and the hash is tried again after its wait.
+//!   The next report no longer lists a forgotten copy.
 //! - **`spec.quarantine_deletes`.** Each id the node holds is deleted: the
 //!   clone first, through the engine, then its kept snapshot and its record
 //!   in one transaction. Only the record's id and `snapshot_id` are read for
@@ -63,7 +68,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use super::{ZERO_CELL, data_segments};
+use super::{VolumeLocks, ZERO_CELL, data_segments};
 use crate::store::{NodeStore, VolumeQuarantineRecord};
 use crate::util;
 
@@ -86,6 +91,10 @@ impl<E: Engine> Clone for Quarantines<E> {
 pub(super) struct Inner<E: Engine> {
     engine: Arc<E>,
     store: NodeStore,
+    /// The warm receiver's locks, one per volume. The forget path holds the
+    /// volume's lock over its engine calls and its reads of the volume
+    /// directory.
+    locks: VolumeLocks,
     tx: watch::Sender<Vec<QuarantineStatus>>,
     /// Held from reading the records to publishing them, so an older read
     /// never overwrites a newer list.
@@ -127,13 +136,15 @@ impl<E: Engine> Drop for Inner<E> {
 }
 
 impl<E: Engine + 'static> Quarantines<E> {
-    /// The copies and the list the session reports. A failed hash is tried
-    /// again after `retry_first`, then after twice as long each time, up to
-    /// 30 minutes.
+    /// The copies and the list the session reports. `locks` are the warm
+    /// receiver's volume locks, which the forget path tries before it asks
+    /// the engine about a volume. A failed hash is tried again after
+    /// `retry_first`, then after twice as long each time, up to 30 minutes.
     #[must_use]
     pub fn new(
         engine: Arc<E>,
         store: NodeStore,
+        locks: VolumeLocks,
         retry_first: Duration,
     ) -> (Self, watch::Receiver<Vec<QuarantineStatus>>) {
         let (tx, rx) = watch::channel(Vec::new());
@@ -142,6 +153,7 @@ impl<E: Engine + 'static> Quarantines<E> {
                 inner: Arc::new(Inner {
                     engine,
                     store,
+                    locks,
                     tx,
                     publishing: tokio::sync::Mutex::new(()),
                     hashing: StdMutex::new(HashMap::new()),
@@ -448,6 +460,11 @@ impl<E: Engine> Inner<E> {
     /// still missing. A volume directory that mounts or unmounts meanwhile
     /// cannot split those three reads. A copy with neither another kept
     /// snapshot nor the live file in that directory is never forgotten.
+    ///
+    /// The engine's lookups and the directory reads run under the volume's
+    /// lock, which is only tried: this runs in the hash task, which never
+    /// waits for a lock. While another holds it, the record stays for now
+    /// and the hash is tried again after its wait.
     pub(super) async fn forget_lost_clone(&self, id: &str) -> Result<(), String> {
         let record = match self.store.volume_quarantine(id).await {
             Ok(Some(record)) if record.sha256.is_none() => record,
@@ -461,6 +478,15 @@ impl<E: Engine> Inner<E> {
             // up by.
             Ok(None) => return Err("the copy's own kept snapshot is not recorded".to_owned()),
             Err(e) => return Err(format!("cannot read the kept snapshot: {e}")),
+        };
+        // Held to the end: the engine's lookups, the directory reads and the
+        // forget. Whoever else holds it (a stream and its commit, a hand-over,
+        // the reconciler's steps on a warm volume) is not interrupted.
+        let Some(_volume) = self.locks.try_lock(&record.volume_id) else {
+            return Err(
+                "another warm call on the volume holds its lock, so the engine is not asked now"
+                    .to_owned(),
+            );
         };
         match self
             .engine
@@ -499,9 +525,10 @@ impl<E: Engine> Inner<E> {
 
     /// The volume's own live file as the evidence of a lost clone, when no
     /// other kept snapshot of the volume shows the directory (section 9 step
-    /// 2). The engine compares the file alone, which it runs on the file in
-    /// its current volume directory (`engine-trait.md` section 3.22), and
-    /// only an `Ok` counts.
+    /// 2). The engine compares the file alone (`engine-trait.md` section
+    /// 3.22), the live file it keeps in its current volume directory, named
+    /// by the volume id (section 3.20), and only an `Ok` counts. The caller
+    /// holds the volume's lock.
     ///
     /// # Errors
     ///

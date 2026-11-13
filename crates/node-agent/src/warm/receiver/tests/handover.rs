@@ -1002,6 +1002,7 @@ async fn an_operator_s_delete_removes_the_copy_and_its_records_once() {
     let (restarted, restarted_statuses) = Quarantines::new(
         Arc::clone(&h.engine),
         h.store.clone(),
+        h.locks.clone(),
         Duration::from_millis(50),
     );
     restarted.refresh().await.expect("the records");
@@ -1055,6 +1056,7 @@ async fn a_restart_resumes_the_hash_of_a_copy_without_one() {
     let (restarted, mut statuses) = Quarantines::new(
         Arc::clone(&h.engine),
         h.store.clone(),
+        h.locks.clone(),
         Duration::from_millis(50),
     );
     restarted.refresh().await.expect("the records");
@@ -2561,6 +2563,7 @@ async fn a_live_file_a_vm_attaches_keeps_a_lost_clone_s_record_for_now() {
     let (quarantines, _statuses) = Quarantines::new(
         Arc::clone(&h.engine),
         h.store.clone(),
+        h.locks.clone(),
         Duration::from_secs(3600),
     );
 
@@ -2742,5 +2745,78 @@ async fn a_lost_clone_s_live_file_is_read_through_one_open_volume_directory() {
     std::fs::remove_dir_all(&dir).expect("remove the new directory");
     std::fs::rename(&moved, &dir).expect("put the directory back");
     assert_record_forgotten(&h, &lost).await;
+    assert_live_kept(&h);
+}
+
+/// The forget path asks the engine about the volume only under the volume's
+/// lock, and only tries it: while a stream, a hand-over or the reconciler
+/// holds it, the record stays without the engine being asked, and the hash
+/// waits as any failed hash does instead of waiting for the lock. Once the
+/// lock is free, the next try forgets the record.
+#[tokio::test]
+async fn a_lost_clone_s_record_stays_while_another_holds_the_volume_s_lock() {
+    let h = Harness::new("handover-clone-gone-locked").await;
+    // The receiver's own hash of the copy never runs here.
+    let _gate = h.receiver.inner.quarantines.inner.hash_gate.lock().await;
+    let lost = lost_clone_beside_the_live_file(&h).await;
+    // The copies on the same engine, store and locks, with a failed hash
+    // waiting an hour before it is tried again.
+    let (quarantines, _statuses) = Quarantines::new(
+        Arc::clone(&h.engine),
+        h.store.clone(),
+        h.locks.clone(),
+        Duration::from_secs(3600),
+    );
+    // Answered by the first engine lookup the forget path makes.
+    h.engine.fail_next(
+        FakeOp::VolumeChangedRanges,
+        EngineError::Io("the first lookup".to_owned()),
+    );
+
+    let held = h.locks.try_lock(VOL).expect("the volume's lock");
+    quarantines.hash(&lost);
+    wait_for("the hash to fail", || async {
+        quarantines.hash_failed(&lost.quarantine_id) && !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert_record_kept(&h, &lost, "the volume's lock is held").await;
+    let reason = quarantines
+        .inner
+        .forget_lost_clone(&lost.quarantine_id)
+        .await
+        .expect_err("the record stays");
+    assert!(reason.contains("holds its lock"), "{reason}");
+    assert_live_kept(&h);
+
+    // No loop: a pass before the wait ends starts no hash of the copy.
+    {
+        let _held_gate = quarantines.inner.hash_gate.lock().await;
+        quarantines.refresh().await.expect("refresh");
+        assert!(!quarantines.hashing(&lost.quarantine_id), "the hash waits");
+    }
+    assert!(quarantines.hash_failed(&lost.quarantine_id));
+    assert_record_kept(&h, &lost, "before the wait ends").await;
+
+    // The lock is free: the engine is asked from here on. Its first answer
+    // is the failure queued before the lock was taken, so no lookup ran
+    // while the lock was held.
+    drop(held);
+    let reason = quarantines
+        .inner
+        .forget_lost_clone(&lost.quarantine_id)
+        .await
+        .expect_err("the queued failure");
+    assert!(reason.contains("the first lookup"), "{reason}");
+    assert_record_kept(&h, &lost, "the queued failure").await;
+
+    // The next try forgets the record, and leaves the lock free.
+    quarantines.hash(&lost);
+    wait_for("the record to go", || async {
+        quarantined(&h).await.is_empty() && !quarantines.hashing(&lost.quarantine_id)
+    })
+    .await;
+    assert_record_forgotten(&h, &lost).await;
+    assert!(!quarantines.hash_failed(&lost.quarantine_id));
+    assert!(h.locks.try_lock(VOL).is_some(), "the lock is released");
     assert_live_kept(&h);
 }
