@@ -6315,6 +6315,25 @@ mod tests {
         (state, node_id, data_dir)
     }
 
+    /// Closes both databases of every state opened on `dir`, then removes
+    /// `dir`.
+    ///
+    /// The order matters (#902). Each state keeps two databases there,
+    /// `quoro.db` and `vulns-cache.db`, whose pools open connections lazily,
+    /// each on a thread of its own. The tasks [`AppState::open`] spawned keep
+    /// using them and hold the state until the runtime ends, so dropping the
+    /// state is not enough. A connection that opens during the removal
+    /// creates its files again, and the removal fails with "Directory not
+    /// empty". Closing a pool waits until its connections are closed, and a
+    /// closed pool opens no more.
+    pub(super) async fn close_and_remove(states: &[&AppState], dir: &std::path::Path) {
+        for state in states {
+            state.store.pool().close().await;
+            state.vulns.cache().close().await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn hello(node_id: &str) -> wire::Hello {
         wire::Hello {
             node_id: node_id.to_string(),
@@ -6391,7 +6410,7 @@ mod tests {
             status_and_disconnects(&state, &node_id).await,
             ("disconnected".to_string(), 1)
         );
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     #[tokio::test]
@@ -6417,7 +6436,7 @@ mod tests {
             status_and_disconnects(&state, &node_id).await,
             ("connected".to_string(), 0)
         );
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     /// Every frame queued on a session, parsed.
@@ -6515,7 +6534,7 @@ mod tests {
         assert_eq!(hub.log_seq(&node_id), None);
         assert_eq!(hub.newest_log_ack(&node_id), seq);
         assert_eq!(node_log_seq(&state, &node_id).await, i64_of(seq));
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     #[tokio::test]
@@ -6541,7 +6560,7 @@ mod tests {
             status_and_disconnects(&state, &node_id).await,
             ("connected".to_string(), 1)
         );
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 
     /// The node's `node.connected` events and change-log entries.
@@ -6605,6 +6624,6 @@ mod tests {
         let start = connect_node(hub, &node_id, c, &below).await.unwrap();
         assert_eq!(start.stored_log_seq, 3);
         assert_eq!(hub.newest_log_ack(&node_id), 7);
-        std::fs::remove_dir_all(&data_dir).unwrap();
+        close_and_remove(&[&state], &data_dir).await;
     }
 }

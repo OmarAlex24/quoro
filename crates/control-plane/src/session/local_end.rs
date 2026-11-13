@@ -1220,7 +1220,7 @@ mod tests {
         assert_eq!(view(&f.state, &f).await, (false, Vec::new(), false));
         assert!(hub.barrier_passed(&f.node_id, generation, LEASE, 3));
         assert!(hub.note_conversion_sent(&f.node_id, generation, LEASE, 3, D));
-        f.done();
+        f.done().await;
     }
 
     /// "While R waits" and "Ending the renewals" step 2 ("while the policy
@@ -1262,7 +1262,7 @@ mod tests {
         ack(&f.state, &f, &on).await;
         hub.attempt_held().await;
         grant_then_ping(&queued(&mut on), 3);
-        f.done();
+        f.done().await;
     }
 
     /// Up to the `local` grant and its `ping` on a session listing the
@@ -1311,7 +1311,7 @@ mod tests {
                 .hub
                 .barrier_passed(&f.node_id, on.session.generation, LEASE, 3)
         );
-        f.done();
+        f.done().await;
 
         let (f, mut on, _grant, ping) = sent("warm", false).await;
         write_row(&f, "UPDATE leases SET duration_ms = 20000 WHERE id = ?").await;
@@ -1319,7 +1319,7 @@ mod tests {
         pong(&mut on.session, &ping).await;
         assert!(f.row().await.unsettled, "written since the grant");
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
 
         let (f, mut on, _grant, ping) = sent("warm", false).await;
         let _newer = live(&f.state, &f, None).await;
@@ -1327,7 +1327,7 @@ mod tests {
         pong(&mut on.session, &ping).await;
         assert!(f.row().await.unsettled, "a replaced session");
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// A settle `ping` sent before the `local` grant never settles the lease
@@ -1363,7 +1363,7 @@ mod tests {
             of_type(&renew(&mut on.session, "msg_r2", 3).await, "lease_grant").is_empty(),
             "nor is a renewal answered or settled"
         );
-        f.done();
+        f.done().await;
 
         let f = fixture("warm", "expiring", Some(D as i64), false).await;
         let mut on = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
@@ -1384,7 +1384,7 @@ mod tests {
             "no write since, refused all the same"
         );
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// ADR 0257 for the repeat from `hello`: a holder that lists an unmarked
@@ -1440,7 +1440,7 @@ mod tests {
             state(&f).await,
             ("local".to_string(), 3, Some(D as i64), false, false)
         );
-        f.done();
+        f.done().await;
     }
 
     /// ADR 0257 after a conversion: each same-token `local` grant has its own
@@ -1487,7 +1487,7 @@ mod tests {
             "a refused grant passes no barrier"
         );
         assert!(f.row().await.unsettled, "nor does its pong write");
-        f.done();
+        f.done().await;
     }
 
     /// The resend from `hello` ("The holder's next `hello`", third bullet,
@@ -1528,7 +1528,7 @@ mod tests {
             pong(&mut on.session, &ping).await;
             let row = f.row().await;
             assert_eq!((row.mode.as_str(), row.unsettled), ("local", false));
-            f.done();
+            f.done().await;
         }
     }
 
@@ -1552,7 +1552,7 @@ mod tests {
         assert_answer(&renew(&mut on.session, "msg_r1", 3).await, "msg_r1", 3, D);
         f.state.hub.attempt_held().await;
         grant_then_ping(&queued(&mut on), 3);
-        f.done();
+        f.done().await;
 
         let f = fixture("warm", "expiring", Some(D as i64), false).await;
         let mut old = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
@@ -1564,7 +1564,7 @@ mod tests {
         assert!(queued(&mut old).is_empty());
         assert!(!f.state.hub.grant_pending(LEASE));
         assert!(f.row().await.unsettled, "the mark stays");
-        f.done();
+        f.done().await;
     }
 
     /// A primary restart in each window. While R waits: the restarted
@@ -1610,7 +1610,7 @@ mod tests {
             None,
             "after the pong"
         );
-        f.done();
+        f.done().await;
     }
 
     /// The holder's refusal `code` of the grant `grant` on `session`.
@@ -1649,7 +1649,7 @@ mod tests {
             ("local".to_string(), 3, Some(D as i64), false, false)
         );
         assert_eq!(view(&f.state, &f).await, (false, Vec::new(), false));
-        f.done();
+        f.done().await;
     }
 
     /// A `local` grant that waits for evidence (the holder's `hello` did not
@@ -1686,7 +1686,7 @@ mod tests {
             state(&f).await,
             ("expiring".to_string(), 3, Some(D as i64), false, false)
         );
-        f.done();
+        f.done().await;
     }
 
     /// The held grant of the row at token 4 went out, through the path of
@@ -1738,7 +1738,7 @@ mod tests {
         f.clock.advance(Duration::from_secs(18));
         hub.attempt_held().await;
         new_token_grants(&queued(&mut on));
-        f.done();
+        f.done().await;
     }
 
     /// A re-entry after a restart: the restarted primary seeds the marked
@@ -1767,7 +1767,7 @@ mod tests {
         clock.advance(Duration::from_secs(18));
         after.hub.attempt_held().await;
         new_token_grants(&queued(&mut on));
-        f.done();
+        f.done().await;
     }
 
     /// ADR 0257: only the newest same-token `local` grant's `pong` passes
@@ -1799,7 +1799,7 @@ mod tests {
             state(&f).await,
             ("local".to_string(), 3, Some(D as i64), false, false)
         );
-        f.done();
+        f.done().await;
     }
 
     /// A grant and its `pong`, then the policy back on `warm` and off it
@@ -1822,7 +1822,7 @@ mod tests {
         pong(&mut on.session, &ping).await;
         assert!(hub.barrier_passed(&f.node_id, generation, LEASE, 3));
         assert!(!f.row().await.unsettled);
-        f.done();
+        f.done().await;
     }
 
     /// "Ending the renewals" step 2 ("once R is replicated (below), while
@@ -1858,7 +1858,7 @@ mod tests {
             ("local".to_string(), 3, Some(D as i64), false, false)
         );
         assert!(hub.barrier_passed(&f.node_id, generation, LEASE, 3));
-        f.done();
+        f.done().await;
     }
 
     /// Section 8.5's regrant runs only on a session whose `hello` listed the
@@ -1888,7 +1888,7 @@ mod tests {
         assert_eq!(f.writes().await, writes);
         pong(&mut on.session, &ping).await;
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// R over a row whose grant with a new token is still held, `expiring`
@@ -1930,7 +1930,7 @@ mod tests {
             state(&f).await,
             ("local".to_string(), 4, Some(D as i64), true, false)
         );
-        f.done();
+        f.done().await;
     }
 
     /// R over a row whose grant with a new token already went out on the
@@ -1963,7 +1963,7 @@ mod tests {
         ack(&f.state, &f, &on).await;
         hub.attempt_held().await;
         grant_then_ping(&queued(&mut on), 4);
-        f.done();
+        f.done().await;
     }
 
     /// What follows R keeps a grant with a new token held since R's
@@ -2009,7 +2009,7 @@ mod tests {
         );
         assert!(hub.row_grant_pending(&row));
         assert!(left_stopped(&f).await.is_empty());
-        f.done();
+        f.done().await;
     }
 
     /// The drop of a `local` grant whose row moved: one held while its
@@ -2040,7 +2040,7 @@ mod tests {
                 "{moved}"
             );
             assert!(!hub.grant_pending(LEASE), "{moved}");
-            f.done();
+            f.done().await;
         }
     }
 
@@ -2061,7 +2061,7 @@ mod tests {
             state(&f).await,
             ("local".to_string(), 3, Some(D as i64), false, false)
         );
-        f.done();
+        f.done().await;
     }
 
     /// A failover's hold that lands after R. The failover wrote token 4,
@@ -2094,7 +2094,7 @@ mod tests {
         assert!(!hub.row_grant_pending(&f.row().await));
         assert_eq!(view(&f.state, &f).await, (false, Vec::new(), true));
         assert!(left_stopped(&f).await.is_empty(), "the drop emits nothing");
-        f.done();
+        f.done().await;
     }
 
     /// The grants, revokes and `ping`s the hub queued on the session's
@@ -2171,7 +2171,7 @@ mod tests {
         assert_eq!(sent[0]["body"]["fencing_token"], 3);
         assert_eq!(held_revokes(), 0);
         assert!(!hub.0.held.lock().unwrap().entries.contains_key(LEASE));
-        f.done();
+        f.done().await;
     }
 
     /// Section 5.1 and "The holder fenced first" step 4, with R: a holder
@@ -2254,7 +2254,7 @@ mod tests {
             vec![the_event(&f, 4)],
             "the entry's drop emits nothing"
         );
-        f.done();
+        f.done().await;
     }
 
     /// A policy change off `warm` over a row whose newest write gave it a
@@ -2292,7 +2292,7 @@ mod tests {
         hub.attempt_held().await;
         new_token_grants_only(&queued(&mut on));
         assert!(!hub.grant_pending(LEASE));
-        f.done();
+        f.done().await;
     }
 
     /// "Settling a lease": "Sending the same-token `local` grant clears any
@@ -2352,7 +2352,7 @@ mod tests {
             (None, Vec::new()),
             "cleared as the grant went out"
         );
-        f.done();
+        f.done().await;
 
         let f = fixture("warm", "expiring", Some(D as i64), true).await;
         let mut on = live(&f.state, &f, Some(("held", LeaseMode::Expiring, 3))).await;
@@ -2371,7 +2371,7 @@ mod tests {
             hub.settle_state(&f.node_id, generation, LEASE),
             (None, Vec::new())
         );
-        f.done();
+        f.done().await;
     }
 
     /// The grant is recorded on a session only once it is queued there, in
@@ -2430,7 +2430,7 @@ mod tests {
             .await;
         assert!(outbox.is_empty());
         assert_eq!(hub.local_grant_sent(&f.node_id, newer, LEASE), None);
-        f.done();
+        f.done().await;
     }
 
     /// "Grants of a marked row": "When that session ends first, the grant
@@ -2473,7 +2473,7 @@ mod tests {
         assert!(!hub.row_grant_pending(&row), "no in_progress");
         assert!(!hub.grant_pending(LEASE));
         assert_ne!(failover(&f).await, Some(crate::error::Reason::InProgress));
-        f.done();
+        f.done().await;
     }
 
     /// "A primary that restarted after R committed holds no such grant, so
@@ -2511,7 +2511,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((incidents, linked), (0, None), "no incident");
-        f.done();
+        f.done().await;
     }
 
     /// A session start checks each entry held for its node against the row
@@ -2560,7 +2560,7 @@ mod tests {
             "the fresh registration stays"
         );
         drop(conn);
-        f.done();
+        f.done().await;
     }
 
     /// "Grants of a marked row": "While the holder's current session is such
@@ -2603,7 +2603,7 @@ mod tests {
         assert_eq!(view(&f.state, &f).await, (true, Vec::new(), true));
         hub.attempt_held().await;
         assert!(queued(&mut again).is_empty(), "no majority support");
-        f.done();
+        f.done().await;
     }
 
     /// "While the holder's current session is such a session, …
@@ -2638,7 +2638,7 @@ mod tests {
             (true, vec![other], true),
             "the holder acknowledged R"
         );
-        f.done();
+        f.done().await;
     }
 
     /// What follows an R that wrote the row, over a held same-token `local`
@@ -2673,7 +2673,7 @@ mod tests {
             "the local grant stays"
         );
         assert!(left_stopped(&f).await.is_empty());
-        f.done();
+        f.done().await;
     }
 
     /// `updateApp` taking the fixture's app off `warm`, as its handler does
@@ -2773,7 +2773,7 @@ mod tests {
         event.3 = serde_json::json!({ "type": "user", "id": actor.id });
         assert_eq!(left_stopped(&f).await, vec![event]);
         assert!(!hub.grant_pending(LEASE));
-        f.done();
+        f.done().await;
     }
 
     /// What R's transaction decides and records for `held`, put in the
@@ -2862,6 +2862,6 @@ mod tests {
             "a grant an earlier R dropped, kept for its held-back revoke"
         );
         assert_eq!(left_stopped(&f).await, vec![the_event(&f, 4)], "once");
-        f.done();
+        f.done().await;
     }
 }

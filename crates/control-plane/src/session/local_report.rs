@@ -260,7 +260,7 @@ mod tests {
                 assert!(!local_pending(&f).await, "{case}");
                 assert_eq!(shown_duration(&f).await, None, "{case}");
                 assert_local_repeat(&start, 3);
-                f.done();
+                f.done().await;
             }
         }
     }
@@ -290,7 +290,7 @@ mod tests {
         assert!(held.contains("its lease is local"), "{held}");
         assert!(!held.contains("unsettled mark"), "{held}");
         assert_local_repeat(&start, 3);
-        f.done();
+        f.done().await;
     }
 
     /// Test 3: the holder lists the lease `local` at a token above the
@@ -315,7 +315,7 @@ mod tests {
             );
             assert_eq!(f.writes().await, writes + 1, "{case}");
             assert_local_repeat(&start, 5);
-            f.done();
+            f.done().await;
         }
     }
 
@@ -340,7 +340,7 @@ mod tests {
             if listed == 3 {
                 assert_local_repeat(&start, 3);
             }
-            f.done();
+            f.done().await;
         }
     }
 
@@ -447,7 +447,7 @@ mod tests {
                 of_type(&start, "lease_grant").is_empty(),
                 "{case}: {start:?}"
             );
-            f.done();
+            f.done().await;
         }
     }
 
@@ -480,7 +480,7 @@ mod tests {
                     // Still `expiring`: the view shows the duration.
                     assert_eq!(shown_duration(&f).await, Some(15_000), "{case}");
                 }
-                f.done();
+                f.done().await;
             }
         }
     }
@@ -511,7 +511,7 @@ mod tests {
         assert!(session.record_local_reports().await);
         assert_eq!(state(&f).await, before);
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// Test 5: a primary restart after the write. The row stays `local`,
@@ -533,7 +533,7 @@ mod tests {
             .unwrap();
         assert!(held.contains("its lease is local"), "{held}");
         drop(conn);
-        f.done();
+        f.done().await;
     }
 
     /// Every frame queued on the hub's channel of a session.
@@ -591,6 +591,6 @@ mod tests {
         let sent = queued(&mut rx);
         assert!(of_type(&sent, "lease_grant").is_empty(), "{sent:?}");
         assert!(of_type(&sent, "lease_revoke").is_empty(), "{sent:?}");
-        f.done();
+        f.done().await;
     }
 }

@@ -686,7 +686,7 @@ pub(super) async fn app_is_warm(
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::super::tests::hub_with_node;
+    use super::super::tests::{close_and_remove, hub_with_node};
     use super::{InFlight, Plan, Seen, plan};
     use crate::AppState;
     use crate::authority::{ManualClock, MonotonicClock, VoterSupport};
@@ -721,6 +721,9 @@ pub(super) mod tests {
         pub(in crate::session) node_id: String,
         pub(in crate::session) data_dir: std::path::PathBuf,
         pub(in crate::session) clock: Arc<ManualClock>,
+        /// The states [`restart`] opened on `data_dir`, which
+        /// [`Fixture::done`] closes with the fixture's own.
+        restarted: std::sync::Mutex<Vec<AppState>>,
     }
 
     pub(in crate::session) async fn fixture(
@@ -785,6 +788,7 @@ pub(super) mod tests {
             node_id,
             data_dir,
             clock,
+            restarted: std::sync::Mutex::default(),
         }
     }
 
@@ -837,8 +841,13 @@ pub(super) mod tests {
             self.state.hub.authority().passed(LEASE)
         }
 
-        pub(in crate::session) fn done(self) {
-            std::fs::remove_dir_all(&self.data_dir).unwrap();
+        /// Closes every state opened on `data_dir` (the fixture's own and the
+        /// ones [`restart`] opened), then removes it. [`close_and_remove`]
+        /// says why the order matters.
+        pub(in crate::session) async fn done(self) {
+            let restarted = self.restarted.into_inner().unwrap();
+            let states: Vec<&AppState> = std::iter::once(&self.state).chain(&restarted).collect();
+            close_and_remove(&states, &self.data_dir).await;
         }
     }
 
@@ -945,7 +954,7 @@ pub(super) mod tests {
     /// Opens a second primary on the fixture's database, as a restart does:
     /// nothing in memory survives, and the start seeds the gates from the
     /// rows. Its authority then runs on a manual clock, seeded again from
-    /// its start.
+    /// its start. [`Fixture::done`] closes it.
     pub(in crate::session) async fn restart(fixture: &Fixture) -> (AppState, Arc<ManualClock>) {
         let store = crate::store::Store::open(&fixture.data_dir.join("quoro.db"))
             .await
@@ -976,6 +985,7 @@ pub(super) mod tests {
             .authority()
             .set_test_clock(Arc::clone(&clock) as Arc<dyn MonotonicClock>);
         state.hub.seed_lease_gates().await.unwrap();
+        fixture.restarted.lock().unwrap().push(state.clone());
         (state, clock)
     }
 
@@ -1049,7 +1059,7 @@ pub(super) mod tests {
         let later = renew(&mut session, "msg_r2", 3).await;
         assert_answer(&later, "msg_r2", 3, D);
         assert_eq!(f.writes().await, writes + 1, "a renewal writes nothing");
-        f.done();
+        f.done().await;
     }
 
     /// The lost session in each window. A conversion is in flight only on
@@ -1093,7 +1103,7 @@ pub(super) mod tests {
         renew(&mut new, "msg_r2", 3).await;
         assert_eq!(f.row().await.mode, "local");
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// The answer lost after its commit (the session lost between the
@@ -1115,7 +1125,7 @@ pub(super) mod tests {
             f.state.hub.authority().gate_remaining(LEASE),
             Some(Duration::from_secs(36))
         );
-        f.done();
+        f.done().await;
     }
 
     /// A primary restart between the conversion and its first answer: the
@@ -1154,7 +1164,7 @@ pub(super) mod tests {
         );
         clock.advance(Duration::from_secs(36));
         assert!(after.hub.authority().passed(LEASE));
-        f.done();
+        f.done().await;
     }
 
     /// Section 8.4 "Changing the mode" (#555): a policy change off `warm`
@@ -1202,7 +1212,7 @@ pub(super) mod tests {
         assert_eq!(f.writes().await, writes, "still no write");
         let row = f.row().await;
         assert_eq!((row.mode.as_str(), row.unsettled), ("local", true));
-        f.done();
+        f.done().await;
     }
 
     /// "Settling a lease" from `hello` (section 8.4, ADR 0261), after a
@@ -1257,7 +1267,7 @@ pub(super) mod tests {
         assert_eq!(f.writes().await, writes + 1);
         pong(&mut session, &ping).await;
         assert_eq!(f.writes().await, writes + 1, "once");
-        f.done();
+        f.done().await;
     }
 
     /// The settle of a marked row, as after a failover's held `expiring`
@@ -1291,7 +1301,7 @@ pub(super) mod tests {
         assert_answer(&later, "msg_r2", 3, D);
         assert!(of_type(&later, "ping").is_empty(), "settled");
         assert!(f.held_while_away().await.is_some(), "a new gate");
-        f.done();
+        f.done().await;
     }
 
     /// A first answer the authority refuses (no majority support, section
@@ -1335,7 +1345,7 @@ pub(super) mod tests {
             f.state.hub.authority().gate_remaining(LEASE),
             Some(Duration::from_secs(36))
         );
-        f.done();
+        f.done().await;
     }
 
     /// "The holder's next `hello`" at a token above a marked row's, while the
@@ -1360,7 +1370,7 @@ pub(super) mod tests {
             (row.mode.as_str(), row.fencing_token, row.unsettled),
             ("expiring", 5, false)
         );
-        f.done();
+        f.done().await;
     }
 
     /// No settle while the policy is off `warm`, nor once the session is
@@ -1395,7 +1405,7 @@ pub(super) mod tests {
             of_type(&renew(&mut session, "msg_r3", 3).await, "lease_grant").is_empty(),
             "nor answers a renewal it read after the newer session started"
         );
-        f.done();
+        f.done().await;
     }
 
     /// Section 8.4, "Settling a lease": a write of the row between the
@@ -1434,7 +1444,7 @@ pub(super) mod tests {
             ("expiring", 3, false)
         );
         assert_eq!(f.writes().await, writes + 1);
-        f.done();
+        f.done().await;
     }
 
     /// The same refusal on the ordinary path, with a duration raise between
@@ -1471,7 +1481,7 @@ pub(super) mod tests {
             ("expiring", Some(30_000), false)
         );
         assert_eq!(f.writes().await, writes + 3);
-        f.done();
+        f.done().await;
     }
 
     /// "Settling a lease": the answer that settles a marked `expiring` row
@@ -1493,7 +1503,7 @@ pub(super) mod tests {
             "counted at the stored duration"
         );
         assert_eq!(f.row().await.duration_ms, Some(30_000));
-        f.done();
+        f.done().await;
 
         let f = fixture("warm", "expiring", Some(30_000), false).await;
         let (mut session, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
@@ -1506,7 +1516,7 @@ pub(super) mod tests {
             Some(Duration::from_secs(18)),
             "an ordinary answer counts its own duration"
         );
-        f.done();
+        f.done().await;
     }
 
     /// A settling answer that raises the stored duration reads the row's
@@ -1527,7 +1537,7 @@ pub(super) mod tests {
             ("expiring", Some(D as i64), false)
         );
         assert_eq!(f.writes().await, writes + 2);
-        f.done();
+        f.done().await;
     }
 
     /// A marked `expiring` row while `policy`, renewed on a session that
@@ -1559,7 +1569,7 @@ pub(super) mod tests {
         assert!(row.is_revoked());
         assert_eq!((row.mode.as_str(), row.unsettled), ("expiring", true));
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// A token raise between the settle's answer and its `pong`, as a fence
@@ -1579,7 +1589,7 @@ pub(super) mod tests {
         let row = f.row().await;
         assert_eq!((row.fencing_token, row.unsettled), (4, true));
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// A failed fence of the lease between the settle's answer and its
@@ -1611,7 +1621,7 @@ pub(super) mod tests {
             let row = f.row().await;
             assert!(row.unsettled, "recorded: {recorded}");
             assert_eq!(f.writes().await, writes, "recorded: {recorded}");
-            f.done();
+            f.done().await;
         }
     }
 
@@ -1627,7 +1637,7 @@ pub(super) mod tests {
             (row.mode.as_str(), row.duration_ms, row.unsettled),
             ("expiring", Some(30_000), false)
         );
-        f.done();
+        f.done().await;
     }
 
     /// R, as `updateApp` writes it when the policy leaves `warm`: the policy
@@ -1701,7 +1711,7 @@ pub(super) mod tests {
                 .is_none()
         );
         w.commit().await.unwrap();
-        f.done();
+        f.done().await;
     }
 
     /// "From R until the holder has taken the grant", Renewals: after R,
@@ -1757,7 +1767,7 @@ pub(super) mod tests {
         // A newer session sent no `local` grant: its renewals are answered.
         let (mut newer, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
         assert_answer(&renew(&mut newer, "msg_r7", 3).await, "msg_r7", 3, D);
-        f.done();
+        f.done().await;
     }
 
     /// A row R wrote over a `local` row stores no duration (a conversion
@@ -1771,7 +1781,7 @@ pub(super) mod tests {
         let writes = f.writes().await;
         assert!(of_type(&renew(&mut session, "msg_r1", 3).await, "lease_grant").is_empty());
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// "While R waits", last sentence: the policy returns to `warm` on a
@@ -1806,7 +1816,7 @@ pub(super) mod tests {
             ("expiring", 3, Some(D as i64), false)
         );
         assert_eq!(f.writes().await, writes + 1);
-        f.done();
+        f.done().await;
     }
 
     /// "Settling a lease": a settling `ping` goes out while the policy is
@@ -1835,7 +1845,7 @@ pub(super) mod tests {
             "the row's newest write changed since the answer: no settle"
         );
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// The double flip. R, then back on `warm` with a renewal whose answer
@@ -1869,7 +1879,7 @@ pub(super) mod tests {
             "off warm at the pong: no settle"
         );
         assert_eq!(f.writes().await, writes);
-        f.done();
+        f.done().await;
     }
 
     /// A renewal whose conversion R ended, without majority support: no
@@ -1909,7 +1919,7 @@ pub(super) mod tests {
         assert_eq!(f.writes().await, writes);
         let row = f.row().await;
         assert_eq!((row.mode.as_str(), row.unsettled), ("local", true));
-        f.done();
+        f.done().await;
     }
 
     /// The unsafe direction while R waits. `failoverApp` finds the lease
@@ -1952,7 +1962,7 @@ pub(super) mod tests {
             }
             assert!(after.hub.authority().passed(LEASE));
             drop(conn);
-            f.done();
+            f.done().await;
         }
     }
 
@@ -1982,7 +1992,7 @@ pub(super) mod tests {
             );
         }
         drop(conn);
-        f.done();
+        f.done().await;
     }
 
     /// A primary restart between the settle's answer and its `pong`, for an
@@ -2008,7 +2018,7 @@ pub(super) mod tests {
                 .is_some()
         );
         drop(conn);
-        f.done();
+        f.done().await;
     }
 
     /// Policy `hot` is read as `warm` (section 8.4, as `grant_app_lease`
@@ -2020,7 +2030,7 @@ pub(super) mod tests {
         pong(&mut session, &ping).await;
         let row = f.row().await;
         assert_eq!((row.mode.as_str(), row.unsettled), ("expiring", false));
-        f.done();
+        f.done().await;
     }
 
     /// The one settling `ping` among `frames`: its message id.
