@@ -49,6 +49,9 @@ pub mod primary_status;
 /// Quarantined copies of a volume: recording, refusals and deletion (ADR
 /// 0176).
 pub(crate) mod quarantines;
+/// The fold of the promotion rebuild (node-agent-protocol.md section 7.3
+/// step 4, ADR 0317).
+pub mod rebuild;
 /// Removing a node from the cluster (`removeNode`, section 10 of the node
 /// agent protocol).
 pub(crate) mod removal;

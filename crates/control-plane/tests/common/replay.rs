@@ -9,50 +9,23 @@
 //! stays: a cascade the primary ran without writing entries shows up as a
 //! row the rebuild kept. An `update` or `delete` of a row the log has not
 //! created yet fails the test, since the rebuild cannot apply it.
+//!
+//! This is a test aid, not the promotion's fold of ADR 0317
+//! (`quoro_control_plane::rebuild`), whose `entity_type` map it shares.
 
 use super::Server;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use quoro_control_plane::rebuild;
 use quoro_control_plane::store::Store;
 use serde_json::Value;
 use sqlx::Row as _;
 
-/// The table each `entity_type` names (`db-schema.sql` and its migrations).
+/// The table each `entity_type` names, as the promotion's fold maps it
+/// (`quoro_control_plane::rebuild::table_of`).
 fn table_of(entity_type: &str) -> &'static str {
-    match entity_type {
-        "agent" => "agents",
-        "agent_key" => "agent_keys",
-        "api_token" => "api_tokens",
-        "app" => "apps",
-        "app_env" => "app_env",
-        "approval" => "approvals",
-        "audit" => "audit_log",
-        "audit_export" => "audit_exports",
-        "backup" => "backups",
-        "backup_repository" => "backup_repositories",
-        "build" => "builds",
-        "deployment" => "deployments",
-        "domain" => "domains",
-        "event" => "events",
-        "grant" => "grants",
-        "incident" => "incidents",
-        "lease" => "leases",
-        "node" => "nodes",
-        "node_credential" => "node_credentials",
-        "node_join_token" => "node_join_tokens",
-        "node_key_custody" => "node_key_custody",
-        "node_tunnel" => "node_tunnels",
-        "project" => "projects",
-        "provider" => "providers",
-        "signing_key" => "signing_keys",
-        "user" => "users",
-        "vm" => "vms",
-        "volume" => "volumes",
-        "volume_quarantine" => "volume_quarantines",
-        "vulnerability_finding" => "vulnerability_findings",
-        "webhook" => "webhooks",
-        other => panic!("no table for entity_type {other}"),
-    }
+    rebuild::table_of(entity_type)
+        .unwrap_or_else(|| panic!("no table for entity_type {entity_type}"))
 }
 
 struct Column {
