@@ -199,7 +199,7 @@ A row resolved this way no longer blocks the schedule, which counts from it like
 2. creates a sparse file of the volume's size, then for each chunk: reads it, decrypts it with the chunk id as associated data, decompresses it, checks that `BLAKE3-keyed(id_key, plaintext)` equals the id, and writes it at its offset. An all-zero chunk is left as a hole;
 3. checks that the chunks covered `logical_bytes` exactly, and reports the volume `ready`.
 
-Any failed check stops the restore: the node deletes the partial file and reports the volume `failed` with the reason. The primary then emits `restore.failed`. Nothing on the target node is mounted at any point.
+Any failed check stops the restore: the node deletes the partial file and reports the volume `failed` with the reason. The primary then emits `restore.failed`. The one exception is a restore the old primary started and the target node never received, after a promotion and while the new primary does not hold the repository key: the primary records it `failed` with the error `repository key absent` and emits `restore.failed` without a report (`node-agent-protocol.md` section 7.3 step 4). Nothing on the target node is mounted at any point.
 
 ### 8.2 The control-plane database, offline
 

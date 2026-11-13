@@ -869,10 +869,13 @@ components:
         ha_ready:
           type: boolean
           description: |
-            Whether `count` is at least `required` and the primary holds the
+            Whether `count`, less the voters whose newest status report carries
+            `mesh_error`, is at least `required`, and the primary holds the
             support of a majority of voters right now, so it can grant and renew
             `expiring` leases (ADR 0169, node-agent-protocol.md section 8.8). A
-            primary that does not track support yet reports false.
+            voter with `mesh_error` answers no promotion vote
+            (node-agent-protocol.md section 6.9). A primary that does not track
+            support yet reports false.
     ClusterVoter:
       type: object
       title: ClusterVoter
