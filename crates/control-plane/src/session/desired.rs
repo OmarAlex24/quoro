@@ -616,9 +616,12 @@ async fn standby_vms(
 /// received the restore from the old primary. If the old primary stopped
 /// before that snapshot reached the node, the node never reports the volume,
 /// so its desired state stays frozen and the app stays down until the owner
-/// restores the key. A `ready` report also leaves the volume `restoring` while
-/// the app's lease waits for an operator's acknowledgement of a failed fence
-/// (`backups::restore`), so the freeze lasts at least that long.
+/// restores the key. A `ready` report also leaves the volume `restoring` until
+/// the app's old lease is released, when its holder answers the revoke or its
+/// node is removed or declared lost, and the lease's gate on the authority
+/// has passed (`backups::restore`, `restore_ready`); an operator's
+/// acknowledgement is needed only when the holder cannot be reached. The
+/// freeze lasts at least that long.
 async fn backup_jobs(
     store: &Store,
     data_key: &DataKey,
