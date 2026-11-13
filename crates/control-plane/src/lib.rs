@@ -44,6 +44,9 @@ pub mod keys;
 /// RFC 8785 canonical JSON, shared with the node agent through `quoro-proto`.
 pub use quoro_proto::jcs;
 pub mod leases;
+/// The `node_credential` and `signing_key` entries migration 0012 asks the
+/// primary to write before it serves (issue #751).
+pub(crate) mod log_backfill;
 pub mod openapi;
 pub mod primary_status;
 /// Quarantined copies of a volume: recording, refusals and deletion (ADR
@@ -283,6 +286,30 @@ impl AppState {
         // Nodes enrolled before the per-node subnet existed get theirs before
         // any session can ask for a desired state (ADR 0144).
         subnet::backfill(&store, &config.node_network).await?;
+        // Migration 0012: before it serves, the primary writes a `create`
+        // entry for each node credential the log lacks and records its
+        // current signing key in `signing_keys`, so a promoted primary
+        // rebuilds both tables from the log (section 7.3 step 4). Without
+        // them a promotion cannot rebuild, so a failure stops the start.
+        // `backup-format.md` section 8.2 (ADR 0280, ADR 0285) asks that a
+        // restored primary's first change-log write come before any other.
+        // That write is not implemented yet; only its move of the primary
+        // status exists, as `primary_status::apply_marker` above. Once it
+        // is, this step must stay after it, as it stays after `apply_marker`
+        // now.
+        match log_backfill::run(&store, &keys).await {
+            Ok(done) if done != log_backfill::Backfilled::default() => tracing::info!(
+                credentials = done.credentials,
+                signing_key = done.signing_key,
+                "wrote the change-log entries a promotion rebuilds from"
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot write the change-log entries a promotion rebuilds from: {e}"
+                ));
+            }
+        }
         // Section 7.2, "When": every start seals what is missing and deletes
         // the seals of retired keys and removed machines, before any session
         // or request. A failure is logged and does not stop the start.

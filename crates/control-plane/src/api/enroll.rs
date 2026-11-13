@@ -830,11 +830,12 @@ async fn enroll(
 }
 
 /// The whole `node_credentials` row of `node_id`, as its change-log entry
-/// carries it (migration 0012).
-async fn credential_payload(
+/// carries it (migration 0012). The start-up entries of
+/// [`crate::log_backfill`] carry the same payload.
+pub(crate) async fn credential_payload(
     conn: &mut sqlx::SqliteConnection,
     node_id: &str,
-) -> Result<Value, ApiError> {
+) -> Result<Value, sqlx::Error> {
     let (node_id, credential_hash, created_at, revoked_at): (
         String,
         String,

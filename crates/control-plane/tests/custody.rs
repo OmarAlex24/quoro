@@ -7,14 +7,17 @@
 mod common;
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use common::replay;
 use common::{Server, restart_with_resolver, start_patient_in};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::ReferenceAsDigest;
+use quoro_control_plane::changelog::{self, Actor, Op};
+use quoro_control_plane::store::Store;
 use quoro_proto::custody::{self, CustodyKey, KeyKind, SealContext};
 use quoro_proto::wire::{self, Capacity as WireCapacity, Kvm as WireKvm, LogAck, NodeMessage};
 use quoro_proto::{jcs, sign};
+use quoro_types::{Prefix, new_id};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -1172,4 +1175,532 @@ async fn node_entries_rebuild_every_column_of_the_row() {
     let mut expected = names.clone();
     expected.sort_unstable();
     assert_eq!(logged, expected);
+}
+
+/// How [`old_primary`] wrote a credential's row and its change-log entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Written {
+    /// Inserted with no change-log entry at all.
+    Unlogged,
+    /// Inserted with no entry and replaced later by a re-enrollment, which
+    /// logged the whole row as an `update`: an update with no create.
+    UpdateOnly,
+    /// Inserted with no entry and revoked, so `revoked_at` is not NULL.
+    Revoked,
+    /// Inserted with its `create` entry, as enrollment writes it since #754.
+    Created,
+    /// Inserted with its `create` entry, deleted with a `delete` entry, then
+    /// inserted again with no entry: its newest create or delete entry is
+    /// the `delete`, though the log holds a `create` of it.
+    Recreated,
+}
+
+/// One machine of [`old_primary`]: its id, the credential secret it holds,
+/// whose SHA-256 is its `credential_hash`, and how its row was written.
+struct OldCredential {
+    node_id: String,
+    secret: String,
+    written: Written,
+}
+
+impl OldCredential {
+    /// Whether a start must write a `create` entry for it: its newest
+    /// `create` or `delete` entry is not a `create`.
+    fn backfilled(&self) -> bool {
+        self.written != Written::Created
+    }
+}
+
+/// [`old_primary`]'s data directory, its credentials, and the `seq` of the
+/// newest change-log entry it wrote: the start's entries come after it.
+struct OldPrimary {
+    dir: std::path::PathBuf,
+    credentials: Vec<OldCredential>,
+    head_seq: i64,
+}
+
+/// Inserts an edge machine's row the way an enrollment writes it, with no
+/// change-log entry.
+async fn insert_old_node(store: &Store, node_id: &str, name: &str) {
+    sqlx::query(
+        "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, behind_nat, \
+         labels, capacity, allocated, kvm, engine_version, agent_version, desired_rev, applied_rev, \
+         log_seq, last_seen_at, created_at) \
+         VALUES (?, ?, '[\"edge\"]', NULL, 'disconnected', '', NULL, 1, '{}', '{}', '{}', '{}', \
+         NULL, NULL, 0, 0, 0, NULL, '2026-10-01T10:00:00.000Z')",
+    )
+    .bind(node_id)
+    .bind(name)
+    .execute(store.pool())
+    .await
+    .unwrap();
+}
+
+/// Inserts a `node_credentials` row for `secret`, with no change-log entry.
+async fn insert_old_credential(
+    store: &Store,
+    node_id: &str,
+    secret: &str,
+    created_at: &str,
+    revoked_at: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO node_credentials (node_id, credential_hash, created_at, revoked_at) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(node_id)
+    .bind(sha256_hex(secret.as_bytes()))
+    .bind(created_at)
+    .bind(revoked_at)
+    .execute(store.pool())
+    .await
+    .unwrap();
+}
+
+/// Writes a `node_credential` entry of `op` for `node_id`: the whole row as
+/// the table holds it for a `create` or an `update`, an empty payload for a
+/// `delete`.
+async fn log_old_credential(store: &Store, node_id: &str, op: Op) {
+    let payload = if op == Op::Delete {
+        json!({})
+    } else {
+        let (node_id, credential_hash, created_at, revoked_at): (
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT node_id, credential_hash, created_at, revoked_at FROM node_credentials \
+             WHERE node_id = ?",
+        )
+        .bind(node_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        json!({
+            "node_id": node_id,
+            "credential_hash": credential_hash,
+            "created_at": created_at,
+            "revoked_at": revoked_at,
+        })
+    };
+    let mut w = store.begin_write().await.unwrap();
+    changelog::append(
+        &mut w.tx,
+        &Actor::system("test"),
+        "node_credential",
+        node_id,
+        op,
+        payload,
+    )
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+}
+
+/// A primary's data directory whose database holds node credentials
+/// written before every insert and update of a row was logged (migration
+/// 0012, issue #751), two written since, and no `signing_keys` row: one
+/// credential of each [`Written`] case.
+async fn old_primary() -> OldPrimary {
+    let dir = std::env::temp_dir().join(format!(
+        "quoro-custody-{}",
+        &quoro_control_plane::store::random_secret()[..16]
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("quoro.db")).await.unwrap();
+    let first = "2026-10-01T10:00:00.000Z";
+    let second = "2026-10-02T10:00:00.000Z";
+    let mut credentials = Vec::new();
+    for (name, written) in [
+        ("edge-unlogged", Written::Unlogged),
+        ("edge-update-only", Written::UpdateOnly),
+        ("edge-revoked", Written::Revoked),
+        ("edge-created", Written::Created),
+        ("edge-recreated", Written::Recreated),
+    ] {
+        let node_id = new_id(Prefix::Node);
+        insert_old_node(&store, &node_id, name).await;
+        let mut secret = quoro_control_plane::store::random_secret();
+        let revoked_at = (written == Written::Revoked).then_some("2026-10-03T10:00:00.000Z");
+        insert_old_credential(&store, &node_id, &secret, first, revoked_at).await;
+        match written {
+            Written::Unlogged | Written::Revoked => {}
+            Written::UpdateOnly => {
+                secret = quoro_control_plane::store::random_secret();
+                sqlx::query(
+                    "UPDATE node_credentials SET credential_hash = ?, created_at = ?, \
+                     revoked_at = NULL WHERE node_id = ?",
+                )
+                .bind(sha256_hex(secret.as_bytes()))
+                .bind(second)
+                .bind(&node_id)
+                .execute(store.pool())
+                .await
+                .unwrap();
+                log_old_credential(&store, &node_id, Op::Update).await;
+            }
+            Written::Created => log_old_credential(&store, &node_id, Op::Create).await,
+            Written::Recreated => {
+                log_old_credential(&store, &node_id, Op::Create).await;
+                sqlx::query("DELETE FROM node_credentials WHERE node_id = ?")
+                    .bind(&node_id)
+                    .execute(store.pool())
+                    .await
+                    .unwrap();
+                log_old_credential(&store, &node_id, Op::Delete).await;
+                secret = quoro_control_plane::store::random_secret();
+                insert_old_credential(&store, &node_id, &secret, second, None).await;
+            }
+        }
+        credentials.push(OldCredential {
+            node_id,
+            secret,
+            written,
+        });
+    }
+    let head_seq: i64 = sqlx::query_scalar("SELECT IFNULL(MAX(seq), 0) FROM change_log")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+    OldPrimary {
+        dir,
+        credentials,
+        head_seq,
+    }
+}
+
+/// The `node_credential` and `signing_key` change-log entries, oldest first:
+/// `(seq, entity_type, entity_id, op, payload)`.
+async fn backfill_entries(server: &Server) -> Vec<(i64, String, String, String, Value)> {
+    let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
+        "SELECT seq, entity_type, entity_id, op, payload FROM change_log \
+         WHERE entity_type IN ('node_credential', 'signing_key') ORDER BY seq",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(seq, entity_type, entity_id, op, payload)| {
+            (
+                seq,
+                entity_type,
+                entity_id,
+                op,
+                serde_json::from_str(&payload).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Migration 0012 and section 7.3 step 4 (issue #751): a primary whose node
+/// credentials were written before every insert and update was logged, and
+/// that holds no `signing_keys` row, writes at its start the entries a
+/// promotion rebuilds both tables from. It writes a `create` for exactly the
+/// credentials whose newest `create` or `delete` entry is not a `create`:
+/// none for one already created, one for one created, deleted and inserted
+/// again without an entry. Folded as a promotion folds them, the log gives
+/// back every column of every row.
+#[tokio::test]
+async fn a_start_logs_what_a_promotion_rebuilds_credentials_and_the_signing_key_from() {
+    let old = old_primary().await;
+    let server = start_patient_in(old.dir.clone()).await;
+
+    let mut created_at_start: Vec<String> = Vec::new();
+    for (seq, entity_type, entity_id, op, _) in backfill_entries(&server).await {
+        if seq > old.head_seq && entity_type == "node_credential" {
+            assert_eq!(op, "create", "seq {seq}");
+            created_at_start.push(entity_id);
+        }
+    }
+    let mut expected: Vec<String> = old
+        .credentials
+        .iter()
+        .filter(|c| c.backfilled())
+        .map(|c| c.node_id.clone())
+        .collect();
+    created_at_start.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        created_at_start, expected,
+        "one create per credential the fold would not rebuild"
+    );
+
+    let rebuilt = replay::rebuild_folded(&server, &["node_credential", "signing_key"]).await;
+    for (table, count) in [
+        ("node_credentials", old.credentials.len()),
+        ("signing_keys", 1),
+    ] {
+        let columns = replay::column_names(&server.state.store, table).await;
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        replay::assert_rebuilt(&server, &rebuilt, table, &columns, count).await;
+    }
+
+    // The row is the key this primary signs with, named as section 7.2
+    // names it.
+    let (key_id, public_key, state): (String, String, String) =
+        sqlx::query_as("SELECT key_id, public_key, state FROM signing_keys")
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, "current");
+    assert_eq!(public_key, server.state.keys.public_key_base64());
+    assert_eq!(key_id, sha256_hex(&STANDARD.decode(&public_key).unwrap()));
+    assert_eq!(key_id, server.state.keys.key_id());
+}
+
+/// A second start writes no `node_credential` or `signing_key` entry and no
+/// second `signing_keys` row: the step writes only what the log lacks.
+#[tokio::test]
+async fn a_second_start_logs_no_credential_or_signing_key_again() {
+    let old = old_primary().await;
+    let server = start_patient_in(old.dir.clone()).await;
+    let logged = backfill_entries(&server).await;
+    let at_start = logged
+        .iter()
+        .filter(|(seq, ..)| *seq > old.head_seq)
+        .count();
+    // One create per credential the fold would not rebuild, and the signing
+    // key's.
+    let backfilled = old.credentials.iter().filter(|c| c.backfilled()).count();
+    assert_eq!(at_start, backfilled + 1, "{logged:?}");
+
+    let restarted = restart_with_resolver(&server, Arc::new(ReferenceAsDigest)).await;
+    assert_eq!(backfill_entries(&restarted).await, logged);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM signing_keys")
+        .fetch_one(restarted.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+/// The test aid [`replay::fold`] folds as section 7.3 step 4 says (ADR
+/// 0317): updates that follow a `delete` make a row of updates only, which
+/// stops the fold as an entity that never received a `create` does; a
+/// `create` after the `delete` rebuilds the row, and a `delete` last leaves
+/// none.
+#[test]
+fn the_replay_fold_refuses_a_row_of_updates_after_a_delete() {
+    let entry = |seq: i64, op: &str, payload: Value| replay::Entry {
+        seq,
+        entity_type: "node_credential".to_string(),
+        entity_id: OTHER_NODE.to_string(),
+        op: op.to_string(),
+        payload,
+    };
+    let row = json!({
+        "node_id": OTHER_NODE,
+        "credential_hash": sha256_hex(b"secret"),
+        "created_at": "2026-10-01T10:00:00.000Z",
+        "revoked_at": null,
+    });
+    let revoke = json!({"node_id": OTHER_NODE, "revoked_at": "2026-10-03T10:00:00.000Z"});
+
+    let refused = replay::fold([
+        entry(1, "create", row.clone()),
+        entry(2, "delete", json!({})),
+        entry(3, "update", revoke.clone()),
+    ])
+    .unwrap_err();
+    assert!(refused.contains(OTHER_NODE), "{refused}");
+    assert!(refused.contains("only of updates"), "{refused}");
+
+    let deleted = replay::fold([
+        entry(1, "create", row.clone()),
+        entry(2, "delete", json!({})),
+    ]);
+    assert!(deleted.unwrap().is_empty());
+
+    let recreated = replay::fold([
+        entry(1, "create", row.clone()),
+        entry(2, "delete", json!({})),
+        entry(3, "create", row.clone()),
+        entry(4, "update", revoke.clone()),
+    ])
+    .unwrap();
+    assert_eq!(recreated.len(), 1);
+    assert_eq!(recreated[0].2["revoked_at"], revoke["revoked_at"]);
+    assert_eq!(recreated[0].2["credential_hash"], row["credential_hash"]);
+
+    let update_first = replay::fold([
+        entry(1, "update", revoke.clone()),
+        entry(2, "create", row.clone()),
+    ]);
+    assert_eq!(
+        update_first.unwrap().len(),
+        1,
+        "an update before its create"
+    );
+
+    for never_created in [
+        vec![entry(1, "update", revoke.clone())],
+        vec![entry(1, "delete", json!({}))],
+    ] {
+        let refused = replay::fold(never_created).unwrap_err();
+        assert!(refused.contains("never received a create"), "{refused}");
+    }
+}
+
+/// `bytes` as lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Every byte string `text` may encode: its own UTF-8 bytes and, wherever
+/// it parses, its decoding as hex (either case) and as standard and
+/// URL-safe base64, each with and without padding.
+fn readings(text: &str) -> Vec<Vec<u8>> {
+    let mut readings = vec![text.as_bytes().to_vec()];
+    if text.len().is_multiple_of(2) && text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        readings.push(
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+                .collect(),
+        );
+    }
+    for engine in [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD] {
+        if let Ok(bytes) = engine.decode(text) {
+            readings.push(bytes);
+        }
+    }
+    readings
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Whether `value` holds one of `secrets` as a contiguous run of bytes: in
+/// any string, object keys included, read as [`readings`] says, or in any
+/// array whose items are all numbers, as consecutive integers.
+fn holds_secret(value: &Value, secrets: &[&[u8]]) -> bool {
+    let in_text = |text: &str| {
+        readings(text)
+            .iter()
+            .any(|bytes| secrets.iter().any(|secret| contains(bytes, secret)))
+    };
+    match value {
+        Value::String(text) => in_text(text),
+        Value::Array(items) if items.iter().all(Value::is_number) => {
+            let numbers: Vec<Option<u64>> = items.iter().map(Value::as_u64).collect();
+            secrets.iter().any(|secret| {
+                numbers.windows(secret.len()).any(|window| {
+                    window
+                        .iter()
+                        .zip(secret.iter())
+                        .all(|(number, byte)| *number == Some(u64::from(*byte)))
+                })
+            })
+        }
+        Value::Array(items) => items.iter().any(|item| holds_secret(item, secrets)),
+        Value::Object(fields) => fields
+            .iter()
+            .any(|(key, item)| in_text(key) || holds_secret(item, secrets)),
+        _ => false,
+    }
+}
+
+/// Sections 7.1 and 11, what followers and off-site copies read. No string
+/// in any change-log payload after the start, the entries this step writes
+/// included, holds the signing key's 32-byte seed or its 64-byte private
+/// key: not in its own bytes, nor decoded as hex or as any of the four
+/// base64 variants wherever it parses, which also finds a key inside a
+/// longer encoded value; and no array of numbers holds either as
+/// consecutive bytes. The check is first shown to catch each of those
+/// forms. The `signing_key` entry carries the public key of the key file,
+/// and each `node_credential` entry the start writes carries the row's four
+/// columns, the credential only as its SHA-256.
+#[tokio::test]
+async fn the_start_up_entries_hold_no_private_key_and_only_credential_hashes() {
+    let old = old_primary().await;
+    let server = start_patient_in(old.dir.clone()).await;
+    let seed: [u8; 32] = std::fs::read(server.data_dir.join("keys").join("signing.key"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let signing = sign::signing_key_from_seed(&seed);
+    let keypair = signing.to_keypair_bytes();
+    let secrets: [&[u8]; 2] = [&seed, &keypair];
+
+    let mut wrapped = vec![0x01u8];
+    wrapped.extend_from_slice(&seed);
+    let mut in_numbers = vec![json!(300), json!(1)];
+    in_numbers.extend(seed.iter().map(|byte| json!(byte)));
+    for leak in [
+        json!(hex(&seed)),
+        json!(hex(&keypair).to_uppercase()),
+        json!(STANDARD.encode(seed)),
+        json!(STANDARD_NO_PAD.encode(seed)),
+        json!(URL_SAFE.encode(keypair)),
+        json!(URL_SAFE_NO_PAD.encode(seed)),
+        json!(STANDARD_NO_PAD.encode(&wrapped)),
+        json!(hex(&wrapped)),
+        json!({ "key": seed.to_vec() }),
+        json!({ "nested": [{ "key": in_numbers }] }),
+    ] {
+        assert!(holds_secret(&leak, &secrets), "the check misses {leak}");
+    }
+
+    let payloads: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT seq, entity_type, payload FROM change_log ORDER BY seq")
+            .fetch_all(server.state.store.pool())
+            .await
+            .unwrap();
+    for (seq, entity_type, payload) in &payloads {
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        assert!(
+            !holds_secret(&payload, &secrets),
+            "the {entity_type} entry at seq {seq} holds the signing key's private bytes"
+        );
+    }
+
+    let entries = backfill_entries(&server).await;
+    let keys_of = |payload: &Value| -> Vec<String> {
+        let mut keys: Vec<String> = payload.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let signing_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|(_, entity_type, ..)| entity_type == "signing_key")
+        .map(|(.., payload)| payload)
+        .collect();
+    assert_eq!(signing_entries.len(), 1);
+    let payload = signing_entries[0];
+    assert_eq!(
+        keys_of(payload),
+        ["created_at", "key_id", "public_key", "state"]
+    );
+    assert_eq!(
+        payload["public_key"],
+        sign::public_key_to_base64(&signing.verifying_key())
+    );
+
+    for credential in old.credentials.iter().filter(|c| c.backfilled()) {
+        let created: Vec<&Value> = entries
+            .iter()
+            .filter(|(seq, entity_type, entity_id, op, _)| {
+                *seq > old.head_seq
+                    && entity_type == "node_credential"
+                    && *entity_id == credential.node_id
+                    && op == "create"
+            })
+            .map(|(.., payload)| payload)
+            .collect();
+        assert_eq!(created.len(), 1, "{:?}", credential.written);
+        let payload = created[0];
+        assert_eq!(
+            keys_of(payload),
+            ["created_at", "credential_hash", "node_id", "revoked_at"]
+        );
+        assert_eq!(
+            payload["credential_hash"],
+            sha256_hex(credential.secret.as_bytes())
+        );
+        assert!(!payload.to_string().contains(&credential.secret));
+    }
 }
