@@ -5134,7 +5134,7 @@ mod tests {
             crate::follow::verify_batch(0, ZERO_HASH, &received(FLOAT_ENTRY, &hash)).unwrap();
         assert_eq!(
             entries[0].payload,
-            r#"{"x":1548.2162860866163,"y":18983552425072.563}"#
+            r#"{"x":1548.2162860866163,"y":18983552425072.562}"#
         );
         let dir = TempDir::new();
         let store = NodeStore::open(&dir.0).await.unwrap();

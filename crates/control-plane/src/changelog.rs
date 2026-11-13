@@ -789,13 +789,13 @@ mod tests {
     /// The payload of [`FLOAT_ENTRY`]: two floats in their RFC 8785 text,
     /// each of which read back as another number before floats parsed
     /// exactly (ADR 0315).
-    const FLOAT_PAYLOAD: &str = r#"{"x":1548.2162860866163,"y":18983552425072.563}"#;
+    const FLOAT_PAYLOAD: &str = r#"{"x":1548.2162860866163,"y":18983552425072.562}"#;
 
     /// A change-log entry without `hash`, holding [`FLOAT_PAYLOAD`], in RFC
     /// 8785 form, written out. Its hash is the SHA-256 of this text. The node
-    /// agent's tests hold the same text (`follow::tests`), so the primary and
+    /// agent's tests hold the same text (`follow::testing`), so the primary and
     /// a node re-hash one entry.
-    const FLOAT_ENTRY: &str = r#"{"actor_id":"test","actor_type":"system","entity_id":"vm_1","entity_type":"vm","op":"update","payload":{"x":1548.2162860866163,"y":18983552425072.563},"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","seq":1,"term":1,"time":"2026-11-10T10:15:31.000Z"}"#;
+    const FLOAT_ENTRY: &str = r#"{"actor_id":"test","actor_type":"system","entity_id":"vm_1","entity_type":"vm","op":"update","payload":{"x":1548.2162860866163,"y":18983552425072.562},"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","seq":1,"term":1,"time":"2026-11-10T10:15:31.000Z"}"#;
 
     /// [`FLOAT_ENTRY`] as the primary stores it, without its hash.
     fn float_entry() -> StoredEntry {

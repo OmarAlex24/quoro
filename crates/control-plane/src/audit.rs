@@ -893,7 +893,7 @@ mod tests {
         assert!(stored.get("params_bytes").is_none(), "{stored}");
         let seq = stored["seq"].as_i64().unwrap();
         let text = params_text(&store, seq).await;
-        assert_eq!(text, r#"{"x":1548.2162860866163,"y":18983552425072.563}"#);
+        assert_eq!(text, r#"{"x":1548.2162860866163,"y":18983552425072.562}"#);
 
         // Re-hashed from the stored text, the record hashes to its hash: as
         // `verifyAudit` and `quoro audit verify --db` read it, and from its
@@ -916,6 +916,41 @@ mod tests {
             json!(sha256(&jcs::canonicalize(&unhashed).unwrap()))
         );
         // Its change-log entry carries it, and the change log verifies.
+        assert_eq!(carried_payload(&store, seq).await, stored);
+        let mut conn = store.pool().acquire().await.unwrap();
+        assert_eq!(changelog::verify(&mut conn).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_worked_float_case_is_stored_with_the_even_digit_and_re_hashes() {
+        // Section 4.1's worked case: the request's `18983552425072.563` reads
+        // as exactly 18983552425072.5625, halfway between two 17-digit
+        // decimals, and RFC 8785 writes the one whose last digit is even.
+        let store = Store::open_in_memory().await.unwrap();
+        let stored = append_with(&store, read(r#"{"x": 18983552425072.563}"#)).await;
+        assert!(stored.get("params_sha256").is_none(), "{stored}");
+        let seq = stored["seq"].as_i64().unwrap();
+        let text = params_text(&store, seq).await;
+        assert_eq!(text, r#"{"x":18983552425072.562}"#);
+        assert_eq!(text.len(), 24);
+        assert_eq!(
+            stored["params"]["x"].as_f64(),
+            Some("18983552425072.5625".parse::<f64>().unwrap())
+        );
+
+        // The record re-hashes from that text, and so does its change-log
+        // entry.
+        let chain = verify_records(stored_records(&store).await, 1, GENESIS_HASH);
+        assert!(chain.ok, "{chain:?}");
+        assert_eq!(chain.checked, seq);
+        let mut unhashed = stored.clone();
+        let hash = unhashed.as_object_mut().unwrap().remove("hash").unwrap();
+        let canonical = jcs::canonicalize(&unhashed).unwrap();
+        assert!(
+            canonical.contains(r#""params":{"x":18983552425072.562}"#),
+            "{canonical}"
+        );
+        assert_eq!(hash, json!(sha256(&canonical)));
         assert_eq!(carried_payload(&store, seq).await, stored);
         let mut conn = store.pool().acquire().await.unwrap();
         assert_eq!(changelog::verify(&mut conn).await.unwrap(), None);

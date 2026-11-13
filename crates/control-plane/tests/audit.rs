@@ -656,7 +656,7 @@ async fn a_float_is_audited_in_params_and_its_record_verifies() {
         .unwrap();
     assert_eq!(
         stored,
-        r#"{"incident_id":null,"justification":"j","operation":"DELETE /api/v1/apps/{app_id}","params":{"x":1548.2162860866163,"y":18983552425072.563},"scope":"app:delete","target":{"id":"app_01JC9Z6Q5W8N3K4T7R2M1XHB0F","type":"app"}}"#
+        r#"{"incident_id":null,"justification":"j","operation":"DELETE /api/v1/apps/{app_id}","params":{"x":1548.2162860866163,"y":18983552425072.562},"scope":"app:delete","target":{"id":"app_01JC9Z6Q5W8N3K4T7R2M1XHB0F","type":"app"}}"#
     );
 
     // Its change-log entry was written, and the chain verifies from the

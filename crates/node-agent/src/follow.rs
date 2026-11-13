@@ -579,7 +579,7 @@ pub(crate) mod testing {
     /// (ADR 0315). The primary's tests hold the same text (`FLOAT_ENTRY` in
     /// `quoro-control-plane`'s `changelog::tests`), so a node and the primary
     /// re-hash one entry. Its hash is the SHA-256 of this text.
-    pub(crate) const FLOAT_ENTRY: &str = r#"{"actor_id":"test","actor_type":"system","entity_id":"vm_1","entity_type":"vm","op":"update","payload":{"x":1548.2162860866163,"y":18983552425072.563},"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","seq":1,"term":1,"time":"2026-11-10T10:15:31.000Z"}"#;
+    pub(crate) const FLOAT_ENTRY: &str = r#"{"actor_id":"test","actor_type":"system","entity_id":"vm_1","entity_type":"vm","op":"update","payload":{"x":1548.2162860866163,"y":18983552425072.562},"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","seq":1,"term":1,"time":"2026-11-10T10:15:31.000Z"}"#;
 
     /// An entry a development build since #723 wrote before floats parsed
     /// exactly (ADR 0315), without `hash`, with the payload text it stored:
