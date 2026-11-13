@@ -291,6 +291,12 @@ impl AppState {
         // current signing key in `signing_keys`, so a promoted primary
         // rebuilds both tables from the log (section 7.3 step 4). Without
         // them a promotion cannot rebuild, so a failure stops the start.
+        // `backup-format.md` section 8.2 (ADR 0280, ADR 0285) asks that a
+        // restored primary's first change-log write come before any other.
+        // That write is not implemented yet; only its move of the primary
+        // status exists, as `primary_status::apply_marker` above. Once it
+        // is, this step must stay after it, as it stays after `apply_marker`
+        // now.
         match log_backfill::run(&store, &keys).await {
             Ok(done) if done != log_backfill::Backfilled::default() => tracing::info!(
                 credentials = done.credentials,
