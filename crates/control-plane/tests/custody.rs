@@ -1420,7 +1420,7 @@ async fn a_start_logs_what_a_promotion_rebuilds_credentials_and_the_signing_key_
         "one create per credential the fold would not rebuild"
     );
 
-    let rebuilt = replay::rebuild_folded(&server, &["node_credential", "signing_key"]).await;
+    let rebuilt = replay::rebuild(&server, &["node_credential", "signing_key"]).await;
     for (table, count) in [
         ("node_credentials", old.credentials.len()),
         ("signing_keys", 1),

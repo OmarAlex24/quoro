@@ -39,11 +39,13 @@
 //! child created before its parent's `delete` went with it, even when the
 //! parent was created again later under the same id.
 //!
-//! Writing the folded rows into the new database is not done here: the
+//! Writing the folded rows into the new database is [`database`]: the
 //! insert with foreign keys deferred, the cascades, the copy of each entry
 //! into `change_log`, `meta` and the checks of both chains. [`Schema`]
 //! keeps each column's declared type, `NOT NULL` and default for that
 //! insert ([`Column`]).
+
+pub mod database;
 
 use serde_json::{Map, Value};
 use sqlx::SqliteConnection;
