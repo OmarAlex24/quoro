@@ -601,13 +601,24 @@ async fn standby_vms(
 /// restore (`node-agent-protocol.md` section 5.11).
 ///
 /// While this primary does not hold the repository key, after a promotion
-/// (ADR 0322), no source key can be derived: a node with backup jobs and no
-/// restore gets neither the jobs nor the repository entry, and the rest of its
-/// desired state is built as usual. The dispatch loop records those backups
-/// `failed` (`node-agent-protocol.md` section 7.3, step 4). A `restoring`
-/// volume is not left out this way: without its `restore` object the node
-/// would create the file empty (section 6.7), so a node with one still needs
-/// the key to be built.
+/// (ADR 0322), no source key can be derived. The start records every `queued`
+/// or `running` volume backup `failed` before any session opens
+/// (`backups::dispatch::fail_without_key`, `node-agent-protocol.md` sections
+/// 6.7 and 7.3, step 4), so no job is left to send. As a fallback, a node that
+/// still has backup jobs and no restore gets neither the jobs nor the
+/// repository entry, and the rest of its desired state is built as usual.
+///
+/// A `restoring` volume is not left out this way: without its `restore`
+/// object the node would create the file empty (section 6.7). While the key is
+/// absent, the build of a node with one fails, and the node keeps the desired
+/// state it already has. That ends when the owner restores the key, or when
+/// the node reports the volume `ready` or `failed`, which it can only do if it
+/// received the restore from the old primary. If the old primary stopped
+/// before that snapshot reached the node, the node never reports the volume,
+/// so its desired state stays frozen and the app stays down until the owner
+/// restores the key. A `ready` report also leaves the volume `restoring` while
+/// the app's lease waits for an operator's acknowledgement of a failed fence
+/// (`backups::restore`), so the freeze lasts at least that long.
 async fn backup_jobs(
     store: &Store,
     data_key: &DataKey,
@@ -655,16 +666,29 @@ async fn backup_jobs(
             .try_get("repository_id")
             .map_err(|e| e.to_string())?
     };
-    let repository = crate::backups::repo::by_id(store, &first)
-        .await
-        .map_err(|e| format!("cannot read repository {first}: {:?}", e.code))?
-        .ok_or_else(|| format!("the repository {first} of a backup job is missing"))?;
-    let repository_id = repository.id.clone();
-    // Without the key the jobs carry no source keys, so they stay out of the
+    let repository = sqlx::query(
+        "SELECT id, provider_id, prefix, repo_key_enc FROM backup_repositories WHERE id = ?",
+    )
+    .bind(&first)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(|e| format!("cannot read repository {first}: {e}"))?
+    .ok_or_else(|| format!("the repository {first} of a backup job is missing"))?;
+    let repository_id: String = repository.try_get("id").map_err(|e| e.to_string())?;
+    let provider_id: String = repository
+        .try_get("provider_id")
+        .map_err(|e| e.to_string())?;
+    let prefix: String = repository.try_get("prefix").map_err(|e| e.to_string())?;
+    let repo_key_enc: Vec<u8> = repository
+        .try_get("repo_key_enc")
+        .map_err(|e| e.to_string())?;
+    // A fallback: the start already failed every job left without the key.
+    // An empty blob means this primary does not hold the key; a wrapped key is
+    // never empty. The jobs then carry no source keys, so they stay out of the
     // snapshot; the node needs the repository entry only for a job or a
     // restore, so it stays out too. An upload already running on the node
     // keeps the entry it started with.
-    if !repository.holds_key() && restores.is_empty() {
+    if repo_key_enc.is_empty() && restores.is_empty() {
         tracing::info!(
             node_id,
             repository_id = %repository_id,
@@ -674,18 +698,23 @@ async fn backup_jobs(
         );
         return Ok((Vec::new(), HashMap::new(), None));
     }
-    let target = crate::backups::repo::target(store, data_key, &repository)
-        .await
+    let target = crate::backups::repo::target_of_provider(
+        store,
+        data_key,
+        &repository_id,
+        &provider_id,
+        &prefix,
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!(repository_id = %repository_id, error = ?e, "cannot reach the backup repository");
+        format!("cannot reach the backup repository {repository_id}: {:?}", e.code)
+    })?;
+    let repo_key = crate::backups::decrypt_repo_key(data_key, &repository_id, &repo_key_enc)
         .map_err(|e| {
-            tracing::warn!(repository_id = %repository_id, error = ?e, "cannot reach the backup repository");
-            format!("cannot reach the backup repository {repository_id}: {:?}", e.code)
+            tracing::warn!(repository_id = %repository_id, "cannot decrypt the repository key");
+            format!("cannot decrypt the repository key: {:?}", e.code)
         })?;
-    let repo_key =
-        crate::backups::decrypt_repo_key(data_key, &repository_id, &repository.repo_key_enc)
-            .map_err(|e| {
-                tracing::warn!(repository_id = %repository_id, "cannot decrypt the repository key");
-                format!("cannot decrypt the repository key: {:?}", e.code)
-            })?;
 
     let mut backups = Vec::with_capacity(rows.len());
     for row in &rows {
