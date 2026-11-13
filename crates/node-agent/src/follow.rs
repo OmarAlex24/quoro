@@ -628,6 +628,28 @@ mod tests {
         assert_eq!(verified[1].hash, hash_of(&second[1]));
     }
 
+    /// A promotion raises the term between two entries (section 7.3 step 5).
+    /// Section 7.1 verifies each entry's hash and link, and sets no rule on
+    /// an entry's term, so a batch across the change verifies and each entry
+    /// keeps its own term.
+    #[test]
+    fn a_batch_across_a_term_change_is_accepted() {
+        let mut entries = genesis(4, "a");
+        for index in 2..entries.len() {
+            entries[index]["term"] = json!(7);
+            entries[index]["prev_hash"] = json!(hash_of(&entries[index - 1]));
+            rehash(&mut entries[index]);
+        }
+        let verified = verify_batch(0, ZERO_HASH, &message(entries.clone())).unwrap();
+        assert_eq!(
+            verified.iter().map(|e| e.term).collect::<Vec<_>>(),
+            [1, 1, 7, 7]
+        );
+        for (stored, sent) in verified.iter().zip(&entries) {
+            assert_eq!(&stored.to_value().unwrap(), sent);
+        }
+    }
+
     #[test]
     fn a_wrong_from_seq_is_rejected() {
         // `from_seq` and the entries skip seq 1.

@@ -15,12 +15,13 @@ use quoro_proto::wire::{self, ControlMessage};
 use serde_json::{Value, json};
 use sqlx::SqliteConnection;
 
-/// `term` is 1 until elections exist (D-0016).
-pub const TERM: i64 = 1;
-
 /// The highest `seq` the change log carries, 2^53 - 1
 /// (`node-agent-protocol.md` section 7.1).
 pub(crate) const MAX_SEQ: u64 = (1 << 53) - 1;
+
+/// The term ceiling, 2^53 - 1: no machine sends, stores or adopts a higher
+/// term (`node-agent-protocol.md` section 8.8).
+pub(crate) const MAX_TERM: i64 = (1 << 53) - 1;
 
 /// Kind of identity behind a change (`change_log.actor_type`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +104,10 @@ pub enum AppendError {
     FrameTooLarge {
         bytes: usize,
     },
+    /// `meta.term` holds no term an entry can carry: not an integer from 1
+    /// to [`MAX_TERM`] (`node-agent-protocol.md` section 8.8). It holds the
+    /// stored text.
+    BadTerm(String),
 }
 
 impl From<sqlx::Error> for AppendError {
@@ -125,6 +130,10 @@ impl std::fmt::Display for AppendError {
                 "a log_entries message holding the change-log entry alone takes {bytes} bytes, above the {} byte message limit",
                 wire::MAX_MESSAGE_BYTES
             ),
+            Self::BadTerm(value) => write!(
+                f,
+                "meta.term {value:?} is not a term from 1 to {MAX_TERM}, so no entry can carry it"
+            ),
         }
     }
 }
@@ -133,6 +142,11 @@ impl std::error::Error for AppendError {}
 
 /// Appends one entry and returns its `seq`. Must run inside the caller's
 /// write transaction, together with the state-table change it describes.
+///
+/// The entry carries the primary's current term, `meta.term`, read through
+/// the same transaction, so a term the transaction itself writes is the one
+/// its entries carry, and no other writer can change it in between
+/// (`node-agent-protocol.md` section 7.3 step 5).
 ///
 /// The entry is built from the payload exactly as it reads back from the
 /// canonical text stored for it, the way `StoredEntry::unhashed` and
@@ -156,8 +170,8 @@ impl std::error::Error for AppendError {}
 /// # Errors
 ///
 /// A database error, a payload with a value JCS cannot canonicalize,
-/// [`AppendError::PayloadNotAnObject`], [`AppendError::Unverifiable`] or
-/// [`AppendError::FrameTooLarge`].
+/// [`AppendError::PayloadNotAnObject`], [`AppendError::Unverifiable`],
+/// [`AppendError::FrameTooLarge`] or [`AppendError::BadTerm`].
 pub async fn append(
     conn: &mut SqliteConnection,
     actor: &Actor,
@@ -203,9 +217,10 @@ pub(crate) async fn prepare(
         Some((seq, hash)) => (seq + 1, hash),
         None => (1, GENESIS_HASH.to_string()),
     };
+    let term = current_term(conn).await?;
     let mut entry = StoredEntry {
         seq,
-        term: TERM,
+        term,
         time: now_rfc3339(),
         actor_type: actor.kind.as_str().to_string(),
         actor_id: actor.id.clone(),
@@ -218,6 +233,27 @@ pub(crate) async fn prepare(
     };
     entry.hash = entry.receivable_hash()?;
     Ok(entry)
+}
+
+/// The primary's current term, `meta.term`, through `conn`: the term the
+/// entry [`prepare`] builds carries. A missing `meta.term` reads as 1, the
+/// term before the first promotion (`db-schema.sql`, `meta`).
+///
+/// # Errors
+///
+/// A database error, or [`AppendError::BadTerm`] for a stored value that is
+/// not an integer from 1 to [`MAX_TERM`].
+async fn current_term(conn: &mut SqliteConnection) -> Result<i64, AppendError> {
+    let stored: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'term'")
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(value) = stored else {
+        return Ok(1);
+    };
+    match value.parse::<i64>() {
+        Ok(term) if (1..=MAX_TERM).contains(&term) => Ok(term),
+        _ => Err(AppendError::BadTerm(value)),
+    }
 }
 
 /// Writes an entry [`prepare`] built and returns its `seq`. Nothing may be
@@ -844,7 +880,7 @@ mod tests {
         let seq: i64 = 1_234_567_890_123;
         let entry = |len: usize| StoredEntry {
             seq,
-            term: TERM,
+            term: 1,
             time: "2026-11-09T10:15:31.000Z".to_string(),
             actor_type: "system".to_string(),
             actor_id: "test".to_string(),
@@ -968,7 +1004,7 @@ mod tests {
             // The hash the entry had before append hashed the read-back
             // form: the same, over the caller's payload.
             let before = json!({
-                "seq": row.seq, "term": TERM, "time": row.time, "actor_type": "system",
+                "seq": row.seq, "term": 1, "time": row.time, "actor_type": "system",
                 "actor_id": "test", "entity_type": "vm", "entity_id": "vm_1",
                 "op": "update", "payload": payload, "prev_hash": row.prev_hash,
             });
@@ -979,6 +1015,128 @@ mod tests {
                 row.seq
             );
         }
+        assert_eq!(verify(&mut w.tx).await.unwrap(), None);
+    }
+
+    /// Sets `meta.term` to `value` through `conn`.
+    async fn set_term(conn: &mut SqliteConnection, value: &str) {
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES ('term', ?) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(value)
+        .execute(conn)
+        .await
+        .unwrap();
+    }
+
+    /// The `term` of every stored entry, in `seq` order.
+    async fn terms(conn: &mut SqliteConnection) -> Vec<i64> {
+        sqlx::query_scalar("SELECT term FROM change_log ORDER BY seq")
+            .fetch_all(conn)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_entry_carries_the_term_in_meta() {
+        let store = Store::open_in_memory().await.unwrap();
+        let actor = Actor::system("test");
+        let mut w = store.begin_write().await.unwrap();
+        // No `meta.term` yet: the term before the first promotion.
+        append(
+            &mut w.tx,
+            &actor,
+            "vm",
+            "vm_1",
+            Op::Create,
+            json!({"id": "vm_1"}),
+        )
+        .await
+        .unwrap();
+        set_term(&mut w.tx, "1").await;
+        append(
+            &mut w.tx,
+            &actor,
+            "vm",
+            "vm_1",
+            Op::Update,
+            json!({"id": "vm_1", "name": "a"}),
+        )
+        .await
+        .unwrap();
+        w.commit().await.unwrap();
+
+        // A promotion writes its term and its first entries in one
+        // transaction (section 7.3 step 5): the entries carry the new term,
+        // read through that transaction before it commits.
+        let mut w = store.begin_write().await.unwrap();
+        set_term(&mut w.tx, "7").await;
+        append(
+            &mut w.tx,
+            &actor,
+            "vm",
+            "vm_1",
+            Op::Update,
+            json!({"id": "vm_1", "name": "b"}),
+        )
+        .await
+        .unwrap();
+        append(&mut w.tx, &actor, "vm", "vm_1", Op::Delete, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(terms(&mut w.tx).await, [1, 1, 7, 7]);
+        w.commit().await.unwrap();
+
+        // The chain verifies across the change, and each entry follow sends
+        // carries its own term.
+        let mut conn = store.pool().acquire().await.unwrap();
+        assert_eq!(verify(&mut conn).await.unwrap(), None);
+        let (_, rows) = read_after(&mut conn, 0, 500).await.unwrap();
+        let sent: Vec<Value> = rows
+            .iter()
+            .map(|row| row.wire_entry().unwrap()["term"].clone())
+            .collect();
+        assert_eq!(sent, [json!(1), json!(1), json!(7), json!(7)]);
+
+        // The hash covers the term: the entry at seq 3 stored back at term
+        // 1 no longer verifies.
+        sqlx::query("DROP TRIGGER change_log_append_only_update")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE change_log SET term = 1 WHERE seq = 3")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(verify(&mut conn).await.unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_term_no_entry_can_carry_refuses_the_append() {
+        let store = Store::open_in_memory().await.unwrap();
+        let actor = Actor::system("test");
+        let mut w = store.begin_write().await.unwrap();
+        append(&mut w.tx, &actor, "vm", "vm_1", Op::Create, json!({}))
+            .await
+            .unwrap();
+        let before = log_state(&mut w.tx).await;
+        for value in ["0", "-1", "seven", "", "1.5", "9007199254740992"] {
+            set_term(&mut w.tx, value).await;
+            let refused = append(&mut w.tx, &actor, "vm", "vm_1", Op::Update, json!({})).await;
+            assert!(
+                matches!(&refused, Err(AppendError::BadTerm(stored)) if stored == value),
+                "{value:?}: {refused:?}"
+            );
+            assert_eq!(log_state(&mut w.tx).await, before, "{value:?}");
+        }
+
+        // The term ceiling itself is a term an entry carries (section 8.8).
+        set_term(&mut w.tx, "9007199254740991").await;
+        append(&mut w.tx, &actor, "vm", "vm_1", Op::Update, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(terms(&mut w.tx).await, [1, MAX_TERM]);
         assert_eq!(verify(&mut w.tx).await.unwrap(), None);
     }
 }
