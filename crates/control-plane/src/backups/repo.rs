@@ -45,13 +45,24 @@ pub(crate) struct Repository {
 }
 
 impl Repository {
+    /// Whether this primary holds the repository key. A promoted primary
+    /// rebuilds the row from the change log, which never carries
+    /// `repo_key_enc`, so the column is an empty blob until the owner restores
+    /// the key from the recovery key; a wrapped key is never empty
+    /// (`node-agent-protocol.md` section 7.3, step 4, ADR 0322).
+    #[must_use]
+    pub(crate) fn holds_key(&self) -> bool {
+        !self.repo_key_enc.is_empty()
+    }
+
     /// The change-log payload of the row, without `repo_key_enc`. Every
     /// machine with the `node` role can open its own seal of the cluster
     /// data-encryption key (`node-agent-protocol.md` section 7.2), so the
     /// encrypted repository key in the log would put the repository key on
-    /// every follower's disk, and the contract says a node never gets it. The
-    /// key stays out of the log until the maintainer decides how a promoted
-    /// primary gets it back.
+    /// every follower's disk, and the contract says a node never gets it. A
+    /// promoted primary therefore starts without the key, and the owner
+    /// restores it on that primary only, from the recovery key (ADR 0322,
+    /// `backup-format.md` section 4).
     #[must_use]
     pub(crate) fn payload(&self) -> Value {
         json!({
@@ -486,8 +497,9 @@ pub(crate) async fn create(
 ///
 /// # Errors
 ///
-/// `not_found` for an unknown repository, `conflict` when the next config
-/// object already exists, or a database error.
+/// `not_found` for an unknown repository, `conflict` while this primary does
+/// not hold the repository key (checked before the bucket is touched) or when
+/// the next config object already exists, or a database error.
 pub(crate) async fn rotate(
     state: &AppState,
     ctx: &CallCtx,
@@ -500,6 +512,11 @@ pub(crate) async fn rotate(
     let mut repository = by_id(&state.store, repository_id)
         .await?
         .ok_or_else(|| ApiError::not_found("backup repository"))?;
+    // There is no key to rewrap while it is absent, and the bucket stays
+    // untouched (ADR 0322).
+    if !repository.holds_key() {
+        return Err(super::key_absent_conflict());
+    }
     let repo_key = decrypt_repo_key(&state.data_key, repository_id, &repository.repo_key_enc)?;
     let target = target(&state.store, &state.data_key, &repository).await?;
     let bucket = state.backups.open_bucket(&target)?;

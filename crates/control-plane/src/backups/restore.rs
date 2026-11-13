@@ -593,8 +593,13 @@ async fn refuse_unrestorable(state: &AppState, backup: &BackupRecord) -> Result<
     if backup.manifest_key.is_none() || backup.manifest_digest.is_none() {
         return Err(ApiError::conflict("the backup has no manifest"));
     }
-    if crate::backups::repo::any(&state.store).await?.is_none() {
+    let Some(repository) = crate::backups::repo::any(&state.store).await? else {
         return Err(ApiError::conflict("the cluster has no backup repository"));
+    };
+    // The target node needs the source keys, derived from the repository key
+    // (`node-agent-protocol.md` section 7.3, step 4).
+    if !repository.holds_key() {
+        return Err(crate::backups::key_absent_conflict());
     }
     let app_id = backup.app_id.as_deref().unwrap_or_default();
     if let Some(volume) = old_volume(state, app_id).await? {

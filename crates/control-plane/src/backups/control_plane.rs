@@ -47,13 +47,19 @@ const TEMP_PREFIX: &str = "cp-backup-";
 const TEMP_SUFFIX: &str = ".sqlite";
 
 /// Queues a control-plane backup when the repository's schedule says one is
-/// due, and returns the `queued` row as the API shows it
-/// (`backup-format.md` section 7.2).
+/// due, and returns the `queued` row, or the row failed at once while the
+/// repository key is absent, as the API shows it (`backup-format.md`
+/// section 7.2).
 ///
 /// Due means: a repository exists, no control-plane backup is `queued` or
 /// `running`, and the newest `succeeded` or `failed` one is older than
 /// `control_plane_schedule.interval_h`, or none exists. A primary with no node
 /// row logs a warning and queues nothing.
+///
+/// While this primary does not hold the repository key, a due backup is
+/// recorded `failed` at once with [`super::KEY_ABSENT`], and the row returned
+/// is that failed one; the next interval tries again
+/// (`node-agent-protocol.md` section 7.3, step 4).
 ///
 /// # Errors
 ///
@@ -78,25 +84,28 @@ pub async fn queue_if_due(
         tracing::warn!("no primary node; skipping the control-plane backup");
         return Ok(None);
     };
-    let backup = dispatch::queue(
-        &state.store,
-        dispatch::NewBackup {
-            repository_id: &repository.id,
-            source_kind: BackupSourceKind::ControlPlane,
-            app_id: None,
-            volume_id: None,
-            node_id: &node_id,
-            fencing_token: None,
-            trigger: BackupTrigger::Schedule,
-            created_by_type: "system",
-            created_by_id: "backups",
-            created_at: &timestamp(now),
-            project_id: None,
-            request: None,
-            dispatch_audit: true,
-        },
-    )
-    .await?;
+    let created_at = timestamp(now);
+    let new = dispatch::NewBackup {
+        repository_id: &repository.id,
+        source_kind: BackupSourceKind::ControlPlane,
+        app_id: None,
+        volume_id: None,
+        node_id: &node_id,
+        fencing_token: None,
+        trigger: BackupTrigger::Schedule,
+        created_by_type: "system",
+        created_by_id: "backups",
+        created_at: &created_at,
+        project_id: None,
+        request: None,
+        dispatch_audit: true,
+    };
+    if !repository.holds_key() {
+        let failed = dispatch::queue_failed(&state.store, new, super::KEY_ABSENT).await?;
+        tracing::warn!(backup_id = %failed.id, reason = super::KEY_ABSENT, "the control-plane backup failed at once");
+        return Ok(Some(failed.api()));
+    }
+    let backup = dispatch::queue(&state.store, new).await?;
     Ok(Some(backup.api()))
 }
 
@@ -336,7 +345,10 @@ pub struct SealedUpgrade {
 /// # Errors
 ///
 /// A one-line reason for any failed step; no migration runs and the temporary
-/// file is removed.
+/// file is removed. [`super::KEY_ABSENT`] while this primary does not hold the
+/// repository key, after a promotion, before the bucket is touched: the
+/// operator migrates with `--skip-upgrade-backup` (`backup-format.md`
+/// section 7.2 step 4, ADR 0322).
 pub async fn backup_before_upgrade(
     store: &Store,
     data_dir: &Path,
@@ -352,6 +364,9 @@ pub async fn backup_before_upgrade(
         tracing::info!("migrating without a pre-upgrade backup: no backup repository");
         return Ok(None);
     };
+    if !repository.holds_key() {
+        return Err(super::KEY_ABSENT.to_string());
+    }
     // `queue_if_due` queues nothing without a primary node, and a `backups` row
     // needs one (`node_id` is a foreign key).
     let Some(node_id) = primary_node(store)
@@ -646,6 +661,13 @@ async fn run(state: &AppState, backup: &BackupRecord, now: OffsetDateTime) -> Re
         .await
         .map_err(|error| reason_of(&error))?
         .ok_or_else(|| "the backup's repository is missing".to_string())?;
+    // A defensive check: the schedule never queues a backup while the key is
+    // absent, and the key never goes absent inside a running process. Should
+    // one get here, it fails with the reason the schedule records
+    // (`node-agent-protocol.md` section 7.3, step 4).
+    if !repository.holds_key() {
+        return Err(super::KEY_ABSENT.to_string());
+    }
     let target = repo::target(&state.store, &state.data_key, &repository)
         .await
         .map_err(|error| reason_of(&error))?;

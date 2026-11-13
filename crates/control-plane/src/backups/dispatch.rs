@@ -9,6 +9,12 @@
 //! not retried sooner, because the interval counts from the last *succeeded*
 //! one. The control-plane database has its own schedule and work
 //! ([`super::control_plane`]); the loop only queues it.
+//!
+//! While this primary does not hold the repository key, after a promotion, a
+//! due scheduled backup of either source is recorded `failed` at once with
+//! [`super::KEY_ABSENT`] and emits `backup.failed`; it counts as the last
+//! attempt, so the next interval tries again (`node-agent-protocol.md`
+//! section 7.3, step 4).
 
 use crate::AppState;
 use crate::api::apps::BackupSchedule;
@@ -18,7 +24,7 @@ use crate::error::ApiError;
 use crate::request::CallCtx;
 use crate::store::Store;
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{Row, SqliteConnection};
 use std::time::Duration;
 
 use super::{repo, seal};
@@ -154,26 +160,31 @@ async fn scheduled_due(store: &Store, now: time::OffsetDateTime) -> Result<Vec<S
         let Some(lease) = current_lease(store, &app_id).await? else {
             continue;
         };
-        let backup = queue(
-            store,
-            NewBackup {
-                repository_id: &repository.id,
-                source_kind: BackupSourceKind::Volume,
-                app_id: Some(&app_id),
-                volume_id: Some(&volume_id),
-                node_id: &node_id,
-                fencing_token: Some(lease),
-                trigger: BackupTrigger::Schedule,
-                created_by_type: "system",
-                created_by_id: "backups",
-                created_at: &super::timestamp(now),
-                project_id: project_id.as_deref(),
-                request: None,
-                dispatch_audit: true,
-            },
-        )
-        .await?;
-        let _ = backup;
+        let created_at = super::timestamp(now);
+        let new = NewBackup {
+            repository_id: &repository.id,
+            source_kind: BackupSourceKind::Volume,
+            app_id: Some(&app_id),
+            volume_id: Some(&volume_id),
+            node_id: &node_id,
+            fencing_token: Some(lease),
+            trigger: BackupTrigger::Schedule,
+            created_by_type: "system",
+            created_by_id: "backups",
+            created_at: &created_at,
+            project_id: project_id.as_deref(),
+            request: None,
+            dispatch_audit: true,
+        };
+        // Without the repository key the node could get no source keys:
+        // the backup fails at once and the node hears nothing
+        // (`node-agent-protocol.md` section 7.3, step 4).
+        if !repository.holds_key() {
+            let failed = queue_failed(store, new, super::KEY_ABSENT).await?;
+            tracing::warn!(backup_id = %failed.id, app_id = %app_id, reason = super::KEY_ABSENT, "a scheduled backup failed at once");
+            continue;
+        }
+        queue(store, new).await?;
         notified.push(node_id);
     }
     Ok(notified)
@@ -208,6 +219,41 @@ pub(crate) struct NewBackup<'a> {
 /// `conflict` when the volume already has a non-terminal backup (the unique
 /// index also refuses it), or a database error.
 pub(crate) async fn queue(store: &Store, new: NewBackup<'_>) -> Result<BackupRecord, ApiError> {
+    let mut w = store.begin_write().await?;
+    let backup = insert_queued(&mut w.tx, new).await?;
+    w.commit().await?;
+    Ok(backup)
+}
+
+/// Records a scheduled backup `failed` at once with `reason`: the `queued` row
+/// of [`queue`] and the failure of [`seal::fail`], with its `backup.failed`
+/// event and its `backup.seal` record, in one transaction. No desired state
+/// ever carries it as a job, and the schedule counts from it like from any
+/// other failed backup, so the next interval tries again
+/// (`node-agent-protocol.md` section 7.3, step 4).
+///
+/// # Errors
+///
+/// As [`queue`].
+pub(crate) async fn queue_failed(
+    store: &Store,
+    new: NewBackup<'_>,
+    reason: &str,
+) -> Result<BackupRecord, ApiError> {
+    let mut w = store.begin_write().await?;
+    let queued = insert_queued(&mut w.tx, new).await?;
+    let failed = seal::fail_in(&mut w.tx, &queued.id, &queued.node_id, reason)
+        .await?
+        .ok_or_else(|| ApiError::internal(&"the backup just queued is not failable"))?;
+    w.commit().await?;
+    Ok(failed)
+}
+
+/// The writes of [`queue`] inside the caller's write transaction.
+async fn insert_queued(
+    conn: &mut SqliteConnection,
+    new: NewBackup<'_>,
+) -> Result<BackupRecord, ApiError> {
     let backup = BackupRecord {
         id: crate::deploy::new_id_with_prefix("bkp"),
         repository_id: new.repository_id.to_string(),
@@ -233,13 +279,12 @@ pub(crate) async fn queue(store: &Store, new: NewBackup<'_>) -> Result<BackupRec
         finished_at: None,
         pruned_at: None,
     };
-    let mut w = store.begin_write().await?;
     if let Some(volume_id) = new.volume_id {
         let active: Option<(String,)> = sqlx::query_as(
             "SELECT id FROM backups WHERE volume_id = ? AND status IN ('queued', 'running') LIMIT 1",
         )
         .bind(volume_id)
-        .fetch_optional(&mut *w.tx)
+        .fetch_optional(&mut *conn)
         .await?;
         if active.is_some() {
             return Err(ApiError::conflict(
@@ -270,7 +315,7 @@ pub(crate) async fn queue(store: &Store, new: NewBackup<'_>) -> Result<BackupRec
     .bind(new.created_by_type)
     .bind(new.created_by_id)
     .bind(&backup.created_at)
-    .execute(&mut *w.tx)
+    .execute(&mut *conn)
     .await
     .map_err(|error| {
         if error
@@ -283,7 +328,7 @@ pub(crate) async fn queue(store: &Store, new: NewBackup<'_>) -> Result<BackupRec
         }
     })?;
     let seq = changelog::append(
-        &mut w.tx,
+        &mut *conn,
         &actor,
         "backup",
         &backup.id,
@@ -297,7 +342,7 @@ pub(crate) async fn queue(store: &Store, new: NewBackup<'_>) -> Result<BackupRec
             crate::api::apps::app_target,
         );
         ctx.append_ok(
-            &mut w.tx,
+            &mut *conn,
             Some(quoro_types::Scope::BackupWrite),
             Some(&target),
             new.project_id,
@@ -315,9 +360,8 @@ pub(crate) async fn queue(store: &Store, new: NewBackup<'_>) -> Result<BackupRec
             None,
             Some(seq),
         );
-        crate::audit::append(&mut w.tx, &record).await?;
+        crate::audit::append(&mut *conn, &record).await?;
     }
-    w.commit().await?;
     Ok(backup)
 }
 
@@ -347,6 +391,11 @@ async fn dispatch_control_plane(
     let Some(backup) = super::control_plane::queue_if_due(state, now).await? else {
         return Ok(Vec::new());
     };
+    // Recorded `failed` at once while the repository key is absent: there is
+    // no work to run.
+    if backup.status.is_terminal() {
+        return Ok(Vec::new());
+    }
     let backup_id = backup.id;
     let state = state.clone();
     // Its own task, so the 60 s loop never waits on a vacuum and an upload.

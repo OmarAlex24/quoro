@@ -15,6 +15,13 @@
 //! encrypted column holds the 64 hex characters of the key rather than its raw
 //! bytes, because [`crate::crypto::DataKey::decrypt`] returns text; the hex is
 //! decoded back to the 32 bytes at the one place that derives source keys.
+//!
+//! `repo_key_enc` never enters the change log, so a promoted primary rebuilds
+//! the row with an empty blob there: it does not hold the repository key until
+//! the owner restores it from the recovery key (ADR 0322). Until then
+//! [`repo::Repository::holds_key`] is false, and the primary takes no backup,
+//! restores none, rotates no recovery key and runs no garbage collection
+//! (`node-agent-protocol.md` section 7.3, step 4).
 
 pub mod control_plane;
 pub mod cost;
@@ -52,6 +59,21 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a backup may stay non-terminal: 24 hours
 /// (`backup-format.md` section 7.1).
 pub const BACKUP_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The error of a scheduled backup recorded `failed` at once, and the reason
+/// the pre-upgrade backup fails, while this primary does not hold the
+/// repository key (`node-agent-protocol.md` section 7.3, step 4).
+pub const KEY_ABSENT: &str = "repository key absent";
+
+/// The `conflict` of `createBackup`, `restoreBackup` and
+/// `rotateBackupRecoveryKey` while this primary does not hold the repository
+/// key (`node-agent-protocol.md` section 7.3, step 4, ADR 0322).
+pub(crate) fn key_absent_conflict() -> ApiError {
+    ApiError::conflict(
+        "this primary does not hold the backup repository key; restore it with \
+         restoreBackupRepositoryKey",
+    )
+}
 
 /// The four object-store operations the backups code needs.
 ///
