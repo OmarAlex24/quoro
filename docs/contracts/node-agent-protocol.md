@@ -164,6 +164,7 @@ node agent                                          primary
     |-- TLS + GET /api/v1/nodes/session (credential) -->|
     |-- hello ---------------------------------------->|
     |<---------------------------------------- welcome  |  a lower term than the node has seen: stale_term
+    |-- event (buffered), status_report (stored) ----->|
     |<----------------------------------- lease_revoke  |  0..n stale or superseded leases
     |-- command_result ------------------------------>|
     |<----------------------------- command fence_ack  |  0..1 when an acknowledgement is pending
@@ -191,7 +192,7 @@ node agent                                          primary
 ### 4.2 Rules of the order
 
 1. `hello` is the first message the node sends on every session.
-2. `welcome` is the first message the primary sends. From M5b the node compares its `term` with the highest term it has seen and ends the session with `error` code `stale_term` when the `welcome` is lower (section 8.8).
+2. `welcome` is the first message the primary sends. From M5b the node compares its `term` with the highest term it has seen and ends the session with `error` code `stale_term` when the `welcome` is lower (section 8.8). Right after `welcome` the node sends its buffered events (section 6.5) and one `status_report` of its stored state (section 5.3); neither waits for the session's `desired_state`.
 3. The primary sends any `lease_revoke` before anything else. The node stops the stateful VMs bound to those leases and answers `command_result` for each revoke. While a revoke's self-fence runs, the node keeps processing `lease_grant` for other leases, including the answers to its renewals, liveness traffic, and on a voter `support_request`, which it answers with `support_grant`; it holds back every other message, such as `desired_state`, a `lease_revoke` of any lease, `command` and `stream_open`, until it has answered the revoke (section 5.13, ADR 0222, ADR 0237).
 4. If an operator acknowledged a failed fence of this node and the node has not yet confirmed it, the primary then sends `command` kind `fence_ack`, once the node has answered every `lease_revoke` of rule 3 (sections 5.17 and 8.5, ADR 0239), and waits for its `command_result`. From M5b, while a signing-key rotation runs and the node still pins the current key, the primary then sends `signing_key_rotate` (sections 5.21 and 7.5) and waits for its `command_result`, so the `desired_state` that follows is signed with the key the node pins.
 5. Only then does the primary send `desired_state`. The node verifies, persists, answers `command_result` with `ok`, and reconciles.
@@ -325,7 +326,7 @@ Each lease entry:
 ### 5.3 `status_report`
 
 **Direction:** node to control plane.
-**When:** once right after `welcome`, before the session's `desired_state` is applied; after the first reconciliation of a session; on any observed change; and at least every 30 s.
+**When:** once right after `welcome`, before the session's `desired_state` is applied, with an entry for every volume of the node's stored desired state; after the first reconciliation of a session; on any observed change; and at least every 30 s.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
@@ -342,7 +343,7 @@ Each lease entry:
 | `images` | array of object | no | From M5a: one `{ "image_digest", "inventory_sha256" }` per prepared image the node holds, where `inventory_sha256` is the hex SHA-256 of the image's inventory (section 6.11) or absent while the node is still building it (ADR 0150) |
 | `warm` | array of object | no | From M5b: one entry per volume of `spec.volumes` that carries `warm`, on the source and on the target (section 6.13, ADR 0173). On a target, also one entry with `role: target` for every warm copy the node still holds that `spec.volumes` does not name as a `present` target entry, until the copy is removed (ADR 0267). A volume the node holds as its own is not such a copy and is never reported that way. A returning source that still holds the volume as its own, before its hand-over (section 9), may leave its target entry out until it has durably recorded that it is returning, so the primary never sends a stale-copy `deleted` entry (section 5.11) for a file the node has not marked. Absent or empty when there is none |
 | `quarantines` | array of object | no | From M5b: one entry per quarantined copy of a volume the node keeps (section 9, ADR 0176); absent or empty when there is none |
-| `mesh_error` | string | no | From M5b: why the last apply of `spec.mesh` failed, one line of at most 2 000 characters; absent once an apply succeeds, and when the desired state carries no `spec.mesh` (section 6.9). The primary keeps the newest value in memory, so after its restart, a promoted primary included, the machine counts as without a failure until its next report, within 30 s |
+| `mesh_error` | string | no | From M5b: why the last apply of `spec.mesh` failed, one line of at most 2 000 characters; absent once an apply succeeds, and when the desired state carries no `spec.mesh` (section 6.9). The primary keeps the newest value in memory, so after its restart, a promoted primary included, the machine counts as without a failure until its next report: at once when its session opens, then within 30 s while it is connected |
 
 VM entry: `vm_id` (string, `vm_`), `observed_status` (one of `creating`, `stopped`, `starting`, `running`, `stopping`, `crashed`, `deleted`, `unknown`), `health` (`passing`, `failing`, `unknown`), `ip` (string, optional), `restart_count` (integer), `last_exit_code` (integer, optional).
 
@@ -1934,7 +1935,7 @@ Then it:
      - `BackupRepository.repository_key_present` is false (ADR 0322);
      - `createBackup` and `restoreBackup` answer `conflict`, as when the cluster has no repository, and so does `rotateBackupRecoveryKey`;
      - a scheduled backup, of a volume or of the control-plane database, is recorded `failed` at once with the error `repository key absent` and emits `backup.failed`; the next interval tries again;
-     - a volume restore the old primary started and the target node never received is recorded `failed` with the error `repository key absent`, as a restore the node reports failed: the volume reads `failed`, `restore.failed` is emitted, and the app stays stopped without a lease. "Never received" means the node is connected and its status report on its current session does not list the volume at all. A restore the node lists is left to the reports it sends. A session on which the node has sent no status report yet does not count: the primary decides on the newest report of the current session, the first of which follows `welcome` (section 5.3). While the node lists such a restore, the primary cannot build that node's desired state, which carries the restore's keys, so the node keeps the desired state it has until the restore ends in its reports, a stated limit of this step;
+     - a volume restore the old primary started and the target node never received is recorded `failed` with the error `repository key absent`, as a restore the node reports failed: the volume reads `failed`, `restore.failed` is emitted, and the app stays stopped without a lease. "Never received" means the node is connected and its status report on its current session does not list the volume at all. A restore the node lists is left to the reports it sends. A session on which the node has sent no status report yet does not count: the primary decides on the newest report of the current session, the first of which follows `welcome` (section 5.3). While the node lists such a restore, the primary cannot build that node's desired state, which carries the restore's keys, so the node keeps the desired state it has until the primary records the restore `ready` or `failed`, a `ready` report counting once the app's old lease is released (section 8.3), or until the owner restores the repository key, a stated limit of this step;
      - the backup before an upgrade fails, so `backup-format.md` section 7.2 step 4 applies;
      - garbage collection does not run, because it reads the manifests with the key (`backup-format.md` section 9).
 

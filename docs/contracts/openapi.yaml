@@ -1110,7 +1110,8 @@ components:
             6.9), or null. While it is set, the node answers no promotion vote
             and `Cluster.votes.ha_ready` does not count it. The primary keeps
             it in memory: after a primary restart it is null until the node's
-            next report, within 30 s.
+            next report, at once when its session opens, then within 30 s
+            while it is connected.
         created_at:
           type: string
           format: date-time
@@ -3931,7 +3932,7 @@ components:
             enters the change log (node-agent-protocol.md sections 7.1 and
             7.3, ADR 0322). While it is false, the primary takes no backup of
             the repository, starts no restore (a restore the old primary started
-            and its target node lists still finishes, and one it never
+            is left to its target node's reports, and one that node never
             received is recorded `failed`, node-agent-protocol.md section 7.3
             step 4) and runs no garbage collection, and
             `rotateBackupRecoveryKey` answers `conflict`. The owner restores
