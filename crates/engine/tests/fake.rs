@@ -1412,6 +1412,78 @@ async fn changed_ranges_refuse_a_foreign_base_and_an_attached_volume() {
 }
 
 #[tokio::test]
+async fn changed_ranges_of_a_live_file_missing_from_the_volume_dir_are_not_found() {
+    let dir = scratch("missing-live");
+    let engine = FakeEngine::new();
+    engine.set_volume_dir(&dir);
+    let volume = VolumeId("vol_01".to_string());
+    let info = engine.ensure_volume(&volume, 1).await.expect("volume");
+    let base = engine.snapshot_volume(&volume).await.expect("base");
+    for with_base in [None, Some(&base)] {
+        assert!(
+            engine
+                .volume_changed_ranges(&RangesOf::Volume(volume.clone()), with_base)
+                .await
+                .is_ok(),
+            "the live file is there, with a base: {}",
+            with_base.is_some()
+        );
+    }
+
+    // The live file is removed by hand: the engine still names the volume,
+    // but a comparison of its file answers `NotFound`, with or without a
+    // base, as the real engine answers when it opens the file.
+    std::fs::remove_file(&info.path).expect("remove the live file");
+    assert!(
+        engine.volumes().iter().any(|(id, _)| *id == volume),
+        "the engine still names the volume"
+    );
+    for with_base in [None, Some(&base)] {
+        assert_eq!(
+            engine
+                .volume_changed_ranges(&RangesOf::Volume(volume.clone()), with_base)
+                .await,
+            Err(EngineError::NotFound),
+            "a missing live file, with a base: {}",
+            with_base.is_some()
+        );
+    }
+    assert!(
+        engine
+            .volume_changed_ranges(&RangesOf::Snapshot(base.clone()), None)
+            .await
+            .is_ok(),
+        "only the live file is checked on disk"
+    );
+
+    // A foreign base and a VM that attaches the file are checked first:
+    // both still answer `Conflict` while the file is missing.
+    let other = VolumeId("vol_02".to_string());
+    engine.ensure_volume(&other, 1).await.expect("volume");
+    let foreign = engine.snapshot_volume(&other).await.expect("snapshot");
+    assert!(
+        matches!(
+            engine
+                .volume_changed_ranges(&RangesOf::Volume(volume.clone()), Some(&foreign))
+                .await,
+            Err(EngineError::Conflict(_))
+        ),
+        "a foreign base"
+    );
+    vm_with_volume(&engine, &volume, "vm_warm").await;
+    assert!(
+        matches!(
+            engine
+                .volume_changed_ranges(&RangesOf::Volume(volume.clone()), None)
+                .await,
+            Err(EngineError::Conflict(_))
+        ),
+        "a VM that exists attaches the missing live file"
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[tokio::test]
 async fn content_mode_reports_the_blocks_that_differ() {
     let dir = scratch("content");
     let engine = FakeEngine::new();
