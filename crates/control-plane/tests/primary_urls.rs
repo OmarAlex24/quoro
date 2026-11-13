@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{Server, start_patient_in};
+use common::{Server, TestDir, start_patient_in};
 use futures_util::{SinkExt, StreamExt};
 use quoro_proto::custody::{self, CustodyKey};
 use quoro_proto::sign;
@@ -33,11 +33,7 @@ const OWN: [&str; 2] = ["https://primary.example:8443", "https://192.0.2.10:8443
 /// them to every custody key it binds (section 7.2), and that advertises
 /// [`OWN`] for itself.
 async fn start() -> Server {
-    let dir = std::env::temp_dir().join(format!(
-        "quoro-primary-urls-{}",
-        &quoro_control_plane::store::random_secret()[..16]
-    ));
-    let server = start_patient_in(dir).await;
+    let server = start_patient_in(TestDir::new("quoro-primary-urls")).await;
     let _state = server
         .state
         .clone()
