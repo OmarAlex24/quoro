@@ -869,10 +869,16 @@ components:
         ha_ready:
           type: boolean
           description: |
-            Whether `count` is at least `required` and the primary holds the
+            Whether `count`, less the voters whose newest status report carries
+            `mesh_error`, is at least `required`, and the primary holds the
             support of a majority of voters right now, so it can grant and renew
             `expiring` leases (ADR 0169, node-agent-protocol.md section 8.8). A
-            primary that does not track support yet reports false.
+            voter with `mesh_error` answers no promotion vote
+            (node-agent-protocol.md section 6.9). The count is a sizing check
+            only: a voter that has not yet applied its mesh successfully and
+            reports no `mesh_error` still counts, although it answers no vote
+            either (node-agent-protocol.md section 8.9). A primary that does not track
+            support yet reports false.
     ClusterVoter:
       type: object
       title: ClusterVoter
@@ -1099,6 +1105,16 @@ components:
             were revoked with new tokens at that time. Cleared once the node
             returns and has answered the revokes of those leases
             (node-agent-protocol.md sections 8.3 and 9).
+        mesh_error:
+          type: [string, 'null']
+          description: |
+            From M5b: why the node's last apply of the mesh failed, from its
+            newest `status_report` (node-agent-protocol.md sections 5.3 and
+            6.9), or null. While it is set, the node answers no promotion vote
+            and `Cluster.votes.ha_ready` does not count it. The primary keeps
+            it in memory: after a primary restart it is null until the node's
+            next report, at once when its session opens, then within 30 s
+            while it is connected.
         created_at:
           type: string
           format: date-time
@@ -3918,7 +3934,10 @@ components:
             promoted since the repository was created, because the key never
             enters the change log (node-agent-protocol.md sections 7.1 and
             7.3, ADR 0322). While it is false, the primary takes no backup of
-            the repository, restores none and runs no garbage collection, and
+            the repository, starts no restore (a restore the old primary started
+            is left to its target node's reports, and one that node never
+            received is recorded `failed`, node-agent-protocol.md section 7.3
+            step 4) and runs no garbage collection, and
             `rotateBackupRecoveryKey` answers `conflict`. The owner restores
             the key with `restoreBackupRepositoryKey`.
         control_plane_schedule:

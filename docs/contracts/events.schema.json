@@ -820,7 +820,7 @@
 
     "data_restore_failed": {
       "type": "object",
-      "description": "A restore did not complete: download, verification of a chunk, the seal or the manifest, or writing the volume (ADR 0147). The app stays stopped with no lease until the operator restores again or deletes the app. Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "description": "A restore did not complete: download, verification of a chunk, the seal or the manifest, or writing the volume (ADR 0147), or, after a promotion, the primary does not hold the repository key and the target node never received the restore (`error` `repository key absent`, node-agent-protocol.md section 7.3 step 4). The app stays stopped with no lease until the operator restores again or deletes the app. Emitted by the control plane. Payload fields are additive within schema_version 1.",
       "required": ["backup_id", "app_id", "volume_id", "node_id", "error"],
       "properties": {
         "backup_id": { "$ref": "#/$defs/BackupId" },

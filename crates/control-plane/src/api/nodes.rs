@@ -98,6 +98,10 @@ pub struct Node {
     /// When an operator declared this node lost (ADR 0183), or null.
     #[schema(format = "date-time", required = true)]
     pub lost_at: Option<String>,
+    /// Why the node's last apply of the mesh failed, from its newest
+    /// `status_report`, or null (`node-agent-protocol.md` sections 5.3 and
+    /// 6.9).
+    pub mesh_error: Option<String>,
     /// When the node first enrolled.
     #[schema(format = "date-time")]
     pub created_at: String,
@@ -360,6 +364,9 @@ pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
         tunnel: None,
         last_seen_at: row.try_get("last_seen_at")?,
         lost_at: row.try_get("lost_at")?,
+        // The contract's field; nothing fills it yet (`status_report.mesh_error`
+        // is not taken by the primary on main).
+        mesh_error: None,
         created_at: row.try_get("created_at")?,
     })
 }
