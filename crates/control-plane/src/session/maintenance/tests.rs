@@ -873,6 +873,97 @@ async fn a_lease_revoked_during_the_window_gets_no_w() {
     f.done();
 }
 
+/// Another node, `node-b`, enrolled as a copy of the fixture's node with its
+/// own subnet and no session.
+async fn other_node(f: &Fixture) -> String {
+    let other = "nod_01JC9Z8K2M4P6R8T0V2X4Z6B9Q";
+    let mut conn = f.state.store.pool().acquire().await.unwrap();
+    sqlx::query("CREATE TEMP TABLE copied AS SELECT * FROM nodes WHERE id = ?")
+        .bind(&f.node_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE copied SET id = ?, name = 'node-b', cp_status = NULL, \
+         subnet = '10.42.2.0/24', status = 'disconnected'",
+    )
+    .bind(other)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO nodes SELECT * FROM copied")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    other.to_string()
+}
+
+/// A lease of the window whose row names another node than the one the
+/// window raised it for, here moved to node B before its first holder A
+/// renewed it: A's renewal gets a revoke, B's is answered with `D` although
+/// the row stores `W`, and the command names the lease, held by B, with the
+/// other-holder reason. The authority refuses a renewal's answer to any node
+/// but the holder of the lease's gate, so B's renewal reaches the window's
+/// holder check only while the lease has no gate in this process, as here.
+#[tokio::test]
+async fn a_lease_granted_to_another_node_during_the_window_is_answered_with_d() {
+    let f = window_fixture().await;
+    two_leases(&f).await;
+    let hub = &f.state.hub;
+    let mut session = session_on(&f.state, &f.node_id, &[LEASE, LEASE_2]).await;
+    let task = open(hub, 30);
+    until_raised(&f.state, LEASE_2, 30_000).await;
+    ack_head(&f, &session).await;
+    until("the window to open", || is_open(hub)).await;
+    let other = other_node(&f).await;
+    sqlx::query("UPDATE leases SET holder_node_id = ? WHERE id = ?")
+        .bind(&other)
+        .bind(LEASE)
+        .execute(f.state.store.pool())
+        .await
+        .unwrap();
+    append_row(&f.state, LEASE).await;
+    assert_eq!(stored(&f.state, LEASE).await, Some(30_000));
+
+    let answer = renew_lease(&mut session, "msg_a", LEASE).await;
+    assert!(
+        !answer.iter().any(|frame| frame["type"] == "lease_grant"),
+        "{answer:?}"
+    );
+    assert!(
+        answer.iter().any(|frame| frame["type"] == "lease_revoke"),
+        "{answer:?}"
+    );
+    let mut on_b = session_on(&f.state, &other, &[LEASE]).await;
+    assert_eq!(
+        answered_ms(&renew_lease(&mut on_b, "msg_b", LEASE).await),
+        D,
+        "the window raised the lease for A, not for B"
+    );
+    assert_eq!(
+        answered_ms(&renew_lease(&mut session, "msg_a2", LEASE_2).await),
+        30_000
+    );
+
+    let result = run_out(&f, task).await;
+    let Err(MaintenanceError::NotCovered {
+        leases, answered, ..
+    }) = result
+    else {
+        panic!("{result:?}");
+    };
+    assert_eq!(
+        leases,
+        vec![Uncovered {
+            lease_id: LEASE.to_string(),
+            holder: other,
+            why: Why::OtherHolder,
+        }]
+    );
+    assert_eq!(answered, 1);
+    f.done();
+}
+
 /// Section 8.11 step 2: the raise skips a marked row and a revoked one. The
 /// window covers the other lease, and the command fails naming the marked
 /// lease and why (a revoked one needs no cover); the window stays open for
