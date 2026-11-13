@@ -1451,6 +1451,25 @@ mod tests {
         assert!(hub.start_grants_queued(&f.node_id, generation));
         hub.unmark_start_grants_queued(&f.node_id, generation);
         assert!(hub.barrier_passed(&f.node_id, generation, LEASE, 3));
+        // The hold of the sessions lock that queues the conversion refuses
+        // it on its own, the barrier passed and the channel open.
+        assert!(!hub.queue_conversion(
+            &f.node_id,
+            generation,
+            LEASE,
+            InFlight {
+                token: 3,
+                duration_ms: D,
+            },
+            "msg_before_the_start_grants",
+            "{}".to_string(),
+        ));
+        assert!(queued(&mut on).is_empty());
+        assert_eq!(
+            hub.conversion_in_flight(&f.node_id, generation, LEASE),
+            None
+        );
+        assert!(grant_ids(&f.state, &f.node_id).is_empty());
         ack(&f.state, &f, &on).await;
         hub.hold_conversion(&f.row().await);
         hub.attempt_held().await;
