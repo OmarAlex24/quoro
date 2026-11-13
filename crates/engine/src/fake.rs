@@ -1952,6 +1952,19 @@ impl Engine for FakeEngine {
             },
             None => None,
         };
+        // A volume's live file missing from the volume directory is
+        // `NotFound`, with or without a base, as the real engine answers when
+        // it opens the file (section 3.22). Without a volume directory the
+        // fake keeps no files, so the record is all there is to check.
+        if matches!(newer, RangesOf::Volume(_)) && state.volume_dir.is_some() {
+            match std::fs::symlink_metadata(&newer_path) {
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    return Err(EngineError::NotFound);
+                }
+                Err(err) => return Err(io_error(err)),
+            }
+        }
         if let Some(pushed) = state.changed_ranges.pop_front() {
             return Ok(pushed);
         }
