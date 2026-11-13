@@ -572,7 +572,7 @@
 
     "data_app_switched_over": {
       "type": "object",
-      "description": "A planned switchover of a warm app completed: the app runs on its former warm node from a final snapshot taken while its writes were frozen, so no write was lost, and the former node is its warm copy (ADR 0177). Emitted by the control plane; the actor is the caller of switchoverApp. Opens no incident. Payload fields are additive within schema_version 1.",
+      "description": "A planned switchover of a warm app completed: the lease moved to its former warm node, which starts the app from a final snapshot taken while its writes were frozen, so no write was lost, and the former node is its warm copy (ADR 0177). Emitted by the control plane in the change that moves the lease; while the lease row carries the unsettled mark, the grant to the warm node follows once that change is replicated (node-agent-protocol.md section 8.4, ADR 0292); the actor is the caller of switchoverApp. Opens no incident. Payload fields are additive within schema_version 1.",
       "required": ["app_id", "from_node_id", "to_node_id", "fencing_token", "snapshot_seq"],
       "properties": {
         "app_id": { "$ref": "#/$defs/AppId" },
@@ -580,20 +580,21 @@
         "to_node_id": { "$ref": "#/$defs/NodeId" },
         "fencing_token": { "type": "integer", "minimum": 1, "description": "Fencing token of the new lease." },
         "snapshot_seq": { "type": "integer", "minimum": 1, "description": "The final snapshot." },
-        "frozen_ms": { "type": "integer", "minimum": 0, "description": "How long the app's writes were frozen, from the pause to the new instance running, when the primary measured it." }
+        "frozen_ms": { "type": "integer", "minimum": 0, "description": "How long the app's writes were frozen, from the pause to the new instance running, when the primary measured it." },
+        "grant_pending": { "type": "boolean", "description": "True when the grant to the warm node waits for replication and majority support, so the app starts later (ADR 0292)." }
       },
       "additionalProperties": true
     },
 
     "data_app_switchover_failed": {
       "type": "object",
-      "description": "A planned switchover of a warm app stopped before the lease moved: the app resumed on its node and nothing moved (ADR 0177). `step` is where it stopped: `freeze` (the node could not pause the app or ship the final snapshot) or `revoke` (the primary gave up before revoking the lease, for example because a node disconnected). Emitted by the control plane. Opens no incident. Payload fields are additive within schema_version 1.",
+      "description": "A planned switchover of a warm app stopped before the lease moved (ADR 0177). `step` is where it stopped: `freeze` (the node could not pause the app or ship the final snapshot), `revoke` (the primary gave up before revoking the lease, for example because a node disconnected) or `move` (a step after the revoke failed: the source did not confirm that the app stopped, or the change that moves the lease could not be made). At `freeze` and `revoke` the primary sent the source `switchover_thaw` and nothing moved, and the event opens no incident. At `move` the app stays stopped on its node and its lease stays revoked, so the event opens an incident for the app; `failoverApp` to the same warm node completes the move (node-agent-protocol.md section 6.13). Emitted by the control plane. Payload fields are additive within schema_version 1.",
       "required": ["app_id", "from_node_id", "to_node_id", "step", "error"],
       "properties": {
         "app_id": { "$ref": "#/$defs/AppId" },
         "from_node_id": { "$ref": "#/$defs/NodeId" },
         "to_node_id": { "$ref": "#/$defs/NodeId" },
-        "step": { "type": "string", "enum": ["freeze", "revoke"] },
+        "step": { "type": "string", "enum": ["freeze", "revoke", "move"] },
         "error": { "type": "string" }
       },
       "additionalProperties": true

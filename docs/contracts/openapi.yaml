@@ -575,8 +575,8 @@ components:
             `grant_exhausted`, `human_only` or `agent_disabled`. From M5b also
             why a `conflict` was returned by `failoverApp` or `switchoverApp`
             (`not_warm`, `no_copy`, `not_in_sync`, `node_disconnected`,
-            `fence_failed`, `no_support`, `lease_held`, `in_progress`; each
-            operation says when), by `deleteApp` and `deleteVolume`
+            `fence_failed`, `no_support`, `lease_held`, `in_progress`,
+            `lease_revoked`; each operation says when), by `deleteApp` and `deleteVolume`
             (`has_quarantines`), by `rotateSigningKey` (`in_progress`), or by
             `ackNodeFence` (`token_exhausted`).
             Absent for other codes and other conflicts.
@@ -598,6 +598,7 @@ components:
             - in_progress
             - has_quarantines
             - token_exhausted
+            - lease_revoked
         scope:
           type: string
           description: |
@@ -8065,14 +8066,25 @@ paths:
         the freeze until the new instance runs, typically a few seconds.
         Refused with `conflict` and `reason`: `not_warm`; `in_progress`, also
         while a failover's grant to the warm node waits
-        (`App.lease.grant_pending`, ADR 0292);
+        (`App.lease.grant_pending`, ADR 0292); `lease_revoked` while the
+        app's lease is revoked in the primary's own view
+        (`App.lease.revoked_at` is set), as after a switchover that stopped
+        after its revoke: `failoverApp` to the warm node moves that lease
+        (node-agent-protocol.md section 6.13);
         `not_in_sync` unless `App.warm.state` is `in_sync`, a lag of at most
         two intervals; `node_disconnected` unless both nodes are connected;
         `fence_failed`; `no_support`. The call answers `202` with the app
         when the switchover started. It ends with `app.switched_over`, the old
         node becoming the warm copy with no quarantine, or, when a step before
         the revoke failed, with `app.switchover_failed`: the app resumed on
-        its node and nothing moved. Destructive and off by default for agents,
+        its node and nothing moved. When a step after the revoke fails, it
+        ends with `app.switchover_failed` at `step` `move`, which opens an
+        incident: the app stays stopped, its lease stays revoked, and
+        `failoverApp` to the same warm node completes the move
+        (node-agent-protocol.md section 6.13). The grant to the warm node
+        waits for replication and majority support as a failover's grant does
+        (`failoverApp`, ADR 0292): `App.lease.grant_pending` shows the wait,
+        and `app.switched_over` then carries `grant_pending`. Destructive and off by default for agents,
         under the same scope as `failoverApp`: without an approval grant on
         `{type: app, id}` with `node_id` in `params` the call is refused with
         `approval_required` (ADR 0030). `Quoro-Justification` is required when
