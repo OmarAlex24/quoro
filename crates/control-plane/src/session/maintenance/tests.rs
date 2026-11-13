@@ -334,7 +334,7 @@ async fn a_window_out_of_range_is_refused_before_anything_starts() {
     assert_eq!(hub.support_lease_ms(), D);
     assert_eq!(stored(&f.state, LEASE).await, Some(15_000));
     assert!(records(&f.state).await.is_empty());
-    f.done();
+    f.done().await;
 }
 
 /// Section 8.11 step 1: the support requests ask for `W` from the moment
@@ -383,7 +383,7 @@ async fn without_a_majority_for_w_nothing_is_raised_and_renewals_get_d() {
             .contains("no majority"),
         "{records:?}"
     );
-    f.done();
+    f.done().await;
 }
 
 /// Section 8.11 and ADR 0289: a raise not replicated within `D / 3` plus
@@ -422,7 +422,7 @@ async fn a_raise_not_replicated_in_time_opens_no_window() {
     let detail = records[0].detail.as_deref().unwrap();
     assert!(detail.contains("not replicated"), "{detail}");
     assert!(detail.contains(&f.node_id), "{detail}");
-    f.done();
+    f.done().await;
 }
 
 /// Section 8.11 steps 2 and 3: once a majority supports `W` and the raise
@@ -484,7 +484,7 @@ async fn once_replicated_every_renewal_gets_w_and_the_command_succeeds() {
         30_000,
         "every renewal while the window is open"
     );
-    f.done();
+    f.done().await;
 }
 
 /// Section 8.11: a holder that has not renewed within `D / 3` plus one
@@ -532,7 +532,7 @@ async fn a_holder_that_does_not_renew_fails_the_command_and_the_others_keep_w() 
     let records = records(&f.state).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].result, "ok", "the window opened");
-    f.done();
+    f.done().await;
 }
 
 /// Section 8.11: `--end` closes the window. Renewals are answered with `D`
@@ -563,7 +563,7 @@ async fn end_closes_the_window_and_renewals_get_d_again() {
     assert_eq!(records[1].result, "ok");
     assert_eq!(hub.end_maintenance().await, Ok(Ending::NothingOpen));
     assert_eq!(self::records(&f.state).await.len(), 2);
-    f.done();
+    f.done().await;
 }
 
 /// Section 8.11: the window closes `W` after it opened. From then on
@@ -591,7 +591,7 @@ async fn the_window_closes_w_after_it_opened() {
         Some(Duration::from_secs(35)),
         "the answer at 29 s gates until 29 + 36 s"
     );
-    f.done();
+    f.done().await;
 }
 
 /// Section 8.11 and the restart rule of section 8.4: the primary's next
@@ -628,7 +628,7 @@ async fn a_restart_closes_the_window_and_counts_w_from_its_start() {
     assert!(after.hub.authority().passed(LEASE));
     assert_eq!(after.hub.lower_durations().await, 1);
     assert_eq!(stored(&after, LEASE).await, Some(15_000));
-    f.done();
+    f.done().await;
 }
 
 /// Section 8.4: after a window, the stored duration is lowered back to `D`
@@ -669,7 +669,7 @@ async fn the_stored_duration_goes_back_to_d_once_the_longer_gate_passed() {
         Some(Duration::from_secs(18)),
         "a restart counts D again"
     );
-    f.done();
+    f.done().await;
 }
 
 /// No lowering runs while a window is open, even for a raised lease whose
@@ -700,7 +700,7 @@ async fn no_lowering_while_a_window_is_open() {
     assert_eq!(hub.end_maintenance().await, Ok(Ending::Ended));
     assert_eq!(hub.lower_durations().await, 1);
     assert_eq!(stored(&f.state, LEASE).await, Some(15_000));
-    f.done();
+    f.done().await;
 }
 
 /// A second window is refused while one is opening or open, with no record.
@@ -712,7 +712,7 @@ async fn a_second_window_is_refused_while_one_is_open() {
     open_window(&f, &mut session, 30).await;
     assert_eq!(hub.open_maintenance(60).await, Err(MaintenanceError::Busy));
     assert_eq!(records(&f.state).await.len(), 1);
-    f.done();
+    f.done().await;
 }
 
 /// With no `expiring` lease the window opens at once and covers nothing.
@@ -723,7 +723,7 @@ async fn with_no_expiring_lease_the_window_opens_and_covers_nothing() {
     assert_eq!((opened.leases, opened.covered_until), (0, None));
     assert!(is_open(&f.state.hub));
     assert_eq!(stored(&f.state, LEASE).await, Some(15_000), "a local row");
-    f.done();
+    f.done().await;
 }
 
 /// The `max_lease_ms` of the support requests: `W` from the start of an
@@ -791,7 +791,7 @@ async fn support_for_w_lost_after_the_window_opened_answers_with_d() {
         answered_ms(&renew_lease(&mut session, "msg_r2", LEASE).await),
         30_000
     );
-    f.done();
+    f.done().await;
 }
 
 /// A lease of the window whose row is marked during the window is answered
@@ -812,7 +812,7 @@ async fn a_lease_marked_during_the_window_is_answered_with_d() {
         answered_ms(&renew_lease(&mut session, "msg_r1", LEASE).await),
         D
     );
-    f.done();
+    f.done().await;
 }
 
 /// A lease of the window granted again during the window, its stored
@@ -839,7 +839,7 @@ async fn a_lease_stored_back_at_d_during_the_window_is_answered_with_d() {
         Some(15_000),
         "nothing raised"
     );
-    f.done();
+    f.done().await;
 }
 
 /// A lease of the window revoked during the window gets no `W`: its renewal
@@ -870,7 +870,7 @@ async fn a_lease_revoked_during_the_window_gets_no_w() {
     );
     let revoked = row_of(&f.state, LEASE).await;
     assert_eq!(hub.window_answer_ms(&revoked, &f.node_id), None);
-    f.done();
+    f.done().await;
 }
 
 /// Another node, `node-b`, enrolled as a copy of the fixture's node with its
@@ -961,7 +961,7 @@ async fn a_lease_granted_to_another_node_during_the_window_is_answered_with_d() 
         }]
     );
     assert_eq!(answered, 1);
-    f.done();
+    f.done().await;
 }
 
 /// Section 8.11 step 2: the raise skips a marked row and a revoked one. The
@@ -1025,7 +1025,7 @@ async fn the_raise_skips_marked_and_revoked_rows_and_the_command_names_the_marke
     let records = records(&f.state).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].result, "ok", "the window opened");
-    f.done();
+    f.done().await;
 }
 
 /// Section 8.11: a lease that turns `expiring` after the raise gets only `D`
@@ -1074,7 +1074,7 @@ async fn a_lease_that_turns_expiring_during_the_window_fails_the_command() {
     // the authority itself answers none of them.)
     let row = row_of(&f.state, LEASE_2).await;
     assert_eq!(hub.window_answer_ms(&row, &f.node_id), None);
-    f.done();
+    f.done().await;
 }
 
 /// A holder counts its validity from its newest answer, so a lease whose
@@ -1120,7 +1120,7 @@ async fn a_lease_whose_newest_answer_carried_d_is_not_covered() {
         }]
     );
     assert_eq!(answered, 1);
-    f.done();
+    f.done().await;
 }
 
 /// An `expiring` row the change log has no entry of, and that already stores
@@ -1145,7 +1145,7 @@ async fn a_row_with_no_change_log_entry_is_named_as_not_covered() {
         }]
     );
     assert_eq!(answered, 0);
-    f.done();
+    f.done().await;
 }
 
 /// The lowering skips a marked row, a revoked one and one this process has
@@ -1190,7 +1190,7 @@ async fn the_lowering_skips_marked_revoked_and_gate_less_rows() {
     assert_eq!(hub.lower_durations().await, 1);
     assert_eq!(stored(&f.state, LEASE).await, Some(15_000));
     assert_eq!(stored(&f.state, LEASE_2).await, Some(60_000), "no gate");
-    f.done();
+    f.done().await;
 }
 
 /// `--end` while the window waits for a majority: the opening stops at once,
@@ -1210,7 +1210,7 @@ async fn end_while_the_window_waits_for_a_majority_records_an_error_and_the_end(
     assert_eq!(hub.support_lease_ms(), D);
     assert_eq!(stored(&f.state, LEASE).await, Some(15_000));
     assert_opening_ended(&f.state).await;
-    f.done();
+    f.done().await;
 }
 
 /// `--end` while the window waits for its raise to be replicated: the
@@ -1235,7 +1235,7 @@ async fn end_while_the_raise_is_replicated_records_an_error_and_the_end() {
     );
     assert_eq!(stored(&f.state, LEASE).await, Some(30_000));
     assert_opening_ended(&f.state).await;
-    f.done();
+    f.done().await;
 }
 
 /// The records of an opening that `--end` ended: one `error` with
@@ -1288,5 +1288,5 @@ async fn a_window_that_raises_nothing_records_no_change_seq() {
         (records[2].result.as_str(), records[2].change_seq),
         ("ok", None)
     );
-    f.done();
+    f.done().await;
 }
