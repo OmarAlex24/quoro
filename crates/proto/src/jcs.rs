@@ -512,6 +512,20 @@ mod tests {
                 assert!(canonicalize(&json!(value)).is_err(), "{exact}");
             }
         }
+
+        // 2^-24 lies exactly halfway between `5.960464477539062e-8` and
+        // `5.960464477539063e-8`, but the even one reads back as another
+        // double, so the odd one is written, as ECMAScript's `String` does.
+        let quarter_ulp = 2f64.powi(-24);
+        assert_ne!("5.960464477539062e-8".parse::<f64>(), Ok(quarter_ulp));
+        assert_eq!("5.960464477539063e-8".parse::<f64>(), Ok(quarter_ulp));
+        for (value, written) in [
+            (quarter_ulp, "5.960464477539063e-8"),
+            (-quarter_ulp, "-5.960464477539063e-8"),
+        ] {
+            assert_eq!(canonicalize_lenient(&json!(value)), written);
+            assert!(canonicalize(&json!(value)).is_err());
+        }
     }
 
     /// The significant digits of a number's text: no sign, point, exponent,
