@@ -1010,8 +1010,11 @@ fn lost(old: &str) -> Vec<String> {
 /// `cluster.restored` with exact `params` (the removed ids and the term the
 /// database holds), the statement as its justification and its removal
 /// entry as `change_seq`, before `cluster.primary_moved` and with no other
-/// record. It is the one write with the mark and the move. The new host's
-/// node keeps its row, its status and its seal.
+/// record. Each removal clears the machine's `cp_status` in its own entry,
+/// so the move that follows finds no node holding the status: it writes the
+/// new host's entry only and records `from_node_id` null. It is the one
+/// write with the mark and the move. The new host's node keeps its row, its
+/// status and its seal.
 #[tokio::test]
 async fn an_accept_loss_first_write_removes_every_other_node() {
     let (dir, store, old, head) = restored().await;
@@ -1077,24 +1080,31 @@ async fn an_accept_loss_first_write_removes_every_other_node() {
         json!({ "removed_node_ids": removed, "term": 7 })
     );
     assert_eq!(record.justification.as_deref(), Some(STATEMENT));
+    assert_eq!(
+        records[1].params,
+        json!({ "from_node_id": null, "to_node_id": NEW_NODE })
+    );
 
     // Every entry after the restored head is this write's: the marks, the
     // raises, the removals, the seal deletions, the move and the entries that
     // carry the two records.
     let entries = entries_after(&store, head.seq).await;
-    // Each machine's removal is its first entry that reads `removed`: the
-    // move's later entry, which clears the old primary's `cp_status`, reads
-    // `removed` too. `change_seq` is the last machine's removal, in id order.
+    // Each machine's removal is its one node entry, which reads `removed`
+    // and no `cp_status`: the move writes no entry for the old primary.
+    // `change_seq` is the last machine's removal, in id order.
     let removals: Vec<i64> = removed
         .iter()
         .map(|id| {
-            entries
+            let node_entries: Vec<_> = entries
                 .iter()
-                .find(|(_, kind, entity, _, _, payload)| {
-                    kind == "node" && entity == id && payload["status"] == "removed"
-                })
-                .map(|(seq, _, _, _, _, _)| *seq)
-                .unwrap_or_else(|| panic!("the removal entry of {id}: {entries:?}"))
+                .filter(|(_, kind, entity, _, _, _)| kind == "node" && entity == id)
+                .collect();
+            let [(seq, _, _, _, _, payload)] = node_entries[..] else {
+                panic!("one node entry of {id}: {entries:?}");
+            };
+            assert_eq!(payload["status"], "removed", "{id}");
+            assert!(payload["cp_status"].is_null(), "{id}: {payload}");
+            *seq
         })
         .collect();
     assert!(removals.is_sorted(), "{removals:?}");
@@ -1102,10 +1112,10 @@ async fn an_accept_loss_first_write_removes_every_other_node() {
     let move_entry = entries
         .iter()
         .find(|(_, kind, entity, _, _, payload)| {
-            kind == "node" && *entity == old && payload["cp_status"].is_null()
+            kind == "node" && entity == NEW_NODE && payload["cp_status"] == "primary"
         })
         .map(|(seq, _, _, _, _, _)| *seq)
-        .expect("the move's entry of the old primary");
+        .expect("the move's entry of the new host's node");
     assert!(
         move_entry > *removals.last().unwrap(),
         "the move comes after the removals: {entries:?}"
@@ -1474,4 +1484,87 @@ async fn a_removed_machines_quarantined_copy_is_dropped() {
             }),
         "{entries:?}"
     );
+}
+
+/// Each machine the `--accept-loss` first write removes loses its
+/// `cp_status`, in its row and in its removal entry. Without `primary-node`
+/// the new host has no node of the restored database, so the write removes
+/// every machine with the `node` role, the old primary's node too, moves
+/// nothing, and leaves no node holding the primary status. The new host's
+/// agent then enrolls with the local token (ADR 0110): it gets a new node
+/// with `cp_status = 'primary'` and does not adopt the old primary's row.
+#[tokio::test]
+async fn an_accept_loss_first_write_without_primary_node_leaves_no_primary_status() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    write_marker(&dir, &forced(&head));
+
+    let mut removed = vec![old.clone(), NEW_NODE.to_string(), HOLDER.to_string()];
+    removed.sort();
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: removed.clone(),
+            moved: false
+        }
+    );
+    for id in &removed {
+        assert_eq!(status(&store, id).await, "removed", "{id}");
+        assert_eq!(cp_status(&store, id).await, None, "{id}");
+    }
+    let holders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE cp_status IS NOT NULL")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(holders, 0, "no node holds the primary status");
+    assert!(moved_audit_ids(&store).await.is_empty());
+    // The old primary's one node entry of the write is its removal, and it
+    // reads no `cp_status`.
+    let entries = entries_after(&store, head.seq).await;
+    let old_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|(_, kind, entity, _, _, _)| kind == "node" && *entity == old)
+        .map(|(_, _, _, _, _, payload)| payload)
+        .collect();
+    assert_eq!(old_entries.len(), 1, "{entries:?}");
+    assert_eq!(old_entries[0]["status"], "removed");
+    assert!(old_entries[0]["cp_status"].is_null(), "{}", old_entries[0]);
+
+    // The next start, then the new host's agent enrolls with the local token.
+    store.pool().close().await;
+    let server = start_in(dir.clone()).await;
+    common::settle_voters(&server).await;
+    quoro_control_plane::api::enroll::ensure_local_join(
+        &server.data_dir,
+        "https://primary.local:8443",
+        common::TLS_FINGERPRINT,
+    )
+    .unwrap();
+    let token = quoro_control_plane::api::enroll::local_join_token(&server.data_dir).unwrap();
+    let res = server
+        .client()
+        .post(server.url("/api/v1/nodes/enroll"))
+        .json(&json!({
+            "join_token": token,
+            "name": "new-host",
+            "public_key": quoro_proto::sign::public_key_to_base64(
+                &quoro_proto::sign::signing_key_from_seed(&[3u8; 32]).verifying_key()
+            ),
+            "roles": ["node"],
+            "capacity": { "cpus": 8, "memory_mb": 16_384, "disk_gb": 200 },
+            "kvm": { "available": true, "kernel": "6.9.0", "nested": true }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let code = res.status();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(code, 201, "{body}");
+    let node_id = body["node_id"].as_str().unwrap();
+    assert!(!removed.iter().any(|id| id == node_id), "{node_id}");
+    let store = &server.state.store;
+    assert_eq!(cp_status(store, node_id).await.as_deref(), Some("primary"));
+    assert_eq!(status(store, &old).await, "removed");
+    assert_eq!(cp_status(store, &old).await, None);
 }

@@ -61,7 +61,10 @@
 //!   does not declare the machine lost: it sets no `lost_at`;
 //! - it turns `removed`, with its node entry, the whole row, as `removeNode`
 //!   writes a removal (section 10), so the voter set and the required set of
-//!   section 8.4 read it removed from that `seq` on;
+//!   section 8.4 read it removed from that `seq` on. The same row write
+//!   clears its `cp_status`, so no removed machine keeps the primary status
+//!   and the next local enrollment on the new host takes it. With
+//!   `primary-node`, the move then finds no node holding the status;
 //! - its custody seals are deleted (section 7.2,
 //!   [`crate::custody::delete_seals`]) and the records of the quarantined
 //!   copies it keeps are dropped ([`crate::quarantines::drop_node_copies`]),
@@ -582,7 +585,7 @@ async fn remove_the_lost(
         crate::leases::bump_tokens(conn, &held, node_id, actor)
             .await
             .map_err(|error| api_reason(&raise, error))?;
-        sqlx::query("UPDATE nodes SET status = 'removed' WHERE id = ?")
+        sqlx::query("UPDATE nodes SET status = 'removed', cp_status = NULL WHERE id = ?")
             .bind(node_id)
             .execute(&mut *conn)
             .await
