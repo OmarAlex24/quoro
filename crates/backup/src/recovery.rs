@@ -12,6 +12,7 @@
 //! padding bits.
 
 use blake3::derive_key;
+use zeroize::Zeroizing;
 
 use crate::{Error, Key, Result, util};
 
@@ -92,26 +93,30 @@ impl RecoveryKey {
         // The prefix matched case-insensitively as ASCII, so this boundary is
         // a character boundary.
         let rest = &text[PREFIX.len()..];
-        let mut symbols = Vec::with_capacity(SYMBOLS);
+        // Every buffer that holds the symbols or the key is wiped when it
+        // drops, on the error paths too. `symbols` is a fixed array, so no
+        // growing buffer leaves an unwiped copy behind.
+        let mut symbols = Zeroizing::new([0u8; SYMBOLS]);
+        let mut count = 0;
         for byte in rest.bytes() {
             if byte == b'-' {
                 continue;
             }
-            symbols.push(byte);
-            if symbols.len() > SYMBOLS {
+            if count == SYMBOLS {
                 return Err(Error::RecoveryKey(
                     "the text has more than 52 symbols".into(),
                 ));
             }
+            symbols[count] = byte;
+            count += 1;
         }
-        if symbols.len() != SYMBOLS {
+        if count != SYMBOLS {
             return Err(Error::RecoveryKey(
                 "the text does not have 52 symbols".into(),
             ));
         }
-        let symbols: [u8; SYMBOLS] = symbols.try_into().expect("checked length");
         let bytes = decode(&symbols)?;
-        Ok(Self(Key::from_bytes(bytes)))
+        Ok(Self(Key::from_bytes(*bytes)))
     }
 
     /// The first 16 hex characters of `derive_key("quoro backup recovery
@@ -158,8 +163,9 @@ fn encode(bytes: &[u8; 32]) -> String {
 }
 
 /// The 32 bytes of 52 symbols, refusing unknown symbols and nonzero padding.
-fn decode(symbols: &[u8; SYMBOLS]) -> Result<[u8; 32]> {
-    let mut bytes = [0u8; 32];
+/// The bytes are wiped when they drop, on an error too.
+fn decode(symbols: &[u8; SYMBOLS]) -> Result<Zeroizing<[u8; 32]>> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
     for (symbol, text) in symbols.iter().enumerate() {
         let value = value_of(*text)?;
         for bit in 0..5 {
