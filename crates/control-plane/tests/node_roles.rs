@@ -344,15 +344,93 @@ async fn agent_token(server: &Server, owner: &reqwest::Client) -> String {
 
 /// Inserts an `expiring` lease held by `holder`, as a warm app's would be.
 async fn expiring_lease(server: &Server, holder: &str) {
+    lease_row(
+        server,
+        "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0D",
+        holder,
+        15_000,
+        false,
+    )
+    .await;
+}
+
+/// Inserts the `expiring` lease `id` of a warm app, held by `holder` for
+/// `duration_ms`, and recorded revoked in the primary's view when `revoked`,
+/// as declaring its holder lost leaves it (section 8.3). The authority holds
+/// no gate for it until a test seeds one or the primary restarts.
+async fn lease_row(server: &Server, id: &str, holder: &str, duration_ms: i64, revoked: bool) {
     sqlx::query(
         "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, fencing_token, \
-         duration_ms, granted_at) VALUES ('lse_01JC9Z6Q5W8N3K4T7R2M1XHB0D', 'app', \
-         'app_01JC9Z6Q5W8N3K4T7R2M1XHB0D', ?, 'expiring', 1, 15000, '2026-11-10T00:00:00.000000Z')",
+         duration_ms, granted_at, revoked_at) VALUES (?, 'app', ?, ?, 'expiring', 1, ?, \
+         '2026-11-10T00:00:00.000000Z', ?)",
     )
+    .bind(id)
+    .bind(format!("app_{}", &id[4..]))
     .bind(holder)
+    .bind(duration_ms)
+    .bind(revoked.then_some("2026-11-10T00:00:01.000000Z"))
     .execute(server.state.store.pool())
     .await
     .unwrap();
+}
+
+/// Records the lease `id` revoked in the primary's view, or not.
+async fn set_revoked(server: &Server, id: &str, revoked: bool) {
+    sqlx::query("UPDATE leases SET revoked_at = ? WHERE id = ?")
+        .bind(revoked.then_some("2026-11-10T00:00:01.000000Z"))
+        .bind(id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+}
+
+/// Three voters: nodes A and B, and an edge that gained the witness role.
+/// All three hold the version of that change, so rule 2 lets the next
+/// voter change through.
+struct ThreeVoters {
+    a: Node,
+    b: Node,
+    edge: Node,
+    machines: Vec<Machine>,
+}
+
+async fn three_voters(server: &Server, owner: &reqwest::Client) -> ThreeVoters {
+    let a = enrolled(server, owner, "node-a", &["node"]).await;
+    let mut machine_a = connected(server, &a).await;
+    let b = enrolled(server, owner, "node-b", &["node"]).await;
+    let edge = enrolled(server, owner, "edge", &["edge"]).await;
+    let mut machine_b = connected(server, &b).await;
+    holds_voters(&mut machine_a, 2).await;
+    let mut machine_edge = connected(server, &edge).await;
+    roles_ok(owner, server, &edge.node_id, json!({ "add": ["witness"] })).await;
+    holds_voters(&mut machine_edge, 3).await;
+    holds_voters(&mut machine_a, 3).await;
+    holds_voters(&mut machine_b, 3).await;
+    ThreeVoters {
+        a,
+        b,
+        edge,
+        machines: vec![machine_a, machine_b, machine_edge],
+    }
+}
+
+/// Removing the witness vote of `node_id`, without `force`, is refused by
+/// D-0170's guard: `409 conflict` with the guard's detail, not rule 2's.
+async fn refused_by_the_guard(client: &reqwest::Client, server: &Server, node_id: &str) {
+    let res = roles(client, server, node_id, json!({ "remove": ["witness"] })).await;
+    let (status, code, detail) = problem_detail(res).await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(detail.contains("expiring lease"), "{detail}");
+    assert_eq!(roles_of(server, node_id).await, json!(["edge", "witness"]));
+}
+
+/// Waits until the primary's gate of `lease_id` has passed.
+async fn gate_passes(server: &Server, lease_id: &str) {
+    let authority = server.state.hub.authority();
+    while let Some(remaining) = authority.gate_remaining(lease_id) {
+        tokio::time::sleep(remaining + std::time::Duration::from_millis(10)).await;
+    }
+    assert!(authority.gate_has_passed(lease_id));
 }
 
 /// The refusals of `updateNodeRoles` in the order the brief and the
@@ -717,6 +795,111 @@ async fn removing_a_vote_below_three_with_expiring_leases_needs_force() {
         json!({ "add": ["witness"] }),
     )
     .await;
+}
+
+/// ADR 0321 (issue #768): D-0170's guard counts an `expiring` lease row while
+/// it is not revoked, or while it is revoked and its gate has not passed. A
+/// revoked row whose gate the primary does not hold counts, and so does one
+/// whose gate is open. Once the gate has passed, the revoked row no longer
+/// counts and removing the vote needs no `force`; the same row unrevoked
+/// counts whatever its gate.
+#[tokio::test]
+async fn a_revoked_expiring_lease_blocks_removing_a_vote_only_until_its_gate_passes() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let voters = three_voters(&server, &owner).await;
+    let authority = server.state.hub.authority();
+    let lease = "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0E";
+    lease_row(&server, lease, &voters.b.node_id, 3_000, true).await;
+
+    // No gate in this process: nothing shows that it passed, so the row
+    // counts.
+    assert!(authority.passed(lease) && !authority.gate_has_passed(lease));
+    refused_by_the_guard(&owner, &server, &voters.edge.node_id).await;
+
+    // A gate 3 s and two margins of 1 s from now: open, so the row counts.
+    authority.seed(lease, &voters.b.node_id, Some(3_000));
+    refused_by_the_guard(&owner, &server, &voters.edge.node_id).await;
+    assert!(
+        authority.gate_remaining(lease).is_some(),
+        "the gate was open"
+    );
+
+    // The gate has passed: the row counts only while it is not revoked.
+    gate_passes(&server, lease).await;
+    set_revoked(&server, lease, false).await;
+    refused_by_the_guard(&owner, &server, &voters.edge.node_id).await;
+    set_revoked(&server, lease, true).await;
+    let node = roles_ok(
+        &owner,
+        &server,
+        &voters.edge.node_id,
+        json!({ "remove": ["witness"] }),
+    )
+    .await;
+    assert_eq!(node["roles"], json!(["edge"]));
+    let (result, params, change_seq) = last_roles_audit(&server).await;
+    assert_eq!(result, "ok");
+    assert_eq!(params, json!({ "remove": ["witness"] }));
+    assert!(change_seq.is_some());
+}
+
+/// ADR 0321 across a primary restart: no gate survives it, so the restarted
+/// primary counts every `expiring` row, revoked or not, as granted at its
+/// start for the stored `duration_ms` (section 8.4). A revoked row blocks
+/// removing a vote until that start gate has passed, then it does not.
+#[tokio::test]
+async fn after_a_restart_a_revoked_expiring_lease_counts_until_its_start_gate_passes() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let ThreeVoters {
+        a,
+        b,
+        edge,
+        machines,
+    } = three_voters(&server, &owner).await;
+    let lease = "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0F";
+    // 6 s and two margins of 1 s: the start gate passes 8 s after the start.
+    lease_row(&server, lease, &b.node_id, 6_000, true).await;
+    drop(machines);
+    for node in [&a, &b, &edge] {
+        while node_status(&server, &node.node_id).await != "disconnected" {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    let restarted = restart_with_resolver(
+        &server,
+        std::sync::Arc::new(quoro_control_plane::ReferenceAsDigest),
+    )
+    .await;
+    let authority = restarted.state.hub.authority();
+    assert!(authority.gate_remaining(lease).is_some(), "seeded at start");
+    // The voters acknowledge the version again on their next sessions.
+    let _machines = [
+        connected(&restarted, &a).await,
+        connected(&restarted, &b).await,
+        connected(&restarted, &edge).await,
+    ];
+    let owner = restarted.client();
+    restarted
+        .login(&owner, common::OWNER_EMAIL, common::OWNER_PASSWORD)
+        .await;
+    refused_by_the_guard(&owner, &restarted, &edge.node_id).await;
+    assert!(
+        authority.gate_remaining(lease).is_some(),
+        "the start gate was open"
+    );
+
+    gate_passes(&restarted, lease).await;
+    let node = roles_ok(
+        &owner,
+        &restarted,
+        &edge.node_id,
+        json!({ "remove": ["witness"] }),
+    )
+    .await;
+    assert_eq!(node["roles"], json!(["edge"]));
 }
 
 /// Rule 2 for the roles operation counts against the version read in its own

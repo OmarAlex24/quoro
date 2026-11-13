@@ -1612,8 +1612,9 @@ fn roles_change(body: &Value) -> Result<(RolesChange, bool), ApiError> {
 /// when the machine would be left with no role; `conflict` for a removed
 /// node; `conflict` while the previous voter-set change has not reached a
 /// majority of voters (section 8.10 rule 2); `conflict` when removing the
-/// vote would leave fewer than three voters while any `expiring` lease
-/// exists, unless `force` is set (D-0170's guard). Or a database error.
+/// vote would leave fewer than three voters while an `expiring` lease row is
+/// not revoked, or is revoked with its gate not yet passed, unless `force`
+/// is set (D-0170's guard, ADR 0321). Or a database error.
 pub async fn update_node_roles(
     State(state): State<AppState>,
     identity: Identity,
@@ -1736,16 +1737,14 @@ async fn roles_tx(
     let changes_vote = votes_before != votes_after;
     if changes_vote {
         let (_, voters) = state.hub.voter_change_gate(&mut w.tx).await?;
-        if votes_before && !force && voters.saturating_sub(1) < 3 {
-            let expiring: bool =
-                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM leases WHERE mode = 'expiring')")
-                    .fetch_one(&mut *w.tx)
-                    .await?;
-            if expiring {
-                return Err(ApiError::conflict(
-                    "removing this vote would leave fewer than three voters while expiring leases exist; set force to remove it anyway",
-                ));
-            }
+        if votes_before
+            && !force
+            && voters.saturating_sub(1) < 3
+            && live_expiring_lease(&mut w.tx, state.hub.authority()).await?
+        {
+            return Err(ApiError::conflict(
+                "removing this vote would leave fewer than three voters while an expiring lease is not revoked or its gate has not passed; set force to remove it anyway",
+            ));
         }
     }
 
@@ -1800,6 +1799,27 @@ pub(crate) async fn node_view(
     )
     .await?;
     Ok(node)
+}
+
+/// Whether an `expiring` lease row counts for D-0170's guard (section 8.10,
+/// ADR 0321): a row that is not revoked, or a revoked one whose gate has not
+/// passed. A revoked row counts unless `authority` holds its gate and that
+/// gate has passed, so a row with no gate in this process counts. A
+/// restarted primary seeds every `expiring` row, revoked or not, with the
+/// start gate `start + duration_ms + 2M` before it serves a request
+/// ([`crate::authority::Authority::seed`]), so it counts a revoked row until
+/// that gate passes.
+async fn live_expiring_lease(
+    conn: &mut SqliteConnection,
+    authority: &crate::authority::Authority,
+) -> Result<bool, ApiError> {
+    let rows: Vec<(String, bool)> =
+        sqlx::query_as("SELECT id, revoked_at IS NOT NULL FROM leases WHERE mode = 'expiring'")
+            .fetch_all(&mut *conn)
+            .await?;
+    Ok(rows
+        .iter()
+        .any(|(id, revoked)| !revoked || !authority.gate_has_passed(id)))
 }
 
 /// The node `node_id` as the API returns it, read on `conn`.
