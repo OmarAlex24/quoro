@@ -4250,7 +4250,9 @@ components:
             majority support. No write with a new token clears it; only a
             write that records what the holder holds does: its report of its
             mode, the `pong` that follows a same-token `local` grant, or the
-            settle of an `expiring` lease. False otherwise.
+            settle of an `expiring` lease, except while a node the row does
+            not name lists the lease `held` or `uncertain` at or above the
+            row's token. False otherwise.
         grant_pending:
           type: boolean
           description: |
@@ -8080,7 +8082,8 @@ paths:
         (`validation_failed` otherwise). It runs as soon as it is asked;
         choosing a low-traffic window is the caller's in M5b. The primary
         pauses the app on its node (the write freeze), ships a final snapshot,
-        stops the app and revokes its lease, grants the warm node the lease
+        stops the app and revokes its lease (it commits `App.lease.revoked_at`
+        before the revoke goes out), grants the warm node the lease
         with a higher token, starts the app there and switches the edge's
         backend while the old backend's requests finish
         (node-agent-protocol.md section 6.13). The app does not serve from
