@@ -941,11 +941,13 @@ async fn a_declaration_before_the_hello_is_revoked_first_and_frees_nothing_until
     let declared =
         declare_lost_after_its_last_report(&setup.app.owner, &setup.app.server, &node_id).await;
     let (row_token, revoked_at, holder) = lease_row(&setup.app.server, &lease_id).await;
-    // At least the token the node holds, whichever way the declaration
-    // treats a row the restore already revoked (section 5.13).
-    assert!(row_token >= token, "{row_token} < {token}");
+    // The declaration raises the row the restore already revoked by one,
+    // as every lease of the node (ADR 0202, #948); the checks below compare
+    // with the row's token.
+    assert_eq!(row_token, token + 1);
     assert_eq!(holder, node_id);
     assert!(revoked_at.is_some());
+    setup.app.token = row_token;
 
     // The node returns once the declaration has committed.
     wait_past(&declared).await;
@@ -964,11 +966,10 @@ async fn a_declaration_before_the_hello_is_revoked_first_and_frees_nothing_until
     );
     let revoke = frames[1].clone();
     assert_eq!(revoke["body"]["lease_id"], lease_id.as_str());
-    assert!(
-        revoke["body"]["fencing_token"]
-            .as_i64()
-            .is_some_and(|revoked| revoked >= token),
-        "at least the token the node holds: {revoke}"
+    assert_eq!(
+        revoke["body"]["fencing_token"].as_i64(),
+        Some(row_token),
+        "the token the declaration raised the row to: {revoke}"
     );
     assert_eq!(revoke["body"]["reason"], "declared_lost", "{revoke}");
     assert!(

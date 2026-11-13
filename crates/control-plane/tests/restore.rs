@@ -2149,7 +2149,8 @@ async fn declare_old_node_lost(setup: &Setup) -> Value {
 /// Section 8.3 through the API: the restore's revoke of the old node is
 /// unanswered and the node is gone, so the restore waits; once the node is
 /// declared lost, the next `ready` report moves the lease. The row was
-/// already revoked, so the declaration leaves its token as it is.
+/// already revoked; the declaration still raises its token by one, as every
+/// lease of the node (ADR 0202, #948).
 #[tokio::test]
 async fn declaring_the_old_node_lost_lets_the_restore_finish() {
     let mut setup = setup().await;
@@ -2163,8 +2164,8 @@ async fn declaring_the_old_node_lost_lets_the_restore_finish() {
         .fetch_one(setup.state.server.state.store.pool())
         .await
         .unwrap();
-    assert_eq!(token, moving.old_token, "a revoked row is not held");
-    ready_grants(&mut setup, &moving, moving.old_token).await;
+    assert_eq!(token, moving.old_token + 1, "a revoked row is raised too");
+    ready_grants(&mut setup, &moving, moving.old_token + 1).await;
 }
 
 /// Section 8.3, ADR 0202: declaring a node lost changes nothing in its
@@ -2206,7 +2207,8 @@ async fn a_lease_of_a_node_declared_lost_through_the_api_waits_for_its_gate() {
     );
 
     tokio::time::sleep_until(passes).await;
-    ready_grants(&mut setup, &moving, moving.old_token).await;
+    // Above the token the declaration raised the row to (ADR 0202, #948).
+    ready_grants(&mut setup, &moving, moving.old_token + 1).await;
 }
 
 /// R, then the old holder's renewal answered from R (section 8.4, "From R
@@ -2216,8 +2218,9 @@ async fn a_lease_of_a_node_declared_lost_through_the_api_waits_for_its_gate() {
 /// that gate is open. The row reads `local`, so the declaration releases it
 /// whatever its gate; the restore enforces the gate itself, and the target's
 /// `ready` reports move nothing until it has passed. Then the volume turns
-/// `ready` and the row names the target at the next token, its grant held
-/// on the lost holder (section 8.4, "Grants of a marked row").
+/// `ready` and the row names the target two tokens above the old one (the
+/// declaration raised it once, ADR 0202; the grant once more), its grant
+/// held on the lost holder (section 8.4, "Grants of a marked row").
 #[tokio::test]
 async fn a_lost_holders_row_r_wrote_is_restored_only_once_its_gate_passed() {
     let mut setup = setup().await;
@@ -2341,7 +2344,7 @@ async fn a_lost_holders_row_r_wrote_is_restored_only_once_its_gate_passed() {
     .unwrap();
     assert_eq!(
         (holder.as_str(), token, unsettled, revoked),
-        (setup.node_b.node_id.as_str(), old_token + 1, 1, None)
+        (setup.node_b.node_id.as_str(), old_token + 2, 1, None)
     );
 }
 
