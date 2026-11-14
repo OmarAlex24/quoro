@@ -1,10 +1,11 @@
 -- Migration 0016: a control-plane backup's node_id may be null
 -- (backup-format.md section 8.2, "The first write").
 --
--- While no machine holds the primary status, as after a `quoro restore
--- --accept-loss` first write until the new host's agent enrolls, and for good
--- on a host without the `node` role, the primary still takes its control-plane
--- backups, and their row names no node: backups.node_id is null
+-- While no machine holds the primary status, as in a new cluster before its
+-- primary's own agent enrolls, after a `quoro restore --accept-loss` first
+-- write until the new host's agent enrolls, and for good on a host whose agent
+-- never enrolls locally, the primary still takes its control-plane backups,
+-- and their row names no node: backups.node_id is null
 -- (openapi.yaml `Backup.node_id`). A volume backup always names its node, which
 -- the new CHECK keeps.
 --

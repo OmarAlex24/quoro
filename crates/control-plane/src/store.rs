@@ -1179,11 +1179,17 @@ mod tests {
                 .await
                 .unwrap()
         }
-        async fn backups(store: &Store) -> Vec<(String, Option<String>, String)> {
-            sqlx::query_as("SELECT id, node_id, status FROM backups ORDER BY id")
-                .fetch_all(store.pool())
-                .await
-                .unwrap()
+        async fn backups(store: &Store) -> String {
+            sqlx::query_scalar(
+                "SELECT json_group_array(json_array(id, repository_id, source_kind, app_id, \
+                 volume_id, node_id, status, \"trigger\", fencing_token, snapshot_method, \
+                 pause_ms, logical_bytes, uploaded_bytes, chunk_count, manifest_key, \
+                 manifest_digest, error, created_by_type, created_by_id, created_at, \
+                 started_at, finished_at, pruned_at)) FROM (SELECT * FROM backups ORDER BY id)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
         }
         let dir = std::env::temp_dir().join(format!("quoro-store-{}", random_secret()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1234,6 +1240,10 @@ mod tests {
         .await
         .unwrap();
         let before = backups(&old).await;
+        assert!(
+            before.contains("bkp_1") && before.contains("bkp_2"),
+            "{before}"
+        );
         drop(old);
 
         let store = Store::open(&path).await.unwrap();
@@ -1277,7 +1287,10 @@ mod tests {
         )
         .execute(store.pool())
         .await;
-        assert!(refused.is_err(), "a volume backup needs its node");
+        let error = refused
+            .expect_err("a volume backup needs its node")
+            .to_string();
+        assert!(error.contains("CHECK constraint failed"), "{error}");
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
