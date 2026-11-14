@@ -13,6 +13,8 @@ use common::{Server, TestDir, restart_with_resolver, start_patient_in};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::ReferenceAsDigest;
 use quoro_control_plane::changelog::{self, Actor, Op};
+use quoro_control_plane::rebuild::FoldError;
+use quoro_control_plane::rebuild::database::{self, BuildError};
 use quoro_control_plane::store::Store;
 use quoro_proto::custody::{self, CustodyKey, KeyKind, SealContext};
 use quoro_proto::wire::{self, Capacity as WireCapacity, Kvm as WireKvm, LogAck, NodeMessage};
@@ -1420,7 +1422,7 @@ async fn a_start_logs_what_a_promotion_rebuilds_credentials_and_the_signing_key_
         "one create per credential the fold would not rebuild"
     );
 
-    let rebuilt = replay::rebuild_folded(&server, &["node_credential", "signing_key"]).await;
+    let rebuilt = replay::rebuild(&server, &["node_credential", "signing_key"]).await;
     for (table, count) in [
         ("node_credentials", old.credentials.len()),
         ("signing_keys", 1),
@@ -1466,73 +1468,6 @@ async fn a_second_start_logs_no_credential_or_signing_key_again() {
         .await
         .unwrap();
     assert_eq!(rows, 1);
-}
-
-/// The test aid [`replay::fold`] folds as section 7.3 step 4 says (ADR
-/// 0317): updates that follow a `delete` make a row of updates only, which
-/// stops the fold as an entity that never received a `create` does; a
-/// `create` after the `delete` rebuilds the row, and a `delete` last leaves
-/// none.
-#[test]
-fn the_replay_fold_refuses_a_row_of_updates_after_a_delete() {
-    let entry = |seq: i64, op: &str, payload: Value| replay::Entry {
-        seq,
-        entity_type: "node_credential".to_string(),
-        entity_id: OTHER_NODE.to_string(),
-        op: op.to_string(),
-        payload,
-    };
-    let row = json!({
-        "node_id": OTHER_NODE,
-        "credential_hash": sha256_hex(b"secret"),
-        "created_at": "2026-10-01T10:00:00.000Z",
-        "revoked_at": null,
-    });
-    let revoke = json!({"node_id": OTHER_NODE, "revoked_at": "2026-10-03T10:00:00.000Z"});
-
-    let refused = replay::fold([
-        entry(1, "create", row.clone()),
-        entry(2, "delete", json!({})),
-        entry(3, "update", revoke.clone()),
-    ])
-    .unwrap_err();
-    assert!(refused.contains(OTHER_NODE), "{refused}");
-    assert!(refused.contains("only of updates"), "{refused}");
-
-    let deleted = replay::fold([
-        entry(1, "create", row.clone()),
-        entry(2, "delete", json!({})),
-    ]);
-    assert!(deleted.unwrap().is_empty());
-
-    let recreated = replay::fold([
-        entry(1, "create", row.clone()),
-        entry(2, "delete", json!({})),
-        entry(3, "create", row.clone()),
-        entry(4, "update", revoke.clone()),
-    ])
-    .unwrap();
-    assert_eq!(recreated.len(), 1);
-    assert_eq!(recreated[0].2["revoked_at"], revoke["revoked_at"]);
-    assert_eq!(recreated[0].2["credential_hash"], row["credential_hash"]);
-
-    let update_first = replay::fold([
-        entry(1, "update", revoke.clone()),
-        entry(2, "create", row.clone()),
-    ]);
-    assert_eq!(
-        update_first.unwrap().len(),
-        1,
-        "an update before its create"
-    );
-
-    for never_created in [
-        vec![entry(1, "update", revoke.clone())],
-        vec![entry(1, "delete", json!({}))],
-    ] {
-        let refused = replay::fold(never_created).unwrap_err();
-        assert!(refused.contains("never received a create"), "{refused}");
-    }
 }
 
 /// `bytes` as lowercase hex.
@@ -1695,5 +1630,233 @@ async fn the_start_up_entries_hold_no_private_key_and_only_credential_hashes() {
             sha256_hex(credential.secret.as_bytes())
         );
         assert!(!payload.to_string().contains(&credential.secret));
+    }
+}
+
+/// The DER of the first PEM block of `pem`, whatever its label.
+fn pem_der(pem: &str) -> Vec<u8> {
+    let body: String = pem
+        .lines()
+        .skip_while(|line| !line.starts_with("-----BEGIN"))
+        .skip(1)
+        .take_while(|line| !line.starts_with("-----END"))
+        .collect();
+    STANDARD.decode(body.trim()).unwrap()
+}
+
+/// Appends one change-log entry to `store`, alone in its write, and returns
+/// its `seq`.
+async fn append_entry(
+    store: &Store,
+    entity_type: &str,
+    entity_id: &str,
+    op: Op,
+    payload: Value,
+) -> u64 {
+    let mut w = store.begin_write().await.unwrap();
+    let seq = changelog::append(
+        &mut w.tx,
+        &Actor::system("test"),
+        entity_type,
+        entity_id,
+        op,
+        payload,
+    )
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+    seq.unsigned_abs()
+}
+
+/// A whole `nodes` row as a `node` entry carries it.
+fn node_row(node_id: &str) -> Value {
+    json!({
+        "id": node_id, "name": node_id, "roles": ["node"], "cp_status": null,
+        "status": "connected", "public_key": STANDARD.encode(node_id), "address": null,
+        "behind_nat": false, "labels": {},
+        "capacity": {"cpus": 8, "memory_mb": 16384, "disk_gb": 100},
+        "allocated": {"cpus": 0, "memory_mb": 0, "disk_gb": 0},
+        "kvm": {"available": true, "kernel": "6.9.0"}, "created_at": "2026-10-01T10:00:00.000Z",
+    })
+}
+
+/// Section 7.3 step 4 (ADR 0317, ADR 0228), for the custody rows, over the
+/// promotion's own fold and build (`rebuild::database::build`).
+///
+/// A primary whose node bound its custody key: the database built from its
+/// change log holds every seal, credential and signing-key row the primary
+/// holds, and no row of any replicated table holds a private key the
+/// primary keeps (the signing key's seed and 64-byte key, the data key and
+/// the TLS key), in any of the forms [`holds_secret`] reads.
+///
+/// A log of credentials written every way an entry can: the build keeps the
+/// row of the last `create` with the `update`s after it, and the row whose
+/// `update` came before its `create`; it keeps no row after a last
+/// `delete`; a row made only of `update`s after a `delete` is listed as
+/// dropped and not inserted; and a credential that never received a
+/// `create` stops the build, its target left uncreated.
+#[tokio::test]
+async fn a_promotion_build_keeps_the_custody_rows_the_log_leaves_and_no_private_key() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, "node-a", &["node"]).await;
+    let _socket = bind(&server, &node, &new_key()).await;
+    let dir = TestDir::new("quoro-custody-build");
+    let cluster_id = server.state.cluster_id.clone();
+
+    let target = dir.join("rebuilt.db");
+    let built = database::build(
+        &replay::followed(&server.state.store).await,
+        &cluster_id,
+        2,
+        &target,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(built.dropped.is_empty(), "{:?}", built.dropped);
+    let rebuilt = Store::open(&target).await.unwrap();
+    for table in ["node_key_custody", "node_credentials", "signing_keys"] {
+        let columns = replay::column_names(&server.state.store, table).await;
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let original = replay::rows(&server.state.store, table, &columns).await;
+        assert!(!original.is_empty(), "the primary holds {table}");
+        assert_eq!(
+            replay::rows(&rebuilt, table, &columns).await,
+            original,
+            "{table} rebuilt from the log"
+        );
+    }
+    assert_eq!(built.rows["node_key_custody"], 3, "one seal per kind");
+
+    let seed: [u8; 32] = std::fs::read(server.data_dir.join("keys/signing.key"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let keypair = sign::signing_key_from_seed(&seed).to_keypair_bytes();
+    let data = std::fs::read(server.data_dir.join("keys/data.key")).unwrap();
+    let tls_key = pem_der(&std::fs::read_to_string(server.data_dir.join("tls/key.pem")).unwrap());
+    let secrets: [&[u8]; 4] = [&seed, &keypair, &data[16..], &tls_key];
+    for table in built.rows.keys() {
+        let columns = replay::column_names(&rebuilt, table).await;
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        for row in replay::rows(&rebuilt, table, &columns).await {
+            for (column, value) in columns.iter().zip(row) {
+                // A BLOB reads as `x'<hex>'`; its hex is what is searched.
+                let value = match value {
+                    Value::String(text)
+                        if text.len() >= 3 && text.starts_with("x'") && text.ends_with('\'') =>
+                    {
+                        Value::String(text[2..text.len() - 1].to_owned())
+                    }
+                    other => other,
+                };
+                assert!(
+                    !holds_secret(&value, &secrets),
+                    "{table}.{column} of the rebuilt database holds a private key"
+                );
+            }
+        }
+    }
+    rebuilt.pool().close().await;
+
+    // Which credential rows a build keeps, drops and refuses, on a log of
+    // its own.
+    let created_at = "2026-10-01T10:00:00.000Z";
+    let revoked_at = "2026-10-03T10:00:00.000Z";
+    // Each node's credential has a hash of its own, as enrollment draws 32
+    // random bytes for each: `credential_hash` is UNIQUE, so two rows the
+    // build keeps cannot share one.
+    let hash = |node_id: &str| sha256_hex(format!("secret of {node_id}").as_bytes());
+    let credential = |node_id: &str| {
+        json!({
+            "node_id": node_id, "credential_hash": hash(node_id), "created_at": created_at,
+            "revoked_at": null,
+        })
+    };
+    let revoke = |node_id: &str| json!({"node_id": node_id, "revoked_at": revoked_at});
+    let deleted = "nod_01JC9Z6Q5W8N3K4T7R2M1XHBA1";
+    let recreated = "nod_01JC9Z6Q5W8N3K4T7R2M1XHBA2";
+    let update_first = "nod_01JC9Z6Q5W8N3K4T7R2M1XHBA3";
+    let after_delete = "nod_01JC9Z6Q5W8N3K4T7R2M1XHBA4";
+    let source = Store::open_in_memory().await.unwrap();
+    for node_id in [deleted, recreated, update_first, after_delete] {
+        append_entry(&source, "node", node_id, Op::Create, node_row(node_id)).await;
+    }
+    let mut last = 0;
+    for (node_id, op, payload) in [
+        (deleted, Op::Create, credential(deleted)),
+        (deleted, Op::Delete, json!({})),
+        (recreated, Op::Create, credential(recreated)),
+        (recreated, Op::Delete, json!({})),
+        (recreated, Op::Create, credential(recreated)),
+        (recreated, Op::Update, revoke(recreated)),
+        (update_first, Op::Update, revoke(update_first)),
+        (update_first, Op::Create, credential(update_first)),
+        (after_delete, Op::Create, credential(after_delete)),
+        (after_delete, Op::Delete, json!({})),
+        (after_delete, Op::Update, revoke(after_delete)),
+    ] {
+        last = append_entry(&source, "node_credential", node_id, op, payload).await;
+    }
+    let target = dir.join("credentials.db");
+    let built = database::build(&replay::followed(&source).await, &cluster_id, 2, &target)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        built
+            .dropped
+            .iter()
+            .map(|d| (d.entity_type.as_str(), d.entity_id.as_str(), d.seq))
+            .collect::<Vec<_>>(),
+        [("node_credential", after_delete, last)],
+        "the updates after the delete"
+    );
+    assert_eq!(built.rows["node_credentials"], 2);
+    let rebuilt = Store::open(&target).await.unwrap();
+    let kept: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT node_id, credential_hash, created_at, revoked_at FROM node_credentials \
+         ORDER BY node_id",
+    )
+    .fetch_all(rebuilt.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        kept,
+        [
+            (
+                recreated.to_owned(),
+                hash(recreated),
+                created_at.to_owned(),
+                Some(revoked_at.to_owned())
+            ),
+            (
+                update_first.to_owned(),
+                hash(update_first),
+                created_at.to_owned(),
+                None
+            ),
+        ]
+    );
+    rebuilt.pool().close().await;
+
+    // A credential that never received a `create`, through an update or a
+    // delete alone, stops the build.
+    for (op, payload) in [(Op::Update, revoke(deleted)), (Op::Delete, json!({}))] {
+        let refused = Store::open_in_memory().await.unwrap();
+        append_entry(&refused, "node", deleted, Op::Create, node_row(deleted)).await;
+        let first_seq = append_entry(&refused, "node_credential", deleted, op, payload).await;
+        let target = dir.join("refused.db");
+        let error = database::build(&replay::followed(&refused).await, &cluster_id, 2, &target)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                BuildError::Fold(FoldError::NoCreate { entity_type, entity_id, first_seq: seq })
+                    if entity_type == "node_credential" && entity_id == deleted && *seq == first_seq
+            ),
+            "{error}"
+        );
+        assert!(!target.exists());
     }
 }
