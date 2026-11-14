@@ -724,6 +724,11 @@ async fn an_audit_record_with_null_params_is_built_as_the_primary_stores_it() {
             .unwrap();
     let payload: Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(payload.get("params"), Some(&Value::Null), "{payload}");
+    // The read-only check reads the folded record as the build reads the
+    // inserted one, `params` `null` included.
+    check(&followed(&primary).await)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
 
     let dir = Dir::new();
     let built = build(&followed(&primary).await, CLUSTER, 2, &dir.target())
@@ -1473,4 +1478,246 @@ async fn the_chain_checks_find_the_same_break_page_by_page() {
     }
     drop(conn);
     rebuilt.pool().close().await;
+}
+
+/// `entries`' [`build`] error, into a directory of its own.
+async fn build_error(entries: &[FollowedEntry]) -> BuildError {
+    let dir = Dir::new();
+    build(entries, CLUSTER, 2, &dir.target()).await.unwrap_err()
+}
+
+/// [`check`], the read-only check of section 7.3, refuses with [`build`]'s
+/// own error a log whose chain breaks, one the fold refuses, a row that
+/// lacks a NOT NULL column or holds `null` there, and an audit chain that
+/// breaks over the folded records. A log that builds passes, and so does a
+/// row the cascade of its parent's delete removed, which the build does not
+/// insert.
+#[tokio::test]
+async fn the_check_refuses_what_the_fold_and_the_chains_refuse() {
+    let source = primary().await;
+    log(
+        &source,
+        "user",
+        "usr_1",
+        Op::Create,
+        user("usr_1", "a@example.com"),
+    )
+    .await;
+    audit_record(&source, "test.one").await;
+    audit_record(&source, "test.two").await;
+    let good = followed(&source).await;
+    check(&good).await.unwrap_or_else(|e| panic!("{e}"));
+    build(&good, CLUSTER, 2, &Dir::new().target())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let mut tampered = good.clone();
+    tampered[0].payload = "[]".to_owned();
+    let error = check(&tampered).await.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            CheckError::Log(BuildError::ChangeLog { seq: 1, .. })
+        ),
+        "{error}"
+    );
+    assert!(matches!(
+        check(&[]).await,
+        Err(CheckError::Log(BuildError::EmptyLog))
+    ));
+
+    // An entity whose log holds an update and no create does not fold.
+    let lost = primary().await;
+    log(
+        &lost,
+        "user",
+        "usr_1",
+        Op::Create,
+        user("usr_1", "a@example.com"),
+    )
+    .await;
+    let first = log(
+        &lost,
+        "user",
+        "usr_9",
+        Op::Update,
+        json!({"id": "usr_9", "name": "Eve"}),
+    )
+    .await;
+    let entries = followed(&lost).await;
+    let error = check(&entries).await.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            CheckError::Log(BuildError::Fold(FoldError::NoCreate { first_seq, .. }))
+                if *first_seq == first
+        ),
+        "{error}"
+    );
+    assert_eq!(error.to_string(), build_error(&entries).await.to_string());
+
+    // A create that lacks a NOT NULL column with no default, and a JSON
+    // null an update wrote into one.
+    let mut lacking = user("usr_2", "b@example.com");
+    lacking.as_object_mut().unwrap().remove("email");
+    for (payload, update) in [
+        (lacking, None),
+        (
+            user("usr_2", "b@example.com"),
+            Some(json!({"id": "usr_2", "email": null})),
+        ),
+    ] {
+        let lacking_log = primary().await;
+        let mut seq = log(&lacking_log, "user", "usr_2", Op::Create, payload).await;
+        if let Some(update) = update {
+            seq = log(&lacking_log, "user", "usr_2", Op::Update, update).await;
+        }
+        let entries = followed(&lacking_log).await;
+        let error = check(&entries).await.unwrap_err();
+        let CheckError::Log(BuildError::Column {
+            entity_id,
+            seq: at,
+            column,
+            ..
+        }) = &error
+        else {
+            panic!("{error}");
+        };
+        assert_eq!(
+            (entity_id.as_str(), *at, column.as_str()),
+            ("usr_2", seq, "email")
+        );
+        assert_eq!(error.to_string(), build_error(&entries).await.to_string());
+    }
+
+    // A token that lacks its hash went with its user's delete: the build
+    // does not insert it, so the check does not test it.
+    let cascaded = primary().await;
+    log(
+        &cascaded,
+        "user",
+        "usr_1",
+        Op::Create,
+        user("usr_1", "a@example.com"),
+    )
+    .await;
+    let mut hashless = token("tok_1", "usr_1", "s");
+    hashless.as_object_mut().unwrap().remove("token_hash");
+    log(&cascaded, "api_token", "tok_1", Op::Create, hashless).await;
+    log(
+        &cascaded,
+        "user",
+        "usr_1",
+        Op::Delete,
+        json!({"id": "usr_1"}),
+    )
+    .await;
+    let entries = followed(&cascaded).await;
+    check(&entries).await.unwrap_or_else(|e| panic!("{e}"));
+    build(&entries, CLUSTER, 2, &Dir::new().target())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    // The second of two audit records edited after it was hashed, as in
+    // `an_audit_chain_break_stops_the_build_and_leaves_no_file`.
+    let records: Vec<String> = sqlx::query_scalar(
+        "SELECT payload FROM change_log WHERE entity_type = 'audit' ORDER BY seq",
+    )
+    .fetch_all(source.pool())
+    .await
+    .unwrap();
+    let edited = primary().await;
+    for (index, text) in records.iter().enumerate() {
+        let mut record: Value = serde_json::from_str(text).unwrap();
+        if index == 1 {
+            record["operation"] = json!("test.edited");
+        }
+        let seq = record["seq"].to_string();
+        log(&edited, "audit", &seq, Op::Create, record).await;
+    }
+    let entries = followed(&edited).await;
+    let error = check(&entries).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CheckError::Log(BuildError::AuditChain {
+                seq: 2,
+                reason: audit::HASH_MISMATCH
+            })
+        ),
+        "{error}"
+    );
+    assert_eq!(error.to_string(), build_error(&entries).await.to_string());
+}
+
+/// [`check`] inserts no row (section 7.3, and the limit section 7.1 states
+/// for a start entry's `UNIQUE` clash): a log whose rows share a `UNIQUE`
+/// value, or whose row references a row the log lacks, passes it, and
+/// [`build`] stops on it at step 4.
+#[tokio::test]
+async fn the_check_inserts_nothing_so_a_unique_clash_or_a_missing_parent_passes_it() {
+    let clash = primary().await;
+    log(
+        &clash,
+        "project",
+        "prj_1",
+        Op::Create,
+        project("prj_1", "web"),
+    )
+    .await;
+    let second = log(
+        &clash,
+        "project",
+        "prj_2",
+        Op::Create,
+        project("prj_2", "web"),
+    )
+    .await;
+    let entries = followed(&clash).await;
+    check(&entries).await.unwrap_or_else(|e| panic!("{e}"));
+    let error = build_error(&entries).await;
+    let BuildError::Insert {
+        entity_id,
+        seq,
+        table,
+        error: refused,
+        ..
+    } = &error
+    else {
+        panic!("{error}");
+    };
+    assert_eq!(
+        (entity_id.as_str(), *seq, *table),
+        ("prj_2", second, "projects")
+    );
+    assert!(refused.contains("UNIQUE"), "{refused}");
+
+    let orphan = primary().await;
+    log(
+        &orphan,
+        "api_token",
+        "tok_9",
+        Op::Create,
+        token("tok_9", "usr_9", "z"),
+    )
+    .await;
+    let entries = followed(&orphan).await;
+    check(&entries).await.unwrap_or_else(|e| panic!("{e}"));
+    let error = build_error(&entries).await;
+    assert!(matches!(&error, BuildError::ForeignKey { .. }), "{error}");
+}
+
+/// The folded audit record leaves out a column its `create` lacked, as the
+/// reader leaves out a NULL: that holds while every column of `audit_log`
+/// defaults to NULL, and each column the reader reads is in the table.
+#[tokio::test]
+async fn every_audit_column_defaults_to_null() {
+    let (schema, _) = schema_and_cascades().await;
+    let columns = schema.columns(AUDIT_TABLE).unwrap();
+    for column in columns {
+        assert_eq!(column.default, None, "audit_log.{}", column.name);
+    }
+    for name in audit::COLUMNS.split(',').map(str::trim) {
+        assert!(columns.iter().any(|c| c.name == name), "audit_log.{name}");
+    }
 }
