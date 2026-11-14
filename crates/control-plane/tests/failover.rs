@@ -627,6 +627,37 @@ async fn disconnected(server: &Server, node_id: &str) {
     }
 }
 
+/// The `last_seen_at` the end of `node_id`'s session stamped, once its row
+/// reads `disconnected`: the primary writes it after the session has left
+/// the hub, which is all [`disconnected`] waits for.
+async fn recorded_disconnect(server: &Server, node_id: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, seen): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_seen_at FROM nodes WHERE id = ?")
+                .bind(node_id)
+                .fetch_one(server.state.store.pool())
+                .await
+                .unwrap();
+        if status == "disconnected" {
+            return seen.expect("the end of the session stamps last_seen_at");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the end of the session was never recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits until the primary's clock reads past `instant`, a time it wrote
+/// with millisecond resolution, so the next time it takes is later.
+async fn wait_past(instant: &str) {
+    while quoro_control_plane::store::now_rfc3339().as_str() <= instant {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 /// The problem body of a refusal, with its status, code and reason checked.
 async fn refused(res: reqwest::Response, status: u16, code: &str, reason: Option<&str>) -> Value {
     assert_eq!(res.status().as_u16(), status);
@@ -1032,9 +1063,13 @@ async fn a_marked_local_row_its_holder_reports_local_is_held_as_local() {
     s.unmoved(false, "a local row reported local").await;
 }
 
-/// `declareNodeLost` of the source (section 8.3, ADR 0183): returns the
-/// node it answers.
+/// `declareNodeLost` of the source (section 8.3, ADR 0183), once the end of
+/// its session is recorded and the primary's clock is past the
+/// `last_seen_at` that end stamped: a declaration in the same millisecond
+/// releases nothing (`leases::declaration_releases`). Returns the node it
+/// answers.
 async fn declare_source_lost(s: &Setup) -> Value {
+    wait_past(&recorded_disconnect(&s.server, &s.source.node_id).await).await;
     let res = s
         .owner
         .post(
@@ -1174,6 +1209,9 @@ async fn a_declaration_frees_nothing_once_the_source_returned_and_its_failure_wa
     ] {
         s.server.state.hub.inject_fault(fault);
     }
+    // Back after the declaration's millisecond, so its `hello` is seen
+    // after `lost_at`.
+    wait_past(&declared).await;
     let mut on_source = connect(&s.server, &s.source.credential).await;
     send(&mut on_source, hello(&s.source.node_id, 1), None).await;
     let revoke = recv_type(&mut on_source, "lease_revoke").await;
@@ -2038,12 +2076,20 @@ async fn a_refusal_after_a_declaration_during_the_gate_wait_says_the_lease_stays
 }
 
 /// The source declared lost in [`declared_while_the_change_waits`] comes
-/// back: a new session says `hello`, listing no lease, which stamps its
-/// `last_seen_at` after `lost_at`, so the declaration no longer releases
-/// the lease (`leases::declaration_releases`). The primary sends it the
+/// back once the primary's clock is past `lost_at`: a new session says
+/// `hello`, listing no lease, which stamps its `last_seen_at` after
+/// `lost_at`, so the declaration no longer releases the lease
+/// (`leases::declaration_releases`; a `hello` in the declaration's own
+/// millisecond would release nothing either). The primary sends it the
 /// `declared_lost` revoke of the raised row at token 5 (section 8.3).
 /// Returns that revoke, unanswered.
 async fn source_returns(s: &mut Setup) -> Value {
+    let declared: Option<String> = sqlx::query_scalar("SELECT lost_at FROM nodes WHERE id = ?")
+        .bind(&s.source.node_id)
+        .fetch_one(s.server.state.store.pool())
+        .await
+        .unwrap();
+    wait_past(&declared.expect("declared lost")).await;
     let mut on_source = connect(&s.server, &s.source.credential).await;
     send(&mut on_source, hello(&s.source.node_id, 1), None).await;
     let revoke = recv_type(&mut on_source, "lease_revoke").await;

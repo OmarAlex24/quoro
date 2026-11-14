@@ -5779,8 +5779,8 @@ async fn connect_node(
     let mut w = hub.0.store.begin_write().await.map_err(|e| e.to_string())?;
     // Taken under the writer gate, so it is never older than a `lost_at` a
     // declaration committed before this write: once this `hello` is
-    // recorded, `last_seen_at` is past the declaration, which then releases
-    // nothing more ([`leases::declaration_releases`]).
+    // recorded, `last_seen_at` is at or past the declaration, which then
+    // releases nothing more ([`leases::declaration_releases`]).
     let now = now_rfc3339();
     // A newer session's start write must not be overwritten (issue #324).
     if !hub.is_current(node_id, generation) {
