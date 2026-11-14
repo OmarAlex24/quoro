@@ -326,6 +326,43 @@ async fn wait_for_no_pending_ack(server: &Server, socket: &mut Socket, node_id: 
     }
 }
 
+/// Tells `node_id`'s session that an input of its desired state changed, as
+/// the API does after its own writes and a row written by hand here does
+/// not, then reads frames until a `desired_state` whose `spec` passes
+/// `ready`. Frames of other types are dropped.
+///
+/// The session writes `nodes.desired_rev` with its change-log entry before
+/// it sends the frame (section 5.11), so once the frame is read that write
+/// is in the log, and a head read after it does not race it (#752).
+async fn take_desired_state(
+    server: &Server,
+    socket: &mut Socket,
+    node_id: &str,
+    what: &str,
+    ready: impl Fn(&Value) -> bool,
+) {
+    server.state.hub.node_changed(node_id);
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = recv_frame(socket).await;
+            if frame["type"] == "desired_state" && ready(&frame["body"]["spec"]) {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no desired_state with {what}"));
+}
+
+/// The `fencing_token` the spec's VM of `lease_id` carries, if one does.
+fn spec_token(spec: &Value, lease_id: &str) -> Option<i64> {
+    spec["vms"]
+        .as_array()?
+        .iter()
+        .find(|vm| vm["lease_id"] == lease_id)?["fencing_token"]
+        .as_i64()
+}
+
 /// The change log's newest `seq`, 0 for an empty log.
 async fn log_head(server: &Server) -> i64 {
     let head: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
@@ -1227,6 +1264,7 @@ async fn declaring_a_node_lost_revokes_its_leases_and_answers_each_case() {
 
     drop(socket);
     wait_disconnected(&server, &node_id).await;
+    wait_row_disconnected(&server, &owner, &node_id).await;
     // A lease another node holds: declaring this node lost leaves it alone
     // (section 8.3 touches the leases the node holds; ADR 0246).
     let other = enrolled_node(&server, &owner, "node-beta").await;
@@ -1959,6 +1997,17 @@ async fn an_ack_that_would_raise_a_token_past_the_cap_writes_nothing() {
         .await
         .unwrap();
     set_token(&server, &lease_id, MAX_TOKEN).await;
+    // The node's VM carries the lease's token, which the write above tells
+    // no session: a rebuild still due (the volume's `ready` report asked for
+    // one) would write `desired_rev` after the head is read. It lands first.
+    take_desired_state(
+        &server,
+        &mut socket,
+        &node_id,
+        "the token at the cap",
+        |spec| spec_token(spec, &lease_id) == Some(MAX_TOKEN),
+    )
+    .await;
     let listed = get_node(&owner, &server, &node_id).await["fence_failure"].clone();
 
     let before = log_head(&server).await;
@@ -2027,6 +2076,7 @@ async fn declaring_lost_a_node_whose_lease_is_at_the_cap_writes_nothing() {
     let node_id = node.node_id.clone();
     drop(socket);
     wait_disconnected(&server, &node_id).await;
+    wait_row_disconnected(&server, &owner, &node_id).await;
     second_lease(&server, &node_id, 3).await;
     set_token(&server, &lease_id, MAX_TOKEN).await;
 
@@ -2116,6 +2166,24 @@ async fn acks_a_lease_another_node_holds_at(row_token: i64) {
         .execute(server.state.store.pool())
         .await
         .unwrap();
+    // The node's session writes `desired_rev` for two changes the test does
+    // not wait for otherwise: the voter watch rebuilds its desired state on
+    // its own time for node-beta's enrollment (`spec.votes` names every
+    // voter), and the lease leaving it changes its VM, which the write above
+    // tells no session. Both land before the head is read.
+    take_desired_state(
+        &server,
+        &mut socket,
+        &node_id,
+        "node-beta's vote and no lease",
+        |spec| {
+            spec["votes"]["voters"]
+                .as_array()
+                .is_some_and(|voters| voters.iter().any(|v| v["node_id"] == other.node_id))
+                && spec_token(spec, &lease_id).is_none()
+        },
+    )
+    .await;
 
     let before = log_head(&server).await;
     let res = ack(
@@ -2137,6 +2205,12 @@ async fn acks_a_lease_another_node_holds_at(row_token: i64) {
         .expect("fence_ack_pending");
     assert_eq!(pending["lease_ids"], json!([lease_id]), "{pending}");
     assert_eq!(pending["fencing_tokens"], tokens, "{pending}");
+
+    let command = of_type(&recv_until(&mut socket, &["command"]).await, "command")[0].clone();
+    assert_eq!(command["body"]["kind"], "fence_ack", "{command}");
+    // Read once the `fence_ack` is out: the session rebuilds its desired
+    // state for the acknowledgement before it sends it, so a write of that
+    // rebuild would be counted here every time.
     let entries = entries_after(&server, before).await;
     assert_eq!(entries.len(), 1, "{entries:?}");
     let (_, kind, id, payload) = &entries[0];
@@ -2145,9 +2219,6 @@ async fn acks_a_lease_another_node_holds_at(row_token: i64) {
         payload["fence_ack_pending"]["fencing_tokens"], tokens,
         "{payload}"
     );
-
-    let command = of_type(&recv_until(&mut socket, &["command"]).await, "command")[0].clone();
-    assert_eq!(command["body"]["kind"], "fence_ack", "{command}");
     assert_eq!(
         command["body"]["params"],
         json!({ "lease_ids": [lease_id], "fencing_tokens": tokens }),
