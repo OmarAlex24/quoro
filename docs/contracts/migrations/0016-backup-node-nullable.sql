@@ -1,5 +1,5 @@
 -- Migration 0016: a control-plane backup's node_id may be null
--- (backup-format.md section 8.2, "The first write").
+-- (backup-format.md section 8.2, "While no machine holds the primary status").
 --
 -- While no machine holds the primary status, as in a new cluster before its
 -- primary's own agent enrolls, after a `quoro restore --accept-loss` first

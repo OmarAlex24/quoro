@@ -994,6 +994,9 @@ components:
             restored primary moves `primary` to the node on its new host at its
             first start (backup-format.md section 8.2); `quoro cluster promote`
             moves it to the promoted node (node-agent-protocol.md section 7.3).
+            After `--accept-loss` without a usable `primary-node` file, the first
+            write clears it on every machine, and no node is `primary` until the
+            new host's agent enrolls locally (backup-format.md section 8.2).
           oneOf:
             - type: string
               enum:
@@ -6594,7 +6597,8 @@ paths:
       summary: Read cluster identity and change-log position
       description: |
         Cluster id and name, binary version, the node that holds the primary
-        status, and the position of the change log. The primary is the single
+        status, or null while none does (backup-format.md section 8.2), and
+        the position of the change log. The primary is the single
         writer and source of truth (D-0012); `log_seq` and `log_head_hash` say how
         far the state has been written. From M5b `votes` lists the voters and
         says whether HA is ready (ADR 0170). Exposed as the MCP tool
