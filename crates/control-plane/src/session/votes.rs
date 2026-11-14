@@ -29,7 +29,11 @@
 //!   ceiling demotes it. Any other primary demotes on `stale_term`, and a
 //!   voter's `bad_message` only leaves it without that voter's support. The
 //!   first `lease_grant` a session sends ends the exception
-//!   ([`NodeHub::frame_going_out`]).
+//!   ([`NodeHub::frame_going_out`]). A session start sends the node every
+//!   lease it holds again (`Session::finish_start`, `Session::send_grants`),
+//!   each as a `lease_grant`, so the first session start of the host's own
+//!   node ends the exception when that node holds a lease: the contract's
+//!   "has sent no `lease_grant` yet" counts those grants too.
 
 use super::{NodeHub, Session, cluster_term, new_msg_id};
 use crate::error::ApiError;
@@ -55,7 +59,7 @@ pub(crate) enum HigherTerm {
 /// Whether the frame `text` is a `lease_grant`. A frame this primary built
 /// always parses; one that does not is taken for a grant, the safe side of
 /// [`NodeHub::frame_going_out`].
-fn is_lease_grant(text: &str) -> bool {
+pub(super) fn is_lease_grant(text: &str) -> bool {
     #[derive(serde::Deserialize)]
     struct Frame<'a> {
         #[serde(rename = "type", borrow)]

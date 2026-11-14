@@ -672,6 +672,9 @@ struct HubInner {
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
+    /// Test seam: `lease_grant`s to hold at their send
+    /// ([`NodeHub::hold_next_lease_grant`]).
+    grant_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
     /// Test seam: removals to hold at one of their steps
     /// ([`NodeHub::hold_next_removal`]).
     removal_holds: Mutex<HashMap<(String, RemovalStep), Arc<RemovalHold>>>,
@@ -780,7 +783,8 @@ impl RemovalHold {
 }
 
 /// A test seam that holds one node's next snapshot after it is built and
-/// before it is sent, so a test can change the state in that window.
+/// before it is sent, so a test can change the state in that window, or its
+/// next `lease_grant` at its send ([`NodeHub::hold_next_lease_grant`]).
 #[doc(hidden)]
 #[derive(Default)]
 pub struct SnapshotHold {
@@ -789,7 +793,8 @@ pub struct SnapshotHold {
 }
 
 impl SnapshotHold {
-    /// Waits until the held snapshot is built.
+    /// Waits until the held snapshot is built, or the held `lease_grant` is
+    /// at its send.
     pub async fn built(&self) {
         self.built.notified().await;
     }
@@ -881,6 +886,7 @@ impl NodeHub {
             removed_nodes: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
+            grant_holds: Mutex::new(HashMap::new()),
             removal_holds: Mutex::new(HashMap::new()),
             faults: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -924,6 +930,37 @@ impl NodeHub {
             .expect("snapshot hold lock")
             .insert(node_id.to_string(), Arc::clone(&hold));
         hold
+    }
+
+    /// Test seam: holds `node_id`'s next `lease_grant` at its send: after the
+    /// session took it to send ([`NodeHub::frame_going_out`]) and before its
+    /// bytes go to the socket.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hold_next_lease_grant(&self, node_id: &str) -> Arc<SnapshotHold> {
+        let hold = Arc::new(SnapshotHold::default());
+        self.0
+            .grant_holds
+            .lock()
+            .expect("grant hold lock")
+            .insert(node_id.to_string(), Arc::clone(&hold));
+        hold
+    }
+
+    /// Waits at the hold of [`NodeHub::hold_next_lease_grant`] when `text`,
+    /// a frame to `node_id`, is a `lease_grant` and such a hold is set.
+    async fn hold_at_send(&self, node_id: &str, text: &str) {
+        let hold = {
+            let mut holds = self.0.grant_holds.lock().expect("grant hold lock");
+            if holds.is_empty() || !votes::is_lease_grant(text) {
+                return;
+            }
+            holds.remove(node_id)
+        };
+        if let Some(hold) = hold {
+            hold.built.notify_one();
+            hold.release.notified().await;
+        }
     }
 
     /// Test seam: holds the next `removeNode` of `node_id` at `step` until
@@ -3273,6 +3310,7 @@ async fn run_session(
             // exception for a higher term only until its first
             // `lease_grant`, which ends it before the frame goes out.
             session.hub.frame_going_out(&text);
+            session.hub.hold_at_send(&session.node_id, &text).await;
             // A send to a node that stopped reading waits until the
             // demotion, then stops waiting: the top of the loop sends
             // `not_primary` within the cap, after the bytes of this frame
