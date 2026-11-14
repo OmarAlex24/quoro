@@ -769,9 +769,12 @@ components:
           type: string
           description: Version of the running binary.
         primary_node_id:
-          type: string
+          type: [string, 'null']
           pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
-          description: Node that currently holds the primary status.
+          description: |
+            Node that currently holds the primary status, or null while no
+            machine holds it, as after an `--accept-loss` restore until the
+            new host's agent enrolls (backup-format.md section 8.2).
         log_seq:
           type: integer
           minimum: 0
@@ -991,6 +994,10 @@ components:
             restored primary moves `primary` to the node on its new host at its
             first start (backup-format.md section 8.2); `quoro cluster promote`
             moves it to the promoted node (node-agent-protocol.md section 7.3).
+            After `--accept-loss` without a usable `primary-node` file, the first
+            write clears it on every machine, and no node is `primary` until the
+            new host's agent enrolls locally; backup-format.md section 8.2,
+            "While no machine holds the primary status", gives every such case.
           oneOf:
             - type: string
               enum:
@@ -3626,9 +3633,12 @@ components:
           pattern: '^vol_[0-9A-HJKMNP-TV-Z]{26}$'
           description: The backed-up volume; null for `control_plane`.
         node_id:
-          type: string
+          type: [string, 'null']
           pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
-          description: The node that took it, the volume's node or the primary.
+          description: |
+            The node that took it, the volume's node or the primary's; null
+            for a control-plane backup taken while no machine holds the
+            primary status (backup-format.md section 8.2).
         status:
           type: string
           description: |
@@ -6588,7 +6598,8 @@ paths:
       summary: Read cluster identity and change-log position
       description: |
         Cluster id and name, binary version, the node that holds the primary
-        status, and the position of the change log. The primary is the single
+        status, or null while none does (backup-format.md section 8.2), and
+        the position of the change log. The primary is the single
         writer and source of truth (D-0012); `log_seq` and `log_head_hash` say how
         far the state has been written. From M5b `votes` lists the voters and
         says whether HA is ready (ADR 0170). Exposed as the MCP tool
@@ -6922,8 +6933,10 @@ paths:
         Records a human's statement that a disconnected node is gone, so the
         apps it held may start elsewhere (ADR 0183, node-agent-protocol.md
         section 8.3). In one transaction the primary increments the fencing
-        token of every lease the node holds and revokes each one in its own
-        view, sets the node's `lost_at`, and writes the audit record. The node
+        token of every lease row that names the node, revoked rows included
+        except one already revoked at 2^53 - 1, and records each one revoked
+        in its own view, sets the node's `lost_at`, and writes the audit
+        record. The node
         stays enrolled and stays a voter. Leases listed in its `fence_failure`
         stay ungrantable until that fence is acknowledged, and an `expiring`
         lease still waits for its gate. When the node returns, the primary

@@ -84,7 +84,9 @@ pub async fn get_cluster(state: &AppState, ctx: &CallCtx) -> Result<Cluster, Api
             id: state.cluster_id.clone(),
             name,
             version: env!("CARGO_PKG_VERSION").to_string(),
-            primary_node_id,
+            // The contract's nullable field; nothing returns null yet
+            // (backup-format.md section 8.2).
+            primary_node_id: Some(primary_node_id),
             log_seq,
             log_head_hash,
             term,

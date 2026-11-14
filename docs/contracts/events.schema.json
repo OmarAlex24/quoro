@@ -753,7 +753,7 @@
 
     "data_backup_succeeded": {
       "type": "object",
-      "description": "A backup's seal was written: its snapshot is in the repository and can be restored (ADR 0147, ADR 0148). `app_id` and `volume_id` are absent for a control-plane backup. Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "description": "A backup's seal was written: its snapshot is in the repository and can be restored (ADR 0147, ADR 0148). `app_id` and `volume_id` are absent for a control-plane backup, and `node_id` is absent for one taken while no machine holds the primary status (backup-format.md section 8.2). Emitted by the control plane. Payload fields are additive within schema_version 1.",
       "required": ["backup_id", "repository_id", "source_kind", "trigger", "logical_bytes", "uploaded_bytes"],
       "properties": {
         "backup_id": { "$ref": "#/$defs/BackupId" },
@@ -773,7 +773,7 @@
 
     "data_backup_failed": {
       "type": "object",
-      "description": "A backup ended without a seal: snapshot, upload, a lost lease or a timeout (ADR 0147). It opens no incident; the next scheduled backup is still taken. Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "description": "A backup ended without a seal: snapshot, upload, a lost lease or a timeout (ADR 0147). `node_id` is absent for a control-plane backup taken while no machine holds the primary status (backup-format.md section 8.2). It opens no incident; the next scheduled backup is still taken. Emitted by the control plane. Payload fields are additive within schema_version 1.",
       "required": ["backup_id", "repository_id", "source_kind", "trigger", "error"],
       "properties": {
         "backup_id": { "$ref": "#/$defs/BackupId" },
