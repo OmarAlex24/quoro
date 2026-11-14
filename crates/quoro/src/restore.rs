@@ -16,10 +16,28 @@
 //!
 //! Before it installs the database, it writes the `restore-pending` marker
 //! next to it (section 8.2, "Detecting the first start", ADR 0285): the
-//! restored log's head `seq` and that entry's hash
+//! restored log's head `seq` and that entry's hash, and whether
+//! `--accept-loss` was given with its statement
 //! ([`quoro_control_plane::restore_pending::Marker`]). The primary's first
 //! start makes the restored primary's first write from it and deletes it. A
 //! restore that stops before the database is installed deletes the marker.
+//!
+//! **The refusal (section 8.2, "When a restore is refused", ADR 0261).**
+//! Before anything is installed, the restore refuses when a machine with the
+//! `node` role, not `removed` and other than the new host's node, appears in
+//! the restored database or in the newest `spec.votes.voters` this host's
+//! node agent stored ([`Survivors`]). Such a cluster recovers by promoting a
+//! surviving node. `--accept-loss --statement <text>` restores anyway: the
+//! statement goes into the marker, and the primary's first write removes
+//! every machine of the first list. The new host's node is the node
+//! `primary-node` names; when none is named, the node of this host's node
+//! agent identity file when that file names this cluster, even one the
+//! restored database does not hold; otherwise the host has no node.
+//!
+//! With `--accept-loss`, the restore also refuses, before anything is
+//! installed, when a lease that the first write would raise is already at the
+//! token cap (node-agent-protocol.md section 8.6, ADR 0325), naming each
+//! lease and its token ([`leases_at_cap`]).
 //!
 //! Every secret is read from a file whose mode refuses group and other access,
 //! never from a flag or the environment, and no error message carries a key, a
@@ -29,6 +47,7 @@
 //!
 //! [`MemoryStore`]: quoro_providers::object_store::MemoryStore
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -61,6 +80,12 @@ const TEMP_FILE: &str = ".restore-quoro.db.tmp";
 const SIGNING_KEY_FILE: &str = "signing.key";
 /// The name of the cluster data-encryption key file inside `<data_dir>/keys`.
 const DATA_KEY_FILE: &str = "data.key";
+/// The node agent's store inside its data directory (node-agent-protocol.md
+/// section 12; `quoro_node_agent::store`).
+const NODE_STORE_FILE: &str = "node.db";
+/// The node-local key that seals the desired-state bodies of
+/// [`NODE_STORE_FILE`] (`quoro_node_agent::localkey`).
+const NODE_LOCAL_KEY_FILE: &str = "local.key";
 
 /// How a restore failed. A usage error exits `2`, any other failure exits `1`
 /// (the exit codes of the other commands).
@@ -109,6 +134,13 @@ pub struct Options {
     /// This host's node agent identity file, read when `node_id` is `None`.
     /// [`run`] sets `/var/lib/quoro-node/identity.json`.
     pub identity_file: PathBuf,
+    /// This host's node agent data directory, whose store holds the newest
+    /// desired state the agent stored. [`run`] sets `/var/lib/quoro-node`.
+    pub node_data_dir: PathBuf,
+    /// `--accept-loss --statement <text>`: the statement, which says that no
+    /// other machine with the `node` role survives and that no control plane
+    /// of this cluster runs. `None` without `--accept-loss`.
+    pub accept_loss: Option<String>,
     /// Do every check and write the database to a scratch file, install
     /// nothing.
     pub dry_run: bool,
@@ -131,6 +163,36 @@ pub struct Report {
     pub installed: bool,
     /// Which node takes the primary status, or why none was named.
     pub primary: PrimaryPick,
+    /// The machines that refuse a restore without `--accept-loss`. With it,
+    /// the primary's first write removes those of
+    /// [`Survivors::in_database`].
+    pub survivors: Survivors,
+    /// Whether `--accept-loss` was given.
+    pub accept_loss: bool,
+}
+
+/// The machines with the `node` role, not `removed` and other than the new
+/// host's node, that refuse a restore without `--accept-loss` (section 8.2,
+/// "When a restore is refused", ADR 0261). Each list is sorted by id.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Survivors {
+    /// Those the restored database holds. The first write of a restore with
+    /// `--accept-loss` removes exactly these.
+    pub in_database: Vec<String>,
+    /// Those in the newest `spec.votes.voters` this host's node agent stored
+    /// that the restored database does not list above and does not hold as
+    /// `removed`: nodes enrolled after the backup. Not read with
+    /// `--accept-loss`, whose statement covers them, so that an unreadable
+    /// agent store cannot stop the override.
+    pub in_agent: Vec<String>,
+}
+
+impl Survivors {
+    /// Whether no machine refuses the restore.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.in_database.is_empty() && self.in_agent.is_empty()
+    }
 }
 
 /// The node `primary-node` names (section 8.2 step 6), or why no file was
@@ -141,8 +203,10 @@ pub enum PrimaryPick {
     NodeIdFlag(String),
     /// The node in this host's node agent identity file.
     IdentityFile(String),
-    /// No `primary-node` file: the primary status stays where the backup had
-    /// it. The text says why.
+    /// No `primary-node` file. Without `--accept-loss` the primary status
+    /// stays where the backup had it; with it, every machine loses the status
+    /// in the primary's first write, and the next local enrollment of this
+    /// host's node agent takes it. The text says why no file was written.
     Unchanged(String),
 }
 
@@ -175,11 +239,13 @@ impl fmt::Debug for Credentials {
 /// `quoro restore --endpoint URL --region REGION --bucket NAME --prefix PREFIX
 /// --cluster-id CLS --credentials-file PATH --recovery-key-file PATH
 /// --signing-key-file PATH --data-key-file PATH --data-dir DIR
-/// [--backup BKP] [--node-id NOD] [--dry-run]`.
+/// [--backup BKP] [--node-id NOD] [--accept-loss --statement TEXT]
+/// [--dry-run]`.
 ///
 /// `node_data_dir` is this host's node agent data directory
 /// (`/var/lib/quoro-node`); its identity file names the node that takes the
-/// primary status when `--node-id` is absent.
+/// primary status when `--node-id` is absent, and its store holds the voters
+/// the refusal reads.
 ///
 /// # Errors
 ///
@@ -212,6 +278,8 @@ pub async fn run(args: &[String], node_data_dir: &Path) -> Result<(), Error> {
             backup: command.backup,
             node_id: command.node_id,
             identity_file: node_data_dir.join(quoro_node_agent::identity::IDENTITY_FILE),
+            node_data_dir: node_data_dir.to_path_buf(),
+            accept_loss: command.accept_loss,
             dry_run: command.dry_run,
         },
     )
@@ -229,21 +297,23 @@ pub async fn run(args: &[String], node_data_dir: &Path) -> Result<(), Error> {
     if report.skipped_seals > 0 {
         println!("skipped {} invalid seals", report.skipped_seals);
     }
-    let takes = if report.installed {
-        "takes"
-    } else {
-        "would take"
-    };
-    match &report.primary {
-        PrimaryPick::NodeIdFlag(node_id) => println!(
-            "node {node_id} (--node-id) {takes} the primary status at the primary's next start"
-        ),
-        PrimaryPick::IdentityFile(node_id) => println!(
-            "node {node_id} (this host's node agent) {takes} the primary status at the primary's next start"
-        ),
-        PrimaryPick::Unchanged(reason) => println!(
-            "no {MARKER_FILE} file: {reason}; the primary status stays where the backup had it"
-        ),
+    println!("{}", primary_line(&report));
+    if report.accept_loss {
+        let removes = if report.installed {
+            "removes"
+        } else {
+            "would remove"
+        };
+        if report.survivors.in_database.is_empty() {
+            println!(
+                "--accept-loss: the primary's first write {removes} no machine with the node role"
+            );
+        } else {
+            println!(
+                "--accept-loss: the primary's first write {removes} these machines with the node role: {}",
+                report.survivors.in_database.join(", ")
+            );
+        }
     }
     if !report.installed {
         println!("dry run: nothing was installed");
@@ -254,13 +324,44 @@ pub async fn run(args: &[String], node_data_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// The line `quoro restore` prints about the primary status: the node that
+/// takes it, or why no `primary-node` file was written and what becomes of the
+/// status then.
+#[must_use]
+pub fn primary_line(report: &Report) -> String {
+    let (takes, loses) = if report.installed {
+        ("takes", "loses")
+    } else {
+        ("would take", "would lose")
+    };
+    match &report.primary {
+        PrimaryPick::NodeIdFlag(node_id) => format!(
+            "node {node_id} (--node-id) {takes} the primary status at the primary's next start"
+        ),
+        PrimaryPick::IdentityFile(node_id) => format!(
+            "node {node_id} (this host's node agent) {takes} the primary status at the primary's next start"
+        ),
+        PrimaryPick::Unchanged(reason) if report.accept_loss => format!(
+            "no {MARKER_FILE} file: {reason}; every machine {loses} the primary status in the primary's first write, and the next local enrollment of this host's node agent {takes} it"
+        ),
+        PrimaryPick::Unchanged(reason) => format!(
+            "no {MARKER_FILE} file: {reason}; the primary status stays where the backup had it"
+        ),
+    }
+}
+
 /// The restore of section 8.2 over any object store.
 ///
 /// # Errors
 ///
+/// [`Error::Usage`] for a statement [`check_statement`] refuses;
 /// [`Error::Failed`] when a refused input, a seal or manifest check, a chunk,
-/// the integrity check or the install fails.
+/// the integrity check, the refusal of ADR 0261, with `--accept-loss` a lease
+/// at the token cap, or the install fails.
 pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Report, Error> {
+    if let Some(statement) = &options.accept_loss {
+        check_statement(statement)?;
+    }
     ensure_fresh_data_dir(&options.data_dir)?;
     // From here on, a restore that stops before the database is installed
     // deletes the marker, also one an interrupted earlier run left in this
@@ -333,13 +434,39 @@ pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Rep
     // The marker names the database by its log's head (section 8.2, ADR
     // 0285); a file without a change log is no control-plane database.
     let head = read_head(&temp).await?;
+    // Section 8.2, "When a restore is refused" (ADR 0261), before anything is
+    // installed; a dry run checks it too.
+    let host_node = new_host_node(options, &primary);
+    let survivors = find_survivors(&temp, options, host_node.as_deref()).await?;
+    if options.accept_loss.is_none() && !survivors.is_empty() {
+        return Err(refusal(&survivors, host_node.as_deref()));
+    }
+    // The token cap (node-agent-protocol.md section 8.6, ADR 0325): the
+    // first write of `--accept-loss` raises the lease tokens of the machines
+    // it removes, so a lease already at the cap refuses here, before anything
+    // is installed, as `promote --ack-fence` checks before it changes
+    // anything. The first write refuses it too, as a backstop.
+    if options.accept_loss.is_some() {
+        let at_cap = leases_at_cap(&temp, primary.node_id()).await?;
+        if !at_cap.is_empty() {
+            return Err(failed(format!(
+                "refusing to restore with --accept-loss: the primary's first write raises the \
+                 lease tokens of the machines it removes, and {}; nothing was installed",
+                restore_pending::token_cap_refusal(&at_cap)
+            )));
+        }
+    }
 
     let installed = !options.dry_run;
     if installed {
         // SQLite may have touched these while checking the file; they must not
         // be installed next to the database.
         remove_sidecars(&temp);
-        let marker = Marker::plain(head);
+        let marker = Marker {
+            head,
+            accept_loss: options.accept_loss.is_some(),
+            statement: options.accept_loss.clone(),
+        };
         if let Err(error) = install(
             options,
             &temp,
@@ -363,6 +490,8 @@ pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Rep
         skipped_seals,
         installed,
         primary,
+        survivors,
+        accept_loss: options.accept_loss.is_some(),
     })
 }
 
@@ -806,29 +935,9 @@ async fn pick_primary(database: &Path, options: &Options) -> Result<PrimaryPick,
     }
 
     let path = &options.identity_file;
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PrimaryPick::Unchanged(format!(
-                "no --node-id and no node agent identity file at {}",
-                path.display()
-            )));
-        }
-        Err(error) => {
-            return Ok(PrimaryPick::Unchanged(format!(
-                "cannot read the node agent identity file {}: {error}",
-                path.display()
-            )));
-        }
-    };
-    let identity: HostIdentity = match serde_json::from_str(&text) {
+    let identity = match read_identity(path) {
         Ok(identity) => identity,
-        Err(error) => {
-            return Ok(PrimaryPick::Unchanged(format!(
-                "the node agent identity file {} is malformed: {error}",
-                path.display()
-            )));
-        }
+        Err(reason) => return Ok(PrimaryPick::Unchanged(reason)),
     };
     if identity.cluster_id != options.cluster_id {
         return Ok(PrimaryPick::Unchanged(format!(
@@ -853,6 +962,335 @@ async fn pick_primary(database: &Path, options: &Options) -> Result<PrimaryPick,
         )),
         Some(_) => PrimaryPick::IdentityFile(identity.node_id),
     })
+}
+
+/// This host's node agent identity file at `path`, or why it names no node:
+/// it is missing, cannot be read or is malformed.
+fn read_identity(path: &Path) -> Result<HostIdentity, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "no --node-id and no node agent identity file at {}",
+                path.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot read the node agent identity file {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "the node agent identity file {} is malformed: {error}",
+            path.display()
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The refusal of ADR 0261
+// ---------------------------------------------------------------------------
+
+/// The new host's node (section 8.2): the node `primary-node` names, the one
+/// `--node-id` or the identity file gave; otherwise the node of this host's
+/// node agent identity file when it names this cluster, even one the
+/// restored database does not hold or holds as `removed`, since that agent is
+/// still this host's own. `None` when the host has no node of the cluster.
+fn new_host_node(options: &Options, primary: &PrimaryPick) -> Option<String> {
+    if let Some(node_id) = primary.node_id() {
+        return Some(node_id.to_string());
+    }
+    read_identity(&options.identity_file)
+        .ok()
+        .filter(|identity| {
+            identity.cluster_id == options.cluster_id
+                && quoro_types::is_id(quoro_types::Prefix::Node, &identity.node_id)
+        })
+        .map(|identity| identity.node_id)
+}
+
+/// Whether `roles` hold the `node` role.
+fn has_node_role(roles: &[String]) -> bool {
+    roles.iter().any(|role| role == "node")
+}
+
+/// The machines that refuse the restore (section 8.2, "When a restore is
+/// refused"), from the restored database at `database` and, without
+/// `--accept-loss`, from this host's node agent store. `host_node` is the new
+/// host's node ([`new_host_node`]), which never counts.
+///
+/// The agent store is not read when the identity file names another
+/// cluster: that agent's voters are machines of the other cluster.
+///
+/// # Errors
+///
+/// [`Error::Failed`] when the restored nodes or, without `--accept-loss`,
+/// the agent's newest desired state cannot be read.
+async fn find_survivors(
+    database: &Path,
+    options: &Options,
+    host_node: Option<&str>,
+) -> Result<Survivors, Error> {
+    let machines = restored_machines(database).await?;
+    let removed: BTreeSet<&str> = machines
+        .iter()
+        .filter(|machine| machine.status == "removed")
+        .map(|machine| machine.id.as_str())
+        .collect();
+    let in_database: Vec<String> = machines
+        .iter()
+        .filter(|machine| {
+            machine.status != "removed"
+                && has_node_role(&machine.roles)
+                && Some(machine.id.as_str()) != host_node
+        })
+        .map(|machine| machine.id.clone())
+        .collect();
+
+    let other_cluster = read_identity(&options.identity_file)
+        .is_ok_and(|identity| identity.cluster_id != options.cluster_id);
+    let voters = if options.accept_loss.is_some() || other_cluster {
+        Vec::new()
+    } else {
+        agent_voters(&options.node_data_dir).await?
+    };
+    let in_agent: BTreeSet<String> = voters
+        .into_iter()
+        .filter(|voter| {
+            has_node_role(&voter.roles)
+                && Some(voter.node_id.as_str()) != host_node
+                && !removed.contains(voter.node_id.as_str())
+                && !in_database.contains(&voter.node_id)
+        })
+        .map(|voter| voter.node_id)
+        .collect();
+    Ok(Survivors {
+        in_database,
+        in_agent: in_agent.into_iter().collect(),
+    })
+}
+
+/// The refusal of a restore that [`Survivors`] lists, with the way out.
+fn refusal(survivors: &Survivors, host_node: Option<&str>) -> Error {
+    let mut found = Vec::new();
+    if !survivors.in_database.is_empty() {
+        found.push(format!(
+            "the restored database holds {}",
+            survivors.in_database.join(", ")
+        ));
+    }
+    if !survivors.in_agent.is_empty() {
+        found.push(format!(
+            "this host's node agent last stored {} among the voters",
+            survivors.in_agent.join(", ")
+        ));
+    }
+    let host = match host_node {
+        Some(node_id) => format!("other than this host's node {node_id}"),
+        None => "and this host has no node of the cluster".to_string(),
+    };
+    failed(format!(
+        "refusing to restore: machines with the node role that are not removed may survive \
+         ({host}): {}. A restored log may lack writes every node already holds, so such a \
+         cluster recovers by promoting a surviving node (quoro cluster promote). If no other \
+         machine with the node role survives and no control plane of this cluster runs, \
+         restore with --accept-loss --statement <text>; the primary's first write then \
+         removes the machines the restored database holds",
+        found.join("; ")
+    ))
+}
+
+/// One machine of the restored database's `nodes` table.
+struct Machine {
+    id: String,
+    roles: Vec<String>,
+    status: String,
+}
+
+/// Every machine of the restored database at `path`, by id, read-only.
+async fn restored_machines(path: &Path) -> Result<Vec<Machine>, Error> {
+    let options = SqliteConnectOptions::new().filename(path).read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|error| failed(format!("cannot open the restored database: {error}")))?;
+    let rows: Result<Vec<(String, String, String)>, sqlx::Error> =
+        sqlx::query_as("SELECT id, roles, status FROM nodes ORDER BY id")
+            .fetch_all(&pool)
+            .await;
+    pool.close().await;
+    let rows = rows.map_err(|error| failed(format!("cannot read the restored nodes: {error}")))?;
+    rows.into_iter()
+        .map(|(id, roles, status)| -> Result<Machine, Error> {
+            let roles: Vec<String> = serde_json::from_str(&roles).map_err(|error| {
+                failed(format!(
+                    "the roles of the restored node {id} are not a list: {error}"
+                ))
+            })?;
+            Ok(Machine { id, roles, status })
+        })
+        .collect()
+}
+
+/// The members of a stored desired state the refusal reads: one voter of
+/// `spec.votes.voters` (node-agent-protocol.md section 6.12).
+#[derive(serde::Deserialize)]
+struct StoredVoter {
+    node_id: String,
+    roles: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct StoredVotes {
+    voters: Vec<StoredVoter>,
+}
+
+#[derive(serde::Deserialize)]
+struct StoredSpec {
+    #[serde(default)]
+    votes: Option<StoredVotes>,
+}
+
+#[derive(serde::Deserialize)]
+struct StoredDesiredState {
+    spec: StoredSpec,
+}
+
+/// A `desired_state` row of the node agent store: `rev`, the plaintext
+/// `body` of a row written before bodies were sealed, and the sealed
+/// `body_enc`.
+type StoredRow = (i64, String, Option<Vec<u8>>);
+
+/// The newest `spec.votes.voters` this host's node agent stored: the
+/// highest `rev` of the `desired_state` table of its store in
+/// `node_data_dir` (node-agent-protocol.md section 12), opened read-only and
+/// opened with the agent's node-local key when sealed. No store, no stored
+/// desired state, or one without `spec.votes`, gives no voter.
+///
+/// # Errors
+///
+/// [`Error::Failed`] when the store exists but its newest desired state
+/// cannot be read: the refusal cannot then tell which nodes enrolled after
+/// the backup. The node-local key is never created here.
+async fn agent_voters(node_data_dir: &Path) -> Result<Vec<StoredVoter>, Error> {
+    let path = node_data_dir.join(NODE_STORE_FILE);
+    let exists = path
+        .try_exists()
+        .map_err(|error| failed(format!("cannot check {}: {error}", path.display())))?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let unreadable = |reason: String| {
+        failed(format!(
+            "cannot read the newest desired state this host's node agent stored in {}: \
+             {reason}; without it the restore cannot tell which nodes enrolled after the backup",
+            path.display()
+        ))
+    };
+    let options = SqliteConnectOptions::new()
+        .filename(path.as_path())
+        .read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|error| unreadable(error.to_string()))?;
+    let row: Result<Option<StoredRow>, sqlx::Error> =
+        sqlx::query_as("SELECT rev, body, body_enc FROM desired_state ORDER BY rev DESC LIMIT 1")
+            .fetch_optional(&pool)
+            .await;
+    pool.close().await;
+    let Some((rev, body, sealed)) = row.map_err(|error| unreadable(error.to_string()))? else {
+        return Ok(Vec::new());
+    };
+    let body = match sealed {
+        None => body,
+        Some(blob) => {
+            let key = load_local_key(node_data_dir).map_err(unreadable)?;
+            let rev =
+                u64::try_from(rev).map_err(|_| unreadable(format!("its rev {rev} is negative")))?;
+            let plaintext = key
+                .open(rev, &blob)
+                .map_err(|error| unreadable(error.to_string()))?;
+            String::from_utf8(plaintext).map_err(|_| unreadable("it is not UTF-8".to_string()))?
+        }
+    };
+    let state: StoredDesiredState = serde_json::from_str(&body)
+        .map_err(|error| unreadable(format!("it is not a desired state: {error}")))?;
+    Ok(state
+        .spec
+        .votes
+        .map(|votes| votes.voters)
+        .unwrap_or_default())
+}
+
+/// The agent's node-local key in `node_data_dir`, which seals the stored
+/// desired states. A restore must not create it: an agent without one stored
+/// no sealed state this restore can read.
+///
+/// The key file is opened first, so a missing file is reported missing and
+/// one that cannot be opened, such as for a permission error, is reported
+/// with its error, never taken as missing. The agent's own loader then reads
+/// the file just opened. node-agent offers no loader that only loads, so a
+/// key deleted between the two calls would be created again.
+///
+/// # Errors
+///
+/// A one-line reason when the file is missing, cannot be read or is not a
+/// key.
+fn load_local_key(node_data_dir: &Path) -> Result<quoro_node_agent::localkey::LocalKey, String> {
+    let key_file = node_data_dir.join(NODE_LOCAL_KEY_FILE);
+    match std::fs::File::open(&key_file) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "it is sealed and {} is missing",
+                key_file.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "it is sealed and {} cannot be read: {error}",
+                key_file.display()
+            ));
+        }
+    }
+    quoro_node_agent::localkey::LocalKey::load_or_create(node_data_dir)
+        .map_err(|error| format!("{}: {error}", key_file.display()))
+}
+
+/// Every lease the first write of a restore with `--accept-loss` would raise
+/// that is already at the token cap, as `(lease id, token)`, read-only from
+/// the restored database at `path`: the leases held, not revoked, by the
+/// machines that write removes when `primary-node` names `host_node`
+/// ([`restore_pending::to_remove`], [`restore_pending::leases_at_cap`], the
+/// same reads the primary's start makes).
+///
+/// # Errors
+///
+/// [`Error::Failed`] when the restored nodes or leases cannot be read.
+async fn leases_at_cap(path: &Path, host_node: Option<&str>) -> Result<Vec<(String, i64)>, Error> {
+    let options = SqliteConnectOptions::new().filename(path).read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|error| failed(format!("cannot open the restored database: {error}")))?;
+    let at_cap = match pool.acquire().await {
+        Ok(mut conn) => match restore_pending::to_remove(&mut conn, host_node).await {
+            Ok(lost) => restore_pending::leases_at_cap(&mut conn, &lost)
+                .await
+                .map_err(|error| format!("cannot read the restored lease tokens: {error}")),
+            Err(reason) => Err(reason),
+        },
+        Err(error) => Err(format!("cannot read the restored database: {error}")),
+    };
+    pool.close().await;
+    at_cap.map_err(failed)
 }
 
 /// The head of the change log in the database at `path`, read-only: the
@@ -1016,10 +1454,12 @@ struct Command {
     data_dir: PathBuf,
     backup: Option<String>,
     node_id: Option<String>,
+    accept_loss: Option<String>,
     dry_run: bool,
 }
 
-/// The value flags of `quoro restore`; `--dry-run` carries no value.
+/// The value flags of `quoro restore`; `--dry-run` and `--accept-loss` carry
+/// no value.
 const VALUE_FLAGS: &[&str] = &[
     "endpoint",
     "region",
@@ -1033,11 +1473,13 @@ const VALUE_FLAGS: &[&str] = &[
     "data-dir",
     "backup",
     "node-id",
+    "statement",
 ];
 
 fn parse_args(args: &[String]) -> Result<Command, Error> {
     let mut flags: Vec<(String, String)> = Vec::new();
     let mut dry_run = false;
+    let mut accept_loss = false;
     let mut args = args.iter();
     while let Some(argument) = args.next() {
         let Some(name) = argument.strip_prefix("--") else {
@@ -1045,6 +1487,10 @@ fn parse_args(args: &[String]) -> Result<Command, Error> {
         };
         if name == "dry-run" {
             dry_run = true;
+            continue;
+        }
+        if name == "accept-loss" {
+            accept_loss = true;
             continue;
         }
         if !VALUE_FLAGS.contains(&name) {
@@ -1072,6 +1518,23 @@ fn parse_args(args: &[String]) -> Result<Command, Error> {
             "--node-id '{node_id}' is not nod_ followed by 26 Crockford base32 characters"
         )));
     }
+    let accept_loss = match (accept_loss, value("statement")) {
+        (true, None) => {
+            return Err(Error::Usage(
+                "restore --accept-loss needs --statement \"<text>\"".to_string(),
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(Error::Usage(
+                "restore --statement needs --accept-loss".to_string(),
+            ));
+        }
+        (true, Some(statement)) => {
+            check_statement(&statement)?;
+            Some(statement)
+        }
+        (false, None) => None,
+    };
     Ok(Command {
         endpoint: required("endpoint")?,
         region: required("region")?,
@@ -1085,6 +1548,28 @@ fn parse_args(args: &[String]) -> Result<Command, Error> {
         data_dir: PathBuf::from(required("data-dir")?),
         backup: value("backup"),
         node_id,
+        accept_loss,
         dry_run,
     })
+}
+
+/// The statement of `--accept-loss` (section 8.2, "Override"): not blank,
+/// and not a value that starts with `--`, which is a flag the shell passed
+/// in its place, such as `--statement --dry-run`.
+///
+/// # Errors
+///
+/// [`Error::Usage`] for such a statement.
+fn check_statement(statement: &str) -> Result<(), Error> {
+    if statement.trim().is_empty() {
+        return Err(Error::Usage(
+            "restore --statement needs a non-empty statement".to_string(),
+        ));
+    }
+    if statement.starts_with("--") {
+        return Err(Error::Usage(format!(
+            "restore --statement '{statement}' starts with --; give the statement itself, quoted"
+        )));
+    }
+    Ok(())
 }

@@ -1093,7 +1093,7 @@ async fn declare_lost_tx(
 ///    as its holder, `local` and `expiring`, a revoked one included, and
 ///    records it revoked in the primary's view, keeping an earlier
 ///    `revoked_at`, with the node still named as the last holder, one
-///    change-log entry per lease ([`crate::leases::bump_tokens`], ADR 0202);
+///    change-log entry per lease ([`raise_lost_leases`], ADR 0202);
 /// 2. sets `nodes.lost_at`, after those revokes, so `revoked_at <= lost_at`
 ///    holds for each row this write revokes ([`crate::leases::is_released`]);
 ///    a kept earlier `revoked_at` is earlier only on the clock that wrote it,
@@ -1149,22 +1149,7 @@ pub(crate) async fn declare_lost_write(
     if lost_at.is_some() {
         return Ok(None);
     }
-    // Every row that names the node, a revoked one included (ADR 0202);
-    // `bump_tokens` keeps an earlier `revoked_at`. A row already revoked at
-    // the cap ([`crate::leases::MAX_TOKEN`]) is left out: no grant ever
-    // issues a token past the cap, so the row is never granted again, and
-    // raising it would refuse every declaration of the node. An unrevoked
-    // row at the cap still refuses the declaration with `token_exhausted` in
-    // `bump_tokens` (ADR 0325).
-    let named: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM leases WHERE holder_node_id = ? \
-         AND (revoked_at IS NULL OR fencing_token < ?) ORDER BY id",
-    )
-    .bind(node_id)
-    .bind(crate::leases::MAX_TOKEN)
-    .fetch_all(&mut *conn)
-    .await?;
-    crate::leases::bump_tokens(conn, &named, node_id, actor).await?;
+    raise_lost_leases(conn, node_id, actor).await?;
     // Taken after the revokes, so `revoked_at <= lost_at` holds for each row
     // this write revokes ([`crate::leases::is_released`]); an earlier
     // `revoked_at` it keeps is earlier only on the clock that wrote it.
@@ -1177,6 +1162,42 @@ pub(crate) async fn declare_lost_write(
     Ok(Some(
         changelog::append(conn, actor, "node", node_id, Op::Update, payload).await?,
     ))
+}
+
+/// The lease raise of [`declare_lost_write`], step 1, alone: it raises the
+/// token of every lease row that names `node_id` as its holder by one and
+/// records it revoked, keeping an earlier `revoked_at`
+/// ([`crate::leases::bump_tokens`]), one change-log entry per row. It touches
+/// no node row and sets no `lost_at`. The `--accept-loss` first write of a
+/// restored primary raises the rows of each machine it removes with it
+/// ([`crate::restore_pending`]).
+///
+/// Every row that names the node is raised, a revoked one included (ADR
+/// 0202). A row already revoked at the cap ([`crate::leases::MAX_TOKEN`]) is
+/// left out: no grant ever issues a token past the cap, so the row is never
+/// granted again, and raising it would refuse every declaration of the
+/// node. An unrevoked row at the cap still refuses with `token_exhausted` in
+/// `bump_tokens` (ADR 0325), before anything is written. Returns the raised
+/// rows, by id.
+///
+/// # Errors
+///
+/// `conflict` with `reason: token_exhausted` at the cap, or a database
+/// error.
+pub(crate) async fn raise_lost_leases(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    actor: &Actor,
+) -> Result<Vec<crate::leases::Lease>, ApiError> {
+    let named: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM leases WHERE holder_node_id = ? \
+         AND (revoked_at IS NULL OR fencing_token < ?) ORDER BY id",
+    )
+    .bind(node_id)
+    .bind(crate::leases::MAX_TOKEN)
+    .fetch_all(&mut *conn)
+    .await?;
+    crate::leases::bump_tokens(conn, &named, node_id, actor).await
 }
 
 /// Removes a node from the cluster (`node-agent-protocol.md` section 10):

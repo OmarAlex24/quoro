@@ -110,7 +110,7 @@ async fn move_primary(store: &Store, node_id: &str) -> Result<Moved, String> {
         .begin_write()
         .await
         .map_err(|error| format!("cannot move the primary status: {error}"))?;
-    let moved = move_in(&mut w.tx, node_id).await?;
+    let moved = move_in(&mut w.tx, node_id, None).await?;
     if let Moved::Yes { .. } = moved {
         w.commit()
             .await
@@ -119,16 +119,38 @@ async fn move_primary(store: &Store, node_id: &str) -> Result<Moved, String> {
     Ok(moved)
 }
 
-/// The move itself, inside the caller's write transaction, which it does not
-/// commit: the two node updates, their change-log entries and the audit
-/// record. It reads before it writes, so [`Moved::No`] has written nothing.
+/// What the node `primary-node` names is to the primary status
+/// ([`read_named`]).
+pub(crate) enum Named {
+    /// A node of the database, not `removed`, that does not hold the status:
+    /// [`move_in`] moves it there.
+    Takes,
+    /// A node of the database, not `removed`, that already holds the status:
+    /// [`move_in`] writes nothing.
+    Holds,
+    /// A node the primary cannot use, and why: [`move_in`] writes nothing.
+    Unusable(&'static str),
+}
+
+impl Named {
+    /// Whether that node holds the primary status once [`move_in`] ran.
+    pub(crate) fn holds_after_move(&self) -> bool {
+        !matches!(self, Named::Unusable(_))
+    }
+}
+
+/// Reads on `conn` what `node_id`, the node `primary-node` names, is to the
+/// primary status, as [`move_in`] reads it before it moves anything.
 ///
 /// # Errors
 ///
-/// A database error, after which the caller drops the transaction.
-pub(crate) async fn move_in(conn: &mut SqliteConnection, node_id: &str) -> Result<Moved, String> {
+/// A database error.
+pub(crate) async fn read_named(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+) -> Result<Named, String> {
     if !quoro_types::is_id(quoro_types::Prefix::Node, node_id) {
-        return Ok(Moved::No("the file does not hold a nod_ id"));
+        return Ok(Named::Unusable("the file does not hold a nod_ id"));
     }
     let status: Option<(String, Option<String>)> =
         sqlx::query_as("SELECT status, cp_status FROM nodes WHERE id = ?")
@@ -136,15 +158,39 @@ pub(crate) async fn move_in(conn: &mut SqliteConnection, node_id: &str) -> Resul
             .fetch_optional(&mut *conn)
             .await
             .map_err(|error| format!("cannot read the node named by primary-node: {error}"))?;
-    match status {
-        None => return Ok(Moved::No("the database holds no such node")),
-        Some((status, _)) if status == "removed" => {
-            return Ok(Moved::No("the node is removed"));
-        }
-        Some((_, Some(cp_status))) if cp_status == "primary" => {
-            return Ok(Moved::No("the node already holds the primary status"));
-        }
-        Some(_) => {}
+    Ok(match status {
+        None => Named::Unusable("the database holds no such node"),
+        Some((status, _)) if status == "removed" => Named::Unusable("the node is removed"),
+        Some((_, Some(cp_status))) if cp_status == "primary" => Named::Holds,
+        Some(_) => Named::Takes,
+    })
+}
+
+/// The move itself, inside the caller's write transaction, which it does not
+/// commit: the two node updates, their change-log entries and the audit
+/// record. It reads before it writes ([`read_named`]), so [`Moved::No`] has
+/// written nothing.
+///
+/// `held_before` is the node that held the primary status when the caller's
+/// write began, given only by a caller whose write cleared it before the move:
+/// the restored primary's first write after a restore with `--accept-loss`,
+/// whose removals clear it ([`crate::restore_pending`]); `cluster.primary_moved`
+/// names it as `from_node_id`. With `None`, as from [`move_primary`] and from a
+/// first write without `--accept-loss`, the move names the node that holds the
+/// status when it runs.
+///
+/// # Errors
+///
+/// A database error, after which the caller drops the transaction.
+pub(crate) async fn move_in(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    held_before: Option<&str>,
+) -> Result<Moved, String> {
+    match read_named(&mut *conn, node_id).await? {
+        Named::Takes => {}
+        Named::Holds => return Ok(Moved::No("the node already holds the primary status")),
+        Named::Unusable(reason) => return Ok(Moved::No(reason)),
     }
 
     let actor = Actor::system(ACTOR);
@@ -181,7 +227,10 @@ pub(crate) async fn move_in(conn: &mut SqliteConnection, node_id: &str) -> Resul
 
     // The cluster has one primary (D-0016); `from_node_id` is null when no node
     // held the status.
-    let from = holders.into_iter().next().map(|(id,)| id);
+    let from = match held_before {
+        Some(holder) => Some(holder.to_string()),
+        None => holders.into_iter().next().map(|(id,)| id),
+    };
     let record = Record {
         actor,
         agent_model: None,
