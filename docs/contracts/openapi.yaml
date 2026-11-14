@@ -5796,7 +5796,9 @@ components:
           description: |
             Call parameters, with secrets redacted; `{}` when the record keeps
             their digest instead, or when the request body was above the
-            limit (README.md, "Request body limit").
+            limit (README.md, "Request body limit"). Records an earlier build
+            wrote for an approve or deny call with no body carry `null`
+            (audit-log-format.md section 2).
         params_sha256:
           type: [string, 'null']
           pattern: '^[0-9a-f]{64}$'

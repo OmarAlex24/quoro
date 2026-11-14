@@ -56,7 +56,7 @@ An audit record has no prefixed id; it is identified by its `seq`, which is gap-
 
 Absent optional fields are **omitted from the JSON**, not set to `null`. This matters because the hash covers the serialized object: `null` and "absent" would otherwise be two encodings of the same record with different hashes (section 5).
 
-`params` is always an object, except in records an earlier build wrote for `POST /api/v1/approvals/{approval_id}/approve` or `.../deny` sent with no request body, whether the decision was made, refused or failed: those carry `params` `null`. The log is append-only, so they keep it, their hash covers that `null`, and a promotion's rebuild keeps it as stored (node-agent-protocol.md section 7.3 step 4).
+`params` is always an object, except in records an earlier build wrote for `POST /api/v1/approvals/{approval_id}/approve` or `POST /api/v1/approvals/{approval_id}/deny` sent with no request body, or with a body but no `Content-Type` header, which the call reads as none, whether the decision was made, refused or failed: those carry `params` `null`. The log is append-only, so they keep it, their hash covers that `null`, and a promotion's rebuild keeps it as stored (node-agent-protocol.md sections 5.14 and 7.3 step 4).
 
 ### 2.1 Example: the M3 demo restart, by an agent, through MCP
 

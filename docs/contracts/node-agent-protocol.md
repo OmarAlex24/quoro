@@ -1073,7 +1073,7 @@ The `payload` depends on `op` (ADR 0297):
 
 A column with no field of its own in the API object travels under the column's name. An app's `warm_node_id`, `warm_node_pinned` and `warm_interval_s` do so in a whole-App payload, and a partial app payload omits them (`db-schema.sql` header, ADR 0286). A payload field with no column is ignored, whether it is a field the primary derives on read, such as `App.warm`, which is null, or a column a later migration dropped.
 
-A BLOB column travels as lowercase hex text, except `node_key_custody.sealed`, which travels as standard base64 with padding (migration 0012). A TEXT column that holds JSON travels as that JSON value, such as an object or an array, not as a string that holds its text. A rebuild turns each back into what the column stores: the bytes, or the JSON text (section 7.3 step 4).
+A BLOB column travels as lowercase hex text, except `node_key_custody.sealed`, which travels as standard base64 with padding (migration 0012). A TEXT column that holds JSON travels as that JSON value, such as an object or an array, not as a string that holds its text. A rebuild turns each back into what the column stores: the bytes, or the JSON text (section 7.3 step 4). A JSON `null` comes back as SQL `NULL` in a nullable column, and as the text `null` in a `NOT NULL` column that holds JSON, as the primary stores it there (an audit record's `params`, `audit-log-format.md` section 2).
 
 ```json
 {
