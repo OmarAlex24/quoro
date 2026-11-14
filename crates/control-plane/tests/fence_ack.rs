@@ -2208,9 +2208,9 @@ async fn acks_a_lease_another_node_holds_at(row_token: i64) {
 
     let command = of_type(&recv_until(&mut socket, &["command"]).await, "command")[0].clone();
     assert_eq!(command["body"]["kind"], "fence_ack", "{command}");
-    // Read once the `fence_ack` is out: the session rebuilds its desired
-    // state for the acknowledgement before it sends it, so a write of that
-    // rebuild would be counted here every time.
+    // Read once the `fence_ack` is out: in the usual order the session
+    // rebuilds its desired state for the acknowledgement before it sends it,
+    // so a write of that rebuild would be counted here.
     let entries = entries_after(&server, before).await;
     assert_eq!(entries.len(), 1, "{entries:?}");
     let (_, kind, id, payload) = &entries[0];
