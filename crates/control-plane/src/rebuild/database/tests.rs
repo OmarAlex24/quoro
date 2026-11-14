@@ -688,8 +688,9 @@ async fn a_json_null_fills_a_column_as_the_column_holds_it() {
     }
 }
 
-/// An approval decided with no body writes its audit record with `params`
-/// `null` (`service::approvals::decide`): the primary stores the text
+/// An approval decided with no body before #970 wrote its audit record with
+/// `params` `null` (`service::approvals::decide`), and the log keeps such
+/// records as they were written: the primary stores the text
 /// `null`, the record's entry carries JSON `null`, and the built database
 /// stores the text `null`, whose record the build's audit chain check
 /// verifies. The app's nullable `source` stays NULL.

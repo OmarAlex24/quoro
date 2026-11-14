@@ -413,6 +413,182 @@ async fn deny_creates_no_grant_and_a_second_decision_conflicts() {
     assert_eq!((status, code.as_str()), (409, "conflict"));
 }
 
+/// The stored `params` of the newest audit record of `operation` with
+/// `result`, and the JSON type SQLite reads in it.
+async fn decision_params(server: &Server, operation: &str, result: &str) -> (Value, String) {
+    let (params, kind): (String, String) = sqlx::query_as(
+        "SELECT params, json_type(params) FROM audit_log \
+         WHERE operation = ? AND result = ? ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(operation)
+    .bind(result)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    (serde_json::from_str(&params).unwrap(), kind)
+}
+
+const APPROVE: &str = "POST /api/v1/approvals/{approval_id}/approve";
+const DENY: &str = "POST /api/v1/approvals/{approval_id}/deny";
+
+/// A server with app `web` in project `demo` and the token of an agent that
+/// may file approval requests for it: the server, the owner, the token and
+/// the app id.
+async fn with_a_filing_agent() -> (Server, reqwest::Client, String, String) {
+    let server = start().await;
+    let owner = server.owner().await;
+    let owner_user_id = owner_id(&owner, &server).await;
+    let project_id = create_project(&owner, &server, "demo").await;
+    let app_id = create_app(&owner, &server, &project_id, "web").await;
+    let agent_id = create_agent(&owner, &server, "deleter", &owner_user_id).await;
+    create_grant(
+        &owner,
+        &server,
+        grant_body(
+            &agent_id,
+            &["approval:create"],
+            json!({ "projects": ["demo"] }),
+        ),
+    )
+    .await;
+    let token = token_for(&owner, &server, &agent_id).await;
+    (server, owner, token, app_id)
+}
+
+/// How many audit records of a decision keep `params` as anything but an
+/// object.
+async fn decisions_without_object_params(server: &Server) -> i64 {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM audit_log WHERE operation IN (?, ?) \
+         AND json_type(params) != 'object'",
+    )
+    .bind(APPROVE)
+    .bind(DENY)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    count
+}
+
+#[tokio::test]
+async fn approving_without_a_body_records_params_as_an_empty_object() {
+    let (server, owner, token, app_id) = with_a_filing_agent().await;
+    let approval = file_pending(&server, &token, &app_id, json!({ "app_id": app_id })).await;
+    let approval_id = approval["id"].as_str().unwrap().to_string();
+
+    // The owner's approval with no body records `{}` (audit-log-format.md
+    // section 2), not `null`.
+    let res = decide(&owner, &server, &approval_id, true, None).await;
+    assert_eq!(res.status(), 200);
+    let approved: Value = res.json().await.unwrap();
+    assert_eq!(approved["status"], "approved", "{approved}");
+    assert!(approved["grant_id"].is_string(), "{approved}");
+    assert_eq!(
+        decision_params(&server, APPROVE, "ok").await,
+        (json!({}), "object".to_string())
+    );
+
+    // So does an agent's refused attempt with no body.
+    let res = reqwest::Client::new()
+        .post(server.url(&format!("/api/v1/approvals/{approval_id}/approve")))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    let (status, code, reason) = problem(res).await;
+    assert_eq!((status, code.as_str()), (403, "forbidden"));
+    assert_eq!(reason.as_deref(), Some("human_only"));
+    assert_eq!(
+        decision_params(&server, APPROVE, "refused").await,
+        (json!({}), "object".to_string())
+    );
+    assert_eq!(decisions_without_object_params(&server).await, 0);
+}
+
+#[tokio::test]
+async fn denying_without_a_body_records_params_as_an_empty_object() {
+    let (server, owner, token, app_id) = with_a_filing_agent().await;
+    let approval = file_pending(&server, &token, &app_id, json!({ "app_id": app_id })).await;
+    let approval_id = approval["id"].as_str().unwrap().to_string();
+
+    // The owner's denial with no body records `{}` (audit-log-format.md
+    // section 2), not `null`.
+    let res = decide(&owner, &server, &approval_id, false, None).await;
+    assert_eq!(res.status(), 200, "deny: {}", res.text().await.unwrap());
+    assert_eq!(
+        decision_params(&server, DENY, "ok").await,
+        (json!({}), "object".to_string())
+    );
+
+    // So does a second denial with no body, which conflicts.
+    let (status, code, _) = problem(decide(&owner, &server, &approval_id, false, None).await).await;
+    assert_eq!((status, code.as_str()), (409, "conflict"));
+    assert_eq!(
+        decision_params(&server, DENY, "error").await,
+        (json!({}), "object".to_string())
+    );
+
+    // A JSON body that is neither an object nor an array is refused before
+    // any decision: the request stays pending and no record keeps it.
+    let approval = file_pending(&server, &token, &app_id, json!({ "app_id": app_id })).await;
+    let pending_id = approval["id"].as_str().unwrap().to_string();
+    for body in ["null", "\"deny\"", "1", "true"] {
+        let res = owner
+            .post(server.url(&format!("/api/v1/approvals/{pending_id}/deny")))
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let (status, code, _) = problem(res).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (422, "validation_failed"),
+            "{body}"
+        );
+    }
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM approvals WHERE id = ?")
+        .bind(&pending_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(status, "pending");
+    assert_eq!(decisions_without_object_params(&server).await, 0);
+    let (records,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM audit_log WHERE target_id = ? AND operation IN (?, ?)",
+    )
+    .bind(&pending_id)
+    .bind(APPROVE)
+    .bind(DENY)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(records, 0, "a refused body writes no decision record");
+}
+
+#[tokio::test]
+async fn a_decision_with_a_body_records_the_body_as_its_params() {
+    let (server, owner, token, app_id) = with_a_filing_agent().await;
+
+    let approval = file_pending(&server, &token, &app_id, json!({ "app_id": app_id })).await;
+    let approval_id = approval["id"].as_str().unwrap().to_string();
+    let res = decide(&owner, &server, &approval_id, true, Some("ok, remove it")).await;
+    assert_eq!(res.status(), 200, "approve: {}", res.text().await.unwrap());
+    assert_eq!(
+        decision_params(&server, APPROVE, "ok").await,
+        (json!({ "note": "ok, remove it" }), "object".to_string())
+    );
+
+    let approval = file_pending(&server, &token, &app_id, json!({ "app_id": app_id })).await;
+    let approval_id = approval["id"].as_str().unwrap().to_string();
+    let res = decide(&owner, &server, &approval_id, false, Some("not now")).await;
+    assert_eq!(res.status(), 200, "deny: {}", res.text().await.unwrap());
+    assert_eq!(
+        decision_params(&server, DENY, "ok").await,
+        (json!({ "note": "not now" }), "object".to_string())
+    );
+}
+
 #[tokio::test]
 async fn an_expired_request_cannot_be_approved_and_the_sweeper_marks_it() {
     let server = start().await;
