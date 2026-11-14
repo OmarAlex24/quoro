@@ -8153,7 +8153,11 @@ paths:
         (node-agent-protocol.md section 5.17), and nothing moved. That event
         opens no incident, except after the source's own failed fence: the
         app then stays down until `failoverApp` moves it, so it opens one as
-        at `move`, which that move's `app.failed_over` resolves. When a step after the
+        at `move`, which that move's `app.failed_over` resolves. After another
+        node's failed fence, while the source still reports the app frozen,
+        it opens one per app, which the next thaw that resumes the app, or
+        that app's `app.failed_over`, resolves (permission-model.md section
+        8.2). When a step after the
         revoke fails, it ends with `app.switchover_failed` at `step` `move`,
         which opens an incident: the lease stays revoked, the app stays
         stopped on its node or, when the node did not confirm the stop, may
