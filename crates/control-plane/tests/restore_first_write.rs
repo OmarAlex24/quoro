@@ -329,37 +329,10 @@ async fn open_state(dir: &Path) -> Result<AppState, String> {
 
 /// Both steps of the marker as a start runs them, [`restore_pending::check`]
 /// and then [`restore_pending::apply`], here with no migration pending
-/// between them. The node agent's data directory is [`node_dir`] in `dir`,
-/// which holds no store unless the test writes one ([`agent_store`]).
+/// between them.
 async fn check_and_apply(store: &Store, dir: &Path) -> Result<Applied, String> {
-    let pending = restore_pending::check_with_node_data_dir(store, dir, &node_dir(dir)).await?;
+    let pending = restore_pending::check(store, dir).await?;
     restore_pending::apply(store, dir, pending).await
-}
-
-/// The data directory of the new host's node agent in the test's `dir`.
-fn node_dir(dir: &Path) -> std::path::PathBuf {
-    dir.join("node-agent")
-}
-
-/// Writes the node agent's store into `node_data_dir`, as the agent keeps
-/// it (node-agent-protocol.md section 12), with `term` as the highest term
-/// it has seen (`node_meta.highest_term`).
-async fn agent_store(node_data_dir: &Path, term: u64) {
-    std::fs::create_dir_all(node_data_dir).unwrap();
-    let options = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(node_data_dir.join("node.db"))
-        .create_if_missing(true);
-    let mut conn = sqlx::ConnectOptions::connect(&options).await.unwrap();
-    sqlx::query("CREATE TABLE node_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        .execute(&mut conn)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO node_meta (key, value) VALUES ('highest_term', ?)")
-        .bind(term.to_string())
-        .execute(&mut conn)
-        .await
-        .unwrap();
-    sqlx::Connection::close(conn).await.unwrap();
 }
 
 /// `meta.term`.
@@ -2070,28 +2043,26 @@ async fn the_first_write_starts_one_above_the_restored_logs_terms() {
 }
 
 /// `backup-format.md` section 8.2, "Term": the restored primary also starts
-/// above the highest term this host's node agent stored
-/// (`node_meta.highest_term` in its store, node-agent-protocol.md section
-/// 12), read from the agent's store. An agent at term 9 over a database at
-/// term 1 starts the primary at 10. An agent below the database's term
-/// changes nothing: the database's 12 gives 13.
+/// above the term this host's node agent stored. `quoro restore` reads that
+/// term, as root, and raises the restored `meta.term` to it before it
+/// installs the database; the start reads no store of the agent. Here the
+/// log's entries are below 9 and `quoro restore` raised `meta.term` to the
+/// agent's 9: the first write starts at 10, and every entry it appends
+/// carries 10.
 #[tokio::test]
-async fn the_first_write_starts_one_above_the_term_this_hosts_agent_stored() {
+async fn the_first_write_starts_one_above_the_agents_term_quoro_restore_installed() {
     let (dir, store, _old, head) = restored().await;
     ensure_cluster_meta(&store).await.unwrap();
-    agent_store(&node_dir(&dir), 9).await;
+    let log = terms_after(&store, 0).await.into_iter().max().unwrap();
+    assert!(
+        log < 9,
+        "the log's entries are below the agent's term: {log}"
+    );
+    set_term(&store, 9).await;
     write_marker(&dir, &Marker::plain(head.clone()));
     check_and_apply(&store, &dir).await.unwrap();
     assert_eq!(meta_term(&store).await.as_deref(), Some("10"));
     assert_eq!(terms_after(&store, head.seq).await, vec![10, 10]);
-
-    let (dir, store, _old, head) = restored().await;
-    ensure_cluster_meta(&store).await.unwrap();
-    set_term(&store, 12).await;
-    agent_store(&node_dir(&dir), 9).await;
-    write_marker(&dir, &Marker::plain(head));
-    check_and_apply(&store, &dir).await.unwrap();
-    assert_eq!(meta_term(&store).await.as_deref(), Some("13"));
 }
 
 /// Asserts that the first write wrote nothing: the log's head, `meta.term`,
@@ -2115,15 +2086,17 @@ async fn assert_nothing_written(
 }
 
 /// #862, node-agent-protocol.md section 8.8, "The term ceiling": a restored
-/// primary whose first term would pass 2^53 - 1 writes nothing. The first
-/// step of the start reads the terms and stops it, before the migrations,
-/// with the marker and `primary-node` left in place. The write itself
-/// refuses too, as a backstop, for a term it reads above the check's.
+/// primary whose first term would pass 2^53 - 1 writes nothing. Here
+/// `quoro restore` installed `meta.term` at the ceiling, the term of an agent
+/// at the ceiling. The first step of the start reads the terms and stops it,
+/// before the migrations, with the marker and `primary-node` left in place.
+/// The write itself refuses too, as a backstop, for a term it reads above
+/// the check's.
 #[tokio::test]
 async fn a_first_term_past_the_term_ceiling_writes_nothing_and_stops_the_start() {
     let (dir, store, _old, head) = restored().await;
     ensure_cluster_meta(&store).await.unwrap();
-    agent_store(&node_dir(&dir), MAX_TERM).await;
+    set_term(&store, i64::try_from(MAX_TERM).unwrap()).await;
     write_marker(&dir, &forced(&head));
     write_primary_node(&dir);
     let audit_before = audit_head(&store).await;
@@ -2131,15 +2104,13 @@ async fn a_first_term_past_the_term_ceiling_writes_nothing_and_stops_the_start()
     let error = check_and_apply(&store, &dir).await.unwrap_err();
     assert!(error.contains("term ceiling"), "{error}");
     assert!(error.contains("nothing was written"), "{error}");
-    assert_nothing_written(&store, &dir, &head, "1", audit_before).await;
+    assert_nothing_written(&store, &dir, &head, &MAX_TERM.to_string(), audit_before).await;
     assert!(!store.restarts_on_a_higher_term());
 
-    // Without the agent's term the check passes; the database's term then
-    // reaches the ceiling before the write runs.
-    std::fs::remove_dir_all(node_dir(&dir)).unwrap();
-    let pending = restore_pending::check_with_node_data_dir(&store, &dir, &node_dir(&dir))
-        .await
-        .unwrap();
+    // Below the ceiling the check passes; the database's term then reaches
+    // the ceiling before the write runs.
+    set_term(&store, 1).await;
+    let pending = restore_pending::check(&store, &dir).await.unwrap();
     set_term(&store, i64::try_from(MAX_TERM).unwrap()).await;
     let error = restore_pending::apply(&store, &dir, pending)
         .await
@@ -2152,12 +2123,13 @@ async fn a_first_term_past_the_term_ceiling_writes_nothing_and_stops_the_start()
 
 /// node-agent-protocol.md section 8.8: only a primary restored with
 /// `--accept-loss` starts again on a higher term until its first
-/// `lease_grant`; a plain restore does not. A marker that a crash after the
-/// first write's commit left behind, which the next start deletes, keeps
-/// that: the process that committed stopped before it served, so it sent no
-/// `lease_grant`.
+/// `lease_grant`, and only in the process that made the first write; a plain
+/// restore does not. A start that finds the marker of a first write already
+/// committed, which it deletes, does not get it either, after `--accept-loss`
+/// too: the process before it may have served and sent a `lease_grant`
+/// before its deletion of the marker failed.
 #[tokio::test]
-async fn only_an_accept_loss_restore_starts_again_on_a_higher_term() {
+async fn only_the_process_of_an_accept_loss_first_write_starts_again_on_a_higher_term() {
     let (dir, store, _old, head) = restored().await;
     ensure_cluster_meta(&store).await.unwrap();
     write_marker(&dir, &Marker::plain(head.clone()));
@@ -2186,5 +2158,6 @@ async fn only_an_accept_loss_restore_starts_again_on_a_higher_term() {
         check_and_apply(&next, &dir).await.unwrap(),
         Applied::AlreadyWritten
     );
-    assert!(next.restarts_on_a_higher_term());
+    assert!(!next.restarts_on_a_higher_term());
+    assert!(!exists(&dir, restore_pending::MARKER_FILE));
 }

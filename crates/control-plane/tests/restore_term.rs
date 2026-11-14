@@ -12,7 +12,8 @@
 //! Each test restores a primary's database as `quoro restore` installs it,
 //! with the `restore-pending` marker and `primary-node` naming the new host's
 //! node, and starts a control plane on it. The new host's node then dials it
-//! as a fake machine.
+//! as a fake machine. No test reads a node agent's store: the start reads
+//! none, as `quoro restore` already raised `meta.term` to the agent's term.
 
 mod common;
 
@@ -54,6 +55,13 @@ struct Restored {
 /// `restore-pending` marker naming the copy's log head and `primary-node`
 /// naming the new host's node; then a control plane starts on the copy.
 async fn restored(accept_loss: bool) -> Restored {
+    restored_with(accept_loss, false).await
+}
+
+/// [`restored`]. With `marker_left_behind`, an earlier process made the
+/// first write, then its deletion of the marker failed: the control plane
+/// that starts finds the marker already written.
+async fn restored_with(accept_loss: bool, marker_left_behind: bool) -> Restored {
     let old = start_with_patient_node_session().await;
     let owner = old.owner().await;
     let host = enroll(&old, &owner, "new-host", &["node"]).await;
@@ -96,6 +104,21 @@ async fn restored(accept_loss: bool) -> Restored {
         format!("{}\n", host.node_id),
     )
     .unwrap();
+    // The earlier process has its own store, so its exception for a higher
+    // term is not this start's, and the start opens the database after it.
+    let store = if marker_left_behind {
+        store.pool().close().await;
+        let earlier = Store::open(&database).await.unwrap();
+        let pending = restore_pending::check(&earlier, &dir).await.unwrap();
+        restore_pending::apply(&earlier, &dir, pending)
+            .await
+            .unwrap();
+        earlier.pool().close().await;
+        std::fs::write(dir.join(restore_pending::MARKER_FILE), marker.to_bytes()).unwrap();
+        Store::open(&database).await.unwrap()
+    } else {
+        store
+    };
     let mut config = (*old.state.config).clone();
     config.data_dir = dir.to_path_buf();
     let state = quoro_control_plane::AppState::open(
@@ -109,9 +132,10 @@ async fn restored(accept_loss: bool) -> Restored {
     let server = common::serve_in(dir, state).await;
     assert_eq!(
         server.state.store.restarts_on_a_higher_term(),
-        accept_loss,
-        "only an --accept-loss restore starts again on a higher term"
+        accept_loss && !marker_left_behind,
+        "only the process of an --accept-loss first write starts again on a higher term"
     );
+    assert!(!server.data_dir.join(restore_pending::MARKER_FILE).exists());
     Restored {
         server,
         host,
@@ -289,7 +313,9 @@ async fn an_accept_loss_primary_starts_again_above_a_voters_bad_message() {
 /// Once the restored primary has sent a `lease_grant`, here the `local`
 /// grant of a new volume's lease, a `stale_term` demotes it as any primary
 /// (section 7.4): every session ends with `not_primary`, it records the
-/// sender's term in `meta.demoted_by_term`, and `meta.term` stays.
+/// sender's term in `meta.demoted_by_term`, and `meta.term` stays. The
+/// exception ends before the grant leaves: held at its send, before its bytes
+/// go to the socket, the grant finds it already off.
 #[tokio::test]
 async fn after_its_first_lease_grant_an_accept_loss_primary_demotes_on_a_stale_term() {
     let r = restored(true).await;
@@ -335,15 +361,34 @@ async fn after_its_first_lease_grant_an_accept_loss_primary_demotes_on_a_stale_t
             None,
         )
         .await;
-    let res = owner
-        .post(r.server.url(&format!("/api/v1/apps/{app_id}/volumes")))
-        .json(&json!({ "size_gb": 5, "mount_path": "/data" }))
-        .send()
+    assert!(
+        r.server.state.store.restarts_on_a_higher_term(),
+        "no lease_grant went out before the volume's"
+    );
+    let hold = r.server.state.hub.hold_next_lease_grant(&r.host.node_id);
+    let volume = tokio::spawn({
+        let owner = owner.clone();
+        let url = r.server.url(&format!("/api/v1/apps/{app_id}/volumes"));
+        async move {
+            owner
+                .post(url)
+                .json(&json!({ "size_gb": 5, "mount_path": "/data" }))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    timeout(Duration::from_secs(10), hold.built())
         .await
-        .unwrap();
-    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+        .expect("the volume's lease_grant reaches its send within 10 s");
+    assert!(
+        !r.server.state.store.restarts_on_a_higher_term(),
+        "the exception ends before the lease_grant's bytes go out"
+    );
+    hold.release();
     on_host.until("lease_grant").await;
-    assert!(!r.server.state.store.restarts_on_a_higher_term());
+    let res = volume.await.unwrap();
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
 
     on_host.send(stale_term(first + 4), Some(&welcome_id)).await;
     let frames = until_closed(&mut on_host).await;
@@ -355,8 +400,15 @@ async fn after_its_first_lease_grant_an_accept_loss_primary_demotes_on_a_stale_t
 
 /// #862: a restart at one above an error's `term` that would pass the term
 /// ceiling, 2^53 - 1, demotes the primary restored with `--accept-loss`
-/// instead, for a `stale_term` and for a voter's `bad_message` alike. It
-/// records the error's term, and `meta.term` stays.
+/// instead, for a `stale_term` and for a voter's `bad_message` alike. The
+/// primary decides it when the error arrives and never tries the restart,
+/// whose write refuses such a term only as a backstop. It records the
+/// error's term, and `meta.term` stays.
+///
+/// Each half reads the demotion from the primary's state. The node ends the
+/// session of a `stale_term` itself, so its frames are not read; a voter's
+/// `bad_message` ends nothing by itself, so only the demotion closes that
+/// session, with `not_primary`.
 #[tokio::test]
 async fn a_restart_past_the_term_ceiling_demotes_an_accept_loss_primary() {
     let r = restored(true).await;
@@ -364,10 +416,14 @@ async fn a_restart_past_the_term_ceiling_demotes_an_accept_loss_primary() {
     let mut on_host = Machine::connect(&r.server, &r.host).await;
     let (welcome_id, _) = welcome(&on_host);
     on_host.send(stale_term(MAX_TERM), Some(&welcome_id)).await;
-    let frames = until_closed(&mut on_host).await;
-    assert!(not_primary(&frames), "{frames:?}");
-    assert_eq!(demoted_by_term(&r.server).await, MAX_TERM.to_string());
+    assert_eq!(
+        demoted_by_term(&r.server).await,
+        MAX_TERM.to_string(),
+        "a stale_term past the ceiling demotes the primary"
+    );
+    assert!(r.server.state.store.is_demoted());
     assert_eq!(term(&r.server).await, first);
+    until_closed(&mut on_host).await;
 
     let r = restored(true).await;
     let first = term(&r.server).await;
@@ -376,10 +432,38 @@ async fn a_restart_past_the_term_ceiling_demotes_an_accept_loss_primary() {
     on_host
         .send(voted_for_another(MAX_TERM), request["id"].as_str())
         .await;
+    assert_eq!(
+        demoted_by_term(&r.server).await,
+        MAX_TERM.to_string(),
+        "a voter's bad_message past the ceiling demotes the primary"
+    );
+    assert!(r.server.state.store.is_demoted());
+    assert_eq!(term(&r.server).await, first);
     let frames = until_closed(&mut on_host).await;
     assert!(not_primary(&frames), "{frames:?}");
-    assert_eq!(demoted_by_term(&r.server).await, MAX_TERM.to_string());
+}
+
+/// node-agent-protocol.md section 8.8: the exception lives only in the
+/// process that made the first write of an `--accept-loss` restore. Here an
+/// earlier process made it, then its deletion of the marker failed; it may
+/// have served and sent a `lease_grant` meanwhile. The start that finds the
+/// marker already written does not get the exception back: a `stale_term`
+/// demotes it as any primary (section 7.4), it records the sender's term,
+/// and `meta.term` stays.
+#[tokio::test]
+async fn a_start_that_finds_the_accept_loss_first_write_made_demotes_on_a_stale_term() {
+    let r = restored_with(true, true).await;
+    let first = term(&r.server).await;
+    assert!(first >= 2, "the earlier process's first write set the term");
+    let mut on_host = Machine::connect(&r.server, &r.host).await;
+    let (welcome_id, welcome_term) = welcome(&on_host);
+    assert_eq!(welcome_term, first);
+
+    on_host.send(stale_term(first + 4), Some(&welcome_id)).await;
+    assert_eq!(demoted_by_term(&r.server).await, (first + 4).to_string());
+    assert!(r.server.state.store.is_demoted());
     assert_eq!(term(&r.server).await, first);
+    until_closed(&mut on_host).await;
 }
 
 /// A plain restore has no exception: a voter's `bad_message` carrying its

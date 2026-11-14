@@ -857,12 +857,13 @@ impl Store {
     /// `backup-format.md` section 8.2, ADR 0261, ADR 0280). Reads memory
     /// only.
     ///
-    /// [`crate::restore_pending::apply`] turns it on at the first start after
-    /// such a restore, before the primary serves, and the first `lease_grant`
-    /// a session sends turns it off for good
+    /// [`crate::restore_pending::apply`] turns it on in the process that
+    /// makes the first write after such a restore, before the primary serves,
+    /// and the first `lease_grant` a session sends turns it off for good
     /// ([`Store::lease_grant_going_out`]). It lives in memory only: a
-    /// process started again finds it off, and demotes on a higher term as
-    /// any primary does, the safe side of the rule.
+    /// process started again, also one that finds the marker of a first write
+    /// already committed, finds it off, and demotes on a higher term as any
+    /// primary does, the safe side of the rule.
     #[must_use]
     pub fn restarts_on_a_higher_term(&self) -> bool {
         self.restarts.load(Ordering::SeqCst)
@@ -900,6 +901,13 @@ impl Store {
     /// holds no term ([`read_term`]); or a database error. The caller then
     /// demotes the primary.
     pub(crate) async fn restart_term(&self, error_term: u64) -> Result<TermRestart, String> {
+        // The caller decides a restart past the ceiling when the error
+        // arrives, and demotes instead (`NodeHub::start_again_above`); the
+        // refusal below is the backstop of a release build.
+        debug_assert!(
+            i64::try_from(error_term).is_ok_and(|term| term < MAX_TERM),
+            "a restart above term {error_term} passes the term ceiling; the caller demotes instead"
+        );
         let to = i64::try_from(error_term)
             .ok()
             .and_then(|term| term.checked_add(1))
