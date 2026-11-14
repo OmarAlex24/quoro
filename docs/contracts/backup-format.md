@@ -209,16 +209,16 @@ A control-plane backup is restored on a fresh host with the CLI (`quoro restore`
 | --- | --- |
 | The bucket's endpoint, region, bucket name, repository prefix and cluster id, plus a credential that may get and list | To read the repository |
 | The recovery key | To unwrap `repo_key` from the config object |
-| The cluster signing key file | To verify the seals, and so that the nodes, which pinned its public half at enrollment, accept the restored primary's desired state |
+| The cluster signing key file, and when `signing_keys` holds a `next` row the next key's file too | The signing key file verifies the seals and is the key the nodes pinned at enrollment, so they accept the restored primary's desired state; during a rotation, the next key's file is the key the machines that already moved pin (node-agent-protocol.md section 7.5) |
 | The cluster data-encryption key file | To read every `*_enc` column of the restored database: provider secrets, environment values, node credentials and `repo_key_enc` itself |
 
-The key files live in `/var/lib/quoro`, outside the database, and are backed up separately ([architecture.md](../architecture/architecture.md) section 6, "Cluster keys"). **They are not in the repository.** Without the signing key file, the restored primary cannot sign desired state that any enrolled node accepts. Without the data-encryption key file, every secret in the restored database is unreadable. In both cases `quoro restore` refuses to proceed, rather than install a primary that cannot work.
+The key files live in `/var/lib/quoro`, outside the database, and are backed up separately ([architecture.md](../architecture/architecture.md) section 6, "Cluster keys"). **They are not in the repository.** Without the signing key file, the restored primary cannot sign desired state that any enrolled node accepts. Without the data-encryption key file, every secret in the restored database is unreadable. In both cases `quoro restore` refuses to proceed, rather than install a primary that cannot work. A database backed up while a rotation ran, whose `signing_keys` holds a `next` row, needs the next key's file too. After the integrity check (step 5), `quoro restore` checks, when the restored `signing_keys` holds a `current` row, that the signing key file holds that row's key, and, when there is a `next` row, that the next key's file holds that row's key, both matched by key id (node-agent-protocol.md section 7.2). A database from before migration 0012 holds no `current` row, and its first start inserts the given key (node-agent-protocol.md section 7.1). A next key's file given for a database with no `next` row is refused. On any mismatch it refuses before installing anything. It installs the two as `keys/signing.key` and `keys/signing.next.key` (node-agent-protocol.md section 7.5). An operator backs up the key files again once `rotateSigningKey` answers `202`, which follows the step that writes the next key, and again once `Cluster.signing_key_rotation` reads null, after the step that drops the old key.
 
 The restore:
 
 1. lists the config objects and unwraps `repo_key` from the newest one the recovery key opens;
-2. checks that the config's `cluster_public_key` equals the public half of the given signing key;
-3. lists `seals/<cluster_id>/`, verifies each seal's signature with the given signing key, and picks the newest valid one, or the one the operator named;
+2. checks that the config's `cluster_public_key` equals the public half of the given current signing key;
+3. lists `seals/<cluster_id>/`, verifies each seal's signature with that key, and picks the newest valid one, or the one the operator named;
 4. reads and checks the manifest and the chunks as in section 8.1, writing the database file;
 5. runs SQLite's `PRAGMA integrity_check` on the file, and only then installs it with the key files into the new host's data directory.
 6. names the node on the new host that takes the primary status (below), by writing its `nod_` id to `primary-node` in the data directory, mode 0600.
