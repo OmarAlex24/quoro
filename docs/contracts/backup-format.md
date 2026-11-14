@@ -209,10 +209,10 @@ A control-plane backup is restored on a fresh host with the CLI (`quoro restore`
 | --- | --- |
 | The bucket's endpoint, region, bucket name, repository prefix and cluster id, plus a credential that may get and list | To read the repository |
 | The recovery key | To unwrap `repo_key` from the config object |
-| The cluster signing key file | To verify the seals, and so that the nodes, which pinned its public half at enrollment, accept the restored primary's desired state |
+| The cluster signing key file, and during a rotation the next key's file too | To verify the seals, and so that the nodes, which pinned its public half at enrollment, accept the restored primary's desired state |
 | The cluster data-encryption key file | To read every `*_enc` column of the restored database: provider secrets, environment values, node credentials and `repo_key_enc` itself |
 
-The key files live in `/var/lib/quoro`, outside the database, and are backed up separately ([architecture.md](../architecture/architecture.md) section 6, "Cluster keys"). **They are not in the repository.** Without the signing key file, the restored primary cannot sign desired state that any enrolled node accepts. Without the data-encryption key file, every secret in the restored database is unreadable. In both cases `quoro restore` refuses to proceed, rather than install a primary that cannot work.
+The key files live in `/var/lib/quoro`, outside the database, and are backed up separately ([architecture.md](../architecture/architecture.md) section 6, "Cluster keys"). **They are not in the repository.** Without the signing key file, the restored primary cannot sign desired state that any enrolled node accepts. Without the data-encryption key file, every secret in the restored database is unreadable. In both cases `quoro restore` refuses to proceed, rather than install a primary that cannot work. A database backed up while a rotation ran, whose `signing_keys` holds a `next` row, needs the next key's file too: `quoro restore` refuses without it, and installs the two as `keys/signing.key` and `keys/signing.next.key` (node-agent-protocol.md section 7.5).
 
 The restore:
 
