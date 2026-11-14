@@ -43,9 +43,11 @@
 //! restart. Running VMs, the engine, the mesh and the voter's vote state are
 //! untouched: the agent's own vote does not depend on the freeze.
 //!
-//! A promotion holds [`PromotionLock`] for its whole run. [`abort`] ends a
-//! freeze that a killed or interrupted command left, after a reboot too, and
-//! is refused while a promotion holds the lock.
+//! A promotion takes [`PromotionLock`] once its vote pre-check passed, just
+//! before it freezes the agent, and holds it to its end; its earlier
+//! refusals and its pre-check change nothing. [`abort`] ends a freeze that a
+//! killed or interrupted command left, after a reboot too, and is refused
+//! while a promotion holds the lock.
 
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -60,7 +62,8 @@ use crate::store::{NodeStore, PROMOTION_FREEZE, Refollowing, connect_options};
 use crate::util;
 
 /// File name of the promotion lock in the agent's data directory, mode
-/// `0600`: a promotion holds an exclusive `flock` on it for its whole run.
+/// `0600`: a promotion holds an exclusive `flock` on it from just before its
+/// freeze to its end.
 pub const PROMOTE_LOCK_FILE: &str = "promote.lock";
 
 /// How often the dial loop of a frozen agent checks whether the freeze
@@ -138,11 +141,11 @@ pub async fn is_frozen(store: &NodeStore) -> Result<bool, AgentError> {
     Ok(store.meta(PROMOTION_FREEZE).await?.is_some())
 }
 
-/// The exclusive advisory lock a promotion holds for its whole run (section
-/// 7.3 "`--abort`", ADR 0280): an `flock` on [`PROMOTE_LOCK_FILE`] in the
-/// agent's data directory. The kernel drops it when the holder exits, a
-/// killed one or a reboot included, so a lock is never left behind. Dropping
-/// the value releases it.
+/// The exclusive advisory lock a promotion holds from just before its freeze
+/// to its end (section 7.3 "`--abort`", ADR 0280): an `flock` on
+/// [`PROMOTE_LOCK_FILE`] in the agent's data directory. The kernel drops it
+/// when the holder exits, a killed one or a reboot included, so a lock is
+/// never left behind. Dropping the value releases it.
 #[derive(Debug)]
 pub struct PromotionLock {
     _file: std::fs::File,
