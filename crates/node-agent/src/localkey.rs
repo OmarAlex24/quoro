@@ -64,6 +64,22 @@ impl LocalKey {
         }
     }
 
+    /// Loads `<data_dir>/local.key` and never creates it, for a process other
+    /// than the agent's that reads a body the agent sealed: `quoro cluster
+    /// promote` reads the newest stored `spec.votes` so
+    /// ([`crate::store::NodeStore::open_read_only_with_local_key`]). A
+    /// missing file is an error, never a new key.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Io`] when the file is missing or cannot be read, and
+    /// [`AgentError::LocalKey`] when it is not exactly [`KEY_LEN`] bytes.
+    pub fn load(data_dir: &Path) -> Result<Self, AgentError> {
+        let bytes = std::fs::read(data_dir.join(KEY_FILE))
+            .map_err(|error| AgentError::io("read the node-local key", error))?;
+        Self::from_bytes(&bytes)
+    }
+
     /// A random key held only in memory, which no file holds: the key of a
     /// store opened read-only ([`crate::store::NodeStore::open_read_only`]),
     /// which neither reads nor creates `local.key`. A body sealed with the
@@ -262,5 +278,24 @@ mod tests {
             LocalKey::load_or_create(&dir.0),
             Err(AgentError::LocalKey(_))
         ));
+        assert!(matches!(
+            LocalKey::load(&dir.0),
+            Err(AgentError::LocalKey(_))
+        ));
+    }
+
+    /// `load` reads the key `load_or_create` wrote, and a missing file is an
+    /// error that creates no key.
+    #[test]
+    fn load_reads_the_key_and_never_creates_one() {
+        let dir = TempDir::new();
+        assert!(matches!(LocalKey::load(&dir.0), Err(AgentError::Io { .. })));
+        assert!(!dir.0.join(KEY_FILE).exists(), "no key is created");
+
+        let sealed = LocalKey::load_or_create(&dir.0).unwrap().seal(4, b"body");
+        assert_eq!(
+            LocalKey::load(&dir.0).unwrap().open(4, &sealed).unwrap(),
+            b"body"
+        );
     }
 }
