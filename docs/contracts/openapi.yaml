@@ -8156,9 +8156,9 @@ paths:
         it, so it opens one as at `move`, which that move's `app.failed_over`
         resolves; after another node's, it opens one when the source's next
         report still shows the app frozen while that fence covers the lease,
-        which the next thaw that resumes the app, or that app's
-        `app.failed_over`, resolves (permission-model.md section 8.2 gives
-        which report and the conditions). When
+        which the app running again unfrozen, whatever ended the freeze, or
+        that app's `app.failed_over`, resolves (permission-model.md section
+        8.2 gives which report and the conditions). When
         a step after the
         revoke fails, it ends with `app.switchover_failed` at `step` `move`,
         which opens an incident: the lease stays revoked, the app stays
