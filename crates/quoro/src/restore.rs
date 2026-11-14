@@ -39,6 +39,18 @@
 //! token cap (node-agent-protocol.md section 8.6, ADR 0325), naming each
 //! lease and its token ([`leases_at_cap`]).
 //!
+//! **The term (section 8.2, "Term").** The restored primary starts one above
+//! the term this host's node agent stored. This command runs as root and
+//! reads it from the agent's store, read-only ([`agent_term`]); the control
+//! plane runs as its own user and cannot read that store. So, before it
+//! installs the database, the restore raises the restored `meta.term` to
+//! that term when it holds a lower one ([`raise_term`]). `meta` is local and
+//! not in the change log, so the marker's head stays the database's, and the
+//! primary's first write starts one above `meta.term` and the log's terms.
+//! An agent store that exists but cannot be read refuses the restore, with
+//! or without `--accept-loss`, before anything is installed. The store is not
+//! read when the identity file names another cluster, as for the voters.
+//!
 //! Every secret is read from a file whose mode refuses group and other access,
 //! never from a flag or the environment, and no error message carries a key, a
 //! credential or the recovery key. [`execute`] is generic over
@@ -86,6 +98,9 @@ const NODE_STORE_FILE: &str = "node.db";
 /// The node-local key that seals the desired-state bodies of
 /// [`NODE_STORE_FILE`] (`quoro_node_agent::localkey`).
 const NODE_LOCAL_KEY_FILE: &str = "local.key";
+/// The term ceiling, 2^53 - 1: no machine sends, stores or adopts a higher
+/// term (node-agent-protocol.md section 8.8).
+const TERM_CEILING: u64 = quoro_proto::wire::MAX_TERM;
 
 /// How a restore failed. A usage error exits `2`, any other failure exits `1`
 /// (the exit codes of the other commands).
@@ -357,7 +372,8 @@ pub fn primary_line(report: &Report) -> String {
 /// [`Error::Usage`] for a statement [`check_statement`] refuses;
 /// [`Error::Failed`] when a refused input, a seal or manifest check, a chunk,
 /// the integrity check, the refusal of ADR 0261, with `--accept-loss` a lease
-/// at the token cap, or the install fails.
+/// at the token cap, an agent store whose term cannot be read, or the install
+/// fails.
 pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Report, Error> {
     if let Some(statement) = &options.accept_loss {
         check_statement(statement)?;
@@ -456,9 +472,20 @@ pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Rep
             )));
         }
     }
+    // Section 8.2, "Term": the term this host's node agent stored, read
+    // before anything is installed; a dry run reads it too. An agent of
+    // another cluster is not this cluster's node.
+    let agents_term = if agent_of_another_cluster(options) {
+        None
+    } else {
+        agent_term(&options.node_data_dir).await?
+    };
 
     let installed = !options.dry_run;
     if installed {
+        if let Some(term) = agents_term {
+            raise_term(&temp, term).await?;
+        }
         // SQLite may have touched these while checking the file; they must not
         // be installed next to the database.
         remove_sidecars(&temp);
@@ -1050,9 +1077,7 @@ async fn find_survivors(
         .map(|machine| machine.id.clone())
         .collect();
 
-    let other_cluster = read_identity(&options.identity_file)
-        .is_ok_and(|identity| identity.cluster_id != options.cluster_id);
-    let voters = if options.accept_loss.is_some() || other_cluster {
+    let voters = if options.accept_loss.is_some() || agent_of_another_cluster(options) {
         Vec::new()
     } else {
         agent_voters(&options.node_data_dir).await?
@@ -1261,6 +1286,127 @@ fn load_local_key(node_data_dir: &Path) -> Result<quoro_node_agent::localkey::Lo
     }
     quoro_node_agent::localkey::LocalKey::load_or_create(node_data_dir)
         .map_err(|error| format!("{}: {error}", key_file.display()))
+}
+
+/// Whether this host's node agent identity file names another cluster: that
+/// agent's store holds the voters and the term of the other cluster, and is
+/// not read.
+fn agent_of_another_cluster(options: &Options) -> bool {
+    read_identity(&options.identity_file)
+        .is_ok_and(|identity| identity.cluster_id != options.cluster_id)
+}
+
+// ---------------------------------------------------------------------------
+// The term
+// ---------------------------------------------------------------------------
+
+/// The term this host's node agent stored (section 8.2, "Term"): the highest
+/// of its `node_meta.highest_term` and the term of its stored vote, as the
+/// agent reads it ([`quoro_node_agent::vote::current_term`]), from its store
+/// in `node_data_dir` opened read-only, as `quoro cluster promote` opens it
+/// ([`quoro_node_agent::store::NodeStore::open_read_only`]). No store, or a
+/// store that holds no term, gives `None`.
+///
+/// # Errors
+///
+/// [`Error::Failed`] when the store exists but cannot be opened or read, or
+/// when whether it exists cannot be told, such as for a permission error,
+/// which is never taken for a missing store; or when it holds a term above
+/// the term ceiling. The restored primary could then start at or below a term
+/// this host's node already knows.
+async fn agent_term(node_data_dir: &Path) -> Result<Option<u64>, Error> {
+    let path = node_data_dir.join(NODE_STORE_FILE);
+    let unreadable = |reason: String| {
+        failed(format!(
+            "cannot read the term this host's node agent stored in {}: {reason}; the restored \
+             primary starts above it (backup-format.md section 8.2, \"Term\"), so nothing was \
+             installed",
+            path.display()
+        ))
+    };
+    let exists = path
+        .try_exists()
+        .map_err(|error| unreadable(error.to_string()))?;
+    if !exists {
+        return Ok(None);
+    }
+    let store = quoro_node_agent::store::NodeStore::open_read_only(node_data_dir)
+        .await
+        .map_err(|error| unreadable(error.to_string()))?;
+    let term = quoro_node_agent::vote::current_term(&store).await;
+    store.pool().close().await;
+    let term = term.map_err(|error| unreadable(error.to_string()))?;
+    if term > TERM_CEILING {
+        return Err(unreadable(format!(
+            "its term {term} is above the term ceiling, {TERM_CEILING}"
+        )));
+    }
+    Ok((term > 0).then_some(term))
+}
+
+/// `text` as the control plane reads `meta.term`: a plain decimal integer
+/// from 1 to the term ceiling, digits only, with no leading zero.
+fn stored_term(text: &str) -> Option<u64> {
+    if text.starts_with('0') || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<u64>()
+        .ok()
+        .filter(|term| (1..=TERM_CEILING).contains(term))
+}
+
+/// Raises `meta.term` of the checked database at `path` to `term`, the term
+/// this host's node agent stored, when it holds a lower term, none (which
+/// reads as 1), or a value that is no term, which the primary's first write
+/// would leave out (section 8.2, "Term"). `meta` is local and not in the
+/// change log, so the log's head, which the marker names, stays. The write is
+/// checkpointed into the file before it is installed.
+///
+/// # Errors
+///
+/// [`Error::Failed`] when the database cannot be read or written.
+async fn raise_term(path: &Path, term: u64) -> Result<(), Error> {
+    let cannot = |error: sqlx::Error| {
+        failed(format!(
+            "cannot raise the restored meta.term to {term}, the term this host's node agent \
+             stored: {error}; nothing was installed"
+        ))
+    };
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(cannot)?;
+    let raised = async {
+        let mut tx = pool.begin().await?;
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT value FROM meta WHERE key = 'term'")
+                .fetch_optional(&mut *tx)
+                .await?;
+        let current = stored.as_deref().map_or(Some(1), stored_term);
+        if current.is_some_and(|current| current >= term) {
+            tx.rollback().await?;
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES ('term', ?) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(term.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
+            .execute(&pool)
+            .await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    pool.close().await;
+    raised.map_err(cannot)
 }
 
 /// Every lease the first write of a restore with `--accept-loss` would raise

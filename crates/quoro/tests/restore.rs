@@ -1389,10 +1389,12 @@ async fn the_agents_newest_voters_refuse_a_node_enrolled_after_the_backup() {
 }
 
 /// A node agent store that exists but cannot be read leaves the restore
-/// unable to tell which nodes enrolled after the backup, so it refuses;
-/// `--accept-loss` does not read it, and restores.
+/// unable to tell which nodes enrolled after the backup, so it refuses.
+/// `--accept-loss` does not read the voters, but it still needs the term the
+/// agent stored, since the restored primary starts above it (section 8.2,
+/// "Term"): it refuses too, before anything is installed.
 #[tokio::test]
-async fn an_agent_store_that_cannot_be_read_refuses_without_the_flag() {
+async fn an_agent_store_that_cannot_be_read_refuses_with_or_without_the_flag() {
     let fixture =
         machines_fixture(&[(NEW_NODE, r#"["node"]"#, "connected", Some("primary"))]).await;
     let agent = fixture.base.join("broken-agent");
@@ -1419,9 +1421,16 @@ async fn an_agent_store_that_cannot_be_read_refuses_without_the_flag() {
     let mut options = fixture.forced_options(&dir);
     options.identity_file = identity;
     options.node_data_dir = agent;
-    let report = restore::execute(&fixture.store, &options).await.unwrap();
-    assert!(report.installed);
-    assert!(report.accept_loss);
+    let error = restore::execute(&fixture.store, &options)
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains("cannot read the term this host's node agent stored"),
+        "{text}"
+    );
+    assert!(text.contains("nothing was installed"), "{text}");
+    assert_nothing_installed(&dir);
 }
 
 /// A single-node cluster restored onto a fresh host needs the flag: the dead
@@ -1787,5 +1796,207 @@ async fn the_agents_node_local_key_is_never_created_and_an_unreadable_one_is_an_
     let text = error.to_string();
     assert!(text.contains("local.key cannot be read"), "{text}");
     assert!(!text.contains("missing"), "{text}");
+    assert_nothing_installed(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The term (section 8.2, "Term")
+// ---------------------------------------------------------------------------
+
+/// The restored database's one change-log entry, which the marker names.
+fn term_head() -> Head {
+    Head {
+        seq: 1,
+        hash: hash(1),
+    }
+}
+
+/// A fixture whose one backup holds the new host's node, the change-log
+/// entry of [`term_head`] and a `meta` table whose `term` is `term`, if any.
+async fn term_fixture(term: Option<&str>) -> Fixture {
+    let fixture = Fixture::new().await;
+    let path = fixture.base.join("term.db");
+    let options = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    create_nodes(
+        &pool,
+        &[(NEW_NODE, r#"["node"]"#, "connected", Some("primary"))],
+    )
+    .await;
+    let h1 = hash(1);
+    create_change_log(&pool, &[(1, h1.as_str())]).await;
+    create_leases(&pool, &[]).await;
+    sqlx::query("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    if let Some(term) = term {
+        sqlx::query("INSERT INTO meta (key, value) VALUES ('term', ?)")
+            .bind(term)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let _ = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
+        .execute(&pool)
+        .await;
+    pool.close().await;
+    let database = std::fs::read(&path).unwrap();
+    fixture
+        .add_backup("bkp_01JC9Z1A2B3C4D5E6F7G8H9J0K", &database, NEW)
+        .await;
+    fixture
+}
+
+/// Writes a node agent store into the new directory `name` as the agent
+/// creates it (`quoro_node_agent::store::NodeStore::open`, a WAL database),
+/// with `highest_term` at `term` and, with `vote_term`, a vote stored in that
+/// term. Returns the directory and the open store: a test that keeps it open
+/// reads the store of a running agent, with its `-wal`.
+async fn agent_with_term(
+    fixture: &Fixture,
+    name: &str,
+    term: u64,
+    vote_term: Option<u64>,
+) -> (PathBuf, quoro_node_agent::store::NodeStore) {
+    let dir = fixture.base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = quoro_node_agent::store::NodeStore::open(&dir)
+        .await
+        .unwrap();
+    store.raise_term(term).await.unwrap();
+    if let Some(vote_term) = vote_term {
+        let vote = quoro_node_agent::vote::StoredVote {
+            term: vote_term,
+            candidate: NEW_NODE.to_string(),
+        };
+        sqlx::query("INSERT INTO node_meta (key, value) VALUES (?, ?)")
+            .bind(quoro_node_agent::store::VOTE)
+            .bind(serde_json::to_string(&vote).unwrap())
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    (dir, store)
+}
+
+/// Restores [`term_fixture`]'s backup into the new directory `name`, with
+/// this host's node agent in `node_data_dir`, and returns the installed
+/// `meta.term`.
+async fn restore_term(fixture: &Fixture, name: &str, node_data_dir: PathBuf) -> Option<String> {
+    let dir = fixture.data_dir(name);
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = fixture.identity_file(&format!("{name}.json"), CLUSTER, NEW_NODE);
+    options.node_data_dir = node_data_dir;
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    // `meta` is not in the log: the marker names the log's head as before.
+    let marker =
+        Marker::parse(&std::fs::read(dir.join(restore_pending::MARKER_FILE)).unwrap()).unwrap();
+    assert_eq!(marker, Marker::plain(term_head()));
+    assert!(!dir.join("quoro.db-wal").exists(), "no -wal is installed");
+    let options = SqliteConnectOptions::new()
+        .filename(dir.join("quoro.db"))
+        .read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let term: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'term'")
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    term
+}
+
+/// Section 8.2, "Term": the restored primary starts above the term this
+/// host's node agent stored. `quoro restore` reads it from the agent's store,
+/// as the agent reads it (the highest of `highest_term` and its stored
+/// vote's term), and raises the restored `meta.term` to it before it installs
+/// the database; the primary's first write then starts one above. It reads a
+/// running agent's store, `-wal` and all, and a stopped one's. An agent at or
+/// below the restored term, or none, leaves `meta.term` as it is; a database
+/// without `meta.term`, which reads as 1, gets the agent's.
+#[tokio::test]
+async fn the_restore_raises_the_restored_term_to_the_term_this_hosts_agent_stored() {
+    let fixture = term_fixture(Some("4")).await;
+
+    let (agent, running) = agent_with_term(&fixture, "agent-at-9", 9, None).await;
+    assert!(agent.join("node.db-wal").exists(), "the agent runs");
+    let term = restore_term(&fixture, "raised-to-9", agent).await;
+    running.pool().close().await;
+    assert_eq!(term.as_deref(), Some("9"));
+
+    let (agent, stopped) = agent_with_term(&fixture, "agent-voted-in-11", 9, Some(11)).await;
+    stopped.pool().close().await;
+    assert_eq!(
+        restore_term(&fixture, "raised-to-11", agent)
+            .await
+            .as_deref(),
+        Some("11")
+    );
+
+    let (agent, below) = agent_with_term(&fixture, "agent-at-2", 2, None).await;
+    below.pool().close().await;
+    assert_eq!(
+        restore_term(&fixture, "kept-above-2", agent)
+            .await
+            .as_deref(),
+        Some("4")
+    );
+    let none = fixture.base.join("no-agent-store");
+    assert_eq!(
+        restore_term(&fixture, "kept-without-agent", none)
+            .await
+            .as_deref(),
+        Some("4")
+    );
+
+    let fixture = term_fixture(None).await;
+    let (agent, stopped) = agent_with_term(&fixture, "agent-at-3", 3, None).await;
+    stopped.pool().close().await;
+    assert_eq!(
+        restore_term(&fixture, "raised-from-none", agent)
+            .await
+            .as_deref(),
+        Some("3")
+    );
+}
+
+/// An agent store this command cannot reach, here behind a directory it may
+/// not search, is never taken for a missing store: the restore refuses, with
+/// `--accept-loss` too, before anything is installed (section 8.2, "Term").
+#[cfg(unix)]
+#[tokio::test]
+async fn an_agent_store_the_restore_cannot_reach_refuses_and_is_not_taken_as_missing() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = term_fixture(Some("4")).await;
+    let (agent, stopped) = agent_with_term(&fixture, "agent-unreachable", 9, None).await;
+    stopped.pool().close().await;
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::metadata(agent.join("node.db")).is_ok() {
+        // Root reaches any file: the unreachable case cannot be made here.
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+    let dir = fixture.data_dir("agent-unreachable-restore");
+    let mut options = fixture.forced_options(&dir);
+    options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+    options.node_data_dir = agent.clone();
+    let error = restore::execute(&fixture.store, &options).await;
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let text = error.unwrap_err().to_string();
+    assert!(
+        text.contains("cannot read the term this host's node agent stored"),
+        "{text}"
+    );
     assert_nothing_installed(&dir);
 }
