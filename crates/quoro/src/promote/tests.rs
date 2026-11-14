@@ -2,7 +2,11 @@
 //! the agent's data directory with its role, identity, custody key, mark and
 //! store, the control-plane data directory, and a fake systemd, uid and
 //! clock. The followed log is written into the agent's store as the agent
-//! writes it, with seals made by `quoro_proto::custody::seal`.
+//! writes it, with seals made by `quoro_proto::custody::seal`. Steps 2 to 6
+//! run through the recording fake of [`fake`]; [`run_steps`] tests them.
+
+mod fake;
+mod run_steps;
 
 use std::cell::{Cell, RefCell};
 use std::fs;
@@ -26,6 +30,7 @@ use super::command::{Flags, Host, Outcome, Paths, Request, parse_args, read_load
 use super::refusals::{RESTORE_PENDING, Refusal};
 use crate::host::Out;
 use crate::node::{Role, write_role};
+use fake::Fake;
 
 const NODE_ID: &str = "nod_01JC9Z0000000000000000000A";
 const OTHER_NODE_ID: &str = "nod_01JC9Z0000000000000000000B";
@@ -70,6 +75,8 @@ struct Fixture {
     reads: RefCell<Vec<&'static str>>,
     /// This machine's custody key.
     custody_key: CustodyKey,
+    /// Steps 2 to 6.
+    steps: Fake,
 }
 
 impl Host for Fixture {
@@ -128,6 +135,7 @@ impl Fixture {
             now: at(NOW),
             reads: RefCell::new(Vec::new()),
             custody_key: CustodyKey::generate(&mut custody::os_rng()),
+            steps: Fake::new(),
         };
         let dir = fixture.node_dir();
         write_role(dir, Role::Node).unwrap();
@@ -271,7 +279,7 @@ impl Fixture {
     /// Runs a promotion with `flags`: its result and the lines it printed.
     async fn promote(&self, flags: Flags) -> (Result<Outcome, Refusal>, Vec<String>) {
         let mut out = Out::quiet();
-        let result = run(&Request::Promote(flags), self, &mut out).await;
+        let result = run(&Request::Promote(flags), self, |_, _| &self.steps, &mut out).await;
         (result, out.lines)
     }
 
@@ -284,15 +292,16 @@ impl Fixture {
         refusal
     }
 
-    /// Asserts that a plain promotion passes every refusal.
+    /// Asserts that a plain promotion passes every refusal, and so runs
+    /// steps 2 to 6.
     async fn passes(&self) {
         let (result, lines) = self.promote(Flags::default()).await;
-        assert_eq!(result.unwrap(), Outcome::NotBuilt, "{lines:#?}");
+        assert_eq!(result.unwrap(), Outcome::Promoted, "{lines:#?}");
     }
 
     async fn run_abort(&self) -> (Result<Outcome, Refusal>, Vec<String>) {
         let mut out = Out::quiet();
-        let result = run(&Request::Abort, self, &mut out).await;
+        let result = run(&Request::Abort, self, |_, _| &self.steps, &mut out).await;
         (result, out.lines)
     }
 }
@@ -442,6 +451,16 @@ fn name_of(refusal: &Refusal) -> &'static str {
         Refusal::Keys(_) => "keys",
         Refusal::PromotionRunning => "promotion running",
         Refusal::NoAgentStore(_) => "no agent store",
+        Refusal::DoesNotFold(_) => "does not fold",
+        Refusal::PrimaryKeys(_) => "primary keys",
+        Refusal::Host(_) => "host",
+        Refusal::TokenExhausted { .. } => "token exhausted",
+        Refusal::NoVotes(_) => "no votes",
+        Refusal::AboveCeiling { .. } => "above ceiling",
+        Refusal::Unsettled { .. } => "unsettled",
+        Refusal::NoMajority { .. } => "no majority",
+        Refusal::AnotherPromotion => "another promotion",
+        Refusal::FreezeFailed(_) => "freeze failed",
     }
 }
 
@@ -561,7 +580,9 @@ async fn a_run_that_is_not_root_stops_before_it_reads_anything() {
             fixture.euid.set(euid);
             fixture.reads.borrow_mut().clear();
             let mut out = Out::quiet();
-            let refusal = run(&request, &fixture, &mut out).await.unwrap_err();
+            let refusal = run(&request, &fixture, |_, _| &fixture.steps, &mut out)
+                .await
+                .unwrap_err();
             assert!(matches!(refusal, Refusal::NotRoot), "{refusal}");
             assert_eq!(*fixture.reads.borrow(), ["euid"], "{request:?}");
             assert!(out.lines.is_empty());
@@ -574,14 +595,24 @@ async fn a_run_that_is_not_root_stops_before_it_reads_anything() {
 /// Issue #19: the command opens its vote connections as root, so no step of
 /// it may run as the data directory's owner. No Rust file under `promote/`,
 /// at any depth, nor `promote.rs`, names the function that re-executes the
-/// command as that owner, nor the module that holds it; and `main` hands
-/// `cluster promote` to `promote::command` directly, with no privilege drop
-/// before or around it.
+/// command as that owner, nor the module that holds it, nor a call that
+/// changes the process's user or groups; and `main` hands `cluster promote`
+/// to `promote::command` directly, with no privilege drop before or around
+/// it. `run_steps` pins the order: every vote connection before any step
+/// that hands something to the data directory's owner.
 #[test]
 fn the_command_never_runs_as_the_data_directory_s_owner() {
     let needles = [
         concat!("run_as_", "data_dir_owner"),
         concat!("privilege", "::"),
+        concat!("set", "uid"),
+        concat!("set", "euid"),
+        concat!("set", "resuid"),
+        concat!("set", "gid"),
+        concat!("set", "egid"),
+        concat!("set", "resgid"),
+        concat!("set", "groups"),
+        concat!("run", "user"),
     ];
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = vec![src.join("promote.rs")];
@@ -606,6 +637,9 @@ fn the_command_never_runs_as_the_data_directory_s_owner() {
         "command.rs",
         "refusals.rs",
         "keys.rs",
+        "steps.rs",
+        "host_steps.rs",
+        "install_keys.rs",
         "prepare.rs",
         "prepare/tests.rs",
     ] {
@@ -802,7 +836,7 @@ async fn a_refollowing_agent_is_refused_unless_accept_loss() {
     );
     assert_eq!(
         fixture.promote(accept_loss()).await.0.unwrap(),
-        Outcome::NotBuilt
+        Outcome::Promoted
     );
 }
 
@@ -824,7 +858,7 @@ async fn a_log_below_the_mark_is_refused_unless_accept_loss() {
     );
     assert_eq!(
         fixture.promote(accept_loss()).await.0.unwrap(),
-        Outcome::NotBuilt
+        Outcome::Promoted
     );
 }
 
@@ -838,7 +872,7 @@ async fn accept_loss_lifts_exactly_the_two_log_refusals() {
     fixture.mark(12);
     assert_eq!(
         fixture.promote(accept_loss()).await.0.unwrap(),
-        Outcome::NotBuilt
+        Outcome::Promoted
     );
     let marker = fixture.paths.data_dir.join(RESTORE_PENDING);
     fs::write(&marker, "").unwrap();
@@ -908,7 +942,7 @@ async fn the_refusals_come_in_the_contract_s_order() {
     loop {
         let refusal = match fixture.promote(Flags::default()).await.0 {
             Ok(outcome) => {
-                assert_eq!(outcome, Outcome::NotBuilt);
+                assert_eq!(outcome, Outcome::Promoted);
                 break;
             }
             Err(refusal) => refusal,
@@ -958,11 +992,12 @@ async fn the_refusals_come_in_the_contract_s_order() {
 }
 
 /// Step 1: the last verified `seq`, the head with its time and age, and the
-/// difference; `--dry-run` then stops and says the vote pre-check is not
-/// built yet, and a plain run stops and says the rest is not built yet.
-/// Neither changes anything: no file, no freeze, no lock, the same log.
+/// difference. `--dry-run` then stops after step 2's vote pre-check and
+/// changes nothing: no file, no freeze, no lock, the same log. A plain run
+/// with `--ack-fence` and `--accept-loss` says what `--accept-loss` loses
+/// and passes both flags and the statement to step 5.
 #[tokio::test]
-async fn step_1_shows_the_log_position_and_nothing_changes() {
+async fn step_1_shows_the_log_position_and_a_dry_run_changes_nothing() {
     let fixture = Fixture::new().await;
     let store = fixture.store().await;
     let position = store.log_position().await.unwrap();
@@ -974,7 +1009,7 @@ async fn step_1_shows_the_log_position_and_nothing_changes() {
             ..Flags::default()
         })
         .await;
-    assert_eq!(result.unwrap(), Outcome::DryRun);
+    assert_eq!(result.unwrap(), Outcome::DryRun { majority: true });
     for line in [
         "step 1, the log position:",
         "  last verified seq: 6",
@@ -992,8 +1027,16 @@ async fn step_1_shows_the_log_position_and_nothing_changes() {
         "{lines:#?}"
     );
     let last = lines.last().unwrap();
-    assert!(last.starts_with("dry run: stopped after step 1"), "{last}");
-    assert!(last.contains("vote pre-check is not built yet"), "{last}");
+    assert!(
+        last.starts_with("dry run: stopped after step 2's vote pre-check"),
+        "{last}"
+    );
+    assert!(last.contains("Nothing was changed"), "{last}");
+    assert!(names(&fixture.paths.data_dir).is_empty());
+    assert_eq!(names(fixture.node_dir()), node_files);
+    assert!(!fixture.node_dir().join(freeze::PROMOTE_LOCK_FILE).exists());
+    assert_eq!(store.meta(PROMOTION_FREEZE).await.unwrap(), None);
+    assert_eq!(store.log_position().await.unwrap(), position);
 
     let (result, lines) = fixture
         .promote(Flags {
@@ -1003,7 +1046,7 @@ async fn step_1_shows_the_log_position_and_nothing_changes() {
             ..Flags::default()
         })
         .await;
-    assert_eq!(result.unwrap(), Outcome::NotBuilt);
+    assert_eq!(result.unwrap(), Outcome::Promoted, "{lines:#?}");
     assert!(
         lines.contains(
             &"  with --accept-loss, every entry past seq 6 is lost to the cluster, replicated \
@@ -1012,16 +1055,9 @@ async fn step_1_shows_the_log_position_and_nothing_changes() {
         ),
         "{lines:#?}"
     );
-    let last = lines.last().unwrap();
-    assert!(last.contains("is not built yet"), "{last}");
-    assert!(last.contains("Nothing was changed"), "{last}");
-    assert!(last.contains("the old host is gone"), "{last}");
-
-    assert!(names(&fixture.paths.data_dir).is_empty());
-    assert_eq!(names(fixture.node_dir()), node_files);
-    assert!(!fixture.node_dir().join(freeze::PROMOTE_LOCK_FILE).exists());
-    assert_eq!(store.meta(PROMOTION_FREEZE).await.unwrap(), None);
-    assert_eq!(store.log_position().await.unwrap(), position);
+    let written = fixture.steps.written.borrow().clone().unwrap();
+    assert!(written.ack_fence && written.accept_loss, "{written:?}");
+    assert_eq!(written.statement.as_deref(), Some("the old host is gone"));
 }
 
 /// Step 1 without a head the primary reported, and with a freeze a stopped
@@ -1031,7 +1067,7 @@ async fn step_1_says_when_no_head_is_stored_and_when_the_agent_is_frozen() {
     let fixture = Fixture::with_head(None).await;
     freeze::freeze(fixture.node_dir()).await.unwrap();
     let (result, lines) = fixture.promote(Flags::default()).await;
-    assert_eq!(result.unwrap(), Outcome::NotBuilt);
+    assert_eq!(result.unwrap(), Outcome::Promoted);
     for line in [
         "  head_seq the primary last reported: none stored",
         "  difference: unknown",
@@ -1145,7 +1181,7 @@ async fn the_tls_key_in_use_is_the_pinned_fingerprint() {
         )
         .await;
     let (result, lines) = fixture.promote(Flags::default()).await;
-    assert_eq!(result.unwrap(), Outcome::NotBuilt);
+    assert_eq!(result.unwrap(), Outcome::Promoted);
     assert!(
         lines.iter().any(|line| line.starts_with("keys in use")
             && line.contains(&other)
