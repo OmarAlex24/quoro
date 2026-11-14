@@ -520,7 +520,14 @@ pub(crate) fn declaration_covers(lease: &Lease, lost_at: &str) -> bool {
 
 /// Whether the declaration that set its holder's `lost_at` still releases
 /// `lease`: it covers the row ([`declaration_covers`]), and the holder has
-/// not reported since (`last_seen_at` is unset or not past `lost_at`).
+/// not reported since: `last_seen_at` is unset or strictly before `lost_at`.
+/// A report stamped at the declaration's own instant counts as a report
+/// since it, so the declaration then releases nothing: the two stamps cannot
+/// be ordered at that resolution, and reading the tie as a return is the
+/// side that holds the lease (#761). The tie is not only a return's
+/// `hello`: the end of a session stamps `last_seen_at` too
+/// ([`crate::session`]'s `disconnect_node`), after the session has left the
+/// hub, and `declareNodeLost` checks only that the node has no session.
 ///
 /// Sections 8.3 and 8.5: "declaring a node lost never covers a failed fence
 /// the operator has not seen". Once the node said `hello` after the
@@ -535,7 +542,12 @@ pub(crate) fn declaration_covers(lease: &Lease, lost_at: &str) -> bool {
 /// answers, and a `lost_at` that was not cleared then frees nothing. The
 /// leases stay held until the node returns again, when its next session
 /// revokes again every lease the declaration covered, listed or not, and
-/// its answers release them; or until the node is removed.
+/// its answers release them; or until the node is removed. So too a
+/// declaration that commits in the same millisecond as the node's
+/// disconnect stamp releases nothing, and declaring the node again changes
+/// nothing (ADR 0202): its leases are then freed by `removeNode` (status
+/// `removed`), or by the node's return and its `ok` answers to the
+/// `declared_lost` revokes. That is the conservative side, and accepted.
 ///
 /// All three timestamps are written by [`crate::store::now_rfc3339`], fixed
 /// width, so they compare as strings.
@@ -544,7 +556,7 @@ pub(crate) fn declaration_releases(
     lost_at: &str,
     last_seen_at: Option<&str>,
 ) -> bool {
-    declaration_covers(lease, lost_at) && last_seen_at.is_none_or(|seen| seen <= lost_at)
+    declaration_covers(lease, lost_at) && last_seen_at.is_none_or(|seen| seen < lost_at)
 }
 
 /// Whether `lease`'s last holder has released it in a way that does not
@@ -1787,9 +1799,10 @@ mod tests {
 
     /// Sections 8.3 and 8.5: a declaration releases a `local` lease it
     /// revoked only while the holder has not reported since. Once the node
-    /// said `hello` after it (`last_seen_at` past `lost_at`), it may have
-    /// answered the revoke `fence_failed` and the primary may have lost that
-    /// failure, so the declaration releases nothing more; removal still does.
+    /// said `hello` at or after it (`last_seen_at` at or past `lost_at`), it
+    /// may have answered the revoke `fence_failed` and the primary may have
+    /// lost that failure, so the declaration releases nothing more; removal
+    /// still does.
     #[tokio::test]
     async fn a_declaration_releases_nothing_once_the_holder_reported_since() {
         let (store, lease, _actor, data_dir) = store_with_lease().await;
@@ -1808,10 +1821,12 @@ mod tests {
         let cases = [
             ("never seen", None, true),
             ("seen before", Some("2026-11-09T10:59:59.999Z"), true),
+            // A report at the declaration's own instant counts as one since
+            // it (#761): the declaration releases nothing.
             (
                 "seen at the declaration",
                 Some("2026-11-09T11:00:00.000Z"),
-                true,
+                false,
             ),
             ("seen since", Some("2026-11-09T11:00:00.001Z"), false),
         ];

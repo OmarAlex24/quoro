@@ -2078,11 +2078,13 @@ async fn a_pending_acknowledgement_releases_only_the_grant_it_covered() {
 /// Section 8.3, ADR 0183: a holder declared lost releases a `local` lease
 /// revoked by then, while it has not reported since. The test sets
 /// `nodes.lost_at` and `last_seen_at` itself, to place the declaration
-/// before and after the revoke, and the node's last report after and at the
-/// declaration; `declaring_the_old_node_lost_lets_the_restore_finish` uses
-/// the API. A declaration older than the revoke says nothing about it. One
-/// the node reported after may have met a failed fence the primary lost, so
-/// it releases nothing either (section 8.5). An `expiring` lease also waits
+/// before and after the revoke, and the node's last report after, at and
+/// before the declaration; `declaring_the_old_node_lost_lets_the_restore_finish`
+/// uses the API. A declaration older than the revoke says nothing about it.
+/// One the node reported after may have met a failed fence the primary lost,
+/// so it releases nothing either (section 8.5); nor does one the node
+/// reported at the declaration's own instant, which counts as a report since
+/// it (#761). An `expiring` lease also waits
 /// for its gate (section 8.4): see
 /// `a_lost_holders_expiring_lease_is_released_by_its_gate`.
 #[tokio::test]
@@ -2112,6 +2114,7 @@ async fn a_holder_declared_lost_releases_the_lease() {
     .unwrap();
     ready_waits(&mut setup, &moving).await;
 
+    // Reported at the declaration's own instant: a report since it (#761).
     sqlx::query(
         "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?), \
          last_seen_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
@@ -2122,12 +2125,50 @@ async fn a_holder_declared_lost_releases_the_lease() {
     .execute(&pool)
     .await
     .unwrap();
+    ready_waits(&mut setup, &moving).await;
+
+    // Last reported before the declaration: released.
+    sqlx::query(
+        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?), \
+         last_seen_at = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+    )
+    .bind(&moving.lease_id)
+    .bind(&setup.state.node.node_id)
+    .execute(&pool)
+    .await
+    .unwrap();
     ready_grants(&mut setup, &moving, moving.old_token).await;
 }
 
-/// `declareNodeLost` of the old node (section 8.3, ADR 0183): returns the
-/// node it answers.
+/// `declareNodeLost` of the old node (section 8.3, ADR 0183), once the end
+/// of its session is recorded and the primary's clock is past the
+/// `last_seen_at` that end stamped: a declaration in the same millisecond
+/// releases nothing (`leases::declaration_releases`). Returns the node it
+/// answers.
 async fn declare_old_node_lost(setup: &Setup) -> Value {
+    let server = &setup.state.server;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // The primary writes the stamp after the session has left the hub,
+    // which is all `drop_old_session` waits for.
+    let seen = loop {
+        let (status, seen): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_seen_at FROM nodes WHERE id = ?")
+                .bind(&setup.state.node.node_id)
+                .fetch_one(server.state.store.pool())
+                .await
+                .unwrap();
+        if status == "disconnected" {
+            break seen.expect("the end of the session stamps last_seen_at");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the end of the session was never recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    while quoro_control_plane::store::now_rfc3339() <= seen {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     let res = setup
         .state
         .owner
@@ -2386,11 +2427,11 @@ async fn a_lost_holders_expiring_lease_is_released_by_its_gate() {
     let moving = start_moving(&mut setup, 17).await;
     drop_old_session(&mut setup).await;
     let passes = expiring_with_gate(&setup, &moving).await;
+    // Declared lost when the row was revoked, last reported before it.
     sqlx::query(
         "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?), \
-         last_seen_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
+         last_seen_at = '2000-01-01T00:00:00.000Z' WHERE id = ?",
     )
-    .bind(&moving.lease_id)
     .bind(&moving.lease_id)
     .bind(&setup.state.node.node_id)
     .execute(setup.state.server.state.store.pool())
