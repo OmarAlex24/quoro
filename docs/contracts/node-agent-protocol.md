@@ -2460,7 +2460,7 @@ Every two voters are therefore peers unless both are witness-only (section 6.9).
 **Voter rules.** A voter grants term `T` to candidate `C` only when all of these hold:
 
 1. `T` is above its current term, or equals it and it already granted `T` to `C`, which makes a repeated request harmless;
-2. its promise to the primary it supports has run out (`now >= v_recv + S` of its last `support_grant`), or `C` is that same primary and not the voter itself. A voter's support names the voter itself only while no machine holds the primary status (`backup-format.md` section 8.2), so a voter never votes for itself before its promise runs out;
+2. its promise to the primary it supports has run out (`now >= v_recv + S` of its last `support_grant`), or `C` is that same primary and not the voter itself. A voter's support names the voter itself when it is the node on the primary's host, which never runs for promotion (section 7.3, ADR 0232), and, while no machine holds the primary status, for every voter (`backup-format.md` section 8.2); so a voter never votes for itself before its promise runs out;
 3. the request's `voters_version` equals its own.
 
 It then stores `T` and `C` (section 12) before it answers `granted`, and from then on refuses every lower term: its session with an older primary ends with `stale_term`.

@@ -996,7 +996,8 @@ components:
             moves it to the promoted node (node-agent-protocol.md section 7.3).
             After `--accept-loss` without a usable `primary-node` file, the first
             write clears it on every machine, and no node is `primary` until the
-            new host's agent enrolls locally (backup-format.md section 8.2).
+            new host's agent enrolls locally; backup-format.md section 8.2,
+            "While no machine holds the primary status", gives every such case.
           oneOf:
             - type: string
               enum:
