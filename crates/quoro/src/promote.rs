@@ -21,15 +21,22 @@
 //!   `quoro_node_agent::freeze::abort`, and is refused while a promotion runs
 //!   on the host.
 //!
-//! [`prepare`] holds step 6's host preparation: the control plane's system
-//! user, the hand-over of its data directory, `quoro.toml`, its unit and its
-//! start, then pointing this machine's agent at it.
+//! [`install_keys`] holds the start of step 6: it writes the keys opened
+//! from this machine's seals where a primary keeps them, in the form its
+//! readers read. Its refusals depend only on the keys and the files, and
+//! its pure check is for the command to run among the refusals before any
+//! change; it is not wired in yet. [`prepare`] holds step 6's host preparation: the control
+//! plane's system user, the hand-over of its data directory, `quoro.toml`,
+//! its unit and its start, then pointing this machine's agent at it.
 //!
 //! The command does not run steps 2 to 6 yet (the term, the freeze, the
 //! database build, the primary-status move, the keys and the start): after
 //! step 1 it says so and stops, having changed nothing.
 
 mod command;
+// The keys of step 6, which the command does not call yet.
+#[allow(dead_code, reason = "quoro cluster promote (#19) does not call it yet")]
+mod install_keys;
 mod keys;
 // Step 6's host preparation, which the command does not call yet.
 #[allow(dead_code, reason = "quoro cluster promote (#19) does not call it yet")]

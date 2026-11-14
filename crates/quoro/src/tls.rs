@@ -77,6 +77,24 @@ pub fn load_existing(data_dir: &Path) -> io::Result<Material> {
     material(cert_pem, key_pem, &cert_path, &key_path)
 }
 
+/// The listener's material from the PEM text that `cert.pem` and `key.pem`
+/// would hold, read as [`load_existing`] reads the files, without reading
+/// or writing any file. `quoro cluster promote` checks a sealed pair with
+/// it before it writes the two files (`node-agent-protocol.md` section 7.3
+/// step 6).
+///
+/// # Errors
+///
+/// A certificate or key that cannot be parsed or used, as [`load_existing`].
+pub(crate) fn material_from_pem(cert_pem: &str, key_pem: &str) -> io::Result<Material> {
+    material(
+        cert_pem.as_bytes().to_vec(),
+        Zeroizing::new(key_pem.as_bytes().to_vec()),
+        Path::new("tls/cert.pem"),
+        Path::new("tls/key.pem"),
+    )
+}
+
 /// The listener's material from the PEM bytes of the two files.
 fn material(
     cert_pem: Vec<u8>,
