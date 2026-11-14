@@ -5,18 +5,23 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use quoro_control_plane::promotion::{Promotion, Written};
-use quoro_control_plane::rebuild::database::{Built, FollowedEntry};
+use quoro_control_plane::rebuild::FoldError;
+use quoro_control_plane::rebuild::database::{BuildError, Built, CheckError, FollowedEntry};
 use quoro_node_agent::follow::LogEntry;
 use quoro_node_agent::freeze::PromotionReads;
-use quoro_node_agent::vote_client::{CheckOutcome, Reply, Round, VoterReply};
+use quoro_node_agent::vote::StoredVote;
+use quoro_node_agent::vote_client::{CheckOutcome, NoAnswer, Reply, Round, VoterReply};
 use quoro_proto::wire::{SpecVoter, SpecVotes, VoteAnswer, VoteOutcome, VoteRefusal};
 use serde_json::{Value, json};
 
 use super::{NODE_ID, OTHER_NODE_ID, hash_of};
 use crate::host::Out;
+use crate::promote::prepare::{self, Accounts};
 use crate::promote::refusals::Refusal;
 use crate::promote::steps::Steps;
 
@@ -55,13 +60,29 @@ pub(super) struct Fake {
     pub(super) grant: RefCell<Vec<&'static str>>,
     /// The call that fails, by its event's name.
     pub(super) fail: Cell<Option<&'static str>>,
-    /// The real vote adds an entry to the log: the agent stored one after
-    /// the freeze.
-    pub(super) grow_during_vote: Cell<bool>,
+    /// `check_log` fails as a check that could not run, not as a log that
+    /// does not fold.
+    pub(super) check_unrun: Cell<bool>,
+    /// The call, by its event's name, during which the agent stores the
+    /// entries after the log, from the next `seq`.
+    pub(super) grow: RefCell<Option<(&'static str, Changes)>>,
+    /// The host `check_host` runs `prepare::check_host` on; `None`: it
+    /// passes.
+    pub(super) host: RefCell<Option<HostCheck>>,
     /// The term `vote` was asked for.
     pub(super) voted: Cell<Option<u64>>,
+    /// The vote this machine's agent stored: the real round's term and this
+    /// machine, when it is among the voters that grant.
+    pub(super) stored_vote: RefCell<Option<StoredVote>>,
+    /// This machine's answer to the real round is lost after its agent
+    /// stored its vote.
+    pub(super) lose_own_answer: Cell<bool>,
+    /// The last `seq` of the entries each `check_log` received, in order.
+    pub(super) checked: RefCell<Vec<u64>>,
     /// The term `build` was asked for.
     pub(super) built: Cell<Option<u64>>,
+    /// The last `seq` of the entries `build` received.
+    pub(super) built_seq: Cell<Option<u64>>,
     /// What `write` was asked to write.
     pub(super) written: RefCell<Option<Promotion>>,
     /// The URL `point_agent` was asked to point at.
@@ -86,9 +107,15 @@ impl Fake {
             check: RefCell::new(None),
             grant: RefCell::new(VOTERS.to_vec()),
             fail: Cell::new(None),
-            grow_during_vote: Cell::new(false),
+            check_unrun: Cell::new(false),
+            grow: RefCell::new(None),
+            host: RefCell::new(None),
             voted: Cell::new(None),
+            stored_vote: RefCell::new(None),
+            lose_own_answer: Cell::new(false),
+            checked: RefCell::new(Vec::new()),
             built: Cell::new(None),
+            built_seq: Cell::new(None),
             written: RefCell::new(None),
             pointed: RefCell::new(None),
             slept: RefCell::new(Vec::new()),
@@ -101,14 +128,22 @@ impl Fake {
 
     /// Makes `changes` the followed log, from `seq` 1.
     pub(super) fn set_log(&self, changes: &[(&str, &str, Value)]) {
-        let entries = changes
-            .iter()
-            .zip(1u64..)
-            .map(|((entity_type, entity_id, payload), seq)| {
-                entry(seq, entity_type, entity_id, payload)
-            })
-            .collect();
-        *self.log.borrow_mut() = entries;
+        self.log.borrow_mut().clear();
+        self.store(changes);
+    }
+
+    /// Stores `changes` after the followed log, as the agent stores a batch.
+    fn store(&self, changes: &[(&str, &str, Value)]) {
+        let mut log = self.log.borrow_mut();
+        let next = log.last().map_or(1, |last| last.seq + 1);
+        log.extend(
+            changes
+                .iter()
+                .zip(next..)
+                .map(|((entity_type, entity_id, payload), seq)| {
+                    entry(seq, entity_type, entity_id, payload)
+                }),
+        );
     }
 
     /// The names of the events, in order.
@@ -116,9 +151,14 @@ impl Fake {
         self.events.borrow().clone()
     }
 
-    /// Records the call `name`; fails when the test said so.
+    /// Records the call `name`, during which the log grows when the test
+    /// said so; fails when the test said so.
     fn step(&self, name: &'static str) -> Result<(), String> {
         self.events.borrow_mut().push(name);
+        let grows = matches!(&*self.grow.borrow(), Some((during, _)) if *during == name);
+        if grows && let Some((_, changes)) = self.grow.borrow_mut().take() {
+            self.store(&changes);
+        }
         if self.fail.get() == Some(name) {
             return Err(format!("{name} failed"));
         }
@@ -131,20 +171,32 @@ impl Fake {
     }
 
     /// A round at `term` in which the voters of [`Fake::grant`] grant and
-    /// the others refuse with `support_held`, every answer received now.
+    /// the others refuse with `support_held`, every answer received now. A
+    /// `check` answer carries the voter's current term, one below `term`,
+    /// as in a check round that settled; a real answer carries `term`. With
+    /// [`Fake::lose_own_answer`], this machine's real answer is lost.
     pub(super) fn round(&self, term: u64, check: bool) -> Round {
         let received = self.clock();
         let grant = self.grant.borrow();
+        let answered = if check { term - 1 } else { term };
         let replies: Vec<VoterReply> = VOTERS
             .iter()
             .map(|voter| {
                 let granted = grant.contains(voter);
+                if !check && *voter == NODE_ID && self.lose_own_answer.get() {
+                    return VoterReply {
+                        node_id: (*voter).to_string(),
+                        reply: Reply::NoAnswer(NoAnswer::Timeout(
+                            "the answer did not arrive in time".to_string(),
+                        )),
+                    };
+                }
                 VoterReply {
                     node_id: (*voter).to_string(),
                     reply: Reply::Answer {
                         answer: VoteAnswer {
                             node_id: (*voter).to_string(),
-                            term,
+                            term: answered,
                             vote: if granted {
                                 VoteOutcome::Granted
                             } else {
@@ -161,9 +213,11 @@ impl Fake {
                 }
             })
             .collect();
-        let granted = VOTERS
+        let granted = replies
             .iter()
-            .filter(|&&voter| grant.contains(&voter))
+            .filter(|reply| {
+                matches!(&reply.reply, Reply::Answer { answer, .. } if answer.vote == VoteOutcome::Granted)
+            })
             .count();
         Round {
             term,
@@ -173,7 +227,7 @@ impl Fake {
             voters: VOTERS.len(),
             granted,
             majority: granted * 2 > VOTERS.len(),
-            highest_term: Some(term),
+            highest_term: Some(answered),
             wait_until: (granted > 0).then(|| received + Duration::from_millis(WAIT_MS)),
         }
     }
@@ -196,6 +250,57 @@ pub(super) fn default_log(token: i64) -> Vec<(&'static str, &'static str, Value)
             json!({"id": "lse_1", "holder_node_id": OTHER_NODE_ID, "fencing_token": token}),
         ),
     ]
+}
+
+/// Changes the agent stores, as [`Fake::set_log`] takes them.
+pub(super) type Changes = Vec<(&'static str, &'static str, Value)>;
+
+/// A node host under a directory of the fixture's, for `check_host`:
+/// `etc/quoro/quoro.toml` with a `[node]` table and `var/lib/quoro` without
+/// the database or the keys, which the promotion writes after its votes,
+/// and the account database `quoro-api` is looked up in.
+pub(super) struct HostCheck {
+    pub(super) root: PathBuf,
+    /// `quoro-api`'s uid and gid; `None`: no such user or group.
+    pub(super) uid: Cell<Option<u32>>,
+    pub(super) gid: Cell<Option<u32>>,
+}
+
+impl HostCheck {
+    pub(super) fn new(root: &Path) -> Self {
+        for dir in ["etc/quoro", "var/lib/quoro/engine"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(
+            root.join("etc/quoro/quoro.toml"),
+            "engine = \"cloud-hypervisor\"\n\n[node]\n",
+        )
+        .unwrap();
+        Self {
+            root: root.to_path_buf(),
+            uid: Cell::new(None),
+            gid: Cell::new(None),
+        }
+    }
+
+    /// `etc/quoro`, the configuration directory.
+    pub(super) fn etc(&self) -> PathBuf {
+        self.root.join("etc/quoro")
+    }
+}
+
+impl Accounts for HostCheck {
+    fn uid(&self, _name: &str) -> Result<Option<u32>, String> {
+        Ok(self.uid.get())
+    }
+
+    fn gid(&self, _name: &str) -> Result<Option<u32>, String> {
+        Ok(self.gid.get())
+    }
+
+    fn create_system_user(&self, name: &str, _home: &Path, _shell: &Path) -> Result<(), String> {
+        panic!("check_host created the user {name}");
+    }
 }
 
 /// A followed entry at `seq`, chained on fake hashes.
@@ -245,7 +350,17 @@ impl Steps for &Fake {
     type Lock = ();
 
     fn check_host(&self) -> Result<(), String> {
-        self.step("check_host")
+        self.step("check_host")?;
+        match &*self.host.borrow() {
+            Some(host) => {
+                let options = prepare::Options {
+                    root: host.root.clone(),
+                    ..prepare::Options::host(PathBuf::from(prepare::CONFIG_PATH))
+                };
+                prepare::check_host(&options, host)
+            }
+            None => Ok(()),
+        }
     }
 
     async fn log(&self) -> Result<Vec<LogEntry>, String> {
@@ -276,8 +391,23 @@ impl Steps for &Fake {
         self.step("open_keys").map_err(|e| vec![e])
     }
 
-    async fn check_log(&self, _entries: &[FollowedEntry]) -> Result<(), String> {
-        self.step("check_log")
+    async fn check_log(&self, entries: &[FollowedEntry]) -> Result<(), CheckError> {
+        self.checked
+            .borrow_mut()
+            .push(entries.last().map_or(0, |last| last.seq));
+        if self.check_unrun.get() {
+            self.events.borrow_mut().push("check_log");
+            return Err(CheckError::Schema(BuildError::Io(std::io::Error::other(
+                "out of memory",
+            ))));
+        }
+        self.step("check_log").map_err(|_| {
+            CheckError::Log(BuildError::Fold(FoldError::NoCreate {
+                entity_type: "user".to_string(),
+                entity_id: "usr_9".to_string(),
+                first_seq: 2,
+            }))
+        })
     }
 
     async fn votes(&self) -> Result<SpecVotes, String> {
@@ -317,12 +447,18 @@ impl Steps for &Fake {
             "a real vote before the freeze"
         );
         self.voted.set(Some(term));
-        if self.grow_during_vote.get() {
-            let mut log = self.log.borrow_mut();
-            let seq = u64::try_from(log.len()).unwrap() + 1;
-            log.push(entry(seq, "project", "prj_9", &json!({"id": "prj_9"})));
+        if self.grant.borrow().contains(&NODE_ID) {
+            *self.stored_vote.borrow_mut() = Some(StoredVote {
+                term,
+                candidate: NODE_ID.to_string(),
+            });
         }
         Ok(self.round(term, false))
+    }
+
+    async fn own_vote(&self) -> Result<Option<StoredVote>, String> {
+        self.step("own_vote")?;
+        Ok(self.stored_vote.borrow().clone())
     }
 
     fn now(&self) -> Instant {
@@ -338,6 +474,7 @@ impl Steps for &Fake {
     async fn build(&self, entries: &[FollowedEntry], term: u64) -> Result<Built, String> {
         self.step("build")?;
         self.built.set(Some(term));
+        self.built_seq.set(entries.last().map(|last| last.seq));
         Ok(Built {
             head_seq: entries.last().map_or(0, |last| last.seq),
             rows: BTreeMap::new(),

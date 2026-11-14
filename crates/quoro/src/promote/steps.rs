@@ -4,13 +4,16 @@
 //! [`super::refusals`] and step 1. In order:
 //!
 //! 1. **The rest of the refusals, before any change.** Step 6's host
-//!    preparation would accept this host; the keys opened from this
-//!    machine's seals pass step 6's checks (`PrimaryKeys::check`); with
-//!    `--ack-fence`, no lease the old primary's node holds is at the token
-//!    cap (`promotion::check_token_cap` on the fold of the `leases` and
-//!    `nodes` entries, issue #931); and the followed log folds and builds,
-//!    with every check of step 4's build run in memory
-//!    (`rebuild::database::check`).
+//!    preparation would accept this host, as far as it can tell before the
+//!    database and the keys exist (`prepare::check_host`); the keys opened
+//!    from this machine's seals pass step 6's checks (`PrimaryKeys::check`);
+//!    with `--ack-fence`, no lease the old primary's node holds is at the
+//!    token cap (`promotion::check_token_cap` on the fold of the `leases`
+//!    and `nodes` entries, issue #931); and the followed log folds: the
+//!    read-only check section 7.3 names, the fold with its cascades and its
+//!    NOT NULL stop, the change-log chain and the audit chain over the
+//!    folded rows (`rebuild::database::check`). It inserts nothing, so a
+//!    foreign key, `CHECK`, `UNIQUE` or type error can still stop step 4.
 //! 2. **Step 2's pre-check.** The vote client is made from the agent's newest
 //!    stored `spec.votes` and asks every voter with `check` requests, from
 //!    one above the highest term this machine has seen. A term above the
@@ -22,8 +25,9 @@
 //!    agent is frozen before the first real vote request.
 //! 4. **The frozen log, checked again** before the first real vote request:
 //!    the freeze holds, every refusal on the log passes on it (ADR 0280),
-//!    the keys open from it, the token cap holds, and it folds and builds.
-//! 5. **Step 2's vote** at the pre-check's term `T`; no majority stops.
+//!    the keys open from it, the token cap holds, and it folds.
+//! 5. **Step 2's vote** at the pre-check's term `T`, then the vote this
+//!    machine's agent stored, read without a write; no majority stops.
 //! 6. **Step 3's wait** until the latest receipt time plus `lease_wait_ms`
 //!    over the granting answers, printing the time left, unless
 //!    `--ack-fence`.
@@ -44,7 +48,9 @@
 //!
 //! **If the promotion stops after the freeze** ([`Stopped`]), the freeze
 //! ends and the agent dials again, as section 7.3 says. The message says
-//! whether this machine's agent granted the real vote, and, once the new
+//! whether this machine's agent granted the real vote, from the vote it
+//! stored before it answered, so a lost answer does not hide a grant, and
+//! says that it may have when that vote cannot be read. Once the new
 //! database is written, that a rerun is refused until it is moved aside
 //! with `quoro node rejoin --force --statement`.
 //!
@@ -56,11 +62,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use quoro_control_plane::promotion::{self, Promotion, Written};
-use quoro_control_plane::rebuild::database::{Built, FollowedEntry};
-use quoro_control_plane::rebuild::{self, Entry, Folded};
+use quoro_control_plane::rebuild::database::{Built, CheckError, FollowedEntry};
+use quoro_control_plane::rebuild::{self, Entry, Folded, Schema};
 use quoro_node_agent::follow::LogEntry;
 use quoro_node_agent::freeze::PromotionReads;
 use quoro_node_agent::identity::Identity;
+use quoro_node_agent::vote::StoredVote;
 use quoro_node_agent::vote_client::{CheckOutcome, Reply, Round};
 use quoro_proto::wire::{SpecVotes, VoteOutcome, VoteRefusal};
 
@@ -84,8 +91,11 @@ pub(crate) trait Steps {
     /// The promotion lock, held until it is dropped.
     type Lock;
 
-    /// Step 6's host preparation would accept this host's configuration and
-    /// data directory. Reads only.
+    /// The refusals of step 6's host preparation that need nothing the
+    /// promotion writes first (`prepare::check_host`): its configuration,
+    /// its configuration and data directories, and `quoro-api`. Not the
+    /// database and the keys, which steps 4 to 6 write. Reads only; the
+    /// error says that nothing was changed.
     fn check_host(&self) -> Result<(), String>;
     /// The agent's followed log, every entry in `seq` order.
     async fn log(&self) -> Result<Vec<LogEntry>, String>;
@@ -94,8 +104,9 @@ pub(crate) trait Steps {
     /// The keys in use, opened from this machine's seals in `entries`, and
     /// checked as step 6 checks them before it writes. Writes nothing.
     async fn open_keys(&self, entries: &[LogEntry]) -> Result<Self::Keys, Vec<String>>;
-    /// Every check of step 4's build on `entries`, writing nothing.
-    async fn check_log(&self, entries: &[FollowedEntry]) -> Result<(), String>;
+    /// The read-only check of `entries` section 7.3 runs before the votes
+    /// (`rebuild::database::check`). It inserts nothing.
+    async fn check_log(&self, entries: &[FollowedEntry]) -> Result<(), CheckError>;
     /// The `spec.votes` of the agent's newest stored desired state.
     async fn votes(&self) -> Result<SpecVotes, String>;
     /// The highest term this machine has seen.
@@ -108,6 +119,10 @@ pub(crate) trait Steps {
     async fn freeze(&self) -> Result<(), String>;
     /// Step 2's real round at `term`.
     async fn vote(&self, votes: &SpecVotes, term: u64) -> Result<Round, String>;
+    /// The vote this machine's agent stored (section 8.9), read without a
+    /// write. The agent stores the term and the candidate before it answers
+    /// `granted`.
+    async fn own_vote(&self) -> Result<Option<StoredVote>, String>;
     /// The clock of the vote answers' receipt times.
     fn now(&self) -> Instant;
     /// Sleeps for `duration`.
@@ -181,7 +196,7 @@ pub(crate) struct Stopped {
     pub freeze: Result<(), String>,
     /// Whether this machine's agent granted the real vote; `None` when no
     /// real vote request was sent.
-    pub own_granted: Option<bool>,
+    pub own_vote: Option<OwnVote>,
     /// The new database, once step 4 wrote it: a rerun is refused until it
     /// is moved aside.
     pub database: Option<PathBuf>,
@@ -195,6 +210,11 @@ impl fmt::Display for Stopped {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let term = self.term;
         write!(f, "{}: {}.", self.at.describe(), self.why)?;
+        if self.at == Stop::Prepare {
+            f.write_str(
+                " quoro.service may already be installed, enabled or started on this host.",
+            )?;
+        }
         match &self.freeze {
             Ok(()) => f.write_str(
                 " The freeze ended: this machine's agent dials its primary again within a second.",
@@ -216,17 +236,23 @@ impl fmt::Display for Stopped {
                 }
             );
         }
-        match self.own_granted {
+        match &self.own_vote {
             None => f.write_str(" No real vote request was sent, so no voter moved.")?,
-            Some(false) => write!(
+            Some(OwnVote::NotGranted) => write!(
                 f,
                 " This machine's agent did not grant term {term}, so it resumes following."
             )?,
-            Some(true) => write!(
+            Some(OwnVote::Granted) => write!(
                 f,
                 " This machine's agent granted term {term}: it answers the old primary's welcome \
                  with stale_term, which demotes that primary. Finish or retry the promotion at \
                  term {term} or above."
+            )?,
+            Some(OwnVote::Unknown(why)) => write!(
+                f,
+                " This machine's agent may have granted term {term} ({why}). If it did, it \
+                 answers the old primary's welcome with stale_term, which demotes that primary: \
+                 finish or retry the promotion at term {term} or above."
             )?,
         }
         if let Some(database) = &self.database {
@@ -243,12 +269,25 @@ impl fmt::Display for Stopped {
     }
 }
 
+/// Whether this machine's agent granted the real vote, as the vote it
+/// stored says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OwnVote {
+    /// It stored a vote for this machine at the promotion's term.
+    Granted,
+    /// It stored no vote at that term or above, or one at that term for
+    /// another candidate.
+    NotGranted,
+    /// Its vote cannot be read, or is for a later term: why.
+    Unknown(String),
+}
+
 /// What happened after the freeze, for a stop.
 #[derive(Default)]
 struct Progress {
     /// Whether this machine's agent granted the real vote; `None` before
     /// any real vote request.
-    own_granted: Option<bool>,
+    own_vote: Option<OwnVote>,
     /// Whether step 4 wrote the new database.
     database_written: bool,
     /// The URL of the control plane step 6 started.
@@ -381,7 +420,9 @@ async fn before_any_change<S: Steps>(
     steps: &S,
     out: &mut Out,
 ) -> Result<(), Refusal> {
-    steps.check_host().map_err(Refusal::Host)?;
+    steps
+        .check_host()
+        .map_err(|e| Refusal::Host(without_unchanged(e)))?;
     let entries = steps
         .log()
         .await
@@ -407,11 +448,25 @@ async fn before_any_change<S: Steps>(
     steps
         .check_log(&followed(entries))
         .await
-        .map_err(Refusal::DoesNotFold)?;
+        .map_err(|e| match &e {
+            CheckError::Log(refused) => Refusal::DoesNotFold(refused.to_string()),
+            CheckError::Schema(_) => {
+                Refusal::Unreadable(format!("cannot check the followed log: {e}"))
+            }
+        })?;
     out.say(format!(
-        "the followed log, seq 1 to {last}, folds and builds (step 4's checks, in memory)"
+        "the followed log, seq 1 to {last}, folds, and its change-log and audit chains verify"
     ));
     Ok(())
+}
+
+/// `message`, a refusal of step 6's host preparation, without the "nothing
+/// was changed" it ends with: [`Refusal::Host`] says it once.
+fn without_unchanged(message: String) -> String {
+    ["; nothing was changed", ". Nothing was changed"]
+        .iter()
+        .find_map(|end| message.strip_suffix(end))
+        .map_or_else(|| message.clone(), str::to_string)
 }
 
 /// The token-cap check of `--ack-fence` (section 7.3, section 8.6, ADR
@@ -420,10 +475,15 @@ async fn before_any_change<S: Steps>(
 ///
 /// # Errors
 ///
-/// [`Refusal::TokenExhausted`] naming each lease at the cap, or
-/// [`Refusal::DoesNotFold`] when the leases and nodes do not fold.
+/// [`Refusal::TokenExhausted`] naming each lease at the cap,
+/// [`Refusal::DoesNotFold`] when the leases and nodes do not fold, or
+/// [`Refusal::Unreadable`] when this binary's schema cannot be made to fold
+/// them.
 async fn token_cap(identity: &Identity, entries: &[LogEntry]) -> Result<Option<String>, Refusal> {
-    let folded = fold_cap(entries).await.map_err(Refusal::DoesNotFold)?;
+    let schema = keys::schema().await.map_err(|e| {
+        Refusal::Unreadable(format!("cannot check the token cap of --ack-fence: {e}"))
+    })?;
+    let folded = fold_cap(&schema, entries).map_err(Refusal::DoesNotFold)?;
     let Some(old) = promotion::old_primary(&folded, &identity.node_id) else {
         return Ok(None);
     };
@@ -434,12 +494,11 @@ async fn token_cap(identity: &Identity, entries: &[LogEntry]) -> Result<Option<S
     Ok(Some(old.to_string()))
 }
 
-/// The fold of the `leases` and `nodes` entries of `entries`, against this
-/// binary's schema.
-async fn fold_cap(entries: &[LogEntry]) -> Result<Folded, String> {
-    let schema = keys::schema().await?;
+/// The fold of the `leases` and `nodes` entries of `entries`, against
+/// `schema`, this binary's.
+fn fold_cap(schema: &Schema, entries: &[LogEntry]) -> Result<Folded, String> {
     rebuild::fold(
-        &schema,
+        schema,
         entries
             .iter()
             .filter(|entry| CAP_ENTITY_TYPES.contains(&entry.entity_type.as_str()))
@@ -563,12 +622,20 @@ fn refusal_name(reason: VoteRefusal) -> &'static str {
     }
 }
 
-/// Whether `own_node_id`'s answer in `round` counts as `granted`.
-fn granted_by(round: &Round, own_node_id: &str) -> bool {
-    round.replies.iter().any(|reply| {
-        reply.node_id == own_node_id
-            && matches!(&reply.reply, Reply::Answer { answer, .. } if answer.vote == VoteOutcome::Granted)
-    })
+/// Whether this machine's agent, `own_node_id`, granted `term`, from
+/// `stored`, the vote it stored. It stores the term and the candidate before
+/// it answers `granted`, so an answer lost or late after it stored them does
+/// not hide the grant.
+fn own_vote(stored: Result<Option<StoredVote>, String>, term: u64, own_node_id: &str) -> OwnVote {
+    match stored {
+        Ok(Some(vote)) if vote.term == term && vote.candidate == own_node_id => OwnVote::Granted,
+        Ok(Some(vote)) if vote.term > term => OwnVote::Unknown(format!(
+            "it has since voted at term {}, and its vote at term {term} is not kept",
+            vote.term
+        )),
+        Ok(_) => OwnVote::NotGranted,
+        Err(e) => OwnVote::Unknown(format!("its stored vote cannot be read: {e}")),
+    }
 }
 
 /// What a dry run says once the pre-check settled.
@@ -673,10 +740,11 @@ impl<S: Steps> After<'_, S> {
                 .map_err(|refusal| Halt::new(Stop::FrozenLog, after_freeze(&refusal)))?;
         }
         steps.check_log(&followed(entries)).await.map_err(|e| {
-            Halt::new(
-                Stop::FrozenLog,
-                format!("the frozen log does not fold: {e}"),
-            )
+            let why = match &e {
+                CheckError::Log(refused) => format!("the frozen log does not fold: {refused}"),
+                CheckError::Schema(_) => format!("cannot check the frozen log: {e}"),
+            };
+            Halt::new(Stop::FrozenLog, why)
         })?;
         out.say(format!(
             "the frozen log, seq 1 to {}, passes the refusals on the log again and folds",
@@ -692,7 +760,7 @@ impl<S: Steps> After<'_, S> {
             .await
             .map_err(|e| Halt::new(Stop::Vote, format!("the vote requests were not sent: {e}")))?;
         show_round(&round, &identity.node_id, out);
-        progress.own_granted = Some(granted_by(&round, &identity.node_id));
+        progress.own_vote = Some(own_vote(steps.own_vote().await, term, &identity.node_id));
         if !round.majority {
             return Err(Halt::new(
                 Stop::NoMajority,
@@ -888,7 +956,7 @@ async fn stop<S: Steps>(
         at: halt.at,
         why: halt.why,
         freeze,
-        own_granted: progress.own_granted,
+        own_vote: progress.own_vote,
         database: progress.database_written.then(|| database.to_path_buf()),
         started: progress.started,
         term,

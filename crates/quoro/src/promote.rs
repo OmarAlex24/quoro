@@ -31,18 +31,8 @@
 
 mod command;
 mod host_steps;
-// What `install_keys` reports is read only by its tests.
-#[allow(
-    dead_code,
-    reason = "part of what the key installation reports is read only by its tests"
-)]
 mod install_keys;
 mod keys;
-// What `prepare_host` and `point_agent` report is read only by their tests.
-#[allow(
-    dead_code,
-    reason = "part of what the host preparation reports is read only by its tests"
-)]
 pub mod prepare;
 mod refusals;
 mod steps;

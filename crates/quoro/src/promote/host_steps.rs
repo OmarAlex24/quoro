@@ -12,14 +12,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use quoro_control_plane::promotion::{self, Promotion, Written};
-use quoro_control_plane::rebuild::database::{self, Built, FollowedEntry};
+use quoro_control_plane::rebuild::database::{self, Built, CheckError, FollowedEntry};
 use quoro_control_plane::store::Store;
 use quoro_node_agent::AgentError;
 use quoro_node_agent::follow::LogEntry;
 use quoro_node_agent::freeze::{self, PromotionLock, PromotionReads};
 use quoro_node_agent::identity::Identity;
 use quoro_node_agent::store::NodeStore;
-use quoro_node_agent::vote;
+use quoro_node_agent::vote::{self, StoredVote};
 use quoro_node_agent::vote_client::{
     Candidate, CheckOutcome, Round, VoteClient, VoteClientOptions,
 };
@@ -79,22 +79,12 @@ impl Steps for HostSteps {
     type Keys = PrimaryKeys;
     type Lock = PromotionLock;
 
-    /// `prepare::prepare_host` runs the control plane from
-    /// `/etc/quoro/quoro.toml`, the file this command reads, and refuses a
-    /// `data_dir` other than [`prepare::DATA_DIR`], the one directory its
-    /// unit may write. The second is checked here, before any change.
+    /// `prepare::check_host` on `/etc/quoro/quoro.toml`, the file this
+    /// command reads and the control plane's unit runs from, with the
+    /// host's account database.
     fn check_host(&self) -> Result<(), String> {
-        let data_dir = Path::new(prepare::DATA_DIR);
-        if self.paths.data_dir.as_path() == data_dir {
-            Ok(())
-        } else {
-            Err(format!(
-                "the configuration's data_dir is {}, and the control plane's unit may write only \
-                 {}",
-                self.paths.data_dir.display(),
-                data_dir.display()
-            ))
-        }
+        let options = prepare::Options::host(PathBuf::from(crate::config::DEFAULT_PATH));
+        prepare::check_host(&options, &prepare::RealAccounts)
     }
 
     async fn log(&self) -> Result<Vec<LogEntry>, String> {
@@ -118,11 +108,8 @@ impl Steps for HostSteps {
         Ok(keys)
     }
 
-    async fn check_log(&self, entries: &[FollowedEntry]) -> Result<(), String> {
-        database::check(entries, &self.identity.cluster_id)
-            .await
-            .map(drop)
-            .map_err(|e| e.to_string())
+    async fn check_log(&self, entries: &[FollowedEntry]) -> Result<(), CheckError> {
+        database::check(entries).await
     }
 
     async fn votes(&self) -> Result<SpecVotes, String> {
@@ -163,6 +150,10 @@ impl Steps for HostSteps {
             .vote(term)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn own_vote(&self) -> Result<Option<StoredVote>, String> {
+        self.store().await?.vote().await.map_err(|e| e.to_string())
     }
 
     /// The vote client's clock: `SystemMonotonic` reads [`Instant`].

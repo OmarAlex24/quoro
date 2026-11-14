@@ -6,13 +6,14 @@
 use quoro_control_plane::promotion::Promotion;
 use quoro_node_agent::vote_client::CheckOutcome;
 use quoro_proto::wire::MAX_TERM;
+use serde_json::json;
 
-use super::fake::{MAX_TOKEN, URL, WITNESS_ID, default_log};
+use super::fake::{HostCheck, MAX_TOKEN, URL, WITNESS_ID, default_log};
 use super::{Fixture, NODE_ID, OTHER_NODE_ID, accept_loss};
 use crate::host::DATABASE;
 use crate::promote::command::{Flags, Outcome, exit_status};
 use crate::promote::refusals::Refusal;
-use crate::promote::steps::{Stop, Stopped};
+use crate::promote::steps::{OwnVote, Stop, Stopped};
 
 /// The events up to the end of step 2's pre-check: the refusals of this
 /// layer, then the pre-check.
@@ -35,8 +36,10 @@ fn promotion() -> Vec<&'static str> {
     let mut events = PRE_CHECK.to_vec();
     events.extend(FROZEN);
     events.extend([
-        // Step 2's vote, then step 3's wait: 12.5 s in steps of 5 s.
+        // Step 2's vote and this machine's stored vote, then step 3's
+        // wait: 12.5 s in steps of 5 s.
         "vote",
+        "own_vote",
         "sleep",
         "sleep",
         "sleep",
@@ -328,9 +331,10 @@ async fn no_majority_in_the_pre_check_stops_before_the_freeze() {
     );
     assert!(refusal.to_string().contains("no voter moved"), "{refusal}");
     for line in [
-        format!("    {NODE_ID} (this machine): granted, at term 5, lease wait 12500 ms"),
-        format!("    {OTHER_NODE_ID}: refused, support_held, at term 5, retry after 1000 ms"),
-        format!("    {WITNESS_ID}: refused, support_held, at term 5, retry after 1000 ms"),
+        // A check answer carries the voter's own term, below the one asked.
+        format!("    {NODE_ID} (this machine): granted, at term 4, lease wait 12500 ms"),
+        format!("    {OTHER_NODE_ID}: refused, support_held, at term 4, retry after 1000 ms"),
+        format!("    {WITNESS_ID}: refused, support_held, at term 4, retry after 1000 ms"),
     ] {
         assert!(lines.contains(&line), "{line:?} in {lines:#?}");
     }
@@ -351,12 +355,20 @@ async fn no_majority_in_the_real_round_ends_the_freeze() {
         let (result, lines) = fixture.promote(Flags::default()).await;
         let stopped = stopped(result);
         assert_eq!(stopped.at, Stop::NoMajority);
-        assert_eq!(stopped.own_granted, Some(own));
+        let expected = if own {
+            OwnVote::Granted
+        } else {
+            OwnVote::NotGranted
+        };
+        assert_eq!(stopped.own_vote, Some(expected));
         assert_eq!(stopped.freeze, Ok(()));
         assert_eq!(stopped.database, None);
         assert_eq!(
             fixture.steps.events(),
-            then(&then(&PRE_CHECK, &FROZEN), &["vote", "unfreeze"])
+            then(
+                &then(&PRE_CHECK, &FROZEN),
+                &["vote", "own_vote", "unfreeze"]
+            )
         );
         assert_eq!(*fixture.steps.frozen_at.borrow(), None);
         assert!(fixture.steps.written.borrow().is_none());
@@ -384,7 +396,8 @@ async fn no_majority_in_the_real_round_ends_the_freeze() {
 #[tokio::test]
 async fn a_log_that_changed_after_the_freeze_stops_step_4() {
     let fixture = Fixture::new().await;
-    fixture.steps.grow_during_vote.set(true);
+    *fixture.steps.grow.borrow_mut() =
+        Some(("vote", vec![("project", "prj_9", json!({"id": "prj_9"}))]));
     let (result, _) = fixture.promote(Flags::default()).await;
     let stopped = stopped(result);
     assert_eq!(stopped.at, Stop::Build);
@@ -399,7 +412,7 @@ async fn a_log_that_changed_after_the_freeze_stops_step_4() {
     assert_eq!(stopped.freeze, Ok(()));
     let mut events = then(&PRE_CHECK, &FROZEN);
     events.extend([
-        "vote", "sleep", "sleep", "sleep", "reads", "log", "unfreeze",
+        "vote", "own_vote", "sleep", "sleep", "sleep", "reads", "log", "unfreeze",
     ]);
     assert_eq!(fixture.steps.events(), events);
     assert_eq!(fixture.steps.built.get(), None);
@@ -426,7 +439,7 @@ async fn a_frozen_log_that_fails_a_refusal_stops_before_the_real_vote() {
             "{}",
             stopped.why
         );
-        assert_eq!(stopped.own_granted, None);
+        assert_eq!(stopped.own_vote, None);
         assert_eq!(
             fixture.steps.events(),
             then(&PRE_CHECK, &["lock", "freeze", "reads", "unfreeze"])
@@ -478,6 +491,11 @@ async fn a_stop_after_the_database_is_written_ends_the_freeze_and_says_how_to_re
         ] {
             assert!(text.contains(words), "{words:?} in {text}");
         }
+        assert_eq!(
+            text.contains("quoro.service may already be installed, enabled or started"),
+            at == Stop::Prepare,
+            "{text}"
+        );
     }
 
     fixture.steps.events.borrow_mut().clear();
@@ -542,4 +560,245 @@ async fn the_refusals_of_steps_2_to_6_come_before_any_real_vote() {
         assert_eq!(fixture.steps.voted.get(), None);
         assert_eq!(*fixture.steps.frozen_at.borrow(), None);
     }
+}
+
+/// Step 6's host refusals run before any vote request (section 7.3), on the
+/// host as it is before the database and the keys exist: a host that would
+/// pass is promoted, and a symbolic link at `/etc/quoro` or a `quoro-api`
+/// with a login uid is refused with no vote request, nothing frozen and
+/// nothing written, saying once that nothing was changed.
+#[tokio::test]
+async fn a_host_step_6_would_refuse_is_refused_before_any_vote() {
+    let fixture = Fixture::new().await;
+    *fixture.steps.host.borrow_mut() = Some(HostCheck::new(&fixture.root.join("host")));
+    fixture.passes().await;
+
+    let etc = fixture.steps.host.borrow().as_ref().unwrap().etc();
+    let real = etc.with_file_name("quoro-real");
+    std::fs::rename(&etc, &real).unwrap();
+    std::os::unix::fs::symlink("quoro-real", &etc).unwrap();
+    refused_by_host(&fixture, "is a symbolic link").await;
+    std::fs::remove_file(&etc).unwrap();
+    std::fs::rename(&real, &etc).unwrap();
+
+    if let Some(host) = fixture.steps.host.borrow().as_ref() {
+        host.uid.set(Some(1000));
+        host.gid.set(Some(1000));
+    }
+    refused_by_host(&fixture, "uid 1000, which is a login account").await;
+}
+
+/// Asserts that a promotion is refused at step 6's host check, with a text
+/// that holds `says` and says once that nothing was changed, before any
+/// other step: no vote request, no stored vote, no freeze, no write.
+async fn refused_by_host(fixture: &Fixture, says: &str) {
+    fixture.steps.events.borrow_mut().clear();
+    *fixture.steps.stored_vote.borrow_mut() = None;
+    *fixture.steps.written.borrow_mut() = None;
+    let (result, _) = fixture.promote(Flags::default()).await;
+    assert_eq!(exit_status(&result), 1);
+    let refusal = result.unwrap_err();
+    assert_eq!(super::name_of(&refusal), "host", "{refusal}");
+    let text = refusal.to_string();
+    assert!(text.contains(says), "{says:?} in {text}");
+    assert_eq!(
+        text.to_lowercase().matches("nothing was changed").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(fixture.steps.events(), ["check_host"]);
+    assert_eq!(*fixture.steps.stored_vote.borrow(), None);
+    assert_eq!(*fixture.steps.frozen_at.borrow(), None);
+    assert!(fixture.steps.written.borrow().is_none());
+}
+
+/// The followed log's check before the votes: a log the fold refuses is
+/// refused with the fold's error, and a check that could not run is not
+/// reported as a log that does not fold. Neither sends a vote request.
+#[tokio::test]
+async fn a_log_the_fold_refuses_is_refused_before_any_vote_and_a_check_that_did_not_run_says_so() {
+    let fixture = Fixture::new().await;
+    fixture.steps.fail.set(Some("check_log"));
+    let refusal = fixture.promote(Flags::default()).await.0.unwrap_err();
+    assert_eq!(super::name_of(&refusal), "does not fold", "{refusal}");
+    assert!(
+        refusal
+            .to_string()
+            .contains("the user usr_9 never received a create"),
+        "{refusal}"
+    );
+    assert_eq!(fixture.steps.events(), PRE_CHECK[..4]);
+
+    fixture.steps.events.borrow_mut().clear();
+    fixture.steps.fail.set(None);
+    fixture.steps.check_unrun.set(true);
+    let refusal = fixture.promote(Flags::default()).await.0.unwrap_err();
+    assert_eq!(super::name_of(&refusal), "unreadable", "{refusal}");
+    let text = refusal.to_string();
+    assert!(
+        text.contains("cannot check the followed log") && text.contains("out of memory"),
+        "{text}"
+    );
+    assert!(!text.contains("does not fold"), "{text}");
+    assert_eq!(fixture.steps.events(), PRE_CHECK[..4]);
+    assert_eq!(fixture.steps.voted.get(), None);
+    assert_eq!(*fixture.steps.frozen_at.borrow(), None);
+}
+
+/// Whether this machine's agent granted the term comes from the vote it
+/// stored, not from its answer: an answer lost after the agent stored its
+/// vote still says that it granted, and a vote that cannot be read says
+/// that it may have.
+#[tokio::test]
+async fn this_machine_s_grant_is_read_from_the_vote_its_agent_stored() {
+    let fixture = Fixture::new().await;
+    *fixture.steps.check.borrow_mut() = Some(CheckOutcome::Settled(fixture.steps.round(5, true)));
+    *fixture.steps.grant.borrow_mut() = vec![NODE_ID];
+    fixture.steps.lose_own_answer.set(true);
+    let (result, lines) = fixture.promote(Flags::default()).await;
+    let lost = stopped(result);
+    assert_eq!(lost.at, Stop::NoMajority);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with(&format!("    {NODE_ID} (this machine): no answer"))),
+        "{lines:#?}"
+    );
+    assert_eq!(lost.own_vote, Some(OwnVote::Granted));
+    let text = lost.to_string();
+    assert!(
+        text.contains("This machine's agent granted term 5") && text.contains("stale_term"),
+        "{text}"
+    );
+    assert_eq!(
+        fixture.steps.events(),
+        then(
+            &then(&PRE_CHECK, &FROZEN),
+            &["vote", "own_vote", "unfreeze"]
+        )
+    );
+
+    fixture.steps.events.borrow_mut().clear();
+    fixture.steps.fail.set(Some("own_vote"));
+    let unknown = stopped(fixture.promote(Flags::default()).await.0);
+    assert_eq!(unknown.at, Stop::NoMajority);
+    assert!(
+        matches!(&unknown.own_vote, Some(OwnVote::Unknown(why)) if why.contains("own_vote failed")),
+        "{:?}",
+        unknown.own_vote
+    );
+    let text = unknown.to_string();
+    assert!(
+        text.contains("may have granted term 5") && text.contains("its stored vote cannot be read"),
+        "{text}"
+    );
+    assert_eq!(unknown.freeze, Ok(()));
+}
+
+/// The real vote requests not sent stop at step 2 with no voter moved, and
+/// the freeze ends.
+#[tokio::test]
+async fn real_vote_requests_that_were_not_sent_stop_with_no_voter_moved() {
+    let fixture = Fixture::new().await;
+    fixture.steps.fail.set(Some("vote"));
+    let stopped = stopped(fixture.promote(Flags::default()).await.0);
+    assert_eq!(stopped.at, Stop::Vote);
+    assert_eq!(stopped.own_vote, None);
+    assert_eq!(stopped.freeze, Ok(()));
+    assert_eq!(
+        fixture.steps.events(),
+        then(&then(&PRE_CHECK, &FROZEN), &["vote", "unfreeze"])
+    );
+    let text = stopped.to_string();
+    assert!(
+        text.contains("the vote requests were not sent: vote failed")
+            && text.contains("No real vote request was sent, so no voter moved"),
+        "{text}"
+    );
+    assert_eq!(*fixture.steps.frozen_at.borrow(), None);
+}
+
+/// A freeze step 6 cannot end stops there: the stop tries once more, and
+/// when that fails too it says that `--abort` ends the freeze and that the
+/// agent is pointed at the started control plane once it has ended.
+#[tokio::test]
+async fn a_freeze_step_6_cannot_end_says_how_to_end_it() {
+    let fixture = Fixture::new().await;
+    fixture.steps.fail.set(Some("unfreeze"));
+    let stopped = stopped(fixture.promote(Flags::default()).await.0);
+    assert_eq!(stopped.at, Stop::Unfreeze);
+    assert_eq!(stopped.freeze, Err("unfreeze failed".to_string()));
+    assert_eq!(stopped.started.as_deref(), Some(URL));
+    let events = fixture.steps.events();
+    assert_eq!(
+        events[events.len() - 3..],
+        ["prepare_host", "unfreeze", "unfreeze"],
+        "{events:?}"
+    );
+    let text = stopped.to_string();
+    let point = format!("quoro node set-primary {URL}");
+    let says: [&str; 4] = [
+        "stopped at step 6, the end of the freeze: cannot end the freeze: unfreeze failed",
+        "The freeze could not be ended (unfreeze failed): quoro cluster promote --abort ends it",
+        "End the freeze first",
+        &point,
+    ];
+    for words in says {
+        assert!(text.contains(words), "{words:?} in {text}");
+    }
+    assert!(fixture.steps.frozen_at.borrow().is_some());
+}
+
+/// The frozen log is the one checked again and built: when the agent stored
+/// an entry between the pre-check's log and the freeze, the frozen checks,
+/// the build and the write all take the log with it.
+#[tokio::test]
+async fn the_frozen_checks_and_the_build_read_the_frozen_log() {
+    let fixture = Fixture::new().await;
+    *fixture.steps.grow.borrow_mut() =
+        Some(("check", vec![("project", "prj_9", json!({"id": "prj_9"}))]));
+    let (result, lines) = fixture.promote(Flags::default()).await;
+    assert_eq!(result.unwrap(), Outcome::Promoted, "{lines:#?}");
+    assert_eq!(*fixture.steps.checked.borrow(), [3, 4]);
+    assert_eq!(fixture.steps.built_seq.get(), Some(4));
+    assert_eq!(
+        fixture.steps.written.borrow().as_ref().map(|w| w.log_seq),
+        Some(4)
+    );
+}
+
+/// With `--ack-fence`, a lease of the old primary's node that reached the
+/// token cap between the pre-check's log and the freeze stops before the
+/// first real vote request: the freeze ends and no voter moved.
+#[tokio::test]
+async fn ack_fence_with_a_lease_at_the_cap_in_the_frozen_log_stops_before_the_real_vote() {
+    let fixture = Fixture::new().await;
+    *fixture.steps.grow.borrow_mut() = Some((
+        "check",
+        vec![(
+            "lease",
+            "lse_1",
+            json!({"id": "lse_1", "holder_node_id": OTHER_NODE_ID, "fencing_token": MAX_TOKEN}),
+        )],
+    ));
+    let stopped = stopped(fixture.promote(ack_fence()).await.0);
+    assert_eq!(stopped.at, Stop::FrozenLog);
+    let declared = format!("--ack-fence declares the old primary's node {OTHER_NODE_ID} lost");
+    let says: [&str; 2] = [
+        &declared,
+        "lease lse_1 is at fencing token 9007199254740991",
+    ];
+    for words in says {
+        assert!(stopped.why.contains(words), "{words:?} in {}", stopped.why);
+    }
+    assert_eq!(stopped.own_vote, None);
+    assert_eq!(
+        fixture.steps.events(),
+        then(
+            &PRE_CHECK,
+            &["lock", "freeze", "reads", "log", "open_keys", "unfreeze"]
+        )
+    );
+    assert_eq!(fixture.steps.voted.get(), None);
+    assert_eq!(*fixture.steps.frozen_at.borrow(), None);
 }
