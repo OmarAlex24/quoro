@@ -3269,6 +3269,10 @@ async fn run_session(
             if session.hub.0.store.is_demoted() {
                 continue 'session;
             }
+            // Section 8.8: a primary restored with `--accept-loss` keeps its
+            // exception for a higher term only until its first
+            // `lease_grant`, which ends it before the frame goes out.
+            session.hub.frame_going_out(&text);
             // A send to a node that stopped reading waits until the
             // demotion, then stops waiting: the top of the loop sends
             // `not_primary` within the cap, after the bytes of this frame
@@ -3866,10 +3870,15 @@ impl Session {
                 //
                 // Section 8.8, "Terms": a `stale_term`, whatever it answers,
                 // means a higher term exists. The primary demotes itself and
-                // ends this session like every other one (section 7.4).
+                // ends this session like every other one (section 7.4). A
+                // primary restored with `--accept-loss` that has sent no
+                // `lease_grant` yet starts again above that term instead, and
+                // only this session ends: the node ended it, as the error is
+                // fatal.
                 if error.code == quoro_proto::ErrorCode::StaleTerm {
-                    self.on_stale_term(error.term);
-                    outbox.push(not_primary_frame());
+                    if self.on_stale_term(error.term) {
+                        outbox.push(not_primary_frame());
+                    }
                     return true;
                 }
                 if let Some(re) = raw.re.as_deref()
@@ -3888,6 +3897,16 @@ impl Session {
                         message = %error.message,
                         "a voter refused a support_request; it is not counted"
                     );
+                    // Section 8.8: a `bad_message` that carries the voter's
+                    // `term` says it voted in that term for another
+                    // candidate.
+                    if error.code == quoro_proto::ErrorCode::BadMessage
+                        && let Some(term) = error.term
+                        && self.on_voter_term(term)
+                    {
+                        outbox.push(not_primary_frame());
+                        return true;
+                    }
                     return false;
                 }
                 if let Some(re) = raw.re.as_deref()

@@ -137,6 +137,19 @@ pub struct Store {
     /// Test seam: the next demotion waits here, with the flag set and the
     /// gate held, before its `meta` write ([`Store::hold_next_demotion`]).
     demotion_hold: Arc<std::sync::Mutex<Option<Arc<DemotionHold>>>>,
+    /// Whether this process is a primary restored with `quoro restore
+    /// --accept-loss` that has sent no `lease_grant` yet, so a higher term
+    /// starts it again instead of demoting it ([`Store::restarts_on_a_higher_term`]).
+    restarts: Arc<AtomicBool>,
+}
+
+/// What [`Store::restart_term`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermRestart {
+    /// `meta.term` went from `from` to `to`.
+    Raised { from: i64, to: i64 },
+    /// `meta.term` was already at or above the new term, and stays.
+    Kept(i64),
 }
 
 /// The first wait of the retry of an unrecorded demotion; it doubles after
@@ -443,6 +456,7 @@ impl Store {
             demotion: Arc::new(DemotionRecord::default()),
             stopped: Arc::new(watch::channel(Vec::new()).0),
             demotion_hold: Arc::new(std::sync::Mutex::new(None)),
+            restarts: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -645,10 +659,10 @@ impl Store {
     /// the refusal of [`Store::begin_write`].
     ///
     /// Section 8.8 excepts a primary restored with `quoro restore
-    /// --accept-loss` that has sent no `lease_grant` yet, which would start
-    /// again above the error's term instead (`backup-format.md` section 8.2,
-    /// ADR 0261). That restore path does not exist yet, so every primary
-    /// demotes here.
+    /// --accept-loss` that has sent no `lease_grant` yet, which starts again
+    /// above the error's term instead (`backup-format.md` section 8.2, ADR
+    /// 0261, [`Store::restart_term`]). The caller decides that before it
+    /// calls this; once called, the primary demotes whatever it was.
     pub fn demote(&self, node_term: Option<u64>) -> DemotionTask {
         self.demoted.send_replace(true);
         self.keep_node_term(node_term);
@@ -835,6 +849,86 @@ impl Store {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hold));
         hold
+    }
+
+    /// Whether a higher term starts this primary again instead of demoting
+    /// it: it was restored with `quoro restore --accept-loss` and has sent no
+    /// `lease_grant` yet (`node-agent-protocol.md` sections 7.4 and 8.8,
+    /// `backup-format.md` section 8.2, ADR 0261, ADR 0280). Reads memory
+    /// only.
+    ///
+    /// [`crate::restore_pending::apply`] turns it on at the first start after
+    /// such a restore, before the primary serves, and the first `lease_grant`
+    /// a session sends turns it off for good
+    /// ([`Store::lease_grant_going_out`]). It lives in memory only: a
+    /// process started again finds it off, and demotes on a higher term as
+    /// any primary does, the safe side of the rule.
+    #[must_use]
+    pub fn restarts_on_a_higher_term(&self) -> bool {
+        self.restarts.load(Ordering::SeqCst)
+    }
+
+    /// Turns [`Store::restarts_on_a_higher_term`] on, for a primary restored
+    /// with `--accept-loss` that has not served yet.
+    pub(crate) fn allow_term_restarts(&self) {
+        self.restarts.store(true, Ordering::SeqCst);
+    }
+
+    /// A `lease_grant` is about to go out: from then on a higher term demotes
+    /// this primary, as any other (section 7.4). Called before the frame is
+    /// sent, so a grant never leaves while the exception still holds. Returns
+    /// whether this call ended the exception.
+    pub(crate) fn lease_grant_going_out(&self) -> bool {
+        self.restarts.swap(false, Ordering::SeqCst)
+    }
+
+    /// Starts this primary again at one above `error_term`, the `term` of a
+    /// `stale_term`, or of a voter's `bad_message` that answers a
+    /// `support_request` (`node-agent-protocol.md` sections 5.18, 5.27 and
+    /// 8.8, `backup-format.md` section 8.2): one write, through the writer
+    /// gate, that sets `meta.term`. Every later `welcome`, `desired_state`,
+    /// `support_request` and change-log entry carries it. `meta.term` is
+    /// never lowered: when it already reads that term or a higher one,
+    /// nothing is written. The caller checks
+    /// [`Store::restarts_on_a_higher_term`] first, when the error arrives.
+    ///
+    /// # Errors
+    ///
+    /// A one-line reason, with nothing written: a new term above the term
+    /// ceiling, 2^53 - 1 (section 8.8), which the caller checks before
+    /// already; a demoted primary ([`DEMOTED_REFUSAL`]); a `meta.term` that
+    /// holds no term ([`read_term`]); or a database error. The caller then
+    /// demotes the primary.
+    pub(crate) async fn restart_term(&self, error_term: u64) -> Result<TermRestart, String> {
+        let to = i64::try_from(error_term)
+            .ok()
+            .and_then(|term| term.checked_add(1))
+            .filter(|term| *term <= MAX_TERM)
+            .ok_or_else(|| {
+                format!("one above term {error_term} is above the term ceiling, {MAX_TERM}")
+            })?;
+        let mut w = self
+            .begin_write()
+            .await
+            .map_err(|error| format!("cannot begin the write of the new term: {error}"))?;
+        let from = read_term(&mut *w.tx)
+            .await
+            .map_err(|error| error.to_string())?;
+        if to <= from {
+            return Ok(TermRestart::Kept(from));
+        }
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES ('term', ?) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(to.to_string())
+        .execute(&mut *w.tx)
+        .await
+        .map_err(|error| format!("cannot write meta.term: {error}"))?;
+        w.commit()
+            .await
+            .map_err(|error| format!("cannot commit meta.term: {error}"))?;
+        Ok(TermRestart::Raised { from, to })
     }
 }
 
