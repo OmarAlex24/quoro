@@ -153,13 +153,20 @@ async fn populate(store: &Store) -> String {
     old
 }
 
+/// Inserts a disconnected machine with the `node` role. `capacity`,
+/// `allocated` and `kvm` hold values the node API parses: every read of the
+/// nodes list builds each row, a removed machine's included, so a row it
+/// cannot parse would fail the whole list.
 async fn insert_node(store: &Store, id: &str) {
     let now = now_rfc3339();
     sqlx::query(
         "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, behind_nat, \
          labels, capacity, allocated, kvm, engine_version, agent_version, desired_rev, applied_rev, \
          log_seq, last_seen_at, created_at) \
-         VALUES (?, ?, '[\"node\"]', NULL, 'disconnected', '', NULL, 1, '{}', '{}', '{}', '{}', \
+         VALUES (?, ?, '[\"node\"]', NULL, 'disconnected', '', NULL, 1, '{}', \
+         '{\"cpus\":8,\"memory_mb\":16384,\"disk_gb\":100}', \
+         '{\"cpus\":0,\"memory_mb\":0,\"disk_gb\":0}', \
+         '{\"available\":true,\"kernel\":\"6.8.0\"}', \
          NULL, NULL, 0, 0, 0, ?, ?)",
     )
     .bind(id)
