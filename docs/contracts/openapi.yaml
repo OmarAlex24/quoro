@@ -1296,7 +1296,7 @@ components:
       title: NodeJoinTokenCreated
       description: |
         The new join token. `token` is shown once and cannot be retrieved again;
-        `join_command` is the single line the operator runs on the new machine.
+        `join_command` is the line that enrolls the new machine.
       required:
         - id
         - token
@@ -1317,7 +1317,11 @@ components:
           description: Expiry of the token.
         join_command:
           type: string
-          description: One-line command that enrolls the node and starts the node agent.
+          description: |
+            One-line command that enrolls the machine, run as root on it. It
+            enrolls only and starts nothing. Starting the node agent is a
+            separate step, as root too: `quoro node`, or the
+            `quoro-node.service` unit, which runs it.
     EnrollNodeRequest:
       type: object
       title: EnrollNodeRequest
@@ -5792,7 +5796,10 @@ components:
           description: |
             Call parameters, with secrets redacted; `{}` when the record keeps
             their digest instead, or when the request body was above the
-            limit (README.md, "Request body limit").
+            limit (README.md, "Request body limit"). Records an earlier build
+            wrote for an approve or deny call with no body, or with one sent
+            without a `Content-Type`, which the call reads as none, carry
+            `null` (audit-log-format.md section 2).
         params_sha256:
           type: [string, 'null']
           pattern: '^[0-9a-f]{64}$'
@@ -5837,7 +5844,9 @@ components:
             - error
         result_detail:
           type: [string, 'null']
-          description: Refusal reason or error code.
+          description: |
+            Refusal reason or error code. On an `ok` record, only where
+            audit-log-format.md section 3 names one (`cluster.maintenance`).
         change_seq:
           type: [integer, 'null']
           description: Change-log seq the action produced, if any.
@@ -6763,9 +6772,18 @@ paths:
       description: |
         Removes a node. Removing a node is destructive and human-only (D-0030):
         an agent is refused with `forbidden` and `reason: human_only`, or with
-        `approval_required` when it asks for approval first. A node that still
-        hosts running instances is refused with `conflict`. The node moves to
-        `removed` and reconciliation stops targeting it. `Quoro-Justification` is
+        `approval_required` when it asks for approval first. Refused with
+        `conflict` for a node already `removed` (except the repair of
+        node-agent-protocol.md section 8.10), for the node that holds the
+        primary status, and for a node that still hosts running instances.
+        A node that is not connected and holds a lease that is not revoked at
+        2^53 - 1, the token cap, is refused with `conflict` and `reason: token_exhausted`, and
+        nothing is written (node-agent-protocol.md section 8.6, ADR 0325).
+        For a connected node the primary first revokes its leases over the
+        session, and the call stays open until the node answers, up to a
+        bound the primary sets, as for `failoverApp`; a fence that is not confirmed in that time answers `conflict`
+        and removes nothing (node-agent-protocol.md section 10). The node
+        moves to `removed` and reconciliation stops targeting it. `Quoro-Justification` is
         required when the caller is an agent (D-0031). From M5b removing a voter
         changes the voter set, so it is also refused with `conflict` while the
         previous voter-set change has not reached a majority of voters
