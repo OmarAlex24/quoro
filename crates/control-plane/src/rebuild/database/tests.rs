@@ -1474,3 +1474,52 @@ async fn the_chain_checks_find_the_same_break_page_by_page() {
     drop(conn);
     rebuilt.pool().close().await;
 }
+
+/// [`check`] stops where [`build`] stops and leaves nothing at a target
+/// path: a log that builds passes with the build's counts, a row whose
+/// parent the log lacks stops at the foreign-key check, a tampered entry at
+/// the chain, and an empty log at once.
+#[tokio::test]
+async fn a_check_stops_where_the_build_stops_and_writes_no_file() {
+    let primary = primary().await;
+    log(
+        &primary,
+        "user",
+        "usr_1",
+        Op::Create,
+        user("usr_1", "a@example.com"),
+    )
+    .await;
+    let good = followed(&primary).await;
+    let dir = Dir::new();
+    let checked = check(&good, CLUSTER).await.unwrap();
+    assert!(dir.files().is_empty(), "{:?}", dir.files());
+    let built = build(&good, CLUSTER, 2, &dir.target()).await.unwrap();
+    assert_eq!(
+        (checked.head_seq, &checked.rows),
+        (built.head_seq, &built.rows)
+    );
+
+    log(
+        &primary,
+        "api_token",
+        "tok_9",
+        Op::Create,
+        token("tok_9", "usr_9", "z"),
+    )
+    .await;
+    let error = check(&followed(&primary).await, CLUSTER).await.unwrap_err();
+    assert!(matches!(&error, BuildError::ForeignKey { .. }), "{error}");
+
+    let mut tampered = good.clone();
+    tampered[0].payload = "[]".to_owned();
+    let error = check(&tampered, CLUSTER).await.unwrap_err();
+    assert!(
+        matches!(&error, BuildError::ChangeLog { seq: 1, .. }),
+        "{error}"
+    );
+    assert!(matches!(
+        check(&[], CLUSTER).await,
+        Err(BuildError::EmptyLog)
+    ));
+}

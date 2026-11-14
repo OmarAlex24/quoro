@@ -47,6 +47,10 @@
 //! a name, or that name with `-wal`, `-shm` or `-journal` after it, and that
 //! belong to the user it runs as.
 //!
+//! [`check`] runs steps 1 to 9 in a database held in memory and writes no
+//! file, so a caller learns whether a log builds before it changes
+//! anything.
+//!
 //! # How a payload's values become columns
 //!
 //! A payload carries each column under the column's name, as its writer
@@ -390,6 +394,35 @@ pub async fn build(
         return Err(error);
     }
     Ok(built)
+}
+
+/// Runs every check of [`build`] on `entries` in a database held in memory,
+/// and writes no file: the chain of the followed entries, the fold, the
+/// cascades, the insert of the final rows, the foreign keys, and the
+/// change-log and audit chains of the result. `quoro cluster promote` runs it
+/// before any vote request, and again on its frozen log before the first
+/// real one (`node-agent-protocol.md` section 7.3, the refusal of a followed
+/// log that does not fold), so a log that would stop [`build`] stops the
+/// promotion before it takes a term. `meta` holds `cluster_id` and term 1,
+/// which no check reads; the database is dropped on return.
+///
+/// # Errors
+///
+/// The [`BuildError`] [`build`] would stop with on the same entries, but
+/// those that concern the file at its target path ([`BuildError::Exists`],
+/// [`BuildError::Unflushed`]).
+pub async fn check(entries: &[FollowedEntry], cluster_id: &str) -> Result<Built, BuildError> {
+    if entries.is_empty() {
+        return Err(BuildError::EmptyLog);
+    }
+    if cluster_id.is_empty() {
+        return Err(BuildError::NoClusterId);
+    }
+    check_chain(entries)?;
+    let store = Store::open_in_memory().await?;
+    let checked = fill(&store, entries, cluster_id, 1).await;
+    store.pool().close().await;
+    checked
 }
 
 /// A name next to `path` that no other build takes:
