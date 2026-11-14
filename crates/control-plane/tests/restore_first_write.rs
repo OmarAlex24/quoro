@@ -335,6 +335,23 @@ async fn check_and_apply(store: &Store, dir: &Path) -> Result<Applied, String> {
     restore_pending::apply(store, dir, pending).await
 }
 
+/// `meta.term`.
+async fn meta_term(store: &Store) -> Option<String> {
+    sqlx::query_scalar("SELECT value FROM meta WHERE key = 'term'")
+        .fetch_optional(store.pool())
+        .await
+        .unwrap()
+}
+
+/// The `term` of every change-log entry after `seq`.
+async fn terms_after(store: &Store, seq: i64) -> Vec<i64> {
+    sqlx::query_scalar("SELECT term FROM change_log WHERE seq > ? ORDER BY seq")
+        .bind(seq)
+        .fetch_all(store.pool())
+        .await
+        .unwrap()
+}
+
 /// The first start after a restore makes the first write before any other
 /// change-log write of the start: the entries right after the restored head
 /// mark every `expiring` row (the revoked one too) and only those, then move
@@ -1026,8 +1043,9 @@ fn lost(old: &str) -> Vec<String> {
 /// with the `node` role that is not removed: the old host's primary node and
 /// the leases' holder. It raises the token of each lease they held and
 /// records it revoked, deletes their custody seals, and records
-/// `cluster.restored` with exact `params` (the removed ids and the term the
-/// database holds), the statement as its justification and its removal
+/// `cluster.restored` with exact `params` (the removed ids and the term of
+/// the first write, one above the term the database holds), the statement
+/// as its justification and its removal
 /// entry as `change_seq`, before `cluster.primary_moved` and with no other
 /// record. Each removal clears the machine's `cp_status` in its own entry.
 /// The move that follows writes the new host's entry only, after the
@@ -1099,10 +1117,13 @@ async fn an_accept_loss_first_write_removes_every_other_node() {
         record.target,
         (Some("cluster".to_string()), Some(cluster_id))
     );
+    // The restored primary's first term (`audit-log-format.md` section 3.9):
+    // one above the 7 the database held, the highest term it knows of.
     assert_eq!(
         record.params,
-        json!({ "removed_node_ids": removed, "term": 7 })
+        json!({ "removed_node_ids": removed, "term": 8 })
     );
+    assert_eq!(meta_term(&store).await.as_deref(), Some("8"));
     assert_eq!(record.justification.as_deref(), Some(STATEMENT));
     assert_eq!(
         records[1].params,
@@ -1965,4 +1986,178 @@ async fn with_no_primary_status_after_an_accept_loss_first_write_the_primary_ser
         assert_eq!(status, "succeeded");
     }
     assert_eq!(holders(store).await, 0, "nothing took the status");
+}
+
+/// The term ceiling, 2^53 - 1 (node-agent-protocol.md section 8.8).
+const MAX_TERM: u64 = (1 << 53) - 1;
+
+/// Writes `id`'s lease row to the change log again, as a later write of the
+/// row did, at the term `meta.term` reads.
+async fn log_lease_again(store: &Store, id: &str) {
+    let mut w = store.begin_write().await.unwrap();
+    changelog::append(
+        &mut w.tx,
+        &Actor::system("test"),
+        "lease",
+        id,
+        Op::Update,
+        json!({
+            "id": id,
+            "resource_type": "app",
+            "resource_id": "app_01JC9Z1A2B3C4D5E6F7G8H9J02",
+            "holder_node_id": HOLDER,
+            "mode": "local",
+            "fencing_token": 5,
+            "duration_ms": null,
+            "granted_at": now_rfc3339(),
+            "renewed_at": null,
+            "expires_at": null,
+            "revoked_at": null,
+            "unsettled": false,
+        }),
+    )
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+}
+
+/// `backup-format.md` section 8.2, "Term": the restored primary starts one
+/// above the highest of the restored log's terms. Here the log's newest
+/// entry is at term 5 while the database's `meta.term` reads 3. The first
+/// write sets `meta.term` to 6 before anything else, so every entry it
+/// appends, the two marks, carries 6.
+#[tokio::test]
+async fn the_first_write_starts_one_above_the_restored_logs_terms() {
+    let (dir, store, _old, _) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    set_term(&store, 5).await;
+    log_lease_again(&store, LOCAL).await;
+    set_term(&store, 3).await;
+    let head = log_head_of(&store).await;
+    assert_eq!(terms_after(&store, head.seq - 1).await, vec![5]);
+    write_marker(&dir, &Marker::plain(head.clone()));
+
+    check_and_apply(&store, &dir).await.unwrap();
+    assert_eq!(meta_term(&store).await.as_deref(), Some("6"));
+    assert_eq!(terms_after(&store, head.seq).await, vec![6, 6]);
+}
+
+/// `backup-format.md` section 8.2, "Term": the restored primary also starts
+/// above the term this host's node agent stored. `quoro restore` reads that
+/// term, as root, and raises the restored `meta.term` to it before it
+/// installs the database; the start reads no store of the agent. Here the
+/// log's entries are below 9 and `quoro restore` raised `meta.term` to the
+/// agent's 9: the first write starts at 10, and every entry it appends
+/// carries 10.
+#[tokio::test]
+async fn the_first_write_starts_one_above_the_agents_term_quoro_restore_installed() {
+    let (dir, store, _old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    let log = terms_after(&store, 0).await.into_iter().max().unwrap();
+    assert!(
+        log < 9,
+        "the log's entries are below the agent's term: {log}"
+    );
+    set_term(&store, 9).await;
+    write_marker(&dir, &Marker::plain(head.clone()));
+    check_and_apply(&store, &dir).await.unwrap();
+    assert_eq!(meta_term(&store).await.as_deref(), Some("10"));
+    assert_eq!(terms_after(&store, head.seq).await, vec![10, 10]);
+}
+
+/// Asserts that the first write wrote nothing: the log's head, `meta.term`,
+/// `meta.restore_marker`, the marks, the removals and the audit log are as
+/// before, and the marker and `primary-node` are still there.
+async fn assert_nothing_written(
+    store: &Store,
+    dir: &Path,
+    head: &Head,
+    term: &str,
+    audit_before: i64,
+) {
+    assert_eq!(&log_head_of(store).await, head);
+    assert_eq!(meta_term(store).await.as_deref(), Some(term));
+    assert_eq!(restore_marker(store).await, None);
+    assert_eq!(marks(store).await, unmarked());
+    assert_eq!(status(store, HOLDER).await, "disconnected");
+    assert_eq!(audit_head(store).await, audit_before);
+    assert!(exists(dir, restore_pending::MARKER_FILE));
+    assert!(exists(dir, primary_status::MARKER_FILE));
+}
+
+/// #862, node-agent-protocol.md section 8.8, "The term ceiling": a restored
+/// primary whose first term would pass 2^53 - 1 writes nothing. Here
+/// `quoro restore` installed `meta.term` at the ceiling, the term of an agent
+/// at the ceiling. The first step of the start reads the terms and stops it,
+/// before the migrations, with the marker and `primary-node` left in place.
+/// The write itself refuses too, as a backstop, for a term it reads above
+/// the check's.
+#[tokio::test]
+async fn a_first_term_past_the_term_ceiling_writes_nothing_and_stops_the_start() {
+    let (dir, store, _old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    set_term(&store, i64::try_from(MAX_TERM).unwrap()).await;
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+    let audit_before = audit_head(&store).await;
+
+    let error = check_and_apply(&store, &dir).await.unwrap_err();
+    assert!(error.contains("term ceiling"), "{error}");
+    assert!(error.contains("nothing was written"), "{error}");
+    assert_nothing_written(&store, &dir, &head, &MAX_TERM.to_string(), audit_before).await;
+    assert!(!store.restarts_on_a_higher_term());
+
+    // Below the ceiling the check passes; the database's term then reaches
+    // the ceiling before the write runs.
+    set_term(&store, 1).await;
+    let pending = restore_pending::check(&store, &dir).await.unwrap();
+    set_term(&store, i64::try_from(MAX_TERM).unwrap()).await;
+    let error = restore_pending::apply(&store, &dir, pending)
+        .await
+        .unwrap_err();
+    assert!(error.contains("term ceiling"), "{error}");
+    assert!(error.contains("nothing was written"), "{error}");
+    assert_nothing_written(&store, &dir, &head, &MAX_TERM.to_string(), audit_before).await;
+    assert!(!store.restarts_on_a_higher_term());
+}
+
+/// node-agent-protocol.md section 8.8: only a primary restored with
+/// `--accept-loss` starts again on a higher term until its first
+/// `lease_grant`, and only in the process that made the first write; a plain
+/// restore does not. A start that finds the marker of a first write already
+/// committed, which it deletes, does not get it either, after `--accept-loss`
+/// too: the process before it may have served and sent a `lease_grant`
+/// before its deletion of the marker failed.
+#[tokio::test]
+async fn only_the_process_of_an_accept_loss_first_write_starts_again_on_a_higher_term() {
+    let (dir, store, _old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    write_marker(&dir, &Marker::plain(head.clone()));
+    check_and_apply(&store, &dir).await.unwrap();
+    assert!(!store.restarts_on_a_higher_term());
+    write_marker(&dir, &Marker::plain(head));
+    let next = Store::open(&dir.join("quoro.db")).await.unwrap();
+    assert_eq!(
+        check_and_apply(&next, &dir).await.unwrap(),
+        Applied::AlreadyWritten
+    );
+    assert!(!next.restarts_on_a_higher_term());
+
+    let (dir, store, _old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+    assert!(matches!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite { .. }
+    ));
+    assert!(store.restarts_on_a_higher_term());
+    write_marker(&dir, &forced(&head));
+    let next = Store::open(&dir.join("quoro.db")).await.unwrap();
+    assert_eq!(
+        check_and_apply(&next, &dir).await.unwrap(),
+        Applied::AlreadyWritten
+    );
+    assert!(!next.restarts_on_a_higher_term());
+    assert!(!exists(&dir, restore_pending::MARKER_FILE));
 }

@@ -28,6 +28,7 @@
 //!   committed. The marker is deleted and nothing is written again.
 //! - **It matches the database's log head:** this is the first start after
 //!   the restore, and the first write is made from it. In one transaction it
+//!   sets the restored primary's term first (below, "The term"), then
 //!   marks every `expiring` lease row unsettled (node-agent-protocol.md
 //!   section 8.4, "The mark", [`crate::leases::mark_expiring_rows`]), makes
 //!   the removals of `--accept-loss` when the marker asks for them (below),
@@ -100,6 +101,38 @@
 //! while no holder has a credential, and the local enrollment then makes the
 //! new host's node the holder.
 //!
+//! **The term (`backup-format.md` section 8.2, "Term"; node-agent-protocol.md
+//! section 8.8; ADR 0261, ADR 0280).** The first write starts the restored
+//! primary at one above the highest term it knows of: the restored log's
+//! terms and the term the restored database holds (`meta.term`). `quoro
+//! restore`, which runs as root, already raised that `meta.term` to the term
+//! this host's node agent stored before it installed the database; this
+//! start never reads the agent's store, which belongs to root while the
+//! control plane runs as its own user. Its first statement sets `meta.term`,
+//! so every entry of the write, and `cluster.restored`, carries the new term.
+//! [`check`] reads the same terms and stops the start, before the migrations
+//! and with nothing written, when that term would pass the term ceiling,
+//! 2^53 - 1: a stated limit, as no restore can take a higher term. The third
+//! source the contract names, the terms in vote `check` answers the restored
+//! primary receives, is not read here: nothing in this start sends a vote
+//! `check`.
+//!
+//! After `--accept-loss`, [`apply`] also lets a higher term start the
+//! primary again until it sends its first `lease_grant`
+//! ([`Store::restarts_on_a_higher_term`]): a `stale_term`, or a voter's
+//! `bad_message` that carries its `term`, then raises `meta.term` to one
+//! above that term instead of demoting it (node-agent-protocol.md section
+//! 8.8, [`Store::restart_term`]). A restart that would pass the ceiling
+//! demotes it. A plain restore does not: it demotes on `stale_term`, and a
+//! voter's `bad_message` leaves it without that voter's support.
+//!
+//! Only the process that made the first write has the exception, and only in
+//! memory. A start that finds the marker already written
+//! ([`Pending::AlreadyWritten`]) does not get it: the process before it may
+//! have committed the first write, served and sent a `lease_grant`, and then
+//! failed to delete the marker. A primary started again before its first
+//! grant therefore demotes on a higher term, the safe side of the rule.
+//!
 //! The token cap (node-agent-protocol.md section 8.6, ADR 0325): [`check`]
 //! reads every lease that write would raise and stops the start, before the
 //! migrations and with nothing written, when one is already at the cap
@@ -117,7 +150,7 @@ use crate::audit::{Channel, Outcome, Record};
 use crate::changelog::{self, Actor, Op};
 use crate::error::ApiError;
 use crate::primary_status::{self, File, Moved};
-use crate::store::{GENESIS_HASH, Store, read_term};
+use crate::store::{GENESIS_HASH, MAX_TERM, Store, TermError, read_term};
 
 /// The marker `quoro restore` writes into the data directory, next to the
 /// database and to `primary-node`.
@@ -346,11 +379,13 @@ pub enum Applied {
 ///
 /// A one-line reason that stops the start, with nothing written, nothing
 /// migrated and the marker and `primary-node` left in place: a
-/// `primary-node` file that cannot be read when the first write is due;
-/// after `--accept-loss`, a lease of a machine to remove whose token is
-/// already at the cap (`token_exhausted`, node-agent-protocol.md section
-/// 8.6), which stops every later start the same way until an operator
-/// resolves it; or a database error.
+/// `primary-node` file that cannot be read when the first write is due; a
+/// first term that would pass the term ceiling (node-agent-protocol.md
+/// section 8.8), which stops every later start the same way; after
+/// `--accept-loss`, a lease of a machine to remove whose token is already at
+/// the cap (`token_exhausted`, node-agent-protocol.md section 8.6), which
+/// stops every later start the same way until an operator resolves it; or a
+/// database error.
 pub async fn check(store: &Store, data_dir: &Path) -> Result<Pending, String> {
     let path = data_dir.join(MARKER_FILE);
     let marker = match std::fs::read(&path) {
@@ -403,10 +438,89 @@ pub async fn check(store: &Store, data_dir: &Path) -> Result<Pending, String> {
             ));
         }
     };
+    let stops = "the start stops before its migrations, and nothing was written";
+    let mut tx = store.pool().begin().await.map_err(|error| {
+        format!(
+            "cannot read the database before the restored primary's first write: {error}; {stops}"
+        )
+    })?;
+    let first = first_term(&mut tx)
+        .await
+        .map_err(|reason| format!("{reason}; {stops}"))?;
+    tx.rollback().await.map_err(|error| {
+        format!("cannot end the read before the restored primary's first write: {error}; {stops}")
+    })?;
+    if let Err(reason) = first {
+        return Err(format!(
+            "{} asks for the restored primary's first write: {reason}; {stops}, and every later \
+             start stops the same way: no restore can take a higher term (node-agent-protocol.md \
+             section 8.8)",
+            path.display()
+        ));
+    }
     if marker.accept_loss {
         check_accept_loss(store, &path, node_id.as_deref()).await?;
     }
     Ok(Pending::FirstWrite { marker, node_id })
+}
+
+/// The restored primary's first term (`backup-format.md` section 8.2,
+/// "Term"), read on `conn`: one above the highest of the change log's terms
+/// and `meta.term`, which `quoro restore` raised to the term this host's
+/// node agent stored. A `meta.term` that holds no term ([`read_term`]) is
+/// logged and left out: the first write replaces it. A database without a
+/// `change_log` or `meta` table yet has no term there.
+///
+/// Gives `Ok(Err(reason))` when that term would pass the term ceiling,
+/// 2^53 - 1 (node-agent-protocol.md section 8.8).
+///
+/// # Errors
+///
+/// A one-line reason for a database error.
+async fn first_term(conn: &mut SqliteConnection) -> Result<Result<i64, String>, String> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('meta', 'change_log')",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|error| format!("cannot read the database's tables: {error}"))?;
+    let has = |name: &str| tables.iter().any(|table| table == name);
+    let log_term: Option<i64> = if has("change_log") {
+        sqlx::query_scalar("SELECT MAX(term) FROM change_log")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|error| format!("cannot read the change log's terms: {error}"))?
+    } else {
+        None
+    };
+    let meta_term = if has("meta") {
+        match read_term(&mut *conn).await {
+            Ok(term) => Some(term),
+            Err(TermError::Database(error)) => {
+                return Err(format!("cannot read meta.term: {error}"));
+            }
+            Err(TermError::Bad(value)) => {
+                tracing::warn!(
+                    meta_term = %value,
+                    "the restored meta.term holds no term; the first write replaces it"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let highest = log_term.max(meta_term).unwrap_or(0);
+    Ok(highest
+        .checked_add(1)
+        .filter(|term| *term <= MAX_TERM)
+        .ok_or_else(|| {
+            format!(
+                "its first term, one above {highest} (the highest of the restored log's terms \
+                 {log_term:?} and meta.term {meta_term:?}), would pass the term ceiling, \
+                 {MAX_TERM}"
+            )
+        }))
 }
 
 /// `meta.restore_marker` and the change log's head, read in one read
@@ -445,10 +559,11 @@ async fn read_database(store: &Store) -> Result<(Option<String>, Head), sqlx::Er
 ///
 /// # Errors
 ///
-/// A one-line reason for a database error, which stops the start, or, after
-/// `--accept-loss`, for a lease to raise at the token cap, the backstop of
-/// what [`check`] already refuses. The first write is then not committed, so
-/// none of it is written, and the marker and `primary-node` stay for the next
+/// A one-line reason for a database error, which stops the start, for a
+/// first term above the term ceiling, or, after `--accept-loss`, for a lease
+/// to raise at the token cap; the last two are the backstops of what
+/// [`check`] already refuses. The first write is then not committed, so none
+/// of it is written, and the marker and `primary-node` stay for the next
 /// start.
 pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<Applied, String> {
     let path = data_dir.join(MARKER_FILE);
@@ -468,6 +583,10 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
                 head_seq = head.seq,
                 "the restored primary's first write already committed; deleting the restore-pending marker"
             );
+            // An `--accept-loss` restore's exception for a higher term is not
+            // given back here: the process that committed the first write may
+            // have served and sent a `lease_grant` before its deletion of the
+            // marker failed (node-agent-protocol.md section 8.8).
             remove(&path);
             return Ok(Applied::AlreadyWritten);
         }
@@ -488,6 +607,21 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
         .begin_write()
         .await
         .map_err(|error| format!("cannot begin the restored primary's first write: {error}"))?;
+    // The restored primary's term, before anything else of the write, so
+    // every entry and record of the write carries it (`backup-format.md`
+    // section 8.2, "Term"). The terms are read again inside the write; the
+    // ceiling here is the backstop of what [`check`] already refuses.
+    let term = first_term(&mut w.tx).await?.map_err(|reason| {
+        format!("the restored primary's first write: {reason}; nothing was written")
+    })?;
+    sqlx::query(
+        "INSERT INTO meta (key, value) VALUES ('term', ?) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(term.to_string())
+    .execute(&mut *w.tx)
+    .await
+    .map_err(|error| format!("cannot write the restored primary's term to meta.term: {error}"))?;
     let actor = Actor::system(ACTOR);
     let marked = crate::leases::mark_expiring_rows(&mut w.tx, &actor)
         .await
@@ -560,9 +694,13 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
     tracing::info!(
         head_seq = marker.head.seq,
         marked = marked.len(),
-        "made the restored primary's first write: every expiring lease row is marked unsettled"
+        term,
+        "made the restored primary's first write: it starts at this term, and every expiring lease row is marked unsettled"
     );
     if marker.accept_loss {
+        // Until its first `lease_grant`, a higher term starts it again
+        // instead of demoting it (node-agent-protocol.md section 8.8).
+        store.allow_term_restarts();
         tracing::warn!(
             removed_node_ids = ?removed,
             "the restore was made with --accept-loss: its first write removed every other machine with the node role and recorded cluster.restored"
@@ -591,10 +729,12 @@ pub async fn apply(store: &Store, data_dir: &Path, pending: Pending) -> Result<A
 /// with the operator's `statement`. Returns the removed ids, by id, and
 /// whether it cleared `cp_status` on every machine.
 ///
-/// `cluster.restored`'s `params.term` is the term the database holds when
-/// the write runs (`meta.term`), and its `change_seq` is the removal entry of
-/// the last machine removed, or, with none removed, the newest entry the
-/// write appended before it, if any.
+/// `cluster.restored`'s `params.term` is the term of the first write, the
+/// restored primary's first term, which the write set in `meta.term` before
+/// anything else (`audit-log-format.md` section 3.9). A later restart above a
+/// higher term leaves the record as it is. Its `change_seq` is the removal
+/// entry of the last machine removed, or, with none removed, the newest entry
+/// the write appended before it, if any.
 ///
 /// # Errors
 ///

@@ -19,13 +19,57 @@
 //!   `error` that answers a request is logged and counts nothing. A
 //!   `stale_term`, whatever it answers, stops all support and demotes the
 //!   primary (sections 7.4 and 8.8, "Terms").
+//! - **A restored primary (section 8.8; `backup-format.md` section 8.2; ADR
+//!   0261, ADR 0280).** A primary restored with `quoro restore
+//!   --accept-loss` that has sent no `lease_grant` yet
+//!   ([`crate::store::Store::restarts_on_a_higher_term`]) starts again at
+//!   one above the `term` of a `stale_term`, or of a voter's `bad_message`
+//!   that answers a `support_request`, instead of demoting itself
+//!   ([`NodeHub::start_again_above`]). A restart that would pass the term
+//!   ceiling demotes it. Any other primary demotes on `stale_term`, and a
+//!   voter's `bad_message` only leaves it without that voter's support. The
+//!   first `lease_grant` a session sends ends the exception
+//!   ([`NodeHub::frame_going_out`]). A session start sends the node every
+//!   lease it holds again (`Session::finish_start`, `Session::send_grants`),
+//!   each as a `lease_grant`, so the first session start of the host's own
+//!   node ends the exception when that node holds a lease: the contract's
+//!   "has sent no `lease_grant` yet" counts those grants too.
 
 use super::{NodeHub, Session, cluster_term, new_msg_id};
 use crate::error::ApiError;
+use crate::store::TermRestart;
 use crate::support::{Answer, REQUEST_INTERVAL, SUPPORT_MS};
 use quoro_proto::wire::{self, ControlMessage};
 use sqlx::SqliteConnection;
 use tokio::time::Instant;
+
+/// What a term above this primary's does to it ([`NodeHub::start_again_above`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HigherTerm {
+    /// This primary is not one restored with `--accept-loss` that has sent no
+    /// `lease_grant` yet: the rules of any primary apply.
+    NoException,
+    /// It starts again at one above the term; the write runs on its own task.
+    StartsAgain,
+    /// One above the term would pass the term ceiling, 2^53 - 1: it demotes
+    /// itself instead (section 8.8, "The term ceiling").
+    PastTheCeiling,
+}
+
+/// Whether the frame `text` is a `lease_grant`. A frame this primary built
+/// always parses; one that does not is taken for a grant, the safe side of
+/// [`NodeHub::frame_going_out`].
+pub(super) fn is_lease_grant(text: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Frame<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: std::borrow::Cow<'a, str>,
+    }
+    match serde_json::from_str::<Frame<'_>>(text) {
+        Ok(frame) => frame.kind == "lease_grant",
+        Err(_) => true,
+    }
+}
 
 /// The `detail` of rule 2's refusal (section 8.10).
 pub const VOTERS_CHANGING: &str = "the previous voter-set change has not reached a majority of voters yet; try again once they have acknowledged it";
@@ -107,6 +151,70 @@ pub(crate) fn removal_allowed(
 }
 
 impl NodeHub {
+    /// A machine answered with `term`, the `term` of a `stale_term` or of a
+    /// voter's `bad_message` (sections 5.18, 5.27 and 8.8). A primary
+    /// restored with `quoro restore --accept-loss` that has sent no
+    /// `lease_grant` yet starts again at one above it instead of demoting
+    /// itself (`backup-format.md` section 8.2, ADR 0261, ADR 0280): its
+    /// `meta.term` is raised in one write, on its own task, so the session
+    /// waits for neither the writer gate nor SQLite
+    /// ([`crate::store::Store::restart_term`]). That write never lowers
+    /// the term; when it fails, the primary demotes itself. The decision is
+    /// taken here, when the error arrives.
+    ///
+    /// When one above `term` would pass the term ceiling, nothing is written
+    /// and the caller demotes the primary. Any other primary gets
+    /// [`HigherTerm::NoException`] and nothing happens here.
+    pub(crate) fn start_again_above(&self, term: u64) -> HigherTerm {
+        if !self.0.store.restarts_on_a_higher_term() {
+            return HigherTerm::NoException;
+        }
+        if term >= wire::MAX_TERM {
+            return HigherTerm::PastTheCeiling;
+        }
+        let hub = self.clone();
+        tokio::spawn(async move {
+            match hub.0.store.restart_term(term).await {
+                Ok(TermRestart::Raised { from, to }) => tracing::warn!(
+                    node_term = term,
+                    from,
+                    to,
+                    "a machine knows a higher term: this primary, restored with --accept-loss and with no lease_grant sent yet, starts again at one above it"
+                ),
+                Ok(TermRestart::Kept(current)) => tracing::info!(
+                    node_term = term,
+                    term = current,
+                    "this primary, restored with --accept-loss, already runs above that term"
+                ),
+                Err(reason) => {
+                    tracing::error!(
+                        node_term = term,
+                        %reason,
+                        "this primary, restored with --accept-loss, cannot start again above that term; it demotes itself"
+                    );
+                    drop(hub.stale_term(Some(term)));
+                }
+            }
+        });
+        HigherTerm::StartsAgain
+    }
+
+    /// A session is about to send the frame `text`. When it is the first
+    /// `lease_grant` of a primary restored with `--accept-loss`, a higher
+    /// term demotes this primary from then on, as any other (section 7.4).
+    /// Called before the frame is sent; reads the frame only while the
+    /// exception holds.
+    pub(crate) fn frame_going_out(&self, text: &str) {
+        if self.0.store.restarts_on_a_higher_term()
+            && is_lease_grant(text)
+            && self.0.store.lease_grant_going_out()
+        {
+            tracing::info!(
+                "the restored primary sends its first lease_grant: from now on a higher term demotes it"
+            );
+        }
+    }
+
     /// Records that `node_id` acknowledged, with `command_result` `ok`, a
     /// `desired_state` carrying voter-set version `version`. The version
     /// only grows, so an older acknowledgement arriving late lowers nothing.
@@ -487,14 +595,70 @@ impl Session {
     /// stops granting and renewing `expiring` leases at once, then demotes
     /// itself ([`NodeHub::stale_term`], section 7.4, ADR 0230). The flag is
     /// set when this returns; the session does not wait for the `meta`
-    /// write, so it ends within its cap.
-    pub(super) fn on_stale_term(&self, node_term: Option<u64>) {
+    /// write, so it ends within its cap. Returns `true`.
+    ///
+    /// A primary restored with `--accept-loss` that has sent no
+    /// `lease_grant` yet starts again at one above the error's `term`
+    /// instead, and this returns `false` ([`NodeHub::start_again_above`]).
+    /// Without a `term` there is nothing to start above, and it demotes;
+    /// the contract gives no rule for that case.
+    pub(super) fn on_stale_term(&self, node_term: Option<u64>) -> bool {
+        if let Some(term) = node_term {
+            match self.hub.start_again_above(term) {
+                HigherTerm::StartsAgain => {
+                    tracing::warn!(
+                        node_id = %self.node_id,
+                        node_term = term,
+                        "a node answered stale_term: this primary, restored with --accept-loss and with no lease_grant sent yet, starts again above its term"
+                    );
+                    return false;
+                }
+                HigherTerm::PastTheCeiling => tracing::error!(
+                    node_id = %self.node_id,
+                    node_term = term,
+                    "a node answered stale_term: one above its term would pass the term ceiling, so this primary, restored with --accept-loss, demotes itself instead"
+                ),
+                HigherTerm::NoException => {}
+            }
+        }
         tracing::error!(
             node_id = %self.node_id,
             ?node_term,
             "a node answered stale_term: a higher term exists; this primary grants and renews no expiring lease and demotes itself"
         );
         drop(self.hub.stale_term(node_term));
+        true
+    }
+
+    /// A voter answered a `support_request` with `bad_message` carrying its
+    /// `term`: it voted in that term for another candidate (sections 5.27
+    /// and 8.8, ADR 0280). The answer already counts for nothing. A primary
+    /// restored with `--accept-loss` that has sent no `lease_grant` yet
+    /// treats it like `stale_term` and starts again at one above that term;
+    /// when that would pass the term ceiling it demotes itself, and this
+    /// returns `true`. Any other primary, a plain restore's included, only
+    /// lacks that voter's support.
+    pub(super) fn on_voter_term(&self, term: u64) -> bool {
+        match self.hub.start_again_above(term) {
+            HigherTerm::StartsAgain => {
+                tracing::warn!(
+                    node_id = %self.node_id,
+                    node_term = term,
+                    "a voter voted in this term for another candidate: this primary, restored with --accept-loss and with no lease_grant sent yet, starts again above it"
+                );
+                false
+            }
+            HigherTerm::PastTheCeiling => {
+                tracing::error!(
+                    node_id = %self.node_id,
+                    node_term = term,
+                    "a voter voted in this term for another candidate, and one above it would pass the term ceiling: this primary, restored with --accept-loss, demotes itself instead"
+                );
+                drop(self.hub.stale_term(Some(term)));
+                true
+            }
+            HigherTerm::NoException => false,
+        }
     }
 }
 
