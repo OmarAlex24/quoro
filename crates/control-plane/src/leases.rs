@@ -520,7 +520,11 @@ pub(crate) fn declaration_covers(lease: &Lease, lost_at: &str) -> bool {
 
 /// Whether the declaration that set its holder's `lost_at` still releases
 /// `lease`: it covers the row ([`declaration_covers`]), and the holder has
-/// not reported since (`last_seen_at` is unset or not past `lost_at`).
+/// not reported since: `last_seen_at` is unset or strictly before `lost_at`.
+/// A report stamped at the declaration's own instant counts as a report
+/// since it, so the declaration then releases nothing: the two stamps cannot
+/// be ordered at that resolution, and reading the tie as a return is the
+/// side that holds the lease (#761).
 ///
 /// Sections 8.3 and 8.5: "declaring a node lost never covers a failed fence
 /// the operator has not seen". Once the node said `hello` after the
@@ -544,7 +548,7 @@ pub(crate) fn declaration_releases(
     lost_at: &str,
     last_seen_at: Option<&str>,
 ) -> bool {
-    declaration_covers(lease, lost_at) && last_seen_at.is_none_or(|seen| seen <= lost_at)
+    declaration_covers(lease, lost_at) && last_seen_at.is_none_or(|seen| seen < lost_at)
 }
 
 /// Whether `lease`'s last holder has released it in a way that does not
@@ -1808,10 +1812,12 @@ mod tests {
         let cases = [
             ("never seen", None, true),
             ("seen before", Some("2026-11-09T10:59:59.999Z"), true),
+            // A report at the declaration's own instant counts as one since
+            // it (#761): the declaration releases nothing.
             (
                 "seen at the declaration",
                 Some("2026-11-09T11:00:00.000Z"),
-                true,
+                false,
             ),
             ("seen since", Some("2026-11-09T11:00:00.001Z"), false),
         ];
