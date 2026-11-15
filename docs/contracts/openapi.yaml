@@ -575,10 +575,14 @@ components:
             `grant_exhausted`, `human_only` or `agent_disabled`. From M5b also
             why a `conflict` was returned by `failoverApp` or `switchoverApp`
             (`not_warm`, `no_copy`, `not_in_sync`, `node_disconnected`,
-            `fence_failed`, `no_support`, `lease_held`, `in_progress`; each
-            operation says when), by `deleteApp` and `deleteVolume`
+            `fence_failed`, `no_support`, `lease_held`, `in_progress`,
+            `lease_revoked`; each operation says when), by `updateApp` leaving
+            `warm` (`in_progress`, `lease_revoked`, `fence_failed`), by `deleteApp` and `deleteVolume`
             (`has_quarantines`), by `rotateSigningKey` (`in_progress`), or by
-            `ackNodeFence` (`token_exhausted`).
+            an operation that would raise a lease's token past 2^53 - 1
+            (`token_exhausted`, ADR 0325): `ackNodeFence`, `declareNodeLost`,
+            `removeNode`, `failoverApp`, `switchoverApp`, `startApp` and
+            `restoreBackup`.
             Absent for other codes and other conflicts.
           enum:
             - scope_missing
@@ -598,6 +602,7 @@ components:
             - in_progress
             - has_quarantines
             - token_exhausted
+            - lease_revoked
         scope:
           type: string
           description: |
@@ -1095,9 +1100,10 @@ components:
           format: date-time
           description: |
             When an operator declared this node lost (ADR 0183,
-            `POST /api/v1/nodes/{node_id}/declare-lost`), or null. Its leases
-            were revoked with new tokens at that time. Cleared once the node
-            returns and has answered the revokes of those leases
+            `POST /api/v1/nodes/{node_id}/declare-lost`), or null. The
+            declaration raised and revoked the node's leases at that time.
+            Cleared once the node returns and has answered the revokes the
+            primary then sends with reason `declared_lost`
             (node-agent-protocol.md sections 8.3 and 9).
         created_at:
           type: string
@@ -4212,7 +4218,9 @@ components:
             holder took the row's `local` grant: from the `pong` that follows
             a same-token `local` grant, or from the holder's report of the
             lease as `local` (node-agent-protocol.md section 8.4, ADR 0261,
-            ADR 0280). It usually turns true when the app leaves `warm`, with
+            ADR 0280). Neither counts while a node the row does not name lists
+            the lease `held` or `uncertain` at or above the row's token on its
+            current session. It usually turns true when the app leaves `warm`, with
             the write that ends an `expiring` lease's renewals; while the row
             is marked, a `local` write with a new token leaves it true. On an
             unmarked row, such a write turns it true when it marks the row:
@@ -4249,7 +4257,9 @@ components:
             majority support. No write with a new token clears it; only a
             write that records what the holder holds does: its report of its
             mode, the `pong` that follows a same-token `local` grant, or the
-            settle of an `expiring` lease. False otherwise.
+            settle of an `expiring` lease, except while a node the row does
+            not name lists the lease `held` or `uncertain` at or above the
+            row's token on its current session. False otherwise.
         grant_pending:
           type: boolean
           description: |
@@ -6927,10 +6937,16 @@ paths:
         stays enrolled and stays a voter. Leases listed in its `fence_failure`
         stay ungrantable until that fence is acknowledged, and an `expiring`
         lease still waits for its gate. When the node returns, the primary
-        revokes those leases on its session before anything else. The scope is
-        human-only: an agent is refused with `forbidden` and
+        revokes on its session, before anything else and with reason
+        `declared_lost`, the leases node-agent-protocol.md section 8.3 names,
+        and clears `lost_at` once they are answered. The scope is human-only:
+        an agent is refused with `forbidden` and
         `reason: human_only`. A connected or removed node is refused with
-        `conflict`. Declaring a node already declared lost changes nothing and
+        `conflict`. When an unrevoked lease row that names the node is
+        already at 2^53 - 1, the token cap, nothing is written and the call
+        answers `conflict` with
+        `reason: token_exhausted` (node-agent-protocol.md section 8.6,
+        ADR 0325). Declaring a node already declared lost changes nothing and
         answers `200`. The call is audited (D-0031).
       x-quoro-scope: node:declare_lost
       parameters:
@@ -7673,9 +7689,27 @@ paths:
         M5b an app without a `source` (`validation_failed` otherwise, ADR
         0265); it starts the copy to the warm node,
         prepares the app's image there, moves the app's domains to the edge
-        when the cluster has one, and turns the app's lease `expiring` as soon
-        as the primary holds the support of a majority of voters
-        (node-agent-protocol.md sections 6.13 and 8.4). Leaving `warm` deletes
+        when the cluster has one, and sends the holder the grant that turns
+        the app's lease `expiring` only once the primary holds the support of
+        a majority of voters and every machine of the required set, every
+        enrolled machine with the `node` role, a declared-lost one included
+        until it is removed, holds the lease row's newest write
+        (node-agent-protocol.md sections 6.13 and 8.4, "Changing the mode"
+        and "When R is replicated"). The lease reads `expiring` from the
+        answer to the holder's first renewal after that grant; until then it
+        stays `local`, and a failover needs the source connected or declared
+        lost (ADR 0244). Leaving `warm` is refused with `conflict` and
+        `reason: in_progress` while a failover or switchover of the app runs
+        or a grant of its lease waits (`App.lease.grant_pending`), and with `reason: lease_revoked` while
+        the app's lease is revoked in the primary's own view
+        (`App.lease.revoked_at` is set), since `failoverApp` needs the policy
+        `warm` to complete the move (node-agent-protocol.md section 6.13),
+        and with `reason: fence_failed` while a failed fence covers the
+        app's lease (a node's `fence_failure` lists it, or a node reported a
+        failed fence of it that the primary could not record), since the
+        warm copy is then the app's way back (node-agent-protocol.md
+        sections 5.17 and 8.5).
+        Otherwise leaving `warm` deletes
         the warm copy and, in the same transaction, writes the lease `local`
         with the unsettled mark (`Lease.unsettled`); `Lease.local_pending`
         stays true until every machine with the `node` role holds that write,
@@ -7860,6 +7894,23 @@ paths:
         Starts the instances of a stopped app. A `conflict` is returned when the app
         is already running. `Quoro-Justification` is required when the caller is an
         agent (D-0031).
+
+        From M5b, when the app's lease row names a node that holds no lease
+        for the app, as after the primary dropped a held grant of it
+        (`app.left_stopped`), the call grants that node the lease with a
+        new token, and is not refused as already running
+        (node-agent-protocol.md section 8.4, "A holder that holds no
+        lease"). It moves nothing: the lease stays with the node the row
+        names. On that path, when the lease's token is 2^53 - 1, the call
+        is refused with `conflict` and `reason: token_exhausted`, and
+        nothing is written (section 8.6). The call stays open while the lease's gate has not passed, at
+        most `duration_ms + 2M`, as `failoverApp` does after a revoke, and
+        answers `202` once the row's write commits. A grant that must wait
+        for replication and majority support follows, and
+        `App.lease.grant_pending` shows the wait. When the primary cannot
+        tell that the node holds no lease, because the node is not
+        connected, or a condition of that section does not hold, the call
+        answers as before M5b.
       x-quoro-scope: app:start
       parameters:
         - $ref: '#/components/parameters/AppId'
@@ -7935,7 +7986,8 @@ paths:
         `reason`:
         - `not_warm`: the app's `ha_policy` is not `warm`;
         - `in_progress`: a failover or switchover of the app is running, or
-          a failover's grant to the warm node still waits, which
+          a grant of its lease still waits, such as a failover's or a
+          switchover's grant to the warm node, which
           `App.lease.grant_pending` shows (ADR 0292). This is checked before
           `node_id`, because the failover already made the old source the
           app's warm node;
@@ -7948,7 +8000,14 @@ paths:
           of voters, so it cannot grant an `expiring` lease (section 8.8);
         - `lease_held`: the source is not connected and may still hold the
           lease: the lease's gate (`App.lease.gate_at`, section 8.4) has not
-          passed and no fence of it was confirmed. A lease that is still
+          passed and no fence of it was confirmed; or the source is
+          connected and refused the revoke, or has not answered, on its
+          current session, the revoke that the call sent when the primary
+          stops waiting, after a bound the primary sets. The call stays open
+          until then. A retry sends no second revoke while that one is
+          unanswered on the same session; on a later session of the source,
+          or after a refusal, the primary revokes again, at the token the
+          source reports when that is higher (section 5.13). A lease that is still
           `local` (section 8.4, "Changing the mode") is held until the node is
           declared lost (`declareNodeLost`). That includes a warm app's
           lease until the primary answers its holder's first renewal after
@@ -7966,7 +8025,16 @@ paths:
           refused for that wait nor held open by it: it answers once the
           change that moves the lease commits, and the grant follows
           (ADR 0292). `App.lease.grant_pending` and
-          `App.lease.grant_waiting_on` show the wait.
+          `App.lease.grant_waiting_on` show the wait. The change itself
+          waits for the lease's gate: when the holder is declared lost and
+          the row reads `local` while the primary keeps a gate for the
+          lease in memory, as after the write that ends an `expiring`
+          lease's renewals, the call stays open until that gate passes
+          (section 8.3), as it does after a connected source's revoke
+          (below).
+        - `token_exhausted`: the lease's token is 2^53 - 1, the token cap,
+          which the grant to the warm node would pass; nothing is revoked
+          or written (section 8.6, ADR 0325).
 
         When the source is connected, the primary first revokes its lease
         over the session; that loses the writes made since the last shipped
@@ -8058,21 +8126,49 @@ paths:
         (`validation_failed` otherwise). It runs as soon as it is asked;
         choosing a low-traffic window is the caller's in M5b. The primary
         pauses the app on its node (the write freeze), ships a final snapshot,
-        stops the app and revokes its lease, grants the warm node the lease
+        stops the app and revokes its lease (it commits `App.lease.revoked_at`
+        before the revoke goes out), grants the warm node the lease
         with a higher token, starts the app there and switches the edge's
         backend while the old backend's requests finish
         (node-agent-protocol.md section 6.13). The app does not serve from
         the freeze until the new instance runs, typically a few seconds.
         Refused with `conflict` and `reason`: `not_warm`; `in_progress`, also
-        while a failover's grant to the warm node waits
-        (`App.lease.grant_pending`, ADR 0292);
+        while a grant of the app's lease waits, such as a failover's to the
+        warm node (`App.lease.grant_pending`, ADR 0292); `token_exhausted` while the
+        lease's token is 2^53 - 1, the token cap, which the grant to the
+        warm node would pass (node-agent-protocol.md section 8.6), checked
+        before the next reasons; `lease_revoked` while the
+        app's lease is revoked in the primary's own view
+        (`App.lease.revoked_at` is set), as after a switchover that stopped
+        after its revoke: `failoverApp` to the warm node moves that lease
+        (node-agent-protocol.md section 6.13);
         `not_in_sync` unless `App.warm.state` is `in_sync`, a lag of at most
         two intervals; `node_disconnected` unless both nodes are connected;
         `fence_failed`; `no_support`. The call answers `202` with the app
         when the switchover started. It ends with `app.switched_over`, the old
         node becoming the warm copy with no quarantine, or, when a step before
-        the revoke failed, with `app.switchover_failed`: the app resumed on
-        its node and nothing moved. Destructive and off by default for agents,
+        the revoke failed, with `app.switchover_failed`: the primary sent
+        the source `switchover_thaw`, unless a failed fence covers the lease
+        or the lease is revoked in the primary's own view
+        (node-agent-protocol.md section 5.17), and nothing moved. That event
+        opens no incident, except when a failed fence held the thaw back:
+        after the source's own, the app stays down until `failoverApp` moves
+        it, so it opens one as at `move`, which that move's `app.failed_over`
+        resolves; after another node's, it opens one when the source's next
+        report still shows the app frozen while that fence covers the lease,
+        which is resolved by the source's first report that shows the app no
+        longer frozen and its VM starting or running, whatever ended the
+        freeze, or by that app's `app.failed_over` (permission-model.md
+        section 8.2 gives which report and the conditions). When
+        a step after the
+        revoke fails, it ends with `app.switchover_failed` at `step` `move`,
+        which opens an incident: the lease stays revoked, the app stays
+        stopped on its node or, when the node did not confirm the stop, may
+        still be paused there, and `failoverApp` to the same warm node
+        completes the move (node-agent-protocol.md section 6.13). The grant to the warm node
+        waits for replication and majority support as a failover's grant does
+        (`failoverApp`, ADR 0292): `App.lease.grant_pending` shows the wait,
+        and `app.switched_over` then carries `grant_pending`. Destructive and off by default for agents,
         under the same scope as `failoverApp`: without an approval grant on
         `{type: app, id}` with `node_id` in `params` the call is refused with
         `approval_required` (ADR 0030). `Quoro-Justification` is required when
@@ -10992,7 +11088,9 @@ paths:
         lease's fencing token), the app has a restore in progress, the
         target node has a fence failure, or this primary does not hold the
         repository key after a promotion (node-agent-protocol.md section
-        7.3). `Quoro-Justification` is required
+        7.3). A lease at 2^53 - 1, the token cap, is refused with `conflict`
+        and `reason: token_exhausted`, and nothing is written
+        (node-agent-protocol.md section 8.6, ADR 0325). `Quoro-Justification` is required
         when the caller is an agent (ADR 0031).
       x-quoro-scope: backup:restore
       parameters:
