@@ -46,8 +46,10 @@ serde = { version = "1", default-features = false, features = [
     "derive",
     "std",
 ] }
-# Reads problem bodies and pretty-prints JSON for a terminal.
-serde_json = { version = "1", default-features = false, features = ["std"] }
+# Reads problem bodies and pretty-prints JSON for a terminal. Floats parse
+# exactly, so an audit record it prints shows the number the primary stored
+# (ADR 0315).
+serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip"] }
 # The timers of `--wait`: the poll interval and the bound on each read of the
 # event stream; `signal` stops `logs -f` and `up` on Ctrl-C. The runtime is
 # the binary's (which already enables `signal`); reqwest already runs on tokio.

@@ -12,7 +12,10 @@ workspace = true
 [dependencies]
 # Every message is JSON on the wire (node-agent-protocol.md section 3.2).
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "1", default-features = false, features = ["std"] }
+# `float_roundtrip` parses each float as the double nearest to its text, so
+# a record hashed over its RFC 8785 text re-hashes from that text (`jcs`,
+# audit-log-format.md sections 4.1 and 5, ADR 0315).
+serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip"] }
 # desired_state and signing_key_rotate are signed with the cluster's Ed25519
 # key (section 5.11, ADR 0050); both sides sign or verify through this crate.
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "zeroize"] }

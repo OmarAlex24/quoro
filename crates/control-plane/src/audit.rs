@@ -296,11 +296,11 @@ pub fn record_value_from_row(row: &SqliteRow) -> Result<Value, sqlx::Error> {
 /// `quoro audit verify --file` then reads each line's `params` from the same
 /// text `--db` reads from the row, so for every record the line reads back
 /// exactly as the stored record does, and verifies offline (section 6.1)
-/// exactly when the stored record verifies. Writing `params` in the RFC 8785
-/// form of the value read back from that text instead can give another text:
-/// a float can read back as a number whose RFC 8785 form differs from the
-/// stored one (`72096104873994100000` reads back as a number written
-/// `72096104873994090000`).
+/// exactly when the stored record verifies. Floats parse exactly (ADR 0315),
+/// so the RFC 8785 form of the value read back from that text is that text
+/// again. A parser that read floats approximately could read one back as
+/// another number (`72096104873994100000` as one written
+/// `72096104873994090000`), and the stored text is written as it is.
 ///
 /// # Errors
 ///
@@ -873,17 +873,137 @@ mod tests {
         assert_kept_as_digest(&store, &stored, r#"{"n":18446744073709551615}"#).await;
     }
 
+    /// The stored `params` text of the record at `seq`.
+    async fn params_text(store: &Store, seq: i64) -> String {
+        sqlx::query_scalar("SELECT params FROM audit_log WHERE seq = ?")
+            .bind(seq)
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn a_float_a_node_reads_as_another_number_keeps_its_digest() {
-        // A node that parses the entry reads it back as another number
-        // (section 4.1, third case); the text is the RFC 8785 form of the
-        // number the primary read.
+    async fn a_float_is_kept_and_its_record_re_hashes_from_the_stored_text() {
+        // Floats parse exactly (ADR 0315): each RFC 8785 text reads back, on
+        // the primary and on a node, as the double it was written from, so
+        // the parameters are kept (section 4.1).
         let store = Store::open_in_memory().await.unwrap();
-        let params = read(r#"{"x": 18983552425072.563}"#);
-        let text = jcs::canonicalize(&params).unwrap();
-        assert_eq!(text, r#"{"x":18983552425072.563}"#);
+        let params = read(r#"{"x": 1548.2162860866162, "y": 18983552425072.563}"#);
         let stored = append_with(&store, params).await;
-        assert_kept_as_digest(&store, &stored, &text).await;
+        assert!(stored.get("params_sha256").is_none(), "{stored}");
+        assert!(stored.get("params_bytes").is_none(), "{stored}");
+        let seq = stored["seq"].as_i64().unwrap();
+        let text = params_text(&store, seq).await;
+        assert_eq!(text, r#"{"x":1548.2162860866163,"y":18983552425072.562}"#);
+
+        // Re-hashed from the stored text, the record hashes to its hash: as
+        // `verifyAudit` and `quoro audit verify --db` read it, and from its
+        // exported line as `--file` reads it.
+        let chain = verify_records(stored_records(&store).await, 1, GENESIS_HASH);
+        assert!(chain.ok, "{chain:?}");
+        assert_eq!(chain.checked, seq);
+        let row = sqlx::query(&format!("SELECT {COLUMNS} FROM audit_log WHERE seq = ?"))
+            .bind(seq)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let line = export_line(&row).unwrap();
+        assert!(line.contains(&format!(r#""params":{text}"#)), "{line}");
+        let exported: Value = serde_json::from_str(&line).unwrap();
+        let mut unhashed = exported.clone();
+        unhashed.as_object_mut().unwrap().remove("hash");
+        assert_eq!(
+            exported["hash"],
+            json!(sha256(&jcs::canonicalize(&unhashed).unwrap()))
+        );
+        // Its change-log entry carries it, and the change log verifies.
+        assert_eq!(carried_payload(&store, seq).await, stored);
+        let mut conn = store.pool().acquire().await.unwrap();
+        assert_eq!(changelog::verify(&mut conn).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_worked_float_case_is_stored_with_the_even_digit_and_re_hashes() {
+        // Section 4.1's worked case: the request's `18983552425072.563` reads
+        // as exactly 18983552425072.5625, halfway between two 17-digit
+        // decimals, and RFC 8785 writes the one whose last digit is even.
+        let store = Store::open_in_memory().await.unwrap();
+        let stored = append_with(&store, read(r#"{"x": 18983552425072.563}"#)).await;
+        assert!(stored.get("params_sha256").is_none(), "{stored}");
+        let seq = stored["seq"].as_i64().unwrap();
+        let text = params_text(&store, seq).await;
+        assert_eq!(text, r#"{"x":18983552425072.562}"#);
+        assert_eq!(text.len(), 24);
+        assert_eq!(
+            stored["params"]["x"].as_f64(),
+            Some("18983552425072.5625".parse::<f64>().unwrap())
+        );
+
+        // The record re-hashes from that text, and so does its change-log
+        // entry.
+        let chain = verify_records(stored_records(&store).await, 1, GENESIS_HASH);
+        assert!(chain.ok, "{chain:?}");
+        assert_eq!(chain.checked, seq);
+        let mut unhashed = stored.clone();
+        let hash = unhashed.as_object_mut().unwrap().remove("hash").unwrap();
+        let canonical = jcs::canonicalize(&unhashed).unwrap();
+        assert!(
+            canonical.contains(r#""params":{"x":18983552425072.562}"#),
+            "{canonical}"
+        );
+        assert_eq!(hash, json!(sha256(&canonical)));
+        assert_eq!(carried_payload(&store, seq).await, stored);
+        let mut conn = store.pool().acquire().await.unwrap();
+        assert_eq!(changelog::verify(&mut conn).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_whole_number_float_above_2_53_beside_another_float_keeps_its_digest() {
+        // `1e16` still makes the parameters a digest (section 4.1): its RFC
+        // 8785 text is an integer above 2^53. The text the digest covers
+        // holds the other float as the primary read it.
+        let store = Store::open_in_memory().await.unwrap();
+        let stored = append_with(&store, read(r#"{"n": 1e16, "x": 1548.2162860866162}"#)).await;
+        let text = r#"{"n":10000000000000000,"x":1548.2162860866163}"#;
+        assert_eq!(stored["params_bytes"], json!(46));
+        assert_kept_as_digest(&store, &stored, text).await;
+    }
+
+    #[tokio::test]
+    async fn a_record_an_earlier_build_wrote_with_a_float_verifies() {
+        // A record an earlier build wrote for a body with
+        // `1548.2162860866162`: its hash covers the RFC 8785 text of the
+        // double that build read, which is the text it stored. That build
+        // read the stored text back as the neighbouring double, so
+        // `verifyAudit` reported `hash_mismatch` at it; read exactly, it
+        // verifies.
+        assert_ne!(
+            "1548.2162860866163".parse::<f64>().unwrap(),
+            "1548.2162860866165".parse::<f64>().unwrap()
+        );
+        let store = Store::open_in_memory().await.unwrap();
+        assert!(stored_records(&store).await.is_empty());
+        let hashed = format!(
+            r#"{{"actor_id":"usr_01JC9Z6Q5W8N3K4T7R2M1XHB0D","actor_type":"user","channel":"api","operation":"POST /api/v1/approvals","params":{{"x":1548.2162860866163}},"prev_hash":"{GENESIS_HASH}","request_id":"req_01JC9Z6Q5W8N3K4T7R2M1XHB0D","result":"refused","seq":1,"time":"2026-11-09T10:15:31.000Z"}}"#
+        );
+        let hash = sha256(&hashed);
+        let mut w = store.begin_write().await.unwrap();
+        sqlx::query(
+            "INSERT INTO audit_log (seq, time, actor_type, actor_id, channel, operation, params, \
+             request_id, result, prev_hash, hash) VALUES (1, '2026-11-09T10:15:31.000Z', 'user', \
+             'usr_01JC9Z6Q5W8N3K4T7R2M1XHB0D', 'api', 'POST /api/v1/approvals', \
+             '{\"x\":1548.2162860866163}', 'req_01JC9Z6Q5W8N3K4T7R2M1XHB0D', 'refused', ?, ?)",
+        )
+        .bind(GENESIS_HASH)
+        .bind(&hash)
+        .execute(&mut *w.tx)
+        .await
+        .unwrap();
+        w.commit().await.unwrap();
+
+        let chain = verify_records(stored_records(&store).await, 1, GENESIS_HASH);
+        assert!(chain.ok, "{chain:?}");
+        assert_eq!((chain.checked, chain.head_hash), (1, hash));
     }
 
     #[tokio::test]

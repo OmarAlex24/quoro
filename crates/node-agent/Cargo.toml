@@ -54,7 +54,9 @@ http-body-util = { version = "0.1", default-features = false }
 # The local node store (section 12) is SQLite, like the control plane's.
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "1", default-features = false, features = ["std"] }
+# Floats parse exactly, as on the primary: the node verifies change-log
+# entries with the same parser (node-agent-protocol.md section 7.1, ADR 0315).
+serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip"] }
 # The certificate pin is SHA-256 over the DER certificate.
 sha2 = { version = "0.10", default-features = false }
 # XChaCha20-Poly1305 AEAD for the desired-state bodies at rest, under the
