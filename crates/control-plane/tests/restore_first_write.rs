@@ -4,7 +4,10 @@
 //! one write the primary makes from it before it serves. That write marks
 //! every `expiring` lease row unsettled (node-agent-protocol.md section 8.4,
 //! "The mark") and, when `primary-node` asks for it, moves the primary status
-//! and records `cluster.primary_moved`.
+//! and records `cluster.primary_moved`. After `quoro restore --accept-loss`
+//! (ADR 0261), the same write also removes every other machine with the
+//! `node` role, raises the tokens of the leases they held, deletes their
+//! custody seals and records `cluster.restored`.
 
 mod common;
 
@@ -14,16 +17,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use common::{Server, TestDir, start_in};
+use quoro_control_plane::backups::control_plane::{queue_if_due, run_control_plane_backup};
 use quoro_control_plane::backups::{Backups, Bucket, BucketFactory, BucketStore, RepositoryTarget};
 use quoro_control_plane::changelog::{self, Actor, Op};
 use quoro_control_plane::crypto::DataKey;
 use quoro_control_plane::driver::{self, Capacity, Kvm, LocalNode};
+use quoro_control_plane::keys::ensure_cluster_meta;
 use quoro_control_plane::primary_status;
 use quoro_control_plane::restore_pending::{self, Applied, Head, Marker};
 use quoro_control_plane::store::{Store, now_rfc3339};
 use quoro_control_plane::{AppState, NodeNetwork, ReferenceAsDigest, ServerConfig};
 use quoro_providers::object_store::{MemoryStore, ObjectInfo, ObjectStore, ObjectStoreError};
 use serde_json::{Value, json};
+use sqlx::Row as _;
 
 /// The node on the new host, which `primary-node` names.
 const NEW_NODE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0B";
@@ -147,13 +153,20 @@ async fn populate(store: &Store) -> String {
     old
 }
 
+/// Inserts a disconnected machine with the `node` role. `capacity`,
+/// `allocated` and `kvm` hold values the node API parses: every read of the
+/// nodes list builds each row, a removed machine's included, so a row it
+/// cannot parse would fail the whole list.
 async fn insert_node(store: &Store, id: &str) {
     let now = now_rfc3339();
     sqlx::query(
         "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, behind_nat, \
          labels, capacity, allocated, kvm, engine_version, agent_version, desired_rev, applied_rev, \
          log_seq, last_seen_at, created_at) \
-         VALUES (?, ?, '[\"node\"]', NULL, 'disconnected', '', NULL, 1, '{}', '{}', '{}', '{}', \
+         VALUES (?, ?, '[\"node\"]', NULL, 'disconnected', '', NULL, 1, '{}', \
+         '{\"cpus\":8,\"memory_mb\":16384,\"disk_gb\":100}', \
+         '{\"cpus\":0,\"memory_mb\":0,\"disk_gb\":0}', \
+         '{\"available\":true,\"kernel\":\"6.8.0\"}', \
          NULL, NULL, 0, 0, 0, ?, ?)",
     )
     .bind(id)
@@ -376,6 +389,17 @@ async fn the_first_start_after_a_restore_makes_the_first_write_before_any_other(
     assert_eq!(cp_status(store, NEW_NODE).await.as_deref(), Some("primary"));
     assert_eq!(cp_status(store, &old).await, None);
     assert_eq!(moved_records(store).await, vec![Some(head.seq + 4)]);
+    // Without `--accept-loss` the move names the node that held the status.
+    let moved: Vec<Value> = records_after(store, 0)
+        .await
+        .into_iter()
+        .filter(|record| record.operation == "cluster.primary_moved")
+        .map(|record| record.params)
+        .collect();
+    assert_eq!(
+        moved,
+        vec![json!({ "from_node_id": old.as_str(), "to_node_id": NEW_NODE })]
+    );
     assert_eq!(restore_marker(store).await, Some(meta_value(&head)));
     assert!(!exists(&dir, restore_pending::MARKER_FILE));
     assert!(!exists(&dir, primary_status::MARKER_FILE));
@@ -415,6 +439,7 @@ async fn a_first_write_that_does_not_commit_writes_nothing_and_the_next_start_ma
         check_and_apply(&store, &dir).await.unwrap(),
         Applied::FirstWrite {
             marked: 2,
+            removed: Vec::new(),
             moved: true
         }
     );
@@ -439,6 +464,7 @@ async fn a_marker_whose_first_write_committed_is_deleted_without_a_second_write(
         check_and_apply(&store, &dir).await.unwrap(),
         Applied::FirstWrite {
             marked: 2,
+            removed: Vec::new(),
             moved: true
         }
     );
@@ -555,6 +581,7 @@ async fn a_first_write_without_primary_node_only_marks() {
         check_and_apply(&store, &dir).await.unwrap(),
         Applied::FirstWrite {
             marked: 2,
+            removed: Vec::new(),
             moved: false
         }
     );
@@ -566,40 +593,6 @@ async fn a_first_write_without_primary_node_only_marks() {
     assert!(moved_records(&store).await.is_empty());
     assert_eq!(restore_marker(&store).await, Some(meta_value(&head)));
     assert!(!exists(&dir, restore_pending::MARKER_FILE));
-}
-
-/// `--accept-loss` is not built yet: a marker of this database that asks
-/// for it stops the start before its migrations and before anything is
-/// written, and both files stay, so the restore is not taken as done without
-/// the removals.
-#[tokio::test]
-async fn a_marker_asking_for_accept_loss_stops_the_start() {
-    let (dir, store, old, head) = restored().await;
-    store.pool().close().await;
-    write_marker(
-        &dir,
-        &Marker {
-            head: head.clone(),
-            accept_loss: true,
-            statement: Some("no other node survives".to_string()),
-        },
-    );
-    write_primary_node(&dir);
-
-    let error = match open_state(&dir).await {
-        Ok(_) => panic!("the start must stop"),
-        Err(error) => error,
-    };
-    assert!(error.contains("--accept-loss"), "{error}");
-    assert!(error.contains("nothing was written"), "{error}");
-
-    let store = Store::open(&dir.join("quoro.db")).await.unwrap();
-    assert_eq!(log_head_of(&store).await, head, "nothing is written");
-    assert_eq!(marks(&store).await, unmarked());
-    assert_eq!(cp_status(&store, &old).await.as_deref(), Some("primary"));
-    assert_eq!(restore_marker(&store).await, None);
-    assert!(exists(&dir, restore_pending::MARKER_FILE));
-    assert!(exists(&dir, primary_status::MARKER_FILE));
 }
 
 /// A marker the primary cannot read or parse names no database it can
@@ -890,4 +883,1086 @@ async fn upgrade_backups(store: &Store) -> Vec<String> {
         .fetch_all(store.pool())
         .await
         .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// `--accept-loss` (backup-format.md section 8.2, "The first write"; ADR 0261,
+// ADR 0280)
+// ---------------------------------------------------------------------------
+
+/// The operator's `--statement`, which the marker carries.
+const STATEMENT: &str =
+    "no other machine with the node role survives, and no control plane of this cluster runs";
+
+/// The highest fencing token (node-agent-protocol.md section 8.6, "The cap").
+const MAX_TOKEN: i64 = (1 << 53) - 1;
+
+fn forced(head: &Head) -> Marker {
+    Marker {
+        head: head.clone(),
+        accept_loss: true,
+        statement: Some(STATEMENT.to_string()),
+    }
+}
+
+async fn set_term(store: &Store, term: i64) {
+    sqlx::query("UPDATE meta SET value = ? WHERE key = 'term'")
+        .bind(term.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+}
+
+/// Writes one custody seal for `node_id` (node-agent-protocol.md section
+/// 7.2).
+async fn seal(store: &Store, node_id: &str) {
+    sqlx::query(
+        "INSERT INTO node_key_custody (node_id, key_kind, key_id, sealed, created_at) \
+         VALUES (?, 'signing', ?, X'00', ?)",
+    )
+    .bind(node_id)
+    .bind("a".repeat(64))
+    .bind(now_rfc3339())
+    .execute(store.pool())
+    .await
+    .unwrap();
+}
+
+/// The nodes that hold a custody seal, by id.
+async fn sealed(store: &Store) -> Vec<String> {
+    sqlx::query_scalar("SELECT DISTINCT node_id FROM node_key_custody ORDER BY node_id")
+        .fetch_all(store.pool())
+        .await
+        .unwrap()
+}
+
+async fn status(store: &Store, id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM nodes WHERE id = ?")
+        .bind(id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+}
+
+async fn lost_at(store: &Store, id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT lost_at FROM nodes WHERE id = ?")
+        .bind(id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+}
+
+/// `(fencing_token, revoked)` of lease `id`.
+async fn lease(store: &Store, id: &str) -> (i64, bool) {
+    let (token, revoked_at): (i64, Option<String>) =
+        sqlx::query_as("SELECT fencing_token, revoked_at FROM leases WHERE id = ?")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    (token, revoked_at.is_some())
+}
+
+async fn audit_head(store: &Store) -> i64 {
+    sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM audit_log")
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+}
+
+/// One audit record, as the tests read it.
+#[derive(Debug)]
+struct AuditRecord {
+    operation: String,
+    actor: (String, String),
+    channel: String,
+    target: (Option<String>, Option<String>),
+    params: Value,
+    justification: Option<String>,
+    change_seq: Option<i64>,
+}
+
+/// Every audit record after `seq`, in order.
+async fn records_after(store: &Store, seq: i64) -> Vec<AuditRecord> {
+    let rows = sqlx::query(
+        "SELECT operation, actor_type, actor_id, channel, target_type, target_id, params, \
+         justification, change_seq FROM audit_log WHERE seq > ? ORDER BY seq",
+    )
+    .bind(seq)
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    rows.iter()
+        .map(|row| AuditRecord {
+            operation: row.get("operation"),
+            actor: (row.get("actor_type"), row.get("actor_id")),
+            channel: row.get("channel"),
+            target: (row.get("target_type"), row.get("target_id")),
+            params: serde_json::from_str(&row.get::<String, _>("params")).unwrap(),
+            justification: row.get("justification"),
+            change_seq: row.get("change_seq"),
+        })
+        .collect()
+}
+
+/// The `cluster.restored` records.
+async fn restored_records(store: &Store) -> usize {
+    records_after(store, 0)
+        .await
+        .iter()
+        .filter(|record| record.operation == restore_pending::RESTORED_OPERATION)
+        .count()
+}
+
+/// The ids of the old host's primary node and the leases' holder, the two
+/// machines `--accept-loss` removes, by id.
+fn lost(old: &str) -> Vec<String> {
+    let mut ids = vec![old.to_string(), HOLDER.to_string()];
+    ids.sort();
+    ids
+}
+
+/// With `--accept-loss`, the first write also removes every other machine
+/// with the `node` role that is not removed: the old host's primary node and
+/// the leases' holder. It raises the token of each lease they held and
+/// records it revoked, deletes their custody seals, and records
+/// `cluster.restored` with exact `params` (the removed ids and the term the
+/// database holds), the statement as its justification and its removal
+/// entry as `change_seq`, before `cluster.primary_moved` and with no other
+/// record. Each removal clears the machine's `cp_status` in its own entry.
+/// The move that follows writes the new host's entry only, after the
+/// removals, and records the old primary, which held the status before the
+/// write, as `from_node_id`. It is the one
+/// write with the mark and the move. The new host's node keeps its row, its
+/// status and its seal.
+#[tokio::test]
+async fn an_accept_loss_first_write_removes_every_other_node() {
+    let (dir, store, old, head) = restored().await;
+    let cluster_id = ensure_cluster_meta(&store).await.unwrap();
+    set_term(&store, 7).await;
+    for id in [old.as_str(), NEW_NODE, HOLDER] {
+        seal(&store, id).await;
+    }
+    let audit_before = audit_head(&store).await;
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    let removed = lost(&old);
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: removed.clone(),
+            moved: true
+        }
+    );
+
+    for id in &removed {
+        assert_eq!(status(&store, id).await, "removed", "{id}");
+        // The write raises the tokens and declares nothing lost.
+        assert_eq!(lost_at(&store, id).await, None, "{id}");
+    }
+    assert_eq!(status(&store, NEW_NODE).await, "disconnected");
+    assert_eq!(
+        cp_status(&store, NEW_NODE).await.as_deref(),
+        Some("primary")
+    );
+    assert_eq!(cp_status(&store, &old).await, None);
+    // Each lease row of the holder moves to its token + 1, recorded revoked,
+    // as declaring the node lost does (ADR 0202): the row revoked before the
+    // write too.
+    for (id, token) in [
+        (EXPIRING, 4),
+        (EXPIRING_REVOKED, 5),
+        (LOCAL, 6),
+        (MARKED, 7),
+    ] {
+        assert_eq!(lease(&store, id).await, (token, true), "{id}");
+    }
+    assert_eq!(sealed(&store).await, vec![NEW_NODE.to_string()]);
+    assert_eq!(marks(&store).await, all_expiring_marked());
+
+    let records = records_after(&store, audit_before).await;
+    let operations: Vec<&str> = records
+        .iter()
+        .map(|record| record.operation.as_str())
+        .collect();
+    assert_eq!(
+        operations,
+        vec!["cluster.restored", "cluster.primary_moved"],
+        "{records:?}"
+    );
+    let record = &records[0];
+    assert_eq!(record.actor, ("system".to_string(), "cluster".to_string()));
+    assert_eq!(record.channel, "system");
+    assert_eq!(
+        record.target,
+        (Some("cluster".to_string()), Some(cluster_id))
+    );
+    assert_eq!(
+        record.params,
+        json!({ "removed_node_ids": removed, "term": 7 })
+    );
+    assert_eq!(record.justification.as_deref(), Some(STATEMENT));
+    assert_eq!(
+        records[1].params,
+        json!({ "from_node_id": old, "to_node_id": NEW_NODE })
+    );
+
+    // Every entry after the restored head is this write's: the marks, the
+    // raises, the removals, the seal deletions, the move and the entries that
+    // carry the two records.
+    let entries = entries_after(&store, head.seq).await;
+    // Each machine's removal is its one node entry, which reads `removed`
+    // and no `cp_status`: the move writes no entry for the old primary.
+    // `change_seq` is the last machine's removal, in id order.
+    let removals: Vec<i64> = removed
+        .iter()
+        .map(|id| {
+            let node_entries: Vec<_> = entries
+                .iter()
+                .filter(|(_, kind, entity, _, _, _)| kind == "node" && entity == id)
+                .collect();
+            let [(seq, _, _, _, _, payload)] = node_entries[..] else {
+                panic!("one node entry of {id}: {entries:?}");
+            };
+            assert_eq!(payload["status"], "removed", "{id}");
+            assert!(payload["cp_status"].is_null(), "{id}: {payload}");
+            *seq
+        })
+        .collect();
+    assert!(removals.is_sorted(), "{removals:?}");
+    assert_eq!(record.change_seq, removals.last().copied(), "{entries:?}");
+    let move_entry = entries
+        .iter()
+        .find(|(_, kind, entity, _, _, payload)| {
+            kind == "node" && entity == NEW_NODE && payload["cp_status"] == "primary"
+        })
+        .map(|(seq, _, _, _, _, _)| *seq)
+        .expect("the move's entry of the new host's node");
+    assert!(
+        move_entry > *removals.last().unwrap(),
+        "the move comes after the removals: {entries:?}"
+    );
+    assert_eq!(
+        moved_records(&store).await,
+        vec![Some(move_entry)],
+        "cluster.primary_moved carries the move's entry: {entries:?}"
+    );
+    for id in &removed {
+        assert!(
+            entries
+                .iter()
+                .any(|(_, kind, entity, _, _, _)| kind == "node_key_custody"
+                    && entity.starts_with(id.as_str())),
+            "the seal deletion of {id}: {entries:?}"
+        );
+    }
+    // The seal deletions carry custody's own system actor, as in a removal.
+    for (_, kind, _, actor_type, actor_id, _) in &entries {
+        let expected = if kind == "node_key_custody" {
+            "custody"
+        } else {
+            "cluster"
+        };
+        assert_eq!(
+            (actor_type.as_str(), actor_id.as_str()),
+            ("system", expected),
+            "{kind}"
+        );
+    }
+    assert_eq!(restore_marker(&store).await, Some(meta_value(&head)));
+    assert!(!exists(&dir, restore_pending::MARKER_FILE));
+    assert!(!exists(&dir, primary_status::MARKER_FILE));
+}
+
+/// The `--accept-loss` part is in the first write's one transaction: one
+/// that fails before its commit removes no node, raises no token, deletes no
+/// seal and records nothing. Once written, the write runs once:
+/// `meta.restore_marker` makes a marker left by a crash a no-op, so no second
+/// `cluster.restored` is recorded and a node enrolled after the restore is
+/// not removed.
+#[tokio::test]
+async fn an_accept_loss_first_write_is_one_transaction_and_runs_once() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    seal(&store, HOLDER).await;
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+    sqlx::query(
+        "CREATE TRIGGER refuse_restore_marker BEFORE INSERT ON meta \
+         WHEN NEW.key = 'restore_marker' BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let error = check_and_apply(&store, &dir).await.unwrap_err();
+    assert!(error.contains("restore_marker"), "{error}");
+    assert_eq!(log_head_of(&store).await, head, "no entry is written");
+    assert_eq!(status(&store, HOLDER).await, "disconnected");
+    assert_eq!(status(&store, &old).await, "connected");
+    assert_eq!(lease(&store, LOCAL).await, (5, false));
+    assert_eq!(sealed(&store).await, vec![HOLDER.to_string()]);
+    assert_eq!(restored_records(&store).await, 0);
+    assert!(exists(&dir, restore_pending::MARKER_FILE));
+
+    sqlx::query("DROP TRIGGER refuse_restore_marker")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: lost(&old),
+            moved: true
+        }
+    );
+    assert_eq!(status(&store, HOLDER).await, "removed");
+    assert_eq!(restored_records(&store).await, 1);
+
+    // A node enrolled after the restore, then a crash that left both files.
+    const LATE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0E";
+    insert_node(&store, LATE).await;
+    let after = log_head_of(&store).await;
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::AlreadyWritten
+    );
+    assert_eq!(log_head_of(&store).await, after, "nothing is written again");
+    assert_eq!(restored_records(&store).await, 1);
+    assert_eq!(status(&store, LATE).await, "disconnected");
+    assert!(!exists(&dir, restore_pending::MARKER_FILE));
+}
+
+/// A lease of a machine to remove whose token is already at the cap cannot
+/// be raised (node-agent-protocol.md section 8.6, ADR 0325): the start's
+/// first step, [`restore_pending::check`], reads it and stops the start
+/// before its migrations, naming the lease and its token in the words of
+/// every other refusal at the cap, with nothing written and both files left
+/// for the next start, which stops the same way until an operator resolves
+/// the lease.
+#[tokio::test]
+async fn a_lease_at_the_token_cap_stops_an_accept_loss_start() {
+    let (dir, store, old, head) = restored().await;
+    sqlx::query("UPDATE leases SET fencing_token = ? WHERE id = ?")
+        .bind(MAX_TOKEN)
+        .bind(LOCAL)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    let error = match open_state(&dir).await {
+        Ok(_) => panic!("the start must stop"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains(&format!("lease {LOCAL} is at fencing token {MAX_TOKEN}")),
+        "{error}"
+    );
+    assert!(error.contains("before its migrations"), "{error}");
+    assert!(error.contains("nothing was written"), "{error}");
+
+    let store = Store::open(&dir.join("quoro.db")).await.unwrap();
+    assert_eq!(log_head_of(&store).await, head, "nothing is written");
+    assert_eq!(marks(&store).await, unmarked());
+    assert_eq!(status(&store, HOLDER).await, "disconnected");
+    assert_eq!(status(&store, &old).await, "connected");
+    assert_eq!(lease(&store, EXPIRING).await, (3, false));
+    assert_eq!(lease(&store, LOCAL).await, (MAX_TOKEN, false));
+    assert_eq!(cp_status(&store, &old).await.as_deref(), Some("primary"));
+    assert_eq!(restored_records(&store).await, 0);
+    assert_eq!(restore_marker(&store).await, None);
+    assert!(exists(&dir, restore_pending::MARKER_FILE));
+    assert!(exists(&dir, primary_status::MARKER_FILE));
+}
+
+/// A full start after `quoro restore --accept-loss`: the primary makes the
+/// whole first write before it serves, and the files are gone.
+#[tokio::test]
+async fn the_first_start_after_an_accept_loss_restore_removes_the_other_nodes() {
+    let (dir, store, old, head) = restored().await;
+    store.pool().close().await;
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    let server = start_in(dir.clone()).await;
+    let store = &server.state.store;
+
+    assert_eq!(status(store, &old).await, "removed");
+    assert_eq!(status(store, HOLDER).await, "removed");
+    assert_ne!(status(store, NEW_NODE).await, "removed");
+    assert_eq!(cp_status(store, NEW_NODE).await.as_deref(), Some("primary"));
+    assert_eq!(lease(store, LOCAL).await, (6, true));
+    assert_eq!(marks(store).await, all_expiring_marked());
+    let records = records_after(store, 0).await;
+    let restored = records
+        .iter()
+        .find(|record| record.operation == restore_pending::RESTORED_OPERATION)
+        .expect("cluster.restored");
+    assert_eq!(restored.params["removed_node_ids"], json!(lost(&old)));
+    assert_eq!(restored.justification.as_deref(), Some(STATEMENT));
+    assert_eq!(restore_marker(store).await, Some(meta_value(&head)));
+    assert!(!exists(&dir, restore_pending::MARKER_FILE));
+    assert!(!exists(&dir, primary_status::MARKER_FILE));
+}
+
+/// The raise itself still refuses at the cap, as a backstop of
+/// [`restore_pending::check`]: a lease that reaches the cap after the check
+/// stops [`restore_pending::apply`], whose first write is then not
+/// committed, so nothing is written and both files stay.
+#[tokio::test]
+async fn the_raise_refuses_at_the_cap_after_the_check_and_writes_nothing() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+    let pending = restore_pending::check(&store, &dir).await.unwrap();
+    assert!(
+        matches!(pending, restore_pending::Pending::FirstWrite { .. }),
+        "{pending:?}"
+    );
+    sqlx::query("UPDATE leases SET fencing_token = ? WHERE id = ?")
+        .bind(MAX_TOKEN)
+        .bind(LOCAL)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let error = restore_pending::apply(&store, &dir, pending)
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains(&format!("lease {LOCAL} is at fencing token {MAX_TOKEN}")),
+        "{error}"
+    );
+    assert!(error.contains("nothing was written"), "{error}");
+    assert_eq!(log_head_of(&store).await, head, "nothing is written");
+    assert_eq!(marks(&store).await, unmarked());
+    assert_eq!(status(&store, HOLDER).await, "disconnected");
+    assert_eq!(lease(&store, EXPIRING).await, (3, false));
+    assert_eq!(restored_records(&store).await, 0);
+    assert_eq!(cp_status(&store, &old).await.as_deref(), Some("primary"));
+    assert!(exists(&dir, restore_pending::MARKER_FILE));
+    assert!(exists(&dir, primary_status::MARKER_FILE));
+}
+
+/// A machine declared lost before the backup, which holds a lease granted
+/// after that declaration, has that lease's token raised too: the write
+/// raises every lease those machines hold, as declaring a node lost does
+/// (`backup-format.md` section 8.2), and does not stop at a `lost_at`
+/// already set. It declares nothing itself: the earlier `lost_at` stays as it
+/// was, and the other removed machine gets none.
+#[tokio::test]
+async fn a_lease_granted_after_an_earlier_declaration_is_raised() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    const DECLARED: &str = "2026-01-02T03:04:05.000Z";
+    sqlx::query("UPDATE nodes SET lost_at = ? WHERE id = ?")
+        .bind(DECLARED)
+        .bind(HOLDER)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: lost(&old),
+            moved: true
+        }
+    );
+    // The holder's unrevoked leases, granted after its declaration, move to
+    // their token + 1, recorded revoked.
+    for (id, token) in [(EXPIRING, 4), (LOCAL, 6), (MARKED, 7)] {
+        assert_eq!(lease(&store, id).await, (token, true), "{id}");
+    }
+    let raised: Vec<String> = entries_after(&store, head.seq)
+        .await
+        .into_iter()
+        .filter(|(_, kind, _, _, _, payload)| kind == "lease" && payload["revoked_at"].is_string())
+        .map(|(_, _, id, _, _, _)| id)
+        .collect();
+    for id in [EXPIRING, LOCAL, MARKED] {
+        assert!(raised.iter().any(|raised| raised == id), "{id}: {raised:?}");
+    }
+    assert_eq!(lost_at(&store, HOLDER).await.as_deref(), Some(DECLARED));
+    assert_eq!(lost_at(&store, &old).await, None);
+    assert_eq!(status(&store, HOLDER).await, "removed");
+}
+
+/// The first write raises the rows declaring a node lost raises (ADR 0202):
+/// a removed machine's row revoked before the write is raised and keeps its
+/// `revoked_at`, also one below the cap, which reaches the cap without a
+/// refusal. A row already revoked at the cap is left as it is, with no
+/// entry, and refuses nothing. No `lost_at` is set.
+#[tokio::test]
+async fn a_removed_machines_revoked_rows_are_raised_below_the_cap() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    const EARLIER: &str = "2026-01-02T03:04:05.000Z";
+    for (id, token) in [(EXPIRING_REVOKED, MAX_TOKEN - 1), (LOCAL, MAX_TOKEN)] {
+        sqlx::query("UPDATE leases SET fencing_token = ?, revoked_at = ? WHERE id = ?")
+            .bind(token)
+            .bind(EARLIER)
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: lost(&old),
+            moved: true
+        }
+    );
+    async fn revoked_at(store: &Store, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT revoked_at FROM leases WHERE id = ?")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+    }
+    for (id, token) in [
+        (EXPIRING, 4),
+        (EXPIRING_REVOKED, MAX_TOKEN),
+        (LOCAL, MAX_TOKEN),
+        (MARKED, 7),
+    ] {
+        assert_eq!(lease(&store, id).await, (token, true), "{id}");
+    }
+    for id in [EXPIRING_REVOKED, LOCAL] {
+        assert_eq!(
+            revoked_at(&store, id).await.as_deref(),
+            Some(EARLIER),
+            "{id}"
+        );
+    }
+    let entries = entries_after(&store, head.seq).await;
+    assert!(
+        entries
+            .iter()
+            .any(|(_, kind, id, _, _, payload)| kind == "lease"
+                && id == EXPIRING_REVOKED
+                && payload["fencing_token"] == MAX_TOKEN),
+        "the raise of the row revoked below the cap: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(_, kind, id, _, _, _)| kind == "lease" && id == LOCAL),
+        "no entry for the row revoked at the cap: {entries:?}"
+    );
+    for id in lost(&old) {
+        assert_eq!(status(&store, &id).await, "removed", "{id}");
+        assert_eq!(lost_at(&store, &id).await, None, "{id}");
+    }
+}
+
+/// Only machines with the `node` role are removed: a witness-only and an
+/// edge-only machine stay as they were, and `cluster.restored` does not name
+/// them.
+#[tokio::test]
+async fn a_witness_only_or_edge_only_machine_is_not_removed() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    const WITNESS: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0F";
+    const EDGE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0G";
+    for (id, roles) in [(WITNESS, r#"["witness"]"#), (EDGE, r#"["edge"]"#)] {
+        insert_node(&store, id).await;
+        sqlx::query("UPDATE nodes SET roles = ? WHERE id = ?")
+            .bind(roles)
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    let head_after = log_head_of(&store).await;
+    assert_eq!(head_after, head, "the rows are written directly, no entry");
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: lost(&old),
+            moved: true
+        }
+    );
+    for id in [WITNESS, EDGE] {
+        assert_eq!(status(&store, id).await, "disconnected", "{id}");
+        assert_eq!(lost_at(&store, id).await, None, "{id}");
+    }
+    let records = records_after(&store, 0).await;
+    let restored = records
+        .iter()
+        .find(|record| record.operation == restore_pending::RESTORED_OPERATION)
+        .expect("cluster.restored");
+    assert_eq!(restored.params["removed_node_ids"], json!(lost(&old)));
+}
+
+/// The record of a quarantined copy a removed machine keeps is dropped in
+/// the same write, with its change-log `delete`, as a removal drops it
+/// (node-agent-protocol.md section 10).
+#[tokio::test]
+async fn a_removed_machines_quarantined_copy_is_dropped() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    const VOLUME: &str = "vol_01JC9Z1A2B3C4D5E6F7G8H9J0A";
+    const QUARANTINE: &str = "qrn_01JC9Z1A2B3C4D5E6F7G8H9J0A";
+    let now = now_rfc3339();
+    // The volume's app and project are not part of this test: the rows are
+    // written without the foreign-key checks, on one connection.
+    let mut conn = store.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO volumes (id, app_id, node_id, size_gb, mount_path, state, \
+         allocated_bytes, restored_from_backup_id, error, created_at, updated_at) \
+         VALUES (?, 'app_01JC9Z1A2B3C4D5E6F7G8H9J0A', ?, 2, '/data', 'ready', NULL, NULL, \
+         NULL, ?, ?)",
+    )
+    .bind(VOLUME)
+    .bind(NEW_NODE)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO volume_quarantines (id, volume_id, app_id, node_id, size_bytes, sha256, \
+         created_at) VALUES (?, ?, 'app_01JC9Z1A2B3C4D5E6F7G8H9J0A', ?, 4096, ?, ?)",
+    )
+    .bind(QUARANTINE)
+    .bind(VOLUME)
+    .bind(HOLDER)
+    .bind("a".repeat(64))
+    .bind(&now)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: lost(&old),
+            moved: true
+        }
+    );
+    let left: Vec<String> = sqlx::query_scalar("SELECT id FROM volume_quarantines")
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+    assert!(left.is_empty(), "{left:?}");
+    let entries = entries_after(&store, head.seq).await;
+    assert!(
+        entries
+            .iter()
+            .any(|(_, kind, id, actor_type, actor_id, _)| {
+                kind == "volume_quarantine"
+                    && id == QUARANTINE
+                    && (actor_type.as_str(), actor_id.as_str()) == ("system", "cluster")
+            }),
+        "{entries:?}"
+    );
+}
+
+/// Each machine the `--accept-loss` first write removes loses its
+/// `cp_status`, in its row and in its removal entry. Without `primary-node`
+/// the new host has no node of the restored database, so the write removes
+/// every machine with the `node` role, the old primary's node too, moves
+/// nothing, and leaves no node holding the primary status. The new host's
+/// agent then enrolls with the local token (ADR 0110): it gets a new node
+/// with `cp_status = 'primary'` and does not adopt the old primary's row.
+#[tokio::test]
+async fn an_accept_loss_first_write_without_primary_node_leaves_no_primary_status() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    write_marker(&dir, &forced(&head));
+
+    let mut removed = vec![old.clone(), NEW_NODE.to_string(), HOLDER.to_string()];
+    removed.sort();
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: removed.clone(),
+            moved: false
+        }
+    );
+    for id in &removed {
+        assert_eq!(status(&store, id).await, "removed", "{id}");
+        assert_eq!(cp_status(&store, id).await, None, "{id}");
+    }
+    let holders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE cp_status IS NOT NULL")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(holders, 0, "no node holds the primary status");
+    assert!(moved_audit_ids(&store).await.is_empty());
+    // The old primary's one node entry of the write is its removal, and it
+    // reads no `cp_status`.
+    let entries = entries_after(&store, head.seq).await;
+    let old_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|(_, kind, entity, _, _, _)| kind == "node" && *entity == old)
+        .map(|(_, _, _, _, _, payload)| payload)
+        .collect();
+    assert_eq!(old_entries.len(), 1, "{entries:?}");
+    assert_eq!(old_entries[0]["status"], "removed");
+    assert!(old_entries[0]["cp_status"].is_null(), "{}", old_entries[0]);
+
+    // The next start, then the new host's agent enrolls with the local token.
+    store.pool().close().await;
+    let (server, node_id) = enroll_new_host_locally(dir.clone()).await;
+    assert!(!removed.contains(&node_id), "{node_id}");
+    let store = &server.state.store;
+    assert_eq!(cp_status(store, &node_id).await.as_deref(), Some("primary"));
+    assert_eq!(status(store, &old).await, "removed");
+    assert_eq!(cp_status(store, &old).await, None);
+}
+
+/// The next start on `dir`, then the new host's agent enrolling with the
+/// local token (ADR 0110). Returns the started server and the enrolled
+/// node's id.
+async fn enroll_new_host_locally(dir: TestDir) -> (Server, String) {
+    let server = start_in(dir).await;
+    common::settle_voters(&server).await;
+    quoro_control_plane::api::enroll::ensure_local_join(
+        &server.data_dir,
+        "https://primary.local:8443",
+        common::TLS_FINGERPRINT,
+    )
+    .unwrap();
+    let token = quoro_control_plane::api::enroll::local_join_token(&server.data_dir).unwrap();
+    let res = server
+        .client()
+        .post(server.url("/api/v1/nodes/enroll"))
+        .json(&json!({
+            "join_token": token,
+            "name": "new-host",
+            "public_key": quoro_proto::sign::public_key_to_base64(
+                &quoro_proto::sign::signing_key_from_seed(&[3u8; 32]).verifying_key()
+            ),
+            "roles": ["node"],
+            "capacity": { "cpus": 8, "memory_mb": 16_384, "disk_gb": 200 },
+            "kvm": { "available": true, "kernel": "6.9.0", "nested": true }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let code = res.status();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(code, 201, "{body}");
+    let node_id = body["node_id"].as_str().unwrap().to_string();
+    (server, node_id)
+}
+
+/// Without `primary-node`, the `--accept-loss` first write also clears
+/// `cp_status` on a machine it does not remove: here the old primary is
+/// edge-only, so the write removes the two machines with the `node` role and
+/// then clears the old primary's `cp_status`, in its row and in one node
+/// entry of its own that keeps its status, before `cluster.restored`. No
+/// node holds the status after the write, nothing is moved, and the new
+/// host's agent, enrolling with the local token, gets a new node with
+/// `cp_status = 'primary'` instead of adopting the old primary's row.
+#[tokio::test]
+async fn an_accept_loss_first_write_without_primary_node_clears_an_edge_only_primary() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    sqlx::query("UPDATE nodes SET roles = '[\"edge\"]' WHERE id = ?")
+        .bind(&old)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        log_head_of(&store).await,
+        head,
+        "the row is written directly"
+    );
+    assert_eq!(cp_status(&store, &old).await.as_deref(), Some("primary"));
+    let status_before = status(&store, &old).await;
+    write_marker(&dir, &forced(&head));
+
+    let mut removed = vec![NEW_NODE.to_string(), HOLDER.to_string()];
+    removed.sort();
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: removed.clone(),
+            moved: false
+        }
+    );
+    assert_eq!(status(&store, &old).await, status_before, "not removed");
+    assert_eq!(cp_status(&store, &old).await, None);
+    for id in &removed {
+        assert_eq!(status(&store, id).await, "removed", "{id}");
+        assert_eq!(cp_status(&store, id).await, None, "{id}");
+    }
+    let holders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE cp_status IS NOT NULL")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(holders, 0, "no node holds the primary status");
+    assert!(moved_audit_ids(&store).await.is_empty());
+
+    // One node entry for the old primary: the whole row, with no `cp_status`,
+    // by the `cluster` actor, before the `audit` entry of `cluster.restored`.
+    let entries = entries_after(&store, head.seq).await;
+    let old_entries: Vec<_> = entries
+        .iter()
+        .filter(|(_, kind, entity, _, _, _)| kind == "node" && *entity == old)
+        .collect();
+    assert_eq!(old_entries.len(), 1, "{entries:?}");
+    let (cleared_seq, _, _, actor_type, actor_id, payload) = old_entries[0];
+    assert_eq!(
+        (actor_type.as_str(), actor_id.as_str()),
+        ("system", "cluster")
+    );
+    assert_eq!(payload["id"], old.as_str());
+    assert_eq!(payload["status"], status_before.as_str());
+    assert_eq!(payload["roles"], json!(["edge"]));
+    assert!(payload["cp_status"].is_null(), "{payload}");
+    let records = records_after(&store, 0).await;
+    let restored = records
+        .iter()
+        .find(|record| record.operation == restore_pending::RESTORED_OPERATION)
+        .expect("cluster.restored");
+    assert_eq!(restored.params["removed_node_ids"], json!(removed));
+    let restored_seq: i64 = sqlx::query_scalar("SELECT seq FROM audit_log WHERE operation = ?")
+        .bind(restore_pending::RESTORED_OPERATION)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let restored_entry = entries
+        .iter()
+        .find(|(_, kind, entity, _, _, _)| kind == "audit" && *entity == restored_seq.to_string())
+        .expect("the audit entry of cluster.restored");
+    assert!(*cleared_seq < restored_entry.0, "{entries:?}");
+
+    // The next start, then the new host's agent enrolls with the local token.
+    store.pool().close().await;
+    let (server, node_id) = enroll_new_host_locally(dir.clone()).await;
+    assert_ne!(node_id, old, "the old primary's row is not adopted");
+    assert!(!removed.contains(&node_id), "{node_id}");
+    let store = &server.state.store;
+    assert_eq!(cp_status(store, &node_id).await.as_deref(), Some("primary"));
+    assert_eq!(cp_status(store, &old).await, None);
+    let holders: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM nodes WHERE cp_status IS NOT NULL ORDER BY id")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(holders, vec![node_id]);
+}
+
+/// The number of machines that hold a `cp_status`.
+async fn holders(store: &Store) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE cp_status IS NOT NULL")
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+}
+
+/// A `primary-node` file that names a node the primary cannot use gives the
+/// new host's node no primary status, so the `--accept-loss` first write
+/// clears `cp_status` on every machine, as without the file
+/// (`backup-format.md` section 8.2): here on an edge-only old primary, which
+/// the write does not remove. Three such files: a node the database does not
+/// hold, a `removed` one, and text that is no `nod_` id. The clear records no
+/// `cluster.primary_moved`, `cluster.restored` stands for it, nothing is
+/// moved, and the file is deleted.
+#[tokio::test]
+async fn an_accept_loss_first_write_with_an_unusable_primary_node_leaves_no_primary_status() {
+    const UNKNOWN: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0Z";
+    for (case, named) in [
+        ("a node the database does not hold", UNKNOWN),
+        ("a removed node", NEW_NODE),
+        ("no nod_ id", "not-a-node-id"),
+    ] {
+        let (dir, store, old, head) = restored().await;
+        ensure_cluster_meta(&store).await.unwrap();
+        sqlx::query("UPDATE nodes SET roles = '[\"edge\"]' WHERE id = ?")
+            .bind(&old)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let mut removed = vec![HOLDER.to_string()];
+        if named == NEW_NODE {
+            sqlx::query("UPDATE nodes SET status = 'removed' WHERE id = ?")
+                .bind(NEW_NODE)
+                .execute(store.pool())
+                .await
+                .unwrap();
+        } else {
+            removed.push(NEW_NODE.to_string());
+        }
+        removed.sort();
+        assert_eq!(
+            log_head_of(&store).await,
+            head,
+            "{case}: the rows are written directly"
+        );
+        assert_eq!(cp_status(&store, &old).await.as_deref(), Some("primary"));
+        write_marker(&dir, &forced(&head));
+        std::fs::write(dir.join(primary_status::MARKER_FILE), format!("{named}\n")).unwrap();
+
+        assert_eq!(
+            check_and_apply(&store, &dir).await.unwrap(),
+            Applied::FirstWrite {
+                marked: 2,
+                removed: removed.clone(),
+                moved: false
+            },
+            "{case}"
+        );
+        assert_eq!(holders(&store).await, 0, "{case}: no node holds the status");
+        assert_eq!(cp_status(&store, &old).await, None, "{case}");
+        assert!(moved_audit_ids(&store).await.is_empty(), "{case}");
+        let records = records_after(&store, 0).await;
+        let restored: Vec<&AuditRecord> = records
+            .iter()
+            .filter(|record| record.operation == restore_pending::RESTORED_OPERATION)
+            .collect();
+        assert_eq!(restored.len(), 1, "{case}: {records:?}");
+        assert_eq!(
+            restored[0].params["removed_node_ids"],
+            json!(removed),
+            "{case}"
+        );
+        // The old primary's one node entry of the write clears its status.
+        let entries = entries_after(&store, head.seq).await;
+        let old_entries: Vec<&Value> = entries
+            .iter()
+            .filter(|(_, kind, entity, _, _, _)| kind == "node" && *entity == old)
+            .map(|(_, _, _, _, _, payload)| payload)
+            .collect();
+        assert_eq!(old_entries.len(), 1, "{case}: {entries:?}");
+        assert!(old_entries[0]["cp_status"].is_null(), "{case}");
+        assert_eq!(restore_marker(&store).await, Some(meta_value(&head)));
+        assert!(!exists(&dir, primary_status::MARKER_FILE), "{case}");
+        assert!(!exists(&dir, restore_pending::MARKER_FILE), "{case}");
+        store.pool().close().await;
+    }
+}
+
+/// When the node `primary-node` names already holds the primary status, it
+/// still holds it after the `--accept-loss` first write: nothing clears it,
+/// nothing is moved, and no `cluster.primary_moved` is recorded.
+#[tokio::test]
+async fn an_accept_loss_first_write_keeps_the_status_on_a_host_node_that_holds_it() {
+    let (dir, store, old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    sqlx::query("UPDATE nodes SET cp_status = NULL WHERE id = ?")
+        .bind(&old)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE nodes SET cp_status = 'primary' WHERE id = ?")
+        .bind(NEW_NODE)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(log_head_of(&store).await, head);
+    write_marker(&dir, &forced(&head));
+    write_primary_node(&dir);
+
+    assert_eq!(
+        check_and_apply(&store, &dir).await.unwrap(),
+        Applied::FirstWrite {
+            marked: 2,
+            removed: lost(&old),
+            moved: false
+        }
+    );
+    assert_eq!(
+        cp_status(&store, NEW_NODE).await.as_deref(),
+        Some("primary")
+    );
+    assert_eq!(holders(&store).await, 1);
+    assert!(moved_audit_ids(&store).await.is_empty());
+    let entries = entries_after(&store, head.seq).await;
+    assert!(
+        !entries
+            .iter()
+            .any(|(_, kind, entity, _, _, _)| kind == "node" && entity == NEW_NODE),
+        "{entries:?}"
+    );
+    assert!(!exists(&dir, primary_status::MARKER_FILE));
+}
+
+/// Between an `--accept-loss` first write that leaves no node holding the
+/// primary status and the first local enrollment of the new host's agent,
+/// the primary starts and serves: `GET /api/v1/cluster` and `GET
+/// /api/v1/nodes` answer 200, and a control-plane backup run does not fail
+/// for lack of a primary. Nothing the start or those calls run takes the
+/// status.
+#[tokio::test]
+async fn with_no_primary_status_after_an_accept_loss_first_write_the_primary_serves() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (dir, store, _old, head) = restored().await;
+    ensure_cluster_meta(&store).await.unwrap();
+    store.pool().close().await;
+    write_marker(&dir, &forced(&head));
+
+    let server = start_in(dir.clone()).await;
+    let store = &server.state.store;
+    assert_eq!(restore_marker(store).await, Some(meta_value(&head)));
+    assert_eq!(holders(store).await, 0, "no node holds the status");
+    server
+        .state
+        .backups
+        .set_factory(Arc::new(MemoryBuckets(Arc::clone(&bucket))));
+
+    let owner = server.owner().await;
+    for path in ["/api/v1/cluster", "/api/v1/nodes"] {
+        let res = owner.get(server.url(path)).send().await.unwrap();
+        let code = res.status();
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(code, 200, "{path}: {body}");
+    }
+
+    create_repository(&owner, &server).await;
+    let now = time::OffsetDateTime::now_utc();
+    let queued = queue_if_due(&server.state, now)
+        .await
+        .expect("no error for lack of a primary");
+    if let Some(backup) = queued {
+        run_control_plane_backup(&server.state, &backup.id, now)
+            .await
+            .expect("the run does not fail for lack of a primary");
+        let status: String = sqlx::query_scalar("SELECT status FROM backups WHERE id = ?")
+            .bind(&backup.id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "succeeded");
+    }
+    assert_eq!(holders(store).await, 0, "nothing took the status");
 }
