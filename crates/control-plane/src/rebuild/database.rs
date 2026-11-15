@@ -47,6 +47,14 @@
 //! a name, or that name with `-wal`, `-shm` or `-journal` after it, and that
 //! belong to the user it runs as.
 //!
+//! [`check`] is the read-only check `quoro cluster promote` runs on the
+//! followed log before its votes, and again on its frozen log
+//! (`node-agent-protocol.md` section 7.3, the refusal of a followed log that
+//! does not fold): step 1, the fold of step 3, the cascades of step 4, the
+//! NOT NULL stop of step 5, and the audit chain of step 9 over the folded
+//! `audit_log` rows in audit `seq` order. It inserts nothing, so a foreign
+//! key, `CHECK`, `UNIQUE` or type error can still stop [`build`].
+//!
 //! # How a payload's values become columns
 //!
 //! A payload carries each column under the column's name, as its writer
@@ -392,6 +400,192 @@ pub async fn build(
     Ok(built)
 }
 
+/// Why [`check`] did not pass.
+#[derive(Debug)]
+pub enum CheckError {
+    /// The log does not fold, a folded row lacks a NOT NULL column, or a
+    /// chain breaks: [`build`] stops with the same error on the same
+    /// entries.
+    Log(BuildError),
+    /// The check did not run, which says nothing of the log: this binary's
+    /// schema could not be made or read in memory, as when memory runs out.
+    Schema(BuildError),
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Log(error) => error.fmt(f),
+            Self::Schema(error) => write!(f, "cannot read this binary's schema in memory: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CheckError {}
+
+/// The read-only check of section 7.3 on `entries`, the followed change log
+/// in `seq` order, that `quoro cluster promote` runs before any vote request
+/// and again on its frozen log before the first real one: the change-log
+/// chain of the entries ([`check_chain`]), the fold ([`super::fold`]), the
+/// schema's `ON DELETE CASCADE` removals over the fold's deletions, the NOT
+/// NULL stop of the insert, and the audit chain over the folded `audit_log`
+/// rows in audit `seq` order (`audit-log-format.md` section 6). Each stops
+/// with the error [`build`] stops with.
+///
+/// It inserts no row, so a foreign key, `CHECK`, `UNIQUE` or type error can
+/// still stop [`build`] after the votes. The only database it opens is one
+/// held in memory, with this binary's schema and no row of the log, to read
+/// the schema's columns and cascades; it is closed before the fold.
+///
+/// # Errors
+///
+/// [`CheckError::Log`] when the log fails a check, and
+/// [`CheckError::Schema`] when the check could not run.
+pub async fn check(entries: &[FollowedEntry]) -> Result<(), CheckError> {
+    if entries.is_empty() {
+        return Err(CheckError::Log(BuildError::EmptyLog));
+    }
+    check_chain(entries).map_err(CheckError::Log)?;
+    let (schema, foreign) = schema_in_memory().await.map_err(CheckError::Schema)?;
+    check_fold(&schema, &foreign, entries).map_err(CheckError::Log)
+}
+
+/// This binary's schema and its cascades, read from a database made in
+/// memory, closed before return.
+async fn schema_in_memory() -> Result<(Schema, Vec<Cascade>), BuildError> {
+    let store = Store::open_in_memory().await?;
+    let read = async {
+        let mut conn = store.pool().acquire().await?;
+        let schema = Schema::read(&mut conn).await?;
+        let foreign = cascades(&mut conn, &schema).await?;
+        Ok((schema, foreign))
+    }
+    .await;
+    store.pool().close().await;
+    read
+}
+
+/// [`check`] once the change-log chain held, with `schema` and `foreign`,
+/// its cascades.
+fn check_fold(
+    schema: &Schema,
+    foreign: &[Cascade],
+    followed: &[FollowedEntry],
+) -> Result<(), BuildError> {
+    let entries: Vec<Entry<'_>> = followed.iter().map(FollowedEntry::as_entry).collect();
+    let mut folded = super::fold(schema, entries.iter().copied())?;
+    let cascaded = cascade(schema, foreign, &entries);
+    remove_cascaded(&mut folded, &cascaded);
+    let order = insert_order(&folded);
+    for (created_seq, table, entity_id, row) in &order {
+        check_not_null(schema, table, entity_id, *created_seq, row, &entries)?;
+    }
+    let records = order
+        .iter()
+        .filter(|(_, table, ..)| *table == AUDIT_TABLE)
+        .map(|(.., row)| folded_record(schema, row));
+    let verification = audit::verify_records(records, 1, GENESIS_HASH);
+    if verification.ok {
+        Ok(())
+    } else {
+        Err(BuildError::AuditChain {
+            seq: verification.broken_at_seq.unwrap_or_default(),
+            reason: verification.reason.unwrap_or_default(),
+        })
+    }
+}
+
+/// Why a folded row cannot fill a NOT NULL column its `create` lacked.
+const LACKS_NOT_NULL: &str = "the create lacks it, and the column has no default and is NOT NULL";
+/// Why a JSON `null` cannot fill a NOT NULL column that holds no JSON text.
+const NULL_IN_NOT_NULL: &str = "null in a NOT NULL column";
+
+/// The NOT NULL stop of [`insert_rows`] on `row`, a folded row of `table`
+/// whose `create` is at `created_seq`, without the insert: a NOT NULL column
+/// with no default that its `create` lacked, or a JSON `null` in a NOT NULL
+/// column that holds no JSON text ([`decode`]).
+fn check_not_null(
+    schema: &Schema,
+    table: &'static str,
+    entity_id: &str,
+    created_seq: u64,
+    row: &FoldedRow,
+    entries: &[Entry<'_>],
+) -> Result<(), BuildError> {
+    let entity_type = entity_type_of(table);
+    for column in schema.columns(table).unwrap_or_default() {
+        if !column.not_null {
+            continue;
+        }
+        let (seq, reason) = match row.cells.get(&column.name) {
+            Some(Cell::Default) if column.default.is_none() => (created_seq, LACKS_NOT_NULL),
+            Some(Cell::Value(Value::Null)) if !column.json => (
+                writer_seq(entries, entity_type, entity_id, created_seq, &column.name),
+                NULL_IN_NOT_NULL,
+            ),
+            _ => continue,
+        };
+        return Err(BuildError::Column {
+            entity_type: entity_type.to_owned(),
+            entity_id: entity_id.to_owned(),
+            seq,
+            table,
+            column: column.name.clone(),
+            reason: reason.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// The audit record a folded `audit_log` row reads back as once [`build`]
+/// inserted it ([`audit::record_value_from_row`]): each column of
+/// [`audit::COLUMNS`] that holds a value, stored as [`decode`] stores it and
+/// read back as the reader reads it, `params` parsed from its JSON text. A
+/// NULL is left out, as the reader leaves out an absent field, and so is a
+/// column the `create` lacked: every column of `audit_log` defaults to NULL.
+/// A value [`decode`] refuses is kept as the payload carries it: the insert
+/// stops on it, and this check does not.
+fn folded_record(schema: &Schema, row: &FoldedRow) -> Value {
+    let mut record = Map::new();
+    for column in schema.columns(AUDIT_TABLE).unwrap_or_default() {
+        if !audit::COLUMNS
+            .split(',')
+            .any(|name| name.trim() == column.name)
+        {
+            continue;
+        }
+        let Some(Cell::Value(value)) = row.cells.get(&column.name) else {
+            continue;
+        };
+        let read = match decode(AUDIT_TABLE, column, value) {
+            Ok(Bound::Null) => continue,
+            Ok(Bound::Int(int)) => Value::from(int),
+            Ok(Bound::Real(real)) => Value::from(real),
+            Ok(Bound::Text(text)) if column.json => {
+                serde_json::from_str(&text).unwrap_or_else(|_| value.clone())
+            }
+            Ok(Bound::Text(text)) => Value::String(text),
+            Ok(Bound::Blob(_)) | Err(_) => value.clone(),
+        };
+        record.insert(column.name.clone(), read);
+    }
+    Value::Object(record)
+}
+
+/// Removes from `folded` each row of `cascaded` that still starts from the
+/// `create` the cascade removed it after.
+fn remove_cascaded(folded: &mut Folded, cascaded: &[Cascaded]) {
+    for removed in cascaded {
+        if let Some(rows) = folded.tables.get_mut(removed.table)
+            && rows
+                .get(&removed.entity_id)
+                .is_some_and(|row| row.created_seq == removed.created_seq)
+        {
+            rows.remove(&removed.entity_id);
+        }
+    }
+}
+
 /// A name next to `path` that no other build takes:
 /// `.<file name>.rebuild-<random hex>`.
 fn temporary_path(path: &Path) -> Result<PathBuf, BuildError> {
@@ -611,15 +805,7 @@ async fn fill(
     let mut folded = super::fold(&schema, entries.iter().copied())?;
     let foreign = cascades(&mut w.tx, &schema).await?;
     let cascaded = cascade(&schema, &foreign, &entries);
-    for removed in &cascaded {
-        if let Some(rows) = folded.tables.get_mut(removed.table)
-            && rows
-                .get(&removed.entity_id)
-                .is_some_and(|row| row.created_seq == removed.created_seq)
-        {
-            rows.remove(&removed.entity_id);
-        }
-    }
+    remove_cascaded(&mut folded, &cascaded);
     insert_rows(&mut w.tx, &schema, &folded, &entries).await?;
     let head_seq = copy_change_log(&mut w.tx, followed).await?;
 
@@ -1049,7 +1235,7 @@ fn decode(table: &str, column: &super::Column, value: &Value) -> Result<Bound, S
             // column can hold that the payload carries as JSON `null`.
             Ok(Bound::Text("null".to_owned()))
         } else {
-            Err("null in a NOT NULL column".to_owned())
+            Err(NULL_IN_NOT_NULL.to_owned())
         };
     }
     match (column.declared_type.to_ascii_uppercase().as_str(), value) {
@@ -1210,8 +1396,7 @@ pub async fn insert_rows(
                         return Err(column_error(
                             &column.name,
                             created_seq,
-                            "the create lacks it, and the column has no default and is NOT NULL"
-                                .to_owned(),
+                            LACKS_NOT_NULL.to_owned(),
                         ));
                     }
                 }

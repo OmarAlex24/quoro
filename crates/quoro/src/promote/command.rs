@@ -1,11 +1,19 @@
 //! The command line of `quoro cluster promote`, the host it reads, step 1
-//! and `--abort` (`node-agent-protocol.md` section 7.3).
+//! and `--abort` (`node-agent-protocol.md` section 7.3). Steps 2 to 6 are
+//! [`super::steps`].
 //!
-//! Every read of the host goes through [`Host`]: the effective uid, the
-//! configuration that names the two data directories, systemd and the
-//! clock. The files under those directories, the agent's store among them,
-//! are read where [`Paths`] points, so the tests lay a host out in a
-//! temporary directory and run without root.
+//! Every read of the host the refusals make goes through [`Host`]: the
+//! effective uid, the configuration that names the two data directories,
+//! systemd and the clock. The files under those directories, the agent's
+//! store among them, are read where [`Paths`] points, so the tests lay a
+//! host out in a temporary directory and run without root. Steps 2 to 6 go
+//! through `super::steps::Steps`.
+//!
+//! The exit status is 0 for a promotion, for `--abort`, and for a dry run
+//! whose vote pre-check found a majority that would grant the term; it is 1
+//! for every other end: a refusal, a stop before or after the freeze, and a
+//! dry run whose pre-check found no majority, at which a promotion would
+//! stop ([`exit_status`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,10 +22,13 @@ use std::time::SystemTime;
 
 use quoro_node_agent::AgentError;
 use quoro_node_agent::freeze::{self, PromotionLock, PromotionReads};
+use quoro_node_agent::identity::Identity;
 use quoro_node_agent::store::{NodeStore, PROMOTION_FREEZE};
 use quoro_proto::custody::KeyKind;
 
+use super::host_steps::HostSteps;
 use super::refusals::{self, Passed, Refusal};
+use super::steps::{self, Steps, Stopped};
 use crate::host::{AGENT_STORE, Out, UNIT};
 
 /// The command line, read by [`parse_args`].
@@ -33,7 +44,8 @@ pub(crate) enum Request {
 /// The flags of a promotion.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Flags {
-    /// `--dry-run`: stop before anything changes.
+    /// `--dry-run`: stop after step 2's vote pre-check, before anything
+    /// changes.
     pub dry_run: bool,
     /// `--ack-fence`: the old primary's host is down and stays down.
     pub ack_fence: bool,
@@ -205,17 +217,26 @@ pub(crate) fn read_load_state(succeeded: bool, stdout: &str, stderr: &str) -> Re
     Ok(state != "not-found")
 }
 
-/// What a run that did not refuse did. None of them changed anything but
-/// `Aborted`, which ended a freeze when there was one.
+/// What a run that did not refuse did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
-    /// `--abort` ran.
+    /// `--abort` ran: it ended a freeze when there was one.
     Aborted,
-    /// `--dry-run` stopped after step 1.
-    DryRun,
-    /// Every refusal passed and step 1 ran; the rest of the promotion is
-    /// not built yet, so the command stopped.
-    NotBuilt,
+    /// `--dry-run` stopped after step 2's vote pre-check, having changed
+    /// nothing; `majority` says whether a majority would grant the term.
+    DryRun { majority: bool },
+    /// Every step ran: this machine is the primary.
+    Promoted,
+    /// The promotion stopped after the freeze, which then ended.
+    Stopped(Stopped),
+}
+
+/// The exit status of a run (module documentation).
+pub(crate) fn exit_status(result: &Result<Outcome, Refusal>) -> u8 {
+    match result {
+        Ok(Outcome::Aborted | Outcome::Promoted | Outcome::DryRun { majority: true }) => 0,
+        Ok(Outcome::DryRun { majority: false } | Outcome::Stopped(_)) | Err(_) => 1,
+    }
 }
 
 /// `quoro cluster promote [--dry-run] [--ack-fence] [--accept-loss]
@@ -225,26 +246,29 @@ pub async fn command(args: &[String]) -> ExitCode {
         Ok(request) => request,
         Err(message) => return crate::usage_error(&message),
     };
-    match run(&request, &RealHost, &mut Out::printing()).await {
-        Ok(Outcome::Aborted | Outcome::DryRun) => ExitCode::SUCCESS,
-        // The promotion did not happen: a script must not read it as done.
-        Ok(Outcome::NotBuilt) => ExitCode::from(1),
-        Err(refusal) => {
-            eprintln!("quoro cluster promote: {refusal}");
-            ExitCode::from(1)
-        }
+    let host_steps =
+        |paths: &Paths, identity: &Identity| HostSteps::new(paths.clone(), identity.clone());
+    let result = run(&request, &RealHost, host_steps, &mut Out::printing()).await;
+    match &result {
+        Ok(Outcome::Stopped(stopped)) => eprintln!("quoro cluster promote: {stopped}"),
+        Err(refusal) => eprintln!("quoro cluster promote: {refusal}"),
+        Ok(_) => {}
     }
+    ExitCode::from(exit_status(&result))
 }
 
 /// Runs `request` on `host`. The effective uid is read first and alone: a
-/// run that is not root's stops before it reads anything else.
+/// run that is not root's stops before it reads anything else. Once the
+/// refusals pass, `make_steps` gives the effects of steps 2 to 6 for the
+/// two data directories and the agent's identity.
 ///
 /// # Errors
 ///
 /// The [`Refusal`] that stopped the run; nothing was changed then.
-pub(crate) async fn run(
+pub(crate) async fn run<S: Steps>(
     request: &Request,
     host: &dyn Host,
+    make_steps: impl FnOnce(&Paths, &Identity) -> S,
     out: &mut Out,
 ) -> Result<Outcome, Refusal> {
     if host.euid() != Some(0) {
@@ -253,16 +277,16 @@ pub(crate) async fn run(
     let paths = host.paths().map_err(Refusal::Unreadable)?;
     match request {
         Request::Abort => abort(&paths, out).await,
-        Request::Promote(flags) => promote(flags, &paths, host, out).await,
+        Request::Promote(flags) => promote(flags, &paths, host, make_steps, out).await,
     }
 }
 
-/// The refusals, then step 1; then a dry run stops, and so does every other
-/// run for now.
-async fn promote(
+/// The refusals, step 1, then steps 2 to 6 ([`super::steps`]).
+async fn promote<S: Steps>(
     flags: &Flags,
     paths: &Paths,
     host: &dyn Host,
+    make_steps: impl FnOnce(&Paths, &Identity) -> S,
     out: &mut Out,
 ) -> Result<Outcome, Refusal> {
     let passed = refusals::check(flags, paths, host).await?;
@@ -272,15 +296,8 @@ async fn promote(
     ));
     out.say(keys_line(&passed));
     show_position(&passed.reads, flags.accept_loss, host.now(), out);
-    if flags.dry_run {
-        out.say(
-            "dry run: stopped after step 1. Step 2's vote pre-check is not built yet, so no \
-             voter was asked. Nothing was changed.",
-        );
-        return Ok(Outcome::DryRun);
-    }
-    out.say(not_built(flags));
-    Ok(Outcome::NotBuilt)
+    let effects = make_steps(paths, &passed.identity);
+    steps::run(flags, paths, host, &passed.identity, &effects, out).await
 }
 
 /// The keys in use the refusals opened.
@@ -355,26 +372,6 @@ fn age_seconds(at: &str, now: SystemTime) -> Option<u64> {
     now.duration_since(SystemTime::from(at))
         .ok()
         .map(|age| age.as_secs())
-}
-
-/// What a run that passed every refusal says before it stops.
-fn not_built(flags: &Flags) -> String {
-    let mut text = "the rest of the promotion (the term, the freeze, the database build, the \
-                    primary-status move, the keys and the start) is not built yet, so the command \
-                    stops here. Nothing was changed."
-        .to_string();
-    if flags.ack_fence {
-        text.push_str(
-            " With --ack-fence the promotion skips step 3's wait and declares the old \
-             primary's node lost.",
-        );
-    }
-    if let Some(statement) = &flags.statement {
-        text.push_str(&format!(
-            " The statement it records as the justification: {statement:?}."
-        ));
-    }
-    text
 }
 
 /// `--abort` (section 7.3, ADR 0280): ends a freeze a stopped promotion

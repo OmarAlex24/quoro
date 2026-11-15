@@ -825,6 +825,55 @@ fn another_configuration_or_data_directory_refuses_before_any_change() {
     Fakes::serving(&host).prepare(&host).0.unwrap();
 }
 
+/// `check_host` makes every refusal of `prepare_host` but the one on the
+/// database and the keys, which the promotion writes after its votes, and
+/// changes nothing: it takes only the account database, and creates no user.
+#[test]
+fn check_host_refuses_before_the_database_and_the_keys_exist_and_changes_nothing() {
+    // A node host before the votes: no database and no key yet.
+    let host = Host::new();
+    for name in PRIMARY_FILES {
+        fs::remove_file(host.data_dir().join(name)).unwrap();
+    }
+    let accounts = FakeAccounts::default();
+    let refused = |says: &[&str]| {
+        let before = host.snapshot();
+        let error = check_host(&host.options(), &accounts).unwrap_err();
+        for words in says {
+            assert!(error.contains(words), "{words:?} in {error}");
+        }
+        assert!(
+            error.to_lowercase().ends_with("nothing was changed"),
+            "{error}"
+        );
+        assert_eq!(host.snapshot(), before);
+    };
+    let before = host.snapshot();
+    check_host(&host.options(), &accounts).unwrap();
+    assert_eq!(host.snapshot(), before);
+
+    let etc = host.root().join("etc/quoro");
+    fs::rename(&etc, host.root().join("etc/quoro-real")).unwrap();
+    std::os::unix::fs::symlink("quoro-real", &etc).unwrap();
+    refused(&["the configuration directory", "is a symbolic link"]);
+    fs::remove_file(&etc).unwrap();
+    fs::rename(host.root().join("etc/quoro-real"), &etc).unwrap();
+
+    accounts.user.set(Some(1000));
+    accounts.group.set(Some(1000));
+    refused(&["uid 1000, which is a login account", "userdel quoro-api"]);
+    accounts.user.set(Some(999));
+    accounts.group.set(None);
+    refused(&["exists without a group quoro-api"]);
+    accounts.user.set(None);
+
+    let outside = host.root().join("outside");
+    write_mode(&outside, b"root's", 0o600);
+    fs::hard_link(&outside, host.data_dir().join("linked")).unwrap();
+    refused(&["linked has 2 hard links"]);
+    assert!(accounts.created.borrow().is_empty(), "no user created");
+}
+
 #[test]
 fn a_quoro_api_with_a_login_uid_refuses_and_changes_nothing() {
     let host = Host::new();

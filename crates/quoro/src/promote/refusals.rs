@@ -14,6 +14,12 @@
 //!    newest schema version this binary knows (section 5.10, ADR 0229);
 //! 7. this machine cannot open a seal of every key in use ([`super::keys`]).
 //!
+//! The refusals that read the whole followed log or the host's preparation
+//! for step 6 come after these, from `super::steps`, and still before any
+//! change: the log does not fold, the keys step 6 installs, the host step 6
+//! prepares, and the token cap of `--ack-fence`. So do the stops of step 2's
+//! vote pre-check, which changes nothing either.
+//!
 //! Within one item the more specific state comes first: a quarantined log
 //! is also empty once it was moved aside, and a refollowing agent's log is
 //! below its mark until it reaches the head it refollows to.
@@ -33,6 +39,7 @@ use quoro_node_agent::freeze::{self, PromotionReads};
 use quoro_node_agent::identity::{self, Identity};
 use quoro_node_agent::store::{NodeStore, Refollowing};
 use quoro_proto::custody::KeyKind;
+use quoro_proto::wire::MAX_TERM;
 
 use super::command::{Flags, Host, Paths};
 use super::keys;
@@ -77,6 +84,32 @@ pub(crate) enum Refusal {
     PromotionRunning,
     /// `--abort` on a host whose agent has no store.
     NoAgentStore(PathBuf),
+    /// The followed log does not fold: the build of step 4 would stop on it.
+    DoesNotFold(String),
+    /// Step 6 would refuse to install the keys opened from the seals.
+    PrimaryKeys(Vec<String>),
+    /// Step 6 would refuse to prepare this host for the control plane.
+    Host(String),
+    /// `--ack-fence` would declare `node_id` lost, and a lease it holds is
+    /// already at the token cap (section 8.6, ADR 0325).
+    TokenExhausted { node_id: String, detail: String },
+    /// The vote pre-check cannot run: no voter set, or a client that would
+    /// not send.
+    NoVotes(String),
+    /// The term would pass the ceiling, 2^53 - 1 (section 8.8).
+    AboveCeiling { highest: u64 },
+    /// The voters' terms kept rising during the pre-check.
+    Unsettled { term: u64 },
+    /// The pre-check found no majority that would grant `term`.
+    NoMajority {
+        term: u64,
+        granted: usize,
+        voters: usize,
+    },
+    /// Another promotion holds the promotion lock on this host.
+    AnotherPromotion,
+    /// The agent could not be frozen.
+    FreezeFailed(String),
 }
 
 impl fmt::Display for Refusal {
@@ -162,6 +195,63 @@ impl fmt::Display for Refusal {
                  changed",
                 path.display()
             ),
+            Self::DoesNotFold(message) => write!(
+                f,
+                "the followed log does not fold: {message}. Step 4 would stop on it after the \
+                 votes, so the command stops before them. Nothing was changed"
+            ),
+            Self::PrimaryKeys(problems) => write!(
+                f,
+                "step 6 would refuse to install the keys opened from this machine's seals: {}. \
+                 Nothing was changed",
+                problems.join("; ")
+            ),
+            Self::Host(message) => write!(
+                f,
+                "step 6 would refuse to prepare this host for the control plane: {message}. \
+                 Nothing was changed"
+            ),
+            Self::TokenExhausted { node_id, detail } => write!(
+                f,
+                "--ack-fence declares the old primary's node {node_id} lost, which raises the \
+                 token of every lease it holds: {detail}. The command stopped before any \
+                 vote request: no term was taken and the agent was not frozen. Nothing was \
+                 changed"
+            ),
+            Self::NoVotes(message) => write!(
+                f,
+                "the vote pre-check cannot run: {message}. Nothing was changed"
+            ),
+            Self::AboveCeiling { highest } => write!(
+                f,
+                "the term would pass the term ceiling, {MAX_TERM} (2^53 - 1, section 8.8): the \
+                 highest term this machine has seen or a voter answered is {highest}. The \
+                 command stopped before any real vote request and before the freeze. Nothing \
+                 was changed"
+            ),
+            Self::Unsettled { term } => write!(
+                f,
+                "the voters' terms kept rising during the vote pre-check; the next check would \
+                 ask for term {term}. Run the command again: it starts from the highest term it \
+                 then sees. Only the pre-check ran, so no voter moved. Nothing was changed"
+            ),
+            Self::NoMajority {
+                term,
+                granted,
+                voters,
+            } => write!(
+                f,
+                "{granted} of {voters} voters would grant term {term}, and a majority is \
+                 needed. Only the pre-check ran, so no voter moved. Nothing was changed"
+            ),
+            Self::AnotherPromotion => {
+                f.write_str("another quoro cluster promote runs on this host. Nothing was changed")
+            }
+            Self::FreezeFailed(message) => write!(
+                f,
+                "cannot freeze this machine's agent: {message}. No real vote request was sent. \
+                 Nothing was changed"
+            ),
         }
     }
 }
@@ -180,6 +270,62 @@ pub(crate) struct Passed {
 /// Whether `path` exists as itself: a dangling symbolic link exists.
 fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+/// Refusal 2: a control-plane database or a control-plane unit on this
+/// host. The command runs it again once it holds the promotion lock, so a
+/// promotion that finished on this host meanwhile stops the next.
+///
+/// # Errors
+///
+/// [`Refusal::ControlPlaneDatabase`] or [`Refusal::ControlPlaneUnit`], or
+/// [`Refusal::Unreadable`] when systemd's answer cannot be read.
+pub(crate) fn control_plane(paths: &Paths, host: &dyn Host) -> Result<(), Refusal> {
+    let database = paths.data_dir.join(crate::host::DATABASE);
+    if exists(&database) {
+        return Err(Refusal::ControlPlaneDatabase(database));
+    }
+    let unit = host.control_plane_unit_known().map_err(|e| {
+        Refusal::Unreadable(format!(
+            "cannot tell whether this host has a control-plane unit: {e}"
+        ))
+    })?;
+    if unit {
+        return Err(Refusal::ControlPlaneUnit);
+    }
+    Ok(())
+}
+
+/// Refusals 3 and 4 on the log `reads` describes: quarantined, empty, and,
+/// unless `accept_loss` lifts them, refollowing or below the mark. Step 4
+/// runs them again on the frozen log (section 7.3, ADR 0280).
+///
+/// # Errors
+///
+/// The first of those refusals that holds.
+pub(crate) fn log_state(reads: &PromotionReads, accept_loss: bool) -> Result<(), Refusal> {
+    if reads.quarantined {
+        return Err(Refusal::LogQuarantined);
+    }
+    if reads.is_empty() {
+        return Err(Refusal::LogEmpty);
+    }
+    // Refollowing, or below the mark: `--accept-loss` lifts both.
+    if !accept_loss {
+        if let Some(Refollowing::Head(head)) = reads.refollowing {
+            return Err(Refusal::Refollowing {
+                log_seq: reads.log_seq,
+                head,
+            });
+        }
+        if reads.below_mark {
+            return Err(Refusal::BelowMark {
+                log_seq: reads.log_seq,
+                mark: reads.mark.unwrap_or_default(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Runs every refusal in order (module documentation).
@@ -209,18 +355,7 @@ pub(crate) async fn check(
         identity::load_identity(node_dir).map_err(|e| Refusal::NoIdentity(e.to_string()))?;
 
     // 2. A control-plane database or unit.
-    let database = paths.data_dir.join(crate::host::DATABASE);
-    if exists(&database) {
-        return Err(Refusal::ControlPlaneDatabase(database));
-    }
-    let unit = host.control_plane_unit_known().map_err(|e| {
-        Refusal::Unreadable(format!(
-            "cannot tell whether this host has a control-plane unit: {e}"
-        ))
-    })?;
-    if unit {
-        return Err(Refusal::ControlPlaneUnit);
-    }
+    control_plane(paths, host)?;
 
     // 3. An empty or quarantined log. A host whose agent never opened its
     // store has followed nothing, and opening it here would create it.
@@ -233,28 +368,9 @@ pub(crate) async fn check(
     let reads = freeze::promotion_reads(&store)
         .await
         .map_err(|e| Refusal::Unreadable(format!("cannot read the agent's followed log: {e}")))?;
-    if reads.quarantined {
-        return Err(Refusal::LogQuarantined);
-    }
-    if reads.is_empty() {
-        return Err(Refusal::LogEmpty);
-    }
-
-    // 4. Refollowing, or below the mark: `--accept-loss` lifts both.
-    if !flags.accept_loss {
-        if let Some(Refollowing::Head(head)) = reads.refollowing {
-            return Err(Refusal::Refollowing {
-                log_seq: reads.log_seq,
-                head,
-            });
-        }
-        if reads.below_mark {
-            return Err(Refusal::BelowMark {
-                log_seq: reads.log_seq,
-                mark: reads.mark.unwrap_or_default(),
-            });
-        }
-    }
+    // 3, then 4: refollowing, or below the mark, which `--accept-loss`
+    // lifts.
+    log_state(&reads, flags.accept_loss)?;
 
     // 5. A restore that has not finished.
     let marker = paths.data_dir.join(RESTORE_PENDING);

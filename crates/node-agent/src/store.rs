@@ -860,6 +860,22 @@ impl NodeStore {
         })
     }
 
+    /// [`Self::open_read_only`] with the node's own key, `local.key`, loaded
+    /// and never created ([`LocalKey::load`]), so [`Self::latest_desired`]
+    /// opens a sealed body: `quoro cluster promote` reads the newest
+    /// `spec.votes` so (section 7.3 step 2). The connection is still
+    /// read-only, so every write through the store fails.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`LocalKey::load`] and [`Self::open_read_only`].
+    pub async fn open_read_only_with_local_key(data_dir: &Path) -> Result<Self, AgentError> {
+        let key = LocalKey::load(data_dir)?;
+        let mut store = Self::open_read_only(data_dir).await?;
+        store.key = Arc::new(key);
+        Ok(store)
+    }
+
     /// The data directory the store lives in.
     #[must_use]
     pub fn data_dir(&self) -> &Path {
@@ -5090,6 +5106,37 @@ mod tests {
         let empty = TempDir::new();
         assert!(NodeStore::open_read_only(&empty.0).await.is_err());
         assert!(!empty.0.join("node.db").exists());
+    }
+
+    /// A store opened read-only with the node's own key opens the sealed
+    /// desired state the plain read-only open cannot, writes nothing, and
+    /// without `local.key` is refused and creates no key.
+    #[tokio::test]
+    async fn a_read_only_store_with_the_local_key_opens_a_sealed_desired_state() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let body =
+            json!({"rev": 4, "issued_at": "2026-11-02T10:15:31Z", "term": 1, "signature": "x"});
+        store.store_desired(4, &body).await.unwrap();
+        store.pool().close().await;
+
+        let plain = NodeStore::open_read_only(&dir.0).await.unwrap();
+        assert!(plain.latest_desired().await.is_err());
+        let keyed = NodeStore::open_read_only_with_local_key(&dir.0)
+            .await
+            .unwrap();
+        assert_eq!(keyed.latest_desired().await.unwrap(), Some((4, body)));
+        assert!(keyed.set_meta("written", "no").await.is_err());
+        keyed.pool().close().await;
+
+        let key = dir.0.join("local.key");
+        std::fs::remove_file(&key).unwrap();
+        assert!(
+            NodeStore::open_read_only_with_local_key(&dir.0)
+                .await
+                .is_err()
+        );
+        assert!(!key.exists(), "no node-local key is created");
     }
 
     /// Verified entries `from_seq..from_seq + count`, chained on `prev_hash`.

@@ -384,8 +384,10 @@ async fn read_ledger(node_id: &str, entries: &[LogEntry]) -> Result<Ledger, Stri
     Ok(ledger)
 }
 
-/// This binary's schema, read from a database made in memory.
-async fn schema() -> Result<Schema, String> {
+/// This binary's schema, read from a database made in memory. The token-cap
+/// check of `--ack-fence` folds the `leases` and `nodes` entries against it
+/// too (`super::steps`).
+pub(crate) async fn schema() -> Result<Schema, String> {
     let store = Store::open_in_memory()
         .await
         .map_err(|e| format!("cannot make this binary's schema in memory: {e}"))?;

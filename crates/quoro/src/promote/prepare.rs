@@ -49,6 +49,11 @@
 //!   directory outside `engine/`;
 //! - a `quoro-api` with a login uid, or without its group.
 //!
+//! [`check_host`] runs every one of these refusals but the one on the
+//! database and the keys, and changes nothing, so the command runs it among
+//! its refusals before its votes, when the promotion has not written them
+//! yet.
+//!
 //! [`point_agent`] is the end of step 6. It is a separate call so that the
 //! command can end the freeze between the two, as the contract orders: start
 //! the control plane, end the freeze, point the agent. It points this
@@ -528,6 +533,114 @@ struct Owner {
     mode: u32,
 }
 
+/// What [`check`] read, for the changes of [`prepare_host`].
+struct Checked {
+    /// `quoro.toml`, under [`Options::root`].
+    config_path: PathBuf,
+    /// Its directory, `/etc/quoro`.
+    config_dir: PathBuf,
+    /// Its text and metadata as read.
+    original: String,
+    original_metadata: fs::Metadata,
+    config: Config,
+    /// Its text with `local = false` in its `[node]` table.
+    edited: String,
+    local: LocalEdit,
+    /// `/var/lib/quoro`, under [`Options::root`].
+    data_dir: PathBuf,
+    /// `quoro-api`'s uid, when the user exists.
+    existing: Option<u32>,
+}
+
+/// Whether [`check`] checks the files the promotion writes into the data
+/// directory before step 6 ([`PRIMARY_FILES`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Files {
+    Checked,
+    Unchecked,
+}
+
+/// The refusals of [`prepare_host`] that need nothing the promotion writes
+/// before step 6, so that `quoro cluster promote` runs them before its votes
+/// (section 7.3): the configuration is [`CONFIG_PATH`]; `/etc/quoro` is a
+/// directory, not a link; `quoro.toml` is a regular file that reads, sets
+/// `data_dir` to [`DATA_DIR`] or leaves it out, and has a `[node]` table
+/// [`set_local_false`] can edit; `/var/lib/quoro` is a directory, not a
+/// link, with no link and no file with another hard link in it but in
+/// `engine/`; and `quoro-api`, when it exists, has no login uid and has its
+/// group. The database and the keys are not checked: steps 4 to 6 write them
+/// later.
+///
+/// It takes only the account database, which it reads, and changes nothing.
+///
+/// # Errors
+///
+/// The refusal [`prepare_host`] stops with on the same host, which says that
+/// nothing was changed.
+pub fn check_host(options: &Options, accounts: &dyn Accounts) -> Result<(), String> {
+    check(options, accounts, Files::Unchecked).map(drop)
+}
+
+/// The refusals of [`prepare_host`], in its order: those of [`check_host`],
+/// and with [`Files::Checked`] the files the promotion wrote, checked after
+/// the data directory itself.
+fn check(options: &Options, accounts: &dyn Accounts, files: Files) -> Result<Checked, String> {
+    if options.config != Path::new(CONFIG_PATH) {
+        return Err(format!(
+            "the configuration is {}, but {UNIT} runs quoro serve with QUORO_CONFIG={CONFIG_PATH}: the control plane would read another file. Move the configuration to {CONFIG_PATH} and run this again; {UNCHANGED}",
+            options.config.display()
+        ));
+    }
+    let config_path = options.on_host(CONFIG_PATH);
+    let config_dir = parent_of(&config_path)?.to_path_buf();
+    check_directory(&config_dir, "the configuration directory")?;
+    let (original, original_metadata) = read_config(&config_path)?;
+    let config: Config = toml::from_str(&original)
+        .map_err(|e| format!("cannot read {}: {e}; {UNCHANGED}", config_path.display()))?;
+    if config.data_dir != Path::new(DATA_DIR) {
+        return Err(format!(
+            "{CONFIG_PATH} sets data_dir = {:?}, but {UNIT} may write only {DATA_DIR}, where the promotion writes the database: set data_dir to {DATA_DIR} or remove the line, and run this again; {UNCHANGED}",
+            config.data_dir.display().to_string()
+        ));
+    }
+    let (edited, local) = set_local_false(&original).map_err(|e| {
+        format!(
+            "cannot set local = false in the [node] table of {}: {e}; {UNCHANGED}",
+            config_path.display()
+        )
+    })?;
+    let data_dir = options.on_host(DATA_DIR);
+    check_directory(&data_dir, "the data directory")?;
+    if files == Files::Checked {
+        check_primary_files(&data_dir).map_err(|e| format!("{e}; {UNCHANGED}"))?;
+    }
+    hand_over(&data_dir, None).map_err(|e| format!("{e}; {UNCHANGED}"))?;
+    let existing = accounts.uid(API_USER)?;
+    if let Some(uid) = existing {
+        if uid >= FIRST_LOGIN_UID {
+            return Err(format!(
+                "user {API_USER} exists with uid {uid}, which is a login account; refusing to hand {DATA_DIR} to a human account. Remove it and run this again: userdel {API_USER}. Nothing was changed"
+            ));
+        }
+        if accounts.gid(API_USER)?.is_none() {
+            return Err(format!(
+                "user {API_USER} exists without a group {API_USER}, which owns the data directory; {UNCHANGED}"
+            ));
+        }
+    }
+    Ok(Checked {
+        config_path,
+        config_dir,
+        original,
+        original_metadata,
+        config,
+        edited,
+        local,
+        data_dir,
+        existing,
+    })
+}
+
 /// Steps 1 to 4: prepares this host to run the control plane and starts it.
 ///
 /// It blocks: it runs `getent`, `useradd` and `systemctl`, and sleeps
@@ -547,47 +660,17 @@ pub fn prepare_host(
     out: &mut Out,
 ) -> Result<Prepared, String> {
     // Every check first: nothing changes before they all passed.
-    if options.config != Path::new(CONFIG_PATH) {
-        return Err(format!(
-            "the configuration is {}, but {UNIT} runs quoro serve with QUORO_CONFIG={CONFIG_PATH}: the control plane would read another file. Move the configuration to {CONFIG_PATH} and run this again; {UNCHANGED}",
-            options.config.display()
-        ));
-    }
-    let config_path = options.on_host(CONFIG_PATH);
-    let config_dir = parent_of(&config_path)?;
-    check_directory(config_dir, "the configuration directory")?;
-    let (original, original_metadata) = read_config(&config_path)?;
-    let config: Config = toml::from_str(&original)
-        .map_err(|e| format!("cannot read {}: {e}; {UNCHANGED}", config_path.display()))?;
-    if config.data_dir != Path::new(DATA_DIR) {
-        return Err(format!(
-            "{CONFIG_PATH} sets data_dir = {:?}, but {UNIT} may write only {DATA_DIR}, where the promotion writes the database: set data_dir to {DATA_DIR} or remove the line, and run this again; {UNCHANGED}",
-            config.data_dir.display().to_string()
-        ));
-    }
-    let (edited, local) = set_local_false(&original).map_err(|e| {
-        format!(
-            "cannot set local = false in the [node] table of {}: {e}; {UNCHANGED}",
-            config_path.display()
-        )
-    })?;
-    let data_dir = options.on_host(DATA_DIR);
-    check_directory(&data_dir, "the data directory")?;
-    check_primary_files(&data_dir).map_err(|e| format!("{e}; {UNCHANGED}"))?;
-    hand_over(&data_dir, None).map_err(|e| format!("{e}; {UNCHANGED}"))?;
-    let existing = seams.accounts.uid(API_USER)?;
-    if let Some(uid) = existing {
-        if uid >= FIRST_LOGIN_UID {
-            return Err(format!(
-                "user {API_USER} exists with uid {uid}, which is a login account; refusing to hand {DATA_DIR} to a human account. Remove it and run this again: userdel {API_USER}. Nothing was changed"
-            ));
-        }
-        if seams.accounts.gid(API_USER)?.is_none() {
-            return Err(format!(
-                "user {API_USER} exists without a group {API_USER}, which owns the data directory; {UNCHANGED}"
-            ));
-        }
-    }
+    let Checked {
+        config_path,
+        config_dir,
+        original,
+        original_metadata,
+        config,
+        edited,
+        local,
+        data_dir,
+        existing,
+    } = check(options, seams.accounts, Files::Checked)?;
 
     // Step 1: the user.
     let user_created = existing.is_none();
@@ -634,7 +717,7 @@ pub fn prepare_host(
         gid: ROOT,
         mode: 0o755,
     };
-    own_in_place(seams.fs, config_dir, config_owner)?;
+    own_in_place(seams.fs, &config_dir, config_owner)?;
     out.say(format!("kept {} (root:root 0755)", config_dir.display()));
 
     // Step 3: quoro.toml, after its copy.

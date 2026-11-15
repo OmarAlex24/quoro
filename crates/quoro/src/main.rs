@@ -66,11 +66,14 @@ commands:
   cluster promote [--dry-run] [--ack-fence] [--accept-loss]
                   [--statement TEXT]
   cluster promote --abort               as root on a machine with the node
-                                        role, when the primary is gone: run
-                                        the refusals and show the log
-                                        position (the later steps are not
-                                        built yet); --abort ends a freeze a
-                                        stopped promotion left
+                                        role, when the primary is gone: take
+                                        a term from the voters, rebuild the
+                                        control plane from the followed log
+                                        and start it here; --dry-run stops
+                                        after the vote pre-check and exits 0
+                                        when a majority would grant; --abort
+                                        ends a freeze a stopped promotion
+                                        left
   mcp stdio --context NAME [--url URL] [--fingerprint FINGERPRINT]
             [--key-file PATH] [--justification TEXT]
   mcp stdio --url URL --fingerprint FINGERPRINT --key-file PATH
