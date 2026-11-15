@@ -976,7 +976,7 @@ A replica node that holds a copy of the change log but is not the primary never 
 ### 5.12 `lease_grant`
 
 **Direction:** control plane to node.
-**When:** when the primary (or, from M5b, the authority behind it) grants a lease, and as the answer to every successful `lease_renew`. From M5a the primary grants a `local` lease on an app when it places a stateful app: when the app's first volume is created, and on the target node when a restore completes (section 8.3).
+**When:** when the primary (or, from M5b, the authority behind it) grants a lease, and as the answer to every successful `lease_renew`. From M5a the primary grants a `local` lease on an app when it places a stateful app: when the app's first volume is created, and on the target node when a restore completes (section 8.3). From M5b, at each session start, after the stale-lease revokes (section 9 step 2), the primary sends a same-token `local` grant, followed by its `ping` (section 5.19), for every `local` lease row that names the node, carries no unsettled mark, is not revoked in its own view and has no failed fence, unless the `hello` lists that lease `expired` or `revoked`.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
@@ -1316,6 +1316,8 @@ A fatal error ends the session immediately; the node applies its redial rule (se
   }
 }
 ```
+
+**The `stale_term` exception's limit.** The exception of a primary restored with `--accept-loss` (the `stale_term` row above) lasts only until its first `lease_grant`, the same-token `local` grant of a session start included (section 5.12). It lives only in memory: a restart of the control plane before that loses it, and the primary then demotes itself on a higher term, as any primary does (section 7.4). This is a stated limit (`backup-format.md` section 8.2).
 
 ### 5.19 `ping`
 
@@ -1984,7 +1986,14 @@ Taking `T` from the vote answers matters here: a promotion that stopped after it
 
 ### 7.4 The old primary
 
-A primary learns that a newer term exists when a machine answers it with `stale_term` (section 8.8): a node that reached it after seeing the new primary, or a voter answering its `support_request`. A primary restored with `quoro restore --accept-loss` that has sent no `lease_grant` yet starts again at one above the error's `term` instead (`backup-format.md` section 8.2, ADR 0261). Any other primary then (ADR 0230):
+A primary learns that a newer term exists when a machine answers it with `stale_term` (section 8.8): a node that reached it after seeing the new primary, or a voter answering its `support_request`. A primary restored with `quoro restore --accept-loss` that has sent no `lease_grant` yet starts again at one above the error's `term` instead (`backup-format.md` section 8.2, ADR 0261). Starting again raises the term only, never lowering it:
+
+- The primary keeps its other sessions and the support it holds at the old term, and sends no `not_primary`.
+- The session that carried the `stale_term` ends, as that error is fatal (section 5.18).
+- The exception ends before the first `lease_grant` frame leaves, the same-token `local` grant of a session start included (section 5.12). So it ends at the first session start of the host's node when that node holds a `local` lease whose row carries no mark.
+- It lives only in the process that made the first write. A restart of the control plane before its first `lease_grant` loses it, and the primary then demotes itself on a higher term, the safe side. This is a stated limit.
+
+Any other primary then (ADR 0230):
 
 1. stops granting and renewing `expiring` leases at once (section 8.8);
 2. records the higher term in `meta` (`demoted_by_term`), so a restart keeps it demoted;
@@ -2379,7 +2388,7 @@ Definitions, each on the clock of the machine that uses it:
 - A `welcome`, `desired_state` or `support_request` with a lower term is answered with `error` code `stale_term`, fatal, and the machine ends the session and redials (section 4.4). It keeps running its stored desired state meanwhile.
 - A higher term in a `welcome` or `desired_state` is stored and adopted. The session is authenticated by the pinned certificate, which a promoted primary keeps (ADR 0181).
 - A voter supports, at its current term, only the primary it voted for when it voted in that term; for a term it did not vote in, the primary of its session.
-- A primary that receives `stale_term` stops granting and renewing `expiring` leases at once, and demotes itself: it ends its sessions with `not_primary` and answers every later request with `503` `not_primary` (section 7.4, ADR 0182). The error carries the sender's `term` (section 5.18). A primary restored with `quoro restore --accept-loss` that has sent no `lease_grant` yet starts again at one above that term instead of demoting itself (`backup-format.md` section 8.2, ADR 0261).
+- A primary that receives `stale_term` stops granting and renewing `expiring` leases at once, and demotes itself: it ends its sessions with `not_primary` and answers every later request with `503` `not_primary` (section 7.4, ADR 0182). The error carries the sender's `term` (section 5.18). A primary restored with `quoro restore --accept-loss` that has sent no `lease_grant` yet starts again at one above that term instead of demoting itself (`backup-format.md` section 8.2, ADR 0261). The exception ends with its first `lease_grant` and lives only in memory: a restart of the control plane before that loses it, and the primary then demotes itself on a higher term. This is a stated limit (section 7.4, `backup-format.md` section 8.2).
 - A voter that voted in the primary's term for another candidate answers its `support_request` with `bad_message`, which carries the voter's `term` (section 5.27). A primary restored with `--accept-loss` that has sent no `lease_grant` yet treats it like `stale_term`: it starts again at one above that term. A plain restore lacks that voter's support, and `backup-format.md` section 8.2 gives the way out (ADR 0280).
 
 **The term ceiling.** A term never exceeds 2^53 - 1, the highest integer the change log's canonical JSON carries (section 8.5). No machine sends, stores or adopts a higher term: not as its own term, a vote, `demoted_by_term` (section 7.4) or the highest term it has seen.
