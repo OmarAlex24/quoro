@@ -49,12 +49,14 @@ An audit record has no prefixed id; it is identified by its `seq`, which is gap-
 | `approval_id` | `apr_` id | no | the approval request behind an approval grant |
 | `request_id` | `req_` id | yes | correlation id of the call, echoed as `Quoro-Request-Id` |
 | `result` | `ok` \| `refused` \| `error` | yes | outcome of the call |
-| `result_detail` | string | no | the refusal reason or the error code |
+| `result_detail` | string | no | the refusal reason or the error code; on an `ok` record, only where section 3 names one (`cluster.maintenance`, section 3.7) |
 | `change_seq` | integer | no | the change-log seq this action produced, when it changed state |
 | `prev_hash` | 64 lowercase hex chars | yes | `hash` of record `seq - 1`; 64 zeros for `seq` 1 |
 | `hash` | 64 lowercase hex chars | yes | hash of this record (section 5) |
 
 Absent optional fields are **omitted from the JSON**, not set to `null`. This matters because the hash covers the serialized object: `null` and "absent" would otherwise be two encodings of the same record with different hashes (section 5).
+
+`params` is always an object, except in records an earlier build wrote for `POST /api/v1/approvals/{approval_id}/approve` or `POST /api/v1/approvals/{approval_id}/deny` sent with no request body, or with a body but no `Content-Type` header, which the call reads as none, whether the decision was made, refused or failed: those carry `params` `null`. The log is append-only, so they keep it, their hash covers that `null`, and a promotion's rebuild keeps it as stored (node-agent-protocol.md sections 5.14 and 7.3 step 4).
 
 ### 2.1 Example: the M3 demo restart, by an agent, through MCP
 
@@ -332,8 +334,8 @@ System records, with `actor_type` `system` and no `scope`:
 | `operation` | `actor_id` | `channel` | `target_type` / `target_id` | When |
 | --- | --- | --- | --- | --- |
 | `lease.grant` | `leases` | `system` | `app` / the app | Also an `expiring` lease granted with a new token, to a new holder or again after expiry or revoke; `params` is `{node_id, fencing_token, mode, duration_ms}`. Renewals write no record |
-| `lease.revoke` | `leases` | `system` | `app` / the app | Also the revokes of a returning node declared lost, with reason `declared_lost` |
-| `cluster.maintenance` | `cluster` | `cli` | `cluster` / the cluster id | The operator or the installer ran `quoro cluster maintenance` on the primary's host and the primary opened the window (node-agent-protocol.md section 8.11); `params` is `{duration_s}`, `ok` once a majority supported it and its raise of `leases.duration_ms` was replicated (ADR 0268), `error` with the reason otherwise. `--end` writes another record with `params` `{end: true}` |
+| `lease.revoke` | `leases` | `system` | `app` / the app | Also the revokes of a returning node declared lost, and those of a removal (node-agent-protocol.md section 10), with reason `declared_lost` |
+| `cluster.maintenance` | `cluster` | `cli` | `cluster` / the cluster id | The operator or the installer ran `quoro cluster maintenance` on the primary's host and asked the primary to open a window (node-agent-protocol.md section 8.11); `params` is `{duration_s}`, `ok` once a majority supported it and its raise of `leases.duration_ms` was replicated (ADR 0268), or at once when the window covers no lease (section 8.11 step 1), `error` with the reason otherwise. When a lease that is not revoked reads `expiring` or carries the unsettled mark and is not one of the window's leases, the `ok` record's `result_detail` is `leases_not_covered`, and the command names those leases. A lease the window stops covering after the record, such as one whose holder does not renew in time, is named by the command only. `--end` writes another record with `params` `{end: true}` |
 
 Support requests and grants, promotion votes and the loss of a majority write no record: they change no state on the primary. What follows from them is recorded: the fences of the nodes (`node.fenced` events) and, with promotion, the promotion itself.
 
