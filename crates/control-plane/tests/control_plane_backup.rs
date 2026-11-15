@@ -483,7 +483,7 @@ async fn a_scheduled_backup_uploads_a_restorable_database_and_seals_it() {
     assert_eq!(queued.source_kind.as_str(), "control_plane");
     assert_eq!(queued.status.as_str(), "queued");
     assert_eq!(queued.trigger.as_str(), "schedule");
-    assert_eq!(queued.node_id, node_id);
+    assert_eq!(queued.node_id.as_deref(), Some(node_id.as_str()));
     assert_eq!(queued.repository_id, repository_id);
     assert!(queued.app_id.is_none() && queued.volume_id.is_none());
     let queued_row = row(&server, &queued.id).await;

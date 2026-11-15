@@ -36,6 +36,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../../docs/contracts/migrations/0013-lease-unsettled.sql"),
     include_str!("../../../docs/contracts/migrations/0014-audit-params-digest.sql"),
     include_str!("../../../docs/contracts/migrations/0015-node-mesh-rules.sql"),
+    include_str!("../../../docs/contracts/migrations/0016-backup-node-nullable.sql"),
 ];
 
 /// 64 zeros: `prev_hash` of the first entry of a chain.
@@ -1100,12 +1101,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Migration 0015: a new database opens at schema 16 with
-    /// `nodes.mesh_rules`, and a database at schema 15 migrates to it,
-    /// keeping its rows, which read `NULL` there. The column takes no value
-    /// below 1.
+    /// Migration 0015: a new database opens with `nodes.mesh_rules`, and a
+    /// database at schema 15 migrates to the shipped schema, keeping its rows,
+    /// which read `NULL` there. The column takes no value below 1.
     #[tokio::test]
-    async fn the_store_opens_at_16_and_a_database_at_15_migrates() {
+    async fn a_database_at_15_migrates_and_gets_mesh_rules() {
         async fn version(store: &Store) -> String {
             sqlx::query_scalar("SELECT value FROM meta WHERE key = 'schema_version'")
                 .fetch_one(store.pool())
@@ -1123,9 +1123,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("quoro-store-{}", random_secret()));
         std::fs::create_dir_all(&dir).unwrap();
 
+        let shipped = Store::shipped_schema_version().to_string();
         let store = Store::open(&dir.join("new.db")).await.unwrap();
-        assert_eq!(Store::shipped_schema_version(), 16);
-        assert_eq!(version(&store).await, "16");
+        assert_eq!(version(&store).await, shipped);
         assert!(has_mesh_rules(&store).await);
         drop(store);
 
@@ -1147,7 +1147,7 @@ mod tests {
         drop(old);
 
         let store = Store::open(&path).await.unwrap();
-        assert_eq!(version(&store).await, "16");
+        assert_eq!(version(&store).await, shipped);
         let rules: Option<i64> =
             sqlx::query_scalar("SELECT mesh_rules FROM nodes WHERE id = 'nod_1'")
                 .fetch_one(store.pool())
@@ -1161,6 +1161,136 @@ mod tests {
                 .await;
             assert_eq!(result.is_ok(), accepted, "{value}");
         }
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Migration 0016: `backups.node_id` takes null for a control-plane
+    /// backup (`backup-format.md` section 8.2). A new database opens at
+    /// schema 17, and a database at schema 16 migrates to it keeping every
+    /// backup row and the volume that names one of them, with no foreign-key
+    /// violation. Afterwards a control-plane backup inserts with a null
+    /// `node_id`, and a volume backup still needs its node.
+    #[tokio::test]
+    async fn the_store_opens_at_17_and_a_database_at_16_keeps_its_backups() {
+        async fn version(store: &Store) -> String {
+            sqlx::query_scalar("SELECT value FROM meta WHERE key = 'schema_version'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap()
+        }
+        async fn backups(store: &Store) -> String {
+            sqlx::query_scalar(
+                "SELECT json_group_array(json_array(id, repository_id, source_kind, app_id, \
+                 volume_id, node_id, status, \"trigger\", fencing_token, snapshot_method, \
+                 pause_ms, logical_bytes, uploaded_bytes, chunk_count, manifest_key, \
+                 manifest_digest, error, created_by_type, created_by_id, created_at, \
+                 started_at, finished_at, pruned_at)) FROM (SELECT * FROM backups ORDER BY id)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+        }
+        let dir = std::env::temp_dir().join(format!("quoro-store-{}", random_secret()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let store = Store::open(&dir.join("new.db")).await.unwrap();
+        assert_eq!(Store::shipped_schema_version(), 17);
+        assert_eq!(version(&store).await, "17");
+        drop(store);
+
+        // A database the release before this one left: schema 16, with a
+        // control-plane backup, a volume backup and a volume restored from it.
+        let path = dir.join("old.db");
+        let mut old = Store::open_unmigrated(&path).await.unwrap();
+        old.migrations = Arc::from(&MIGRATIONS[..15]);
+        old.migrate().await.unwrap();
+        assert_eq!(version(&old).await, "16");
+        sqlx::raw_sql(
+            "INSERT INTO users (id, email, name, role, password_hash, created_at) \
+             VALUES ('usr_1', 'owner@example.com', 'Owner', 'owner', 'hash', \
+             '2026-11-13T10:00:00.000Z'); \
+             INSERT INTO providers (id, kind, name, config_json, secret_enc, created_by, \
+             created_at) VALUES ('prv_1', 'object_store', 'bucket', '{}', x'00', 'usr_1', \
+             '2026-11-13T10:00:00.000Z'); \
+             INSERT INTO backup_repositories (id, name, provider_id, prefix, repo_key_enc, \
+             recovery_key_fingerprint, created_by, created_at) VALUES ('brp_1', 'repo', \
+             'prv_1', 'quoro', x'00', '0123456789abcdef', 'usr_1', \
+             '2026-11-13T10:00:00.000Z'); \
+             INSERT INTO nodes (id, name, roles, status, public_key, behind_nat, labels, \
+             capacity, allocated, kvm, created_at) VALUES ('nod_1', 'node-1', '[\"node\"]', \
+             'connected', 'key', 0, '{}', '{}', '{}', '{}', '2026-11-13T10:00:00.000Z'); \
+             INSERT INTO backups (id, repository_id, source_kind, node_id, status, \"trigger\", \
+             created_by_type, created_by_id, created_at) VALUES ('bkp_1', 'brp_1', \
+             'control_plane', 'nod_1', 'queued', 'schedule', 'system', 'backups', \
+             '2026-11-13T10:00:00.000Z'); \
+             INSERT INTO backups (id, repository_id, source_kind, app_id, volume_id, node_id, \
+             status, \"trigger\", fencing_token, manifest_key, manifest_digest, \
+             created_by_type, created_by_id, created_at, finished_at) VALUES ('bkp_2', \
+             'brp_1', 'volume', 'app_1', 'vol_0', 'nod_1', 'succeeded', 'api', 1, \
+             'manifests/bkp_2', \
+             '0000000000000000000000000000000000000000000000000000000000000000', 'user', \
+             'usr_1', '2026-11-13T10:00:00.000Z', '2026-11-13T10:01:00.000Z'); \
+             INSERT INTO volumes (id, app_id, node_id, size_gb, mount_path, state, \
+             restored_from_backup_id, created_at, updated_at) VALUES ('vol_1', 'app_1', \
+             'nod_1', 1, '/data', 'restoring', 'bkp_2', '2026-11-13T10:02:00.000Z', \
+             '2026-11-13T10:02:00.000Z');",
+        )
+        .execute(old.pool())
+        .await
+        .unwrap();
+        let before = backups(&old).await;
+        assert!(
+            before.contains("bkp_1") && before.contains("bkp_2"),
+            "{before}"
+        );
+        drop(old);
+
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(version(&store).await, "17");
+        assert_eq!(backups(&store).await, before);
+        let restored_from: Option<String> =
+            sqlx::query_scalar("SELECT restored_from_backup_id FROM volumes WHERE id = 'vol_1'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(restored_from.as_deref(), Some("bkp_2"));
+        let parents: Vec<String> =
+            sqlx::query_scalar("SELECT \"table\" FROM pragma_foreign_key_list('volumes')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            parents.iter().any(|parent| parent == "backups"),
+            "{parents:?}"
+        );
+        let violations = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+        assert!(violations.is_empty(), "{} violations", violations.len());
+
+        sqlx::query(
+            "INSERT INTO backups (id, repository_id, source_kind, node_id, status, \"trigger\", \
+             created_by_type, created_by_id, created_at) VALUES ('bkp_3', 'brp_1', \
+             'control_plane', NULL, 'succeeded', 'schedule', 'system', 'backups', \
+             '2026-11-13T11:00:00.000Z')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let refused = sqlx::query(
+            "INSERT INTO backups (id, repository_id, source_kind, app_id, volume_id, node_id, \
+             status, \"trigger\", fencing_token, created_by_type, created_by_id, created_at) \
+             VALUES ('bkp_4', 'brp_1', 'volume', 'app_1', 'vol_1', NULL, 'queued', 'api', 2, \
+             'user', 'usr_1', '2026-11-13T11:00:00.000Z')",
+        )
+        .execute(store.pool())
+        .await;
+        let error = refused
+            .expect_err("a volume backup needs its node")
+            .to_string();
+        assert!(error.contains("CHECK constraint failed"), "{error}");
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }

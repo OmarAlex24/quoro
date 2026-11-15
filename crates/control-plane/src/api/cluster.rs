@@ -25,9 +25,10 @@ pub struct Cluster {
     pub name: String,
     /// Version of the running binary.
     pub version: String,
-    /// Node that currently holds the primary status.
-    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
-    pub primary_node_id: String,
+    /// Node that currently holds the primary status, or null while no
+    /// machine holds it (`backup-format.md` section 8.2).
+    #[schema(required = true, pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub primary_node_id: Option<String>,
     /// Sequence number of the last change-log entry.
     #[schema(minimum = 0)]
     pub log_seq: i64,
